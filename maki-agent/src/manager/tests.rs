@@ -709,11 +709,12 @@ fn root_cancelled_before_managed_admission_has_no_start_and_resolves_end() {
     let ticket = actor.turn_ticket(turn_id).unwrap();
     assert!(events.is_empty());
     actor.close();
+    assert!(ticket.peek_result().is_none());
+    release_tx.send(()).unwrap();
     assert!(matches!(
         smol::block_on(ticket.wait()),
         TurnOutcome::Cancelled { .. }
     ));
-    release_tx.send(()).unwrap();
     assert!(
         smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
             .timed_out
@@ -1825,10 +1826,23 @@ fn cancellation_wakes_pending_managed_execution_and_runs_cleanup() {
                 .await
                 .unwrap();
         let (polled_tx, polled_rx) = flume::unbounded();
-        let backend = std::future::poll_fn(move |_| {
+        let cleanup_gate = Gate::new();
+        let backend_gate = Arc::clone(&cleanup_gate);
+        let backend_cancel = token.clone();
+        let backend_agent_id = root.id();
+        let backend = async move {
             polled_tx.send(()).unwrap();
-            Poll::<BackendResult>::Pending
-        });
+            let reason = backend_cancel.cancelled().await;
+            polled_tx.send(()).unwrap();
+            backend_gate.enter().await;
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                backend_agent_id,
+                turn_id,
+                TokenUsage::default(),
+                0,
+                reason,
+            ))
+        };
         let execution = super::manage_execution(
             Box::pin(backend),
             guard,
@@ -1848,8 +1862,25 @@ fn cancellation_wakes_pending_managed_execution_and_runs_cleanup() {
         );
         assert!(!current.lease.inner.state.lock().unwrap().closing);
 
-        task.cancel().await;
-        assert!(current.lease.inner.state.lock().unwrap().closing);
+        while current.lease.inner.state.lock().unwrap().permit.is_none() {
+            smol::future::yield_now().await;
+        }
+        assert!(!task.is_finished());
+        cleanup_gate.release(1);
+        assert!(matches!(
+            task.await,
+            BackendResult::EnteredRun(TurnOutcome::Cancelled {
+                reason: crate::TurnCancellationReason::User,
+                ..
+            })
+        ));
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert!(state.closing);
+            assert!(state.permit.is_none());
+        }
+        let permit = manager.0.limiter.acquire_arc().await;
+        drop(permit);
         root.actor().unwrap().shutdown();
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
         assert!(report.timed_out.is_empty());
@@ -2416,7 +2447,11 @@ fn closing_active_child_consumes_capacity_until_runner_finishes() {
             .unwrap();
         entered_rx.recv_async().await.unwrap();
 
+        let actor = child.actor().unwrap();
+        let events = actor.subscribe_events();
         child.close_subtree().unwrap();
+        assert!(ticket.peek_result().is_none());
+        assert!(events.is_empty());
         assert_eq!(
             child.snapshot().unwrap().graph_lifecycle,
             GraphLifecycle::Closing
@@ -2433,10 +2468,18 @@ fn closing_active_child_consumes_capacity_until_runner_finishes() {
         ));
 
         child_gate.release(1);
-        ticket.wait().await;
+        let outcome = ticket.wait().await;
         while !manager.runner_finished(child.id()).unwrap() {
             smol::future::yield_now().await;
         }
+        assert!(
+            matches!(events.try_recv().unwrap(), crate::ActorEvent::End(result) if result.outcome == outcome)
+        );
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            crate::ActorEvent::Close { .. }
+        ));
+        assert!(events.is_empty());
         manager
             .spawn_child(
                 &current,
@@ -3410,6 +3453,12 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
                 .await
                 .is_none()
         );
+        assert!(root_ticket.peek_result().is_none());
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert!(!state.closing);
+            assert!(state.permit.is_none());
+        }
         child_gate.release(1);
         assert!(matches!(
             child_completion.await,

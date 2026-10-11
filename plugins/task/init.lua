@@ -283,13 +283,22 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
   }
 end
 
-local function create_session(ctx, options)
+local function create_session(ctx, options, blocking)
   if not ctx:_maki_managed() then
     return maki.agent.session(ctx, options)
   end
   local agent, err = maki.agent.spawn(ctx, options)
   if not agent then
     return nil, err
+  end
+  if blocking then
+    local ok, registered, close_err = pcall(function()
+      return ctx:defer_close(agent)
+    end)
+    if not ok or not registered then
+      agent:close(ctx)
+      return nil, ok and close_err or registered
+    end
   end
   local latest
   local adapter = {}
@@ -534,7 +543,7 @@ local function handler(input, ctx)
   -- pcall so a raised error cannot leak the session.
   local ok, out = pcall(function()
     local ok_sess, s, sess_err = pcall(function()
-      return create_session(ctx, ctx_opts(spec, input, semaphore, false))
+      return create_session(ctx, ctx_opts(spec, input, semaphore, false), true)
     end)
     if not ok_sess then
       error(s, 0)

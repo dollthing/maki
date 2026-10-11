@@ -1029,6 +1029,8 @@ mod tests {
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
                 AgentEvent::QueueItemConsumed { ref text, .. } if text == RESTORED_TEXT => {
+                    assert_eq!(envelope.run_id, app.run_id + 1);
+                    app.adopt_actor_presentation(&envelope);
                     assert_eq!(envelope.run_id, app.run_id);
                     restored_seen += 1;
                 }

@@ -443,6 +443,7 @@ impl ActorBackend for LuaActorBackend {
             .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
+            .with_local_tool_capture(Arc::clone(&state.commit))
             .with_admission(context.admission.clone());
             if let Some(structured) = &state.structured {
                 let structured = Arc::clone(structured);
@@ -1142,6 +1143,20 @@ async fn build_session(
     let model_id = model.id.clone();
 
     let inherit_tools = inherit_defaults && tools_val.is_none();
+    let mut parent_tools_context = agent_ctx.to_tool_context();
+    if trusted.is_some() {
+        parent_tools_context.turn_bindings =
+            Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                &parent_tools_context.registry,
+                &parent_tools_context.local_tools,
+                parent_tools_context.mcp.as_ref(),
+            ));
+    }
+    let parent_allowed: std::collections::HashSet<_> =
+        tool_dispatch::callable(&parent_tools_context)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
     let mut tools_json: JsonValue = match tools_val {
         Some(LuaValue::Table(table)) if table.is_empty() => JsonValue::Array(Vec::new()),
         Some(value) => request_tools_json(&lua, &value)?,
@@ -1151,20 +1166,6 @@ async fn build_session(
                 .as_ref()
                 .clone()
                 .excluding(maki_agent::tools::capability_exclusions(&model));
-            let mut parent_tools_context = agent_ctx.to_tool_context();
-            if trusted.is_some() {
-                parent_tools_context.turn_bindings =
-                    Arc::new(maki_agent::tools::TurnToolBindings::capture(
-                        &parent_tools_context.registry,
-                        &parent_tools_context.local_tools,
-                        parent_tools_context.mcp.as_ref(),
-                    ));
-            }
-            let allowed: std::collections::HashSet<_> =
-                tool_dispatch::callable(&parent_tools_context)
-                    .into_iter()
-                    .map(|tool| tool.name)
-                    .collect();
             let mut definitions = try_pair!(
                 agent_ctx
                     .request_tools
@@ -1180,7 +1181,7 @@ async fn build_session(
                         .and_then(JsonValue::as_str)
                         .is_some_and(|name| {
                             name != structured_output::TOOL_NAME
-                                && allowed.contains(name)
+                                && parent_allowed.contains(name)
                                 && filter.matches(name)
                         })
                 });
@@ -1238,11 +1239,16 @@ async fn build_session(
             let audience =
                 parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
-            let commit = Arc::clone(&commit);
             local_map.insert(
                 name,
-                maki_agent::tools::local_tool(audience, move |input, _ctx| {
-                    let result = call_local_tool(&weak, &handler, &input, &commit, capture_input);
+                maki_agent::tools::local_tool(audience, move |input, ctx| {
+                    let result = call_local_tool(
+                        &weak,
+                        &handler,
+                        &input,
+                        ctx.local_tool_capture.as_ref(),
+                        capture_input,
+                    );
                     Box::pin(async move { result })
                 }),
             );
@@ -1327,13 +1333,16 @@ async fn build_session(
     let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
     let inherit_parent_mode =
         inherit_defaults || restrictive_parent || matches!(&parent_mode, AgentMode::Custom(_));
-    let child_mode = if inherit_parent_mode {
-        let mut child_ctx = agent_ctx.to_tool_context();
+    if inherit_parent_mode {
+        let mut child_ctx = parent_tools_context.clone();
         child_ctx.audience = audience;
         child_ctx.tool_filter = Arc::clone(initial_tools.filter());
         let mut allowed: std::collections::HashSet<_> = tool_dispatch::callable(&child_ctx)
             .into_iter()
             .map(|tool| tool.name)
+            .filter(|name| {
+                !(inherit_defaults || restrictive_parent) || parent_allowed.contains(name)
+            })
             .collect();
         allowed.extend(local_map.keys().cloned());
         tools_json
@@ -1345,6 +1354,8 @@ async fn build_session(
                     .and_then(JsonValue::as_str)
                     .is_some_and(|name| allowed.contains(name))
             });
+    }
+    let child_mode = if inherit_parent_mode {
         parent_mode
     } else {
         AgentMode::Build
@@ -1362,6 +1373,7 @@ async fn build_session(
     child_template.request_tools = Some(tools.clone());
     child_template.managed_turn = None;
     child_template.local_tools = Arc::new(local_map.clone());
+    child_template.local_tool_capture = Some(Arc::clone(&commit));
     child_template.mcp = agent_ctx
         .mcp
         .as_ref()
@@ -2157,16 +2169,19 @@ fn call_local_tool(
     weak: &mlua::WeakLua,
     f: &Function,
     input: &JsonValue,
-    commit: &Arc<Mutex<Option<JsonValue>>>,
+    commit: Option<&Arc<Mutex<Option<JsonValue>>>>,
     capture_input: bool,
 ) -> Result<String, String> {
     let lua = weak.try_upgrade().ok_or("Lua runtime shut down")?;
     let arg = json_to_lua(&lua, input).map_err(|e| e.to_string())?;
-    let previous = ACTIVE_COMMIT.replace(Some(Arc::clone(commit)));
+    let previous = ACTIVE_COMMIT.replace(commit.cloned());
     let values = f.call::<mlua::MultiValue>(arg);
     ACTIVE_COMMIT.replace(previous);
     let result = lua_tool_result(values.map_err(|e| e.to_string())?);
-    if result.is_ok() && capture_input {
+    if result.is_ok()
+        && capture_input
+        && let Some(commit) = commit
+    {
         *commit.lock().unwrap() = Some(input.clone());
     }
     result
@@ -2262,7 +2277,7 @@ mod tests {
         let lua = Lua::new();
         let f: Function = lua.load(src).eval().unwrap();
         let commit = Arc::new(Mutex::new(None));
-        call_local_tool(&lua.weak(), &f, &input, &commit, false)
+        call_local_tool(&lua.weak(), &f, &input, Some(&commit), false)
     }
 
     #[test]

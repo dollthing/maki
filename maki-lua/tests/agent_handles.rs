@@ -57,6 +57,29 @@ struct CapturedRequest {
     reply: flume::Sender<StreamResponse>,
 }
 
+async fn request_with_command_diagnostics(
+    requests: &flume::Receiver<CapturedRequest>,
+    command: &flume::Receiver<Result<(), String>>,
+    operation: &str,
+) -> CapturedRequest {
+    futures_lite::future::race(
+        async {
+            requests
+                .recv_async()
+                .await
+                .expect("provider request channel closed")
+        },
+        async {
+            smol::Timer::after(TEST_TIMEOUT).await;
+            panic!(
+                "{operation} did not arrive; command: {:?}",
+                command.try_recv()
+            );
+        },
+    )
+    .await
+}
+
 async fn wait_for_gate_drop(request: &CapturedRequest, operation: &str) {
     bounded(
         async {
@@ -92,12 +115,18 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
         &self,
         _: Option<&CommandInvocation>,
     ) -> Result<Option<TrustedTarget>, String> {
-        Ok(self
+        let target = self
             .targets
             .lock()
             .unwrap()
             .get(self.selected.load(Ordering::SeqCst))
-            .cloned())
+            .map(|registered| registered.target.clone());
+        target
+            .map(|target| {
+                self.template(&target)
+                    .map(|template| TrustedTarget { target, template })
+            })
+            .transpose()
     }
 
     fn plan_path_preparer(&self) -> Option<Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>> {
@@ -130,8 +159,12 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
     }
 
     fn template(&self, target: &maki_agent::AgentRef) -> Result<ToolContext, String> {
-        target.actor().map_err(|error| error.to_string())?;
-        self.targets
+        let config = target
+            .effective_config()
+            .map_err(|error| error.to_string())?
+            .ok_or("test target configuration is unavailable")?;
+        let mut template = self
+            .targets
             .lock()
             .unwrap()
             .iter()
@@ -140,7 +173,15 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
                     && registered.target.manager().same_manager(&target.manager())
             })
             .map(|registered| registered.template.clone())
-            .ok_or_else(|| "unregistered test target".into())
+            .ok_or_else(|| "unregistered test target".to_owned())?;
+        template.provider = Arc::clone(&config.provider);
+        template.model = Arc::new(config.model.clone());
+        template.opts.thinking = config.thinking;
+        template.opts.fast = config.fast;
+        template.workflow = config.workflow;
+        template.mode = config.mode.clone();
+        template.mode_def = config.mode_def.clone().map(Arc::new);
+        Ok(template)
     }
 }
 
@@ -196,6 +237,15 @@ impl ActorBackend for LuaInvocationBackend {
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(config) = &context.policy {
+                self.context.provider = Arc::clone(&config.provider);
+                self.context.model = Arc::new(config.model.clone());
+                self.context.opts.thinking = config.thinking;
+                self.context.opts.fast = config.fast;
+                self.context.workflow = config.workflow;
+                self.context.mode = config.mode.clone();
+                self.context.mode_def = config.mode_def.clone().map(Arc::new);
+            }
             self.context.cancel = context.cancel.clone();
             self.context.managed_turn = context.managed_turn;
             let invocation = self
@@ -273,7 +323,10 @@ impl Fixture {
             })),
         )
         .unwrap();
-        if tool == "pr5_bundled_schema" {
+        if tool == "pr5_bundled_schema"
+            || tool == "pr6_abandoned_blocking"
+            || tool == "pr6_persistent_spawn"
+        {
             host.load_source(
                 "pr5_bundled_task",
                 &format!(
@@ -287,6 +340,39 @@ impl Fixture {
             tool,
             &format!(
                 r#"
+            if "{tool}" == "pr5_audience_ceiling" then
+                maki.api.register_tool({{
+                    name = "{tool}_sub", description = "subagent-only registry tool",
+                    schema = {{ type = "object", properties = {{}} }}, audiences = {{ "general_sub" }},
+                    handler = function() error("audience capability escalated") end,
+                }})
+                maki.api.register_tool({{
+                    name = "{tool}_unpublished", description = "unadvertised registry tool",
+                    schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
+                    handler = function() error("request capability escalated") end,
+                }})
+            end
+            if "{tool}" == "pr6_nested_capture" then
+                maki.api.register_tool({{
+                    name = "pr6_spawn_grandchild", description = "exercise inherited capture",
+                    schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
+                    handler = function(_, child_ctx)
+                        local grandchild = assert(maki.agent.spawn(child_ctx, {{ inherit_provider = true, silent = true }}))
+                        local first = assert(grandchild:send(child_ctx, "grandchild capture"))
+                        local result = assert(first:wait(child_ctx))
+                        assert(#result.output == 1 and result.output[1].answer == 42 and result.captured.answer == 42)
+                        local second = assert(grandchild:send(child_ctx, "grandchild capture again"))
+                        local next_result = assert(second:wait(child_ctx))
+                        assert(#next_result.output == 1 and next_result.output[1].answer == 7 and next_result.captured.answer == 7)
+                        local frozen = assert(first:result(child_ctx))
+                        assert(#frozen.output == 1 and frozen.output[1].answer == 42 and frozen.captured.answer == 42)
+                        assert(grandchild:close(child_ctx))
+                        local closed = assert(first:result(child_ctx))
+                        assert(#closed.output == 1 and closed.output[1].answer == 42 and closed.captured.answer == 42)
+                        return "grandchild complete"
+                    end,
+                }})
+            end
             if "{tool}" == "pr5_schema_inheritance" then
                 maki.api.register_tool({{
                     name = "pr5_spawn_schema_children", description = "spawn children from a schema-enabled parent",
@@ -306,6 +392,17 @@ impl Fixture {
                 name = "{tool}_probe", description = "probe executing authority",
                 schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                 handler = function(input, ctx) return pr5_child_authority_handler(input, ctx) end,
+            }})
+            maki.api.register_tool({{
+                name = "{tool}_write", description = "nested write restriction probe",
+                schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
+                handler = function(_, ctx)
+                    pr5_nested_write_entered = true
+                    local ok, err = ctx:check_before_edit("/test/forbidden.txt")
+                    if not ok then return {{ llm_output = err, is_error = true }} end
+                    assert(maki.fs.atomic_write("/test/forbidden.txt", "escaped"))
+                    return "escaped"
+                end,
             }})
             end
             maki.api.register_tool({{
@@ -330,7 +427,11 @@ impl Fixture {
         ));
         let mut definition = context.modes.current(&mode);
         if tool.starts_with("pr5_tool_authority") {
-            definition.tools = Some(vec![tool.into(), format!("{tool}_probe")]);
+            definition.tools = Some(vec![
+                tool.into(),
+                format!("{tool}_probe"),
+                format!("{tool}_write"),
+            ]);
             context
                 .modes
                 .define(maki_agent::ModeDefSpec {
@@ -352,11 +453,25 @@ impl Fixture {
                 "input_schema": { "type": "object", "properties": {} },
             }));
         }
+        if tool.starts_with("pr5_tool_authority") {
+            definitions.push(json!({ "name": format!("{tool}_write"), "description": "nested write", "input_schema": { "type": "object", "properties": {} } }));
+        }
+        if tool == "pr5_audience_ceiling" {
+            definitions.push(json!({ "name": "pr5_audience_ceiling_sub", "description": "subagent-only registry tool", "input_schema": { "type": "object", "properties": {} } }));
+        }
+        if tool == "pr6_nested_capture" {
+            definitions.push(json!({ "name": "pr6_spawn_grandchild", "description": "spawn grandchild", "input_schema": { "type": "object" } }));
+        }
         if tool == "pr5_schema_inheritance" {
             definitions.push(json!({ "name": "pr5_spawn_schema_children", "description": "spawn schema children", "input_schema": { "type": "object", "properties": {} } }));
         }
-        if tool == "pr5_bundled_schema" {
-            definitions.push(json!({ "name": "task", "description": "managed blocking task", "input_schema": { "type": "object" } }));
+        if tool == "pr5_bundled_schema"
+            || tool == "pr6_abandoned_blocking"
+            || tool == "pr6_persistent_spawn"
+        {
+            for name in ["task", "task_spawn", "task_get", "task_despawn"] {
+                definitions.push(json!({ "name": name, "description": "managed task", "input_schema": { "type": "object" } }));
+            }
         }
         let request_tools = maki_agent::tools::RequestTools::assembled(
             Value::Array(definitions),
@@ -617,6 +732,10 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(restricted: bool) {
                     if {restricted} then
                         local changed, mode_err = current:set_mode(child_ctx, "build")
                         assert(changed == nil and mode_err ~= nil)
+                        local written, write_err = maki.agent.call_tool(child_ctx, "{tool}_write", {{}})
+                        assert(written == nil and write_err ~= nil)
+                        assert(pr5_nested_write_entered)
+                        assert(maki.fs.read("/test/forbidden.txt") == nil)
                     end
                     for _, target in ipairs({{ parent, sibling }}) do
                         local status, status_err = target:status(child_ctx)
@@ -647,7 +766,10 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(restricted: bool) {
             assert(found, "parent callable probe missing before child preparation")
             local child = assert(maki.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true,
-                tools = {{{{ name = "{probe}", description = "check scope", input_schema = {{ type = "object", properties = {{}} }} }}}},
+                tools = {{
+                    {{ name = "{probe}", description = "check scope", input_schema = {{ type = "object", properties = {{}} }} }},
+                    {{ name = "{tool}_write", description = "nested write", input_schema = {{ type = "object", properties = {{}} }} }},
+                }},
             }}))
             local ticket = assert(child:send(ctx, "check authority"))
             assert(assert(ticket:wait(ctx)).text == "{SECOND_REPLY}")
@@ -1031,7 +1153,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
 }
 
 #[test]
-fn build_trusted_context_cannot_expand_registered_restricted_target_policy() {
+fn trusted_mode_changes_preserve_registered_target_model_policy() {
     smol::block_on(async {
         let owner = Fixture::start("pr5_destination_owner", "");
         let restricted = Fixture::start_with_mode(
@@ -1082,8 +1204,7 @@ fn build_trusted_context_cannot_expand_registered_restricted_target_policy() {
                 name = "/pr5_destination_attack", tui_only = false,
                 handler = function(_, ctx)
                     assert(assert(maki.agent.current(ctx)):id() ~= target:id())
-                    local expanded, mode_err = target:set_mode(ctx, "build")
-                    assert(expanded == nil and mode_err ~= nil)
+                    assert(target:set_mode(ctx, "build"))
                     local changed, model_err = target:set_model(ctx, "anthropic/claude-opus-4-20250514")
                     assert(changed == nil and model_err ~= nil)
                     assert(target:set_model(ctx, { thinking = "off" }))
@@ -1116,7 +1237,7 @@ fn build_trusted_context_cannot_expand_registered_restricted_target_policy() {
             .unwrap()
             .effective_config()
             .unwrap();
-        assert!(matches!(config.mode, AgentMode::Plan(_)));
+        assert!(matches!(config.mode, AgentMode::Build));
         assert_eq!(config.model.spec(), common::default_model().spec());
         owner.manager.shutdown(SHUTDOWN_TIMEOUT).await;
         restricted.manager.shutdown(SHUTDOWN_TIMEOUT).await;
@@ -1136,9 +1257,8 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             .unwrap(),
             Ok(())
         );
-        let (tx, rx) = flume::unbounded();
-        let (template, _events, _cancel) =
-            common::ctx_with_provider(Arc::new(ScriptedProvider { requests: tx }));
+        let rx = fixture.requests.clone();
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
         let handle = fixture._host.event_handle();
         handle.install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
             TrustedTarget {
@@ -1188,16 +1308,12 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             String::new(),
             0,
         );
-        let terminal: CapturedRequest = bounded(rx.recv_async(), "integration channel receive")
-            .await
-            .unwrap();
+        let terminal = request_with_command_diagnostics(&rx, &begin, "terminal request").await;
         terminal
             .reply
             .send(common::canned_reply("terminal reply"))
             .unwrap();
-        let active = bounded(rx.recv_async(), "integration channel receive")
-            .await
-            .unwrap();
+        let active = request_with_command_diagnostics(&rx, &begin, "active request").await;
         assert_eq!(begin.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
         let inspect = handle.run_command_for_test(
             Arc::from("pr5_retained_ticket"),
@@ -1205,9 +1321,8 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             String::new(),
             0,
         );
-        let checkpoint = bounded(rx.recv_async(), "integration channel receive")
-            .await
-            .unwrap();
+        let checkpoint =
+            request_with_command_diagnostics(&rx, &inspect, "checkpoint request").await;
         assert!(
             serde_json::to_string(&checkpoint.messages)
                 .unwrap()
@@ -1251,10 +1366,8 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
             .unwrap(),
             Ok(())
         );
-        let (requests_tx, requests) = flume::unbounded();
-        let (template, _events, _cancel) = common::ctx_with_provider(Arc::new(ScriptedProvider {
-            requests: requests_tx,
-        }));
+        let requests = fixture.requests.clone();
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
         let handle = fixture._host.event_handle();
         handle.install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
             TrustedTarget {
@@ -1500,6 +1613,154 @@ fn tool_origin_subscriptions_deliver_config_and_idle_with_fresh_contexts() {
         for gate in gates {
             wait_for_gate_drop(&gate, "tool-origin subscription cancellation").await;
         }
+    });
+}
+
+#[test_case::test_case(false ; "inherited_snapshot")]
+#[test_case::test_case(true ; "explicit_registry_definitions")]
+fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit: bool) {
+    smol::block_on(async {
+        let fixture = Fixture::start("pr5_audience_ceiling", "");
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "root completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "root settlement").await;
+        let (mut template, _events, _cancel) = common::ctx_with_canned_provider();
+        template.registry = Arc::clone(ToolRegistry::global_arc());
+        template.turn_bindings = Arc::new(maki_agent::tools::TurnToolBindings::default());
+        let definitions = json!([
+            { "name": "pr5_audience_ceiling", "description": "exact parent snapshot", "input_schema": { "type": "object", "properties": {} } },
+            { "name": "pr5_audience_ceiling_sub", "description": "subagent only", "input_schema": { "type": "object", "properties": {} } },
+        ]);
+        let tools = maki_agent::tools::RequestTools::assembled(
+            definitions.clone(),
+            &template.config,
+            &template.model,
+        );
+        template.tool_filter = Arc::clone(tools.filter());
+        template.request_tools = Some(tools);
+        let handle = fixture._host.event_handle();
+        handle.install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
+            TrustedTarget {
+                target: fixture.manager.root().unwrap(),
+                template,
+            },
+        ])));
+        let selection = if explicit {
+            r#"tools = {
+                { name = "pr5_audience_ceiling", description = "exact parent snapshot", input_schema = { type = "object", properties = {} } },
+                { name = "pr5_audience_ceiling_sub", description = "subagent only", input_schema = { type = "object", properties = {} } },
+                { name = "pr5_audience_ceiling_unpublished", description = "not advertised", input_schema = { type = "object", properties = {} } },
+            },"#
+        } else {
+            ""
+        };
+        fixture._host.load_source("pr5_trusted_bindings", &format!(r#"
+            maki.api.register_command({{
+                name = "/pr5_trusted_bindings", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(maki.agent.spawn(ctx, {{
+                        inherit_provider = true, silent = true, audience = "main", {selection}
+                    }}))
+                    assert(assert(assert(child:send(ctx, "trusted bindings")):wait(ctx)).text == "{SECOND_REPLY}")
+                    assert(child:close(ctx))
+                end,
+            }})
+        "#)).unwrap();
+        fixture._host.wait_for_worker_barrier_for_test();
+        let command = handle.run_command_for_test(
+            Arc::from("pr5_trusted_bindings"),
+            Arc::from("/pr5_trusted_bindings"),
+            String::new(),
+            0,
+        );
+        let first = fixture.request().await;
+        assert_eq!(first.tools, json!([definitions[0].clone()]));
+        first
+            .reply
+            .send(common::canned_tool_use("pr5_audience_ceiling", json!({})))
+            .unwrap();
+        let second = fixture.request().await;
+        assert!(
+            serde_json::to_string(&second.messages)
+                .unwrap()
+                .contains("ok")
+        );
+        second
+            .reply
+            .send(common::canned_reply(SECOND_REPLY))
+            .unwrap();
+        assert_eq!(
+            bounded(command.recv_async(), "trusted command completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[test_case::test_case(false ; "inherited_snapshot")]
+#[test_case::test_case(true ; "explicit_registry_definitions")]
+fn child_audience_cannot_expand_parent_capabilities(explicit: bool) {
+    smol::block_on(async {
+        let tools = if explicit {
+            r#"tools = {
+                { name = "pr5_audience_ceiling_sub", description = "subagent-only registry tool", input_schema = { type = "object", properties = {} } },
+                { name = "pr5_audience_ceiling_unpublished", description = "unadvertised registry tool", input_schema = { type = "object", properties = {} } },
+            },"#
+        } else {
+            ""
+        };
+        let fixture = Fixture::start(
+            "pr5_audience_ceiling",
+            &format!(
+                r#"
+                local callable = assert(maki.agent.callable_tools(ctx))
+                for _, tool in ipairs(callable) do
+                    assert(tool.name ~= "pr5_audience_ceiling_sub")
+                    assert(tool.name ~= "pr5_audience_ceiling_unpublished")
+                end
+                local child = assert(maki.agent.spawn(ctx, {{
+                    inherit_provider = true, silent = true, audience = "general_sub", {tools}
+                    local_tools = {{ fresh = {{
+                        description = "new local tool remains available",
+                        input_schema = {{ type = "object", properties = {{}} }},
+                        handler = function() return "fresh local tool ran" end,
+                    }} }},
+                }}))
+                assert(assert(assert(child:send(ctx, "audience ceiling")):wait(ctx)).text == "{SECOND_REPLY}")
+                assert(child:close(ctx))
+            "#
+            ),
+        );
+        let first = fixture.request().await;
+        let names = common::tool_names(&first.tools);
+        assert!(names.iter().any(|name| name == "fresh"));
+        assert!(!names.iter().any(|name| name == "pr5_audience_ceiling_sub"));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "pr5_audience_ceiling_unpublished")
+        );
+        first
+            .reply
+            .send(common::canned_tool_use("fresh", json!({})))
+            .unwrap();
+        let second = fixture.request().await;
+        assert!(
+            serde_json::to_string(&second.messages)
+                .unwrap()
+                .contains("fresh local tool ran")
+        );
+        second
+            .reply
+            .send(common::canned_reply(SECOND_REPLY))
+            .unwrap();
+        fixture.finish().await;
     });
 }
 
@@ -1823,9 +2084,8 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
                 .unwrap(),
             Ok(())
         );
-        let (tx, rx) = flume::unbounded();
-        let (template, _events, _cancel) =
-            common::ctx_with_provider(Arc::new(ScriptedProvider { requests: tx }));
+        let rx = fixture.requests.clone();
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
         let handle = fixture._host.event_handle();
         handle.install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
             TrustedTarget {
@@ -1856,12 +2116,14 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
                 String::new(),
                 0,
             );
-            let a: CapturedRequest = bounded(rx.recv_async(), "cycle first provider request")
-                .await
-                .unwrap();
-            let b = bounded(rx.recv_async(), "cycle descendant provider request")
-                .await
-                .unwrap();
+            let a = request_with_command_diagnostics(&rx, &command, "cycle first provider request")
+                .await;
+            let b = request_with_command_diagnostics(
+                &rx,
+                &command,
+                "cycle descendant provider request",
+            )
+            .await;
             let (parent, descendant) = if serde_json::to_string(&a.messages)
                 .unwrap()
                 .contains("cycle parent")
@@ -2318,6 +2580,139 @@ fn public_agent_ticket_cancel_stops_gated_request_and_keeps_actor_reusable() {
             .send(common::canned_reply(SECOND_REPLY))
             .unwrap();
         fixture.finish().await;
+    });
+}
+
+#[test_case::test_case(true; "capture_input")]
+#[test_case::test_case(false; "explicit_report")]
+fn inherited_local_capture_belongs_to_executing_grandchild(capture_input: bool) {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr6_nested_capture",
+            &format!(
+                r#"
+            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true,
+                tools = {{ {{ name = "pr6_spawn_grandchild", description = "spawn grandchild", input_schema = {{ type = "object" }} }} }},
+                local_tools = {{ inherited_capture = {{
+                    description = "capture answer", input_schema = {{ type = "object" }},
+                    capture_input = {capture_input},
+                    handler = function(input)
+                        if not {capture_input} then assert(maki.agent.report_task_result(input)) end
+                        return "captured"
+                    end,
+                }} }},
+            }}))
+            local result = assert(assert(child:send(ctx, "spawn grandchild")):wait(ctx))
+            assert(result.captured == nil and #result.output == 0, "grandchild capture leaked into parent")
+            assert(child:close(ctx))
+        "#
+            ),
+        );
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_tool_use("pr6_spawn_grandchild", json!({})))
+            .unwrap();
+        let grandchild = fixture.request().await;
+        assert!(common::tool_names(&grandchild.tools).contains(&"inherited_capture".to_owned()));
+        grandchild
+            .reply
+            .send(common::canned_tool_use(
+                "inherited_capture",
+                json!({ "answer": 42 }),
+            ))
+            .unwrap();
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_reply("grandchild complete"))
+            .unwrap();
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_tool_use(
+                "inherited_capture",
+                json!({ "answer": 7 }),
+            ))
+            .unwrap();
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_reply("grandchild second turn complete"))
+            .unwrap();
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_reply("parent complete"))
+            .unwrap();
+        fixture.finish().await;
+    });
+}
+
+#[test]
+fn abandoned_managed_blocking_task_releases_child_provider() {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr6_abandoned_blocking",
+            r#"
+            maki.agent.call_tool(ctx, "task", {
+                description = "abandoned child", prompt = "wait forever", subagent_type = "general",
+            })
+        "#,
+        );
+        let gate = fixture.request().await;
+        fixture.manager.root().unwrap().cancel().unwrap();
+        wait_for_gate_drop(&gate, "abandoned blocking child release").await;
+        bounded(
+            async {
+                while fixture.manager.snapshot().iter().any(|node| {
+                    node.parent_id.is_some()
+                        && (node.graph_lifecycle != maki_agent::manager::GraphLifecycle::Closed
+                            || !fixture.manager.runner_finished(node.agent_id).unwrap())
+                }) {
+                    smol::future::yield_now().await;
+                }
+            },
+            "blocking child retirement",
+        )
+        .await;
+        bounded(fixture.root_ticket.wait(), "cancelled root settlement").await;
+        fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[test]
+fn managed_task_spawn_survives_origin_invocation_completion() {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr6_persistent_spawn",
+            r#"
+            local text, err = maki.agent.call_tool(ctx, "task_spawn", {
+                description = "persistent child", prompt = "wait forever", subagent_type = "general",
+            })
+            assert(text ~= nil and err == nil, err)
+        "#,
+        );
+        let gate = bounded(fixture.requests.recv_async(), "persistent child request")
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "spawn caller completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert!(!gate.reply.is_disconnected());
+        assert_eq!(fixture.manager.list().len(), 2);
+        gate.reply
+            .send(common::canned_reply("persistent complete"))
+            .unwrap();
+        fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
     });
 }
 

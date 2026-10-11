@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -230,6 +230,7 @@ pub struct Agent<'h> {
     question_mode: crate::tools::QuestionMode,
     workflow: bool,
     local_tools: LocalTools,
+    local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
@@ -280,6 +281,7 @@ impl<'h> Agent<'h> {
             question_mode: params.question_mode,
             workflow: false,
             local_tools: LocalTools::default(),
+            local_tool_capture: None,
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
             file_write_locks: params.file_write_locks,
@@ -323,6 +325,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_local_tools(mut self, local_tools: LocalTools) -> Self {
         self.local_tools = local_tools;
+        self
+    }
+
+    pub fn with_local_tool_capture(mut self, capture: Arc<Mutex<Option<Value>>>) -> Self {
+        self.local_tool_capture = Some(capture);
         self
     }
 
@@ -793,6 +800,7 @@ impl<'h> Agent<'h> {
             workflow: self.workflow,
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
+            local_tool_capture: self.local_tool_capture.clone(),
             turn_bindings: Arc::clone(&self.turn_bindings),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),

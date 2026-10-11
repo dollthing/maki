@@ -136,6 +136,11 @@ pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
     drop(retired);
 }
 
+fn session_settled_closed(session: &LuaSession) -> bool {
+    let snapshot = session.actor.snapshot();
+    snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
+}
+
 fn retire_closed(lua: &Lua) {
     let Some(sessions) = lua.app_data_ref::<AgentSessions>() else {
         return;
@@ -144,7 +149,7 @@ fn retire_closed(lua: &Lua) {
         let mut sessions = sessions.0.lock().unwrap();
         let ids: Vec<_> = sessions
             .iter()
-            .filter(|(_, session)| session.actor.snapshot().lifecycle != ActorLifecycle::Open)
+            .filter(|(_, session)| session_settled_closed(session))
             .map(|(id, _)| *id)
             .collect();
         ids.into_iter()
@@ -575,7 +580,8 @@ pub(super) async fn spawn(
         .insert(agent.id, session);
     let sessions = lua.app_data_ref::<AgentSessions>().unwrap().clone();
     let id = agent.id;
-    if actor.snapshot().lifecycle != ActorLifecycle::Open {
+    let snapshot = actor.snapshot();
+    if snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none() {
         let retired = sessions.0.lock().unwrap().remove(&id);
         drop(retired);
         return Ok((Some(agent), None));
@@ -965,7 +971,12 @@ async fn agent_set_mode(
 ) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(&lua, &ctx, &this));
     let template = try_pair!(destination_template(&lua, &this));
-    if template.restrict_write_to().is_some() {
+    if ctx.trusted(&lua).is_err()
+        && (template.restrict_write_to().is_some()
+            || ctx
+                .agent()
+                .is_some_and(|agent| agent.restrict_write_to().is_some()))
+    {
         return Ok(err_pair("restricted agents cannot change mode"));
     }
     let definition = try_pair!(
@@ -1432,9 +1443,7 @@ pub(crate) fn agent_defer_close(
                     let mut sessions = sessions.0.lock().unwrap();
                     let ids: Vec<_> = sessions
                         .iter()
-                        .filter(|(_, session)| {
-                            session.actor.snapshot().lifecycle != ActorLifecycle::Open
-                        })
+                        .filter(|(_, session)| session_settled_closed(session))
                         .map(|(id, _)| *id)
                         .collect();
                     ids.into_iter()
@@ -1499,10 +1508,15 @@ mod tests {
         tests::{StreamOnceProvider, canned_reply_with_usage, session_with_provider},
     };
     use crate::runtime::TaskScope;
-    use maki_agent::{AgentLimits, tools::test_support::stub_ctx};
+    use maki_agent::{
+        ActorBackend, AgentLimits, BackendResult, ControlWork, History, TurnContext, WorkKind,
+        tools::test_support::stub_ctx,
+    };
     use maki_providers::TokenUsage;
+    use std::{future::Future, pin::Pin};
 
     const REPLY: &str = "retained reply";
+    const RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct TestServices(crate::orchestration::TrustedTarget);
 
@@ -1512,6 +1526,17 @@ mod tests {
             _: Option<&maki_commands::CommandInvocation>,
         ) -> Result<Option<crate::orchestration::TrustedTarget>, String> {
             Ok(Some(self.0.clone()))
+        }
+
+        fn register_target(
+            &self,
+            target: crate::orchestration::TrustedTarget,
+        ) -> Result<(), String> {
+            if target.target.same_manager(&self.0.target) {
+                Ok(())
+            } else {
+                Err("wrong test manager".into())
+            }
         }
 
         fn template(
@@ -1744,6 +1769,218 @@ mod tests {
                 .await
                 .unwrap();
             assert!(closed);
+        });
+    }
+
+    #[test]
+    fn abandoned_defer_close_scope_removes_retained_session_without_gc() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = TaskScope::detached(&lua);
+            let context = stub_ctx(&maki_agent::AgentMode::Build);
+            let config = maki_agent::EffectiveAgentConfig::new(
+                maki_agent::RunSettings {
+                    model: (*context.model).clone(),
+                    provider: Arc::clone(&context.provider),
+                    thinking: context.opts.thinking,
+                    fast: context.opts.fast,
+                    workflow: false,
+                },
+                context.mode.clone(),
+            );
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let mut root_fixture = None;
+            let target = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |id| {
+                    let (_, state, session, _) =
+                        super::super::tests::session_with_provider_for_agent(
+                            Arc::clone(&context.provider),
+                            id,
+                        );
+                    root_fixture = Some(session);
+                    Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                })
+                .unwrap();
+            let trusted_target = crate::orchestration::TrustedTarget {
+                target,
+                template: context,
+            };
+            lua.set_app_data(crate::orchestration::OrchestrationServicesSlot(Some(
+                Arc::new(TestServices(trusted_target.clone())),
+            )));
+            let ctx = LuaCtx::trusted_context(&lua, trusted_target, Arc::from("agent-test"));
+            lua.globals().set("ctx", ctx).unwrap();
+            lua.globals()
+                .set("agent_api", super::super::create_agent_table(&lua).unwrap())
+                .unwrap();
+            let child: mlua::AnyUserData = scope
+                .scope_future(
+                    lua.load(
+                        r#"
+                local child = assert(agent_api.spawn(ctx, {
+                    inherit_provider = true, silent = true, tools = {},
+                }))
+                assert(child:defer_close(ctx))
+                return child
+            "#,
+                    )
+                    .eval_async(),
+                )
+                .await
+                .unwrap();
+            let child = child.borrow::<LuaAgent>().unwrap();
+            let actor = child.manager.lookup(child.id).unwrap().actor().unwrap();
+            assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
+            let sessions = lua.app_data_ref::<AgentSessions>().unwrap().clone();
+            assert!(sessions.0.lock().unwrap().contains_key(&child.id));
+            drop(scope);
+            assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
+            futures_lite::future::race(
+                async {
+                    while sessions.0.lock().unwrap().contains_key(&child.id) {
+                        smol::future::yield_now().await;
+                    }
+                },
+                async {
+                    smol::Timer::after(RETIRE_TIMEOUT).await;
+                    panic!("deferred session ownership was not released");
+                },
+            )
+            .await;
+            assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Closed);
+            assert!(actor.snapshot().active_turn.is_none());
+            manager.shutdown(RETIRE_TIMEOUT).await;
+            drop(root_fixture);
+        });
+    }
+
+    struct SettlementGate {
+        backend: LuaActorBackend,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl ActorBackend for SettlementGate {
+        fn run_turn<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            input: AgentInput,
+            work: WorkKind,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async move {
+                let result = self.backend.run_turn(history, context, input, work).await;
+                self.entered.send(()).unwrap();
+                self.release.recv_async().await.unwrap();
+                result
+            })
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            control: &'a ControlWork,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            self.backend.run_control(history, context, control)
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            instructions: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            self.backend.run_compact(history, context, instructions)
+        }
+    }
+
+    #[test]
+    fn active_close_keeps_session_until_billed_end_before_close() {
+        smol::block_on(async {
+            let usage = TokenUsage {
+                input: 13,
+                output: 7,
+                ..Default::default()
+            };
+            let provider = Arc::new(StreamOnceProvider::new_replies(vec![
+                canned_reply_with_usage(REPLY, usage),
+            ]));
+            let (original, state, mut session, _) = session_with_provider(provider, None, None);
+            original.close();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let (actor, runner) = AgentActorHandle::spawn(
+                session.agent_id,
+                Vec::new(),
+                None,
+                Box::new(SettlementGate {
+                    backend: LuaActorBackend::new(Arc::clone(&state)),
+                    entered: entered_tx,
+                    release: release_rx,
+                }),
+            );
+            runner.detach();
+            session.actor = Arc::new(actor.clone());
+            let lua = Lua::new();
+            let id = session.agent_id;
+            let sessions = AgentSessions(Arc::new(Mutex::new(HashMap::from([(id, session)]))));
+            lua.set_app_data(sessions.clone());
+            let events = actor.subscribe_events();
+            let ticket = actor
+                .admit_turn(
+                    AgentInput {
+                        message: REPLY.into(),
+                        mode: maki_agent::AgentMode::Build,
+                        images: Vec::new(),
+                        preamble: Vec::new(),
+                        thinking: Default::default(),
+                        fast: false,
+                        workflow: false,
+                        prompt: None,
+                        cancel: None,
+                        lease_committer: None,
+                    },
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            futures_lite::future::race(
+                async {
+                    entered_rx.recv_async().await.unwrap();
+                    actor.close();
+                    assert!(actor.snapshot().active_turn.is_some());
+                    retire_closed(&lua);
+                    assert!(sessions.0.lock().unwrap().contains_key(&id));
+                    assert_eq!(actor.snapshot().cumulative_usage, TokenUsage::default());
+                    release_tx.send(()).unwrap();
+                    let mut ended = false;
+                    loop {
+                        match events.recv_async().await.unwrap() {
+                            maki_agent::ActorEvent::End(result) => {
+                                assert_eq!(result.outcome.usage(), usage);
+                                assert_eq!(actor.snapshot().cumulative_usage, usage);
+                                ended = true;
+                            }
+                            maki_agent::ActorEvent::Close { .. } => {
+                                assert!(ended);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(RETIRE_TIMEOUT).await;
+                    panic!("active close did not settle");
+                },
+            )
+            .await;
+            ticket.wait().await;
+            assert!(actor.snapshot().active_turn.is_none());
+            assert_eq!(actor.snapshot().cumulative_usage, usage);
+            retire_closed(&lua);
+            assert!(!sessions.0.lock().unwrap().contains_key(&id));
         });
     }
 

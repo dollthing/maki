@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    ContentBlock, ImageMediaType, ImageSource, Message, Model, ProviderEvent, RequestOptions,
+    ContentBlock, ImageMediaType, ImageSource, Message, Model, ProviderEvent, RequestOptions, Role,
     StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
@@ -33,6 +33,10 @@ use crate::tools::{
 use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
 use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 use std::borrow::Cow;
+
+const BILLED_RESPONSE: &str = "billed response";
+const BILLED_COST: f64 = 0.007;
+const BILLED_LIST_COST: f64 = 0.009;
 
 struct PolicyTestProvider;
 
@@ -324,6 +328,7 @@ struct CancellableBackend {
     state: Arc<ScriptedState>,
     block_first: std::sync::atomic::AtomicU32,
     after_cancel: Option<Arc<Gate>>,
+    billed_request: Option<(TokenUsage, EventSender)>,
 }
 
 impl CancellableBackend {
@@ -332,6 +337,7 @@ impl CancellableBackend {
             state: Arc::new(ScriptedState::default()),
             block_first: std::sync::atomic::AtomicU32::new(0),
             after_cancel: None,
+            billed_request: None,
         }
     }
 }
@@ -345,20 +351,45 @@ impl ActorBackend for CancellableBackend {
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            self.state.entered.fetch_add(1, Ordering::SeqCst);
             history.push(Message::user(input.message));
+            if self.billed_request.is_some() {
+                context.output.append_text(BILLED_RESPONSE);
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: BILLED_RESPONSE.into(),
+                    }],
+                    ..Default::default()
+                });
+            }
+            self.state.entered.fetch_add(1, Ordering::SeqCst);
             if self.block_first.fetch_add(1, Ordering::SeqCst) == 0 {
                 let reason = context.cancel_reason.cancelled().await;
                 if let Some(gate) = &self.after_cancel {
                     gate.wait().await;
                 }
-                return BackendResult::EnteredRun(TurnOutcome::cancelled(
+                let mut outcome = TurnOutcome::cancelled(
                     context.agent_id,
                     context.turn_id.unwrap(),
-                    TokenUsage::default(),
-                    0,
+                    self.billed_request
+                        .as_ref()
+                        .map_or(TokenUsage::default(), |(usage, _)| *usage),
+                    u32::from(self.billed_request.is_some()),
                     reason,
-                ));
+                );
+                if let Some((_, sender)) = &self.billed_request {
+                    if let TurnOutcome::Cancelled {
+                        cost, list_cost, ..
+                    } = &mut outcome
+                    {
+                        *cost = Some(BILLED_COST);
+                        *list_cost = Some(BILLED_LIST_COST);
+                    }
+                    sender
+                        .send(AgentEvent::TurnOutcome(outcome.clone()))
+                        .unwrap();
+                }
+                return BackendResult::EnteredRun(outcome);
             }
             default_completed(&context)
         })
@@ -442,7 +473,7 @@ impl Tool for QueuedTool {
 }
 
 #[test_case::test_case(false; "queued_cancel_during_active_history")]
-#[test_case::test_case(true; "close_before_backend_publish")]
+#[test_case::test_case(true; "close_queued_during_active_history")]
 fn synthetic_settlement_has_unavailable_history_boundary(close: bool) {
     smol::block_on(async {
         let gate = Gate::new();
@@ -454,16 +485,14 @@ fn synthetic_settlement_has_unavailable_history_boundary(close: bool) {
             .unwrap();
         until(|| state.entered.load(Ordering::SeqCst) == 1).await;
         active.output().append_text("partial");
-        let settled = if close {
+        let settled = actor
+            .admit_turn(input("queued"), None, "queued".into())
+            .unwrap();
+        if close {
             actor.close();
-            active.clone()
         } else {
-            let queued = actor
-                .admit_turn(input("queued"), None, "queued".into())
-                .unwrap();
-            actor.cancel_turn(queued.turn_id()).unwrap();
-            queued
-        };
+            actor.cancel_turn(settled.turn_id()).unwrap();
+        }
         settled.wait().await;
         let request = super::TranscriptRequest {
             through_turn: Some(settled.turn_id()),
@@ -473,9 +502,6 @@ fn synthetic_settlement_has_unavailable_history_boundary(close: bool) {
         assert!(
             matches!(actor.transcript(request.clone()), Err(ActorError::UnavailableTurnHistory(id)) if id == settled.turn_id())
         );
-        if close {
-            assert_eq!(settled.peek_result().unwrap().text, "partial");
-        }
         gate.open();
         active.wait().await;
         actor.close();
@@ -644,9 +670,9 @@ fn idle_admission_frozen_result_and_future_events(close: bool) {
         );
         if close {
             actor.close();
-        } else {
-            gate.open();
+            assert!(ticket.peek_result().is_none());
         }
+        gate.open();
         let first = ticket.wait_result().await;
         output.append_text(LATE);
         assert_eq!(ticket.wait_result().await.text, PARTIAL);
@@ -738,7 +764,7 @@ fn transcript_keeps_tool_groups(last_messages: usize, max_bytes: usize, expected
         .store(Arc::new(crate::HistorySnapshot::new(messages)));
     let turn_id = crate::TurnId::generate();
     let outcome = super::cancelled_outcome(actor.agent_id(), turn_id, TurnCancellationReason::User);
-    super::retire_turn(&actor.inner, turn_id, &outcome, false, true);
+    super::retire_and_publish(&actor.inner, turn_id, outcome, None, false, false, true);
     let snapshot = actor
         .transcript(super::TranscriptRequest {
             through_turn: None,
@@ -1367,30 +1393,64 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
     });
 }
 
-#[test]
-fn terminal_ticket_is_retired_before_notification() {
+#[test_case::test_case(false; "entered_run")]
+#[test_case::test_case(true; "setup_failure")]
+fn terminal_ticket_is_retired_before_notification(setup_failure: bool) {
     smol::block_on(async {
-        let backend = ScriptedBackend::new();
+        let backend = if setup_failure {
+            ScriptedBackend::failing_setup()
+        } else {
+            ScriptedBackend::new()
+        };
         let (handle, task) = spawn(backend);
         let (retired, release) = handle.pause_after_next_finalization_retire();
+        let (tx, rx) = flume::unbounded();
         let ticket = handle
-            .admit_turn(input("work"), None, "work".into())
+            .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "work".into())
             .unwrap();
         let turn_id = ticket.turn_id();
 
         let cancel_handle = handle.clone();
+        let pending_ticket = ticket.clone();
+        let events = handle.subscribe_events();
         let cancel = std::thread::spawn(move || {
             retired.recv().unwrap();
             let result = cancel_handle.cancel_turn(turn_id);
+            let pending = pending_ticket.peek_result().is_none();
+            let retained = cancel_handle.outcome(turn_id).is_some();
+            let presentation_pending = rx.is_empty();
+            cancel_handle.close();
+            let close_pending = !events
+                .drain()
+                .any(|event| matches!(event, super::ActorEvent::Close { .. }));
             release.send(()).unwrap();
-            result
+            assert!(pending && retained && presentation_pending && close_pending);
+            (result, rx, events)
         });
 
-        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let outcome = ticket.wait().await;
+        if setup_failure {
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+        } else {
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        }
+        let (cancel_result, presentation, events) = cancel.join().unwrap();
+        assert!(matches!(cancel_result, Err(ActorError::UnknownTurn(id)) if id == turn_id));
+        if setup_failure {
+            assert!(
+                matches!(presentation.try_recv().unwrap().event, AgentEvent::TurnOutcome(delivered) if delivered == outcome)
+            );
+        }
+        assert!(presentation.is_empty());
+        task.await;
+        assert!(
+            matches!(events.try_recv().unwrap(), super::ActorEvent::End(result) if result.outcome == outcome)
+        );
         assert!(matches!(
-            cancel.join().unwrap(),
-            Err(ActorError::UnknownTurn(id)) if id == turn_id
+            events.try_recv().unwrap(),
+            super::ActorEvent::Close { .. }
         ));
+        assert!(events.is_empty());
         assert!(
             !handle
                 .inner
@@ -1401,7 +1461,6 @@ fn terminal_ticket_is_retired_before_notification() {
                 .contains(&turn_id)
         );
         handle.close();
-        task.await;
     });
 }
 
@@ -1864,6 +1923,8 @@ fn first_reason_wins_across_sources(cancel_one: bool) {
             handle.cancel_all();
         }
         handle.close();
+        assert!(ticket.peek_result().is_none());
+        gate.open();
         let outcome = ticket.wait().await;
         assert!(matches!(
             outcome,
@@ -1872,8 +1933,151 @@ fn first_reason_wins_across_sources(cancel_one: bool) {
                 ..
             }
         ));
-        gate.open();
         task.await;
+    });
+}
+
+#[test_case::test_case(false, false; "close")]
+#[test_case::test_case(true, false; "shutdown")]
+#[test_case::test_case(false, true; "user_cancel_then_close")]
+#[test_case::test_case(true, true; "user_cancel_then_shutdown")]
+fn close_retains_billed_request_after_active_backend_unwinds(shutdown: bool, user_cancel: bool) {
+    smol::block_on(async {
+        const USAGE: TokenUsage = TokenUsage {
+            input: 23,
+            output: 11,
+            cache_creation: 7,
+            cache_read: 5,
+        };
+        let gate = Gate::new();
+        let (tx, presentation) = flume::unbounded();
+        let sender = EventSender::new(tx, 1);
+        let mut backend = CancellableBackend::new();
+        backend.after_cancel = Some(Arc::clone(&gate));
+        backend.billed_request = Some((USAGE, sender.clone()));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let events = actor.subscribe_events();
+        let ticket = actor
+            .admit_turn(input("active"), Some(sender), "active".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::ActorEvent::Start { .. }
+        ));
+        let queued = actor
+            .admit_turn(input("queued"), None, "queued".into())
+            .unwrap();
+        if user_cancel {
+            actor.cancel_turn(ticket.turn_id()).unwrap();
+        }
+        let (lifecycle, reason, error) = if shutdown {
+            actor.shutdown();
+            (
+                ActorLifecycle::Shutdown,
+                TurnCancellationReason::Shutdown,
+                ActorError::Shutdown,
+            )
+        } else {
+            actor.close();
+            (
+                ActorLifecycle::Closed,
+                TurnCancellationReason::Closed,
+                ActorError::Closed,
+            )
+        };
+        actor.close();
+        actor.shutdown();
+        assert_eq!(actor.snapshot().lifecycle, lifecycle);
+        assert_eq!(actor.snapshot().active_turn, Some(ticket.turn_id()));
+        assert_eq!(
+            actor.admit_turn(input("late"), None, "late".into()).err(),
+            Some(error)
+        );
+        assert!(ticket.peek_result().is_none());
+        assert!(
+            actor
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .peek_result()
+                .is_none()
+        );
+        assert!(actor.outcome(ticket.turn_id()).is_none());
+        assert!(presentation.is_empty());
+        let queued_outcome = queued.peek_result().unwrap().outcome;
+        assert_eq!(queued_outcome.usage(), TokenUsage::default());
+        assert_eq!(queued_outcome.num_turns(), 0);
+        assert!(
+            matches!(queued_outcome, TurnOutcome::Cancelled { reason: actual, .. } if actual == reason)
+        );
+        assert!(
+            matches!(events.try_recv().unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == queued.turn_id())
+        );
+        let closing_events = actor.subscribe_events();
+        assert!(closing_events.is_empty());
+        assert!(events.is_empty());
+        gate.open();
+        let result = ticket.wait_result().await;
+        task.await;
+        let expected_reason = if user_cancel {
+            TurnCancellationReason::User
+        } else {
+            reason
+        };
+        assert!(
+            matches!(result.outcome, TurnOutcome::Cancelled { reason: actual, .. } if actual == expected_reason)
+        );
+        assert_eq!(result.outcome.usage(), USAGE);
+        assert_eq!(result.outcome.num_turns(), 1);
+        assert_eq!(result.outcome.cost(), Some(BILLED_COST));
+        assert_eq!(result.outcome.list_cost(), Some(BILLED_LIST_COST));
+        assert_eq!(result.text, BILLED_RESPONSE);
+        assert_eq!(
+            actor.wait_outcome(ticket.turn_id()).await.unwrap(),
+            result.outcome
+        );
+        assert_eq!(
+            actor
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .wait_result()
+                .await
+                .outcome,
+            result.outcome
+        );
+        let snapshot = actor.snapshot();
+        assert_eq!(snapshot.lifecycle, lifecycle);
+        assert_eq!(snapshot.status, ActorStatus::Idle);
+        assert_eq!(snapshot.cumulative_usage, USAGE);
+        assert_eq!(snapshot.latest, Some(result.outcome.clone()));
+        assert!(
+            matches!(presentation.try_recv().unwrap().event, AgentEvent::TurnOutcome(outcome) if outcome == result.outcome)
+        );
+        assert!(presentation.is_empty());
+        for observer in [&events, &closing_events] {
+            assert!(
+                matches!(observer.try_recv().unwrap(), super::ActorEvent::End(end) if end.outcome == result.outcome && end.text == result.text)
+            );
+            assert!(
+                matches!(observer.try_recv().unwrap(), super::ActorEvent::Close { lifecycle: actual, .. } if actual == lifecycle)
+            );
+            assert!(observer.is_empty());
+        }
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 2);
+        assert_eq!(
+            actor
+                .transcript(super::TranscriptRequest {
+                    through_turn: Some(ticket.turn_id()),
+                    last_messages: 10,
+                    max_bytes: 1024,
+                })
+                .unwrap()
+                .total_messages,
+            2
+        );
     });
 }
 

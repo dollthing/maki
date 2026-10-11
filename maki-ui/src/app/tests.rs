@@ -453,6 +453,52 @@ pub(crate) fn test_app() -> App {
     app
 }
 
+pub(crate) fn actor_presentation_app(queue: shared_queue::QueueSender, run_id: u64) -> App {
+    let mut app = test_app();
+    app.queue.set_shared(queue);
+    app.run_id = run_id;
+    app
+}
+
+pub(crate) fn assert_displayed_root_adoption(envelope: Envelope, run_id: u64) {
+    let mut app = test_app();
+    app.run_id = run_id - 1;
+    app.queue.set_run_id(run_id);
+    app.main_chat().show_user_message("hello", Vec::new());
+    let before = app.main_chat().message_count();
+    app.update(Msg::Agent(Box::new(envelope)));
+    assert_eq!(app.run_id, run_id);
+    assert_eq!(app.main_chat().message_count(), before);
+    const RESPONSE: &str = "displayed root response";
+    app.update(agent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: RESPONSE.into(),
+        },
+        run_id,
+    ));
+    assert!(!app.main_chat().streaming_text_is_empty());
+    app.update(agent_msg_with_run_id(done(), run_id));
+    assert_eq!(app.main_chat().last_message_text(), RESPONSE);
+}
+
+pub(crate) fn assert_actor_response(app: &mut App, response: &str) {
+    assert_eq!(app.main_chat().last_message_text(), response);
+}
+
+pub(crate) fn assert_actor_presentation(app: &mut App, run_id: u64, response: &str, text: &str) {
+    assert_eq!(app.run_id, run_id);
+    assert!(
+        !app.main_chat().streaming_text_is_empty(),
+        "missing streamed response: {response}"
+    );
+    assert!((0..app.main_chat().message_count()).any(|index| {
+        app.main_chat()
+            .message_at(index)
+            .is_some_and(|message| message.text == text)
+    }));
+    assert_eq!(app.status, Status::Streaming);
+}
+
 /// A `test_app` past its idle splash, whose drifting starfield would mask
 /// every other cadence.
 fn app_without_splash() -> App {
@@ -927,7 +973,7 @@ fn queue_item_consumed_shows_mcp_startup_notice() {
 /// or the busy-guard and esc-to-cancel stay off during the whole run.
 #[test_case(false; "backend_outruns_ui")]
 #[test_case(true; "cancel_fences_buffered_presentations")]
-fn buffered_explicit_turn_presentations_preserve_fifo_and_cancel_fence(cancel: bool) {
+fn buffered_mixed_fifo_presentations_preserve_prior_bubbles_and_cancel_fence(cancel: bool) {
     const FIRST_RUN: u64 = 7;
     const SECOND_RUN: u64 = 8;
     let mut app = test_app();
@@ -956,6 +1002,18 @@ fn buffered_explicit_turn_presentations_preserve_fifo_and_cancel_fence(cancel: b
         buffered.push(agent_msg_with_run_id(done(), run_id));
         buffered.push(agent_msg_with_run_id(AgentEvent::QueueDrained, run_id));
     }
+    buffered.insert(
+        4,
+        agent_msg_with_run_id(
+            AgentEvent::QueueItemConsumed {
+                text: "earlier deferred input".into(),
+                images: Vec::new(),
+                mcp_startup_notice: None,
+                already_displayed: false,
+            },
+            SECOND_RUN,
+        ),
+    );
     let before = app.main_chat().message_count();
     if cancel {
         app.handle_cancel();
@@ -972,7 +1030,7 @@ fn buffered_explicit_turn_presentations_preserve_fifo_and_cancel_fence(cancel: b
         assert_eq!(app.run_id, SECOND_RUN + 1);
     } else {
         assert_eq!(app.run_id, SECOND_RUN);
-        assert_eq!(app.main_chat().message_count(), before + 4);
+        assert_eq!(app.main_chat().message_count(), before + 5);
         assert_eq!(app.main_chat().last_message_text(), "response b");
         assert_eq!(app.status, Status::Idle);
     }

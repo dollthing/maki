@@ -182,6 +182,8 @@ impl ProcessingWork {
 /// never match again.
 pub(crate) struct ActorState {
     pub(crate) lifecycle: ActorLifecycle,
+    close_pending: bool,
+    pending_publications: usize,
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) processing: Option<ProcessingWork>,
@@ -623,6 +625,24 @@ impl ActorState {
         self.event_observers
             .retain(|sender| sender.send(event.clone()).is_ok());
     }
+    pub(super) fn finish_close(&mut self, inner: &ActorInner) {
+        if self.close_pending
+            && self.processing.is_none()
+            && self.pending_publications == 0
+            && inner
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.close_pending = false;
+            self.emit(ActorEvent::Close {
+                agent_id: inner.agent_id,
+                lifecycle: self.lifecycle,
+            });
+        }
+    }
+
     pub(crate) fn active_matches_correlation(&self, correlation: &str) -> bool {
         self.active.as_ref().is_some_and(|active| {
             active.correlation() == Some(correlation)
@@ -686,6 +706,8 @@ impl ActorState {
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
             lifecycle: ActorLifecycle::Open,
+            close_pending: false,
+            pending_publications: 0,
             status: ActorStatus::Idle,
             active: None,
             processing: None,
@@ -760,14 +782,14 @@ fn retire_turn(
     outcome: &TurnOutcome,
     settle_runner: bool,
     history_ready: bool,
-) -> bool {
+) -> Option<Option<TurnTicket>> {
     let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
     if settle_runner {
         state.settle_runner();
     }
     let std::collections::hash_map::Entry::Vacant(vacant) = outcomes.entry(turn_id) else {
-        return false;
+        return None;
     };
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
@@ -786,30 +808,16 @@ fn retire_turn(
         );
     state.latest = Some(outcome.clone());
     state.usage += outcome.usage();
-    if let Some(ticket) = tickets.remove(&turn_id) {
-        ticket.resolve(outcome.clone());
-        if let Some(result) = ticket.peek_result() {
-            state.emit(ActorEvent::End(result));
-        }
+    state.pending_publications += 1;
+    let ticket = tickets.remove(&turn_id);
+    if let Some(ticket) = &ticket {
         inner
             .retained_tickets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id, ticket);
+            .insert(turn_id, ticket.clone());
     }
-    true
-}
-
-pub(crate) fn publish_turn(outcome: TurnOutcome, admission: Option<&TurnAdmission>, deliver: bool) {
-    if deliver
-        && let Some(admission) = admission
-        && let Some(sender) = &admission.event_sender
-    {
-        let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
-    }
-    if let Some(admission) = admission {
-        admission.ticket.resolve(outcome);
-    }
+    Some(ticket)
 }
 
 pub(crate) fn finalize_turn(
@@ -851,7 +859,10 @@ fn retire_and_publish(
     settle_runner: bool,
     history_ready: bool,
 ) {
-    if retire_turn(inner, turn_id, &outcome, settle_runner, history_ready) {
+    let presentation = admission
+        .filter(|_| deliver)
+        .and_then(|admission| admission.event_sender.as_ref());
+    if let Some(ticket) = retire_turn(inner, turn_id, &outcome, settle_runner, history_ready) {
         #[cfg(test)]
         if let Some((retired, release)) = inner
             .after_finalization_retire
@@ -862,7 +873,18 @@ fn retire_and_publish(
             let _ = retired.send(());
             let _ = release.recv();
         }
-        publish_turn(outcome, admission, deliver);
+        if let Some(sender) = presentation {
+            let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
+        }
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ticket) = ticket {
+            ticket.resolve(outcome);
+            if let Some(result) = ticket.peek_result() {
+                state.emit(ActorEvent::End(result));
+            }
+        }
+        state.pending_publications -= 1;
+        state.finish_close(inner);
     }
 }
 
@@ -1656,8 +1678,8 @@ impl AgentActorHandle {
     }
 
     /// Closes the actor: admissions are rejected, the active turn is
-    /// cancelled with `Closed`, queued turns terminalize, and the runner
-    /// task exits.
+    /// cancelled with `Closed`, queued turns terminalize immediately, and the
+    /// runner retains the active backend outcome before emitting `Close` and exiting.
     pub fn close(&self) {
         self.close_internal(ActorLifecycle::Closed, TurnCancellationReason::Closed);
     }
@@ -1860,7 +1882,7 @@ impl AgentActorHandle {
     }
 
     fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
-        let (active, deferred, active_turn, active_reason) = {
+        let (active, deferred, active_reason) = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             // First terminal lifecycle/reason wins: repeated close/shutdown are
             // idempotent no-ops, so a race cannot overwrite Closed with Shutdown
@@ -1869,10 +1891,6 @@ impl AgentActorHandle {
                 return;
             }
             state.lifecycle = lifecycle;
-            state.emit(ActorEvent::Close {
-                agent_id: self.inner.agent_id,
-                lifecycle,
-            });
             state.preparing = None;
             for entry in &state.operations {
                 if let ActorOperation::Prepared(pending) = entry {
@@ -1896,10 +1914,6 @@ impl AgentActorHandle {
             (
                 state.active.take(),
                 state.operations.drain(..).collect::<Vec<_>>(),
-                match state.status {
-                    ActorStatus::Running(id) => Some(id),
-                    ActorStatus::Idle => None,
-                },
                 state
                     .processing
                     .as_ref()
@@ -1907,21 +1921,17 @@ impl AgentActorHandle {
                     .unwrap_or(reason),
             )
         };
-        if let Some(turn_id) = active_turn {
-            finalize_turn(
-                &self.inner,
-                turn_id,
-                cancelled_outcome(self.inner.agent_id, turn_id, active_reason),
-                None,
-                false,
-            );
-        }
-        settle_deferred(&self.inner, deferred, reason);
         if let Some(active) = active {
             active.fire(active_reason);
         }
+        settle_deferred(&self.inner, deferred, reason);
         let drained = self.inner.queue.drain_all();
         terminalize_work(&self.inner, drained, reason);
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.close_pending = true;
+            state.finish_close(&self.inner);
+        }
         self.inner.queue.notify();
         self.wake.wake();
         info!(agent_id = %self.inner.agent_id, ?reason, ?lifecycle, "actor closed");

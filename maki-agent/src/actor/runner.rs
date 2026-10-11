@@ -138,6 +138,7 @@ impl Runner {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.processing = None;
+            state.finish_close(&self.inner);
             if state.lifecycle == ActorLifecycle::Open && !state.has_pending_work(&self.queue) {
                 state.emit(super::ActorEvent::Idle {
                     agent_id: self.inner.agent_id,

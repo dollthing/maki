@@ -183,7 +183,8 @@ impl TuiActorBackend {
                 event_tx: EventSender::new(self.agent_tx.clone(), 0),
                 tools,
             },
-        );
+        )
+        .with_mcp(self.mcp.clone());
         let mut template = agent.tool_context();
         template.cwd = (**self.cwd.load()).clone();
         template
@@ -737,19 +738,37 @@ impl ActorBackend for TuiActorBackend {
         work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
+            let mut context = context;
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            let admission_run_id = correlation_to_run_id(&context.correlation);
+            if context.cancel.is_cancelled() {
+                let _ = self.drain_tx.try_send(admission_run_id);
+                return BackendResult::EnteredRun(self.cancel_setup(
+                    &context,
+                    turn_id,
+                    admission_run_id,
+                ));
+            }
             let explicit = matches!(&work, WorkKind::Turn)
                 && !context.correlation.starts_with(ROOT_CORRELATION_PREFIX);
-            let run_id = match &work {
-                WorkKind::Root { run_id, .. } => *run_id,
-                WorkKind::Turn if explicit => self.run_id.fetch_add(1, Ordering::Relaxed) + 1,
-                WorkKind::Turn | WorkKind::Control | WorkKind::Compact => {
-                    correlation_to_run_id(&context.correlation)
-                }
+            let fresh_presentation = explicit || matches!(&work, WorkKind::Root { .. });
+            let run_id = if fresh_presentation {
+                self.run_id.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                correlation_to_run_id(&context.correlation)
             };
-            if explicit {
+            if fresh_presentation {
                 if let Some(current) = &context.managed_turn {
                     let bound = current.manager().actor(context.agent_id).and_then(|actor| {
+                        if let WorkKind::Root { earlier, .. } = &work {
+                            for item in earlier {
+                                actor
+                                    .bind_active_correlation(turn_id, item.correlation.clone())
+                                    .map_err(|error| {
+                                        maki_agent::ManagerError::Policy(error.to_string())
+                                    })?;
+                            }
+                        }
                         actor
                             .bind_active_correlation(
                                 turn_id,
@@ -757,13 +776,18 @@ impl ActorBackend for TuiActorBackend {
                             )
                             .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
                     });
-                    if bound.is_err() {
-                        let _ = self.drain_tx.try_send(run_id);
-                        return BackendResult::EnteredRun(
-                            self.cancel_setup(&context, turn_id, run_id),
-                        );
+                    if bound.is_err() || context.cancel.is_cancelled() {
+                        let _ = self.drain_tx.try_send(admission_run_id);
+                        return BackendResult::EnteredRun(self.cancel_setup(
+                            &context,
+                            turn_id,
+                            admission_run_id,
+                        ));
                     }
                 }
+                context.correlation = format!("{ROOT_CORRELATION_PREFIX}{run_id}");
+            }
+            if explicit {
                 EventSender::new(self.agent_tx.clone(), run_id).try_send(
                     AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
@@ -773,6 +797,45 @@ impl ActorBackend for TuiActorBackend {
                             .as_ref()
                             .and_then(|snapshot| snapshot.mcp_startup_notice),
                         already_displayed: false,
+                    },
+                );
+            }
+            // A root admitted as a standalone turn carries the presentation
+            // metadata: draw the bubble exactly once when the UI has not drawn
+            // it yet. Immediate-dispatch roots (`displayed == true`) were drawn
+            // by `start_from_queue`, and folded roots never reach here (the
+            // active run consumes them through its interrupt source).
+            if let WorkKind::Root {
+                displayed,
+                text,
+                images,
+                earlier,
+                ..
+            } = &work
+            {
+                for item in earlier {
+                    let notice = item.mcp_startup_notice;
+                    if !item.displayed || notice.is_some() {
+                        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
+                            AgentEvent::QueueItemConsumed {
+                                text: item.text.clone(),
+                                images: item.images.clone(),
+                                mcp_startup_notice: notice,
+                                already_displayed: item.already_displayed,
+                            },
+                        );
+                    }
+                }
+                let notice = context
+                    .admission
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.mcp_startup_notice);
+                let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
+                    AgentEvent::QueueItemConsumed {
+                        text: text.clone(),
+                        images: images.clone(),
+                        mcp_startup_notice: notice,
+                        already_displayed: *displayed,
                     },
                 );
             }
@@ -801,47 +864,6 @@ impl ActorBackend for TuiActorBackend {
                     %run_id,
                     "tui actor turn"
                 );
-                // A root admitted as a standalone turn carries the presentation
-                // metadata: draw the bubble exactly once when the UI has not drawn
-                // it yet. Immediate-dispatch roots (`displayed == true`) were drawn
-                // by `start_from_queue`, and folded roots never reach here (the
-                // active run consumes them through its interrupt source).
-                if let WorkKind::Root {
-                    displayed,
-                    text,
-                    images,
-                    earlier,
-                    ..
-                } = &work
-                {
-                    for item in earlier {
-                        let notice = item.mcp_startup_notice;
-                        if !item.displayed || notice.is_some() {
-                            let _ = EventSender::new(self.agent_tx.clone(), item.run_id).send(
-                                AgentEvent::QueueItemConsumed {
-                                    text: item.text.clone(),
-                                    images: item.images.clone(),
-                                    mcp_startup_notice: notice,
-                                    already_displayed: item.already_displayed,
-                                },
-                            );
-                        }
-                    }
-                    let notice = context
-                        .admission
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.mcp_startup_notice);
-                    if !displayed || notice.is_some() {
-                        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
-                            AgentEvent::QueueItemConsumed {
-                                text: text.clone(),
-                                images: images.clone(),
-                                mcp_startup_notice: notice,
-                                already_displayed: *displayed,
-                            },
-                        );
-                    }
-                }
                 match self
                     .execute_agent(history, &context, input, turn_id, run_id)
                     .await
@@ -853,25 +875,26 @@ impl ActorBackend for TuiActorBackend {
                     },
                 }
             };
-            let result = if explicit && matches!(result, BackendResult::SetupFailed { .. }) {
-                let outcome = TurnOutcome::failed(
-                    context.agent_id,
-                    turn_id,
-                    Default::default(),
-                    0,
-                    maki_agent::TurnFailure {
-                        kind: maki_agent::TurnFailureKind::Internal,
-                        diagnostic: "actor setup failed".into(),
-                        user_message: "The agent could not start this turn.".into(),
-                        retryable: true,
-                    },
-                );
-                EventSender::new(self.agent_tx.clone(), run_id)
-                    .try_send(AgentEvent::TurnOutcome(outcome.clone()));
-                BackendResult::EnteredRun(outcome)
-            } else {
-                result
-            };
+            let result =
+                if fresh_presentation && matches!(result, BackendResult::SetupFailed { .. }) {
+                    let outcome = TurnOutcome::failed(
+                        context.agent_id,
+                        turn_id,
+                        Default::default(),
+                        0,
+                        maki_agent::TurnFailure {
+                            kind: maki_agent::TurnFailureKind::Internal,
+                            diagnostic: "actor setup failed".into(),
+                            user_message: "The agent could not start this turn.".into(),
+                            retryable: true,
+                        },
+                    );
+                    EventSender::new(self.agent_tx.clone(), run_id)
+                        .try_send(AgentEvent::TurnOutcome(outcome.clone()));
+                    BackendResult::EnteredRun(outcome)
+                } else {
+                    result
+                };
             let _ = self.drain_tx.try_send(run_id);
             result
         })
@@ -1043,9 +1066,14 @@ mod tests {
     use super::*;
     use crate::agent::ProviderSlot;
 
-    #[test_case(false; "complete")]
-    #[test_case(true; "cancel")]
-    fn explicit_actual_root_turn_uses_current_ui_run_and_cancel_alias(cancel: bool) {
+    #[test_case(false, false; "explicit_complete")]
+    #[test_case(true, false; "explicit_cancel")]
+    #[test_case(false, true; "mixed_fifo_complete")]
+    #[test_case(true, true; "mixed_fifo_cancel")]
+    fn explicit_actual_root_turn_uses_current_ui_run_and_cancel_alias(
+        cancel: bool,
+        deferred: bool,
+    ) {
         smol::block_on(async {
             const RUN_ID: u64 = 7;
             const RESPONSE: &str = "visible explicit response";
@@ -1057,6 +1085,7 @@ mod tests {
             let agent_tx = backend.agent_tx.clone();
             backend.drain_tx = drain_tx;
             backend.run_id.store(RUN_ID - 1, Ordering::Relaxed);
+            let actor_run_id = Arc::clone(&backend.run_id);
             let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
             let root = manager
                 .create_root_with_config(
@@ -1084,16 +1113,140 @@ mod tests {
                 )
                 .unwrap();
             let actor = root.actor().unwrap();
-            let successor_input = AgentInput::from_defaults(
-                "successor".into(),
-                AgentMode::Build,
-                Vec::new(),
-                Default::default(),
+            let mut app = crate::app::tests::actor_presentation_app(
+                crate::agent::shared_queue::actor_queue(
+                    Arc::new(actor.clone()),
+                    Arc::clone(&actor_run_id),
+                ),
+                RUN_ID - 1,
             );
-            let ticket = actor.admit_turn(input, None, String::new()).unwrap();
-            let successor = actor
-                .admit_turn(successor_input, None, String::new())
+            let make_input = |text: &str| {
+                AgentInput::from_defaults(
+                    text.into(),
+                    AgentMode::Build,
+                    Vec::new(),
+                    Default::default(),
+                )
+            };
+            if deferred {
+                actor_run_id.store(RUN_ID - 2, Ordering::Relaxed);
+                actor
+                    .rush(maki_agent::actor::RootWork::new(
+                        make_input("successor"),
+                        RUN_ID - 1,
+                        true,
+                        "successor".into(),
+                        Vec::new(),
+                        format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
+                    ))
+                    .unwrap();
+                loop {
+                    let envelope = events.recv_async().await.unwrap();
+                    assert_eq!(envelope.run_id, RUN_ID - 1);
+                    if matches!(envelope.event, AgentEvent::TextDelta { .. }) {
+                        break;
+                    }
+                }
+                let active_policy_generation = actor.config_snapshot().unwrap().generation;
+                actor
+                    .rush(maki_agent::actor::RootWork::new(
+                        make_input("successor"),
+                        RUN_ID - 1,
+                        false,
+                        "folded user input".into(),
+                        Vec::new(),
+                        format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
+                    ))
+                    .unwrap();
+                let barrier = actor.reserve_config_update().unwrap();
+                barrier
+                    .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
+                    .unwrap();
+                assert!(matches!(
+                    futures_lite::future::or(barrier.wait(), async {
+                        smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                        panic!("interrupt admission never became runnable");
+                    })
+                    .await,
+                    Err(maki_agent::actor::ActorError::PolicyCancelled)
+                ));
+                assert_eq!(
+                    actor.config_snapshot().unwrap().generation,
+                    active_policy_generation
+                );
+                assert_eq!(
+                    maki_agent::batch_key(&make_input("successor")),
+                    Some((AgentMode::Build, false))
+                );
+                assert_eq!(
+                    actor.snapshot().queue,
+                    vec![maki_agent::actor::QueueProjection::Message {
+                        text: "folded user input".into(),
+                        image_count: 0,
+                        displayed: false,
+                    }]
+                );
+                release.send(()).unwrap();
+                let mut folded_bubble = false;
+                loop {
+                    let envelope = events.recv_async().await.unwrap();
+                    assert_eq!(envelope.run_id, RUN_ID - 1);
+                    folded_bubble |= matches!(envelope.event, AgentEvent::QueueItemConsumed { .. });
+                    if matches!(envelope.event, AgentEvent::TextDelta { .. }) {
+                        break;
+                    }
+                }
+                assert!(folded_bubble);
+                assert_eq!(actor_run_id.load(Ordering::Relaxed), RUN_ID - 1);
+                release.send(()).unwrap();
+                assert_eq!(drain_rx.recv_async().await.unwrap(), RUN_ID - 1);
+                events.drain().for_each(drop);
+            }
+            let ticket = actor
+                .admit_turn_with_options(
+                    input,
+                    None,
+                    String::new(),
+                    maki_agent::actor::TurnAdmissionOptions {
+                        provenance: maki_agent::actor::TurnProvenance {
+                            origin: maki_agent::actor::TurnOrigin::Plugin,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
+            let successor = if deferred {
+                let queue = crate::agent::shared_queue::actor_queue(
+                    Arc::new(actor.clone()),
+                    Arc::clone(&actor_run_id),
+                );
+                for text in ["earlier deferred", "final deferred"] {
+                    let input = make_input(text);
+                    queue.push(crate::agent::shared_queue::QueueItem::Message {
+                        text: text.into(),
+                        image_count: 0,
+                        input,
+                        run_id: RUN_ID - 1,
+                        displayed: false,
+                    });
+                }
+                let barrier = actor.reserve_config_update().unwrap();
+                barrier
+                    .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
+                    .unwrap();
+                assert!(matches!(
+                    barrier.wait().await,
+                    Err(maki_agent::actor::ActorError::PolicyCancelled)
+                ));
+                None
+            } else {
+                Some(
+                    actor
+                        .admit_turn(make_input("successor"), None, String::new())
+                        .unwrap(),
+                )
+            };
             let mut visible = Vec::new();
             const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             loop {
@@ -1104,16 +1257,16 @@ mod tests {
                 assert_eq!(envelope.run_id, RUN_ID);
                 let streamed =
                     matches!(&envelope.event, AgentEvent::TextDelta { text } if text == RESPONSE);
-                visible.push(envelope);
+                visible.push(matches!(
+                    envelope.event,
+                    AgentEvent::QueueItemConsumed { .. }
+                ));
+                app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 if streamed {
                     break;
                 }
             }
-            assert!(
-                visible
-                    .iter()
-                    .any(|envelope| matches!(envelope.event, AgentEvent::QueueItemConsumed { .. }))
-            );
+            assert!(visible.iter().any(|consumed| *consumed));
             if cancel {
                 manager
                     .cancel_correlation(
@@ -1154,6 +1307,7 @@ mod tests {
                 RUN_ID
             );
             let mut terminal = false;
+            let mut successor_bubbles = Vec::new();
             loop {
                 let envelope = futures_lite::future::or(events.recv_async(), async {
                     smol::Timer::after(TEST_TIMEOUT).await;
@@ -1164,15 +1318,35 @@ mod tests {
                 })
                 .await
                 .unwrap();
+                if envelope.run_id == RUN_ID + 1
+                    && let AgentEvent::QueueItemConsumed { text, .. } = &envelope.event
+                {
+                    successor_bubbles.push(text.clone());
+                }
                 terminal |= envelope.run_id == RUN_ID
                     && matches!(&envelope.event, AgentEvent::TurnOutcome(_));
-                if envelope.run_id == RUN_ID + 1
-                    && matches!(&envelope.event, AgentEvent::TextDelta { .. })
-                {
+                let streamed = envelope.run_id == RUN_ID + 1
+                    && matches!(&envelope.event, AgentEvent::TextDelta { .. });
+                app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                if streamed {
                     break;
                 }
             }
             assert!(terminal);
+            crate::app::tests::assert_actor_presentation(
+                &mut app,
+                RUN_ID + 1,
+                RESPONSE,
+                if deferred {
+                    "final deferred"
+                } else {
+                    "successor"
+                },
+            );
+            if deferred {
+                assert_eq!(successor_bubbles, ["earlier deferred", "final deferred"]);
+                assert_eq!(actor_run_id.load(Ordering::Relaxed), RUN_ID + 1);
+            }
             manager
                 .cancel_correlation(
                     root.id(),
@@ -1180,21 +1354,65 @@ mod tests {
                     TurnCancellationReason::User,
                 )
                 .unwrap();
-            assert!(successor.peek().is_none());
-            release.send(()).unwrap();
-            assert!(matches!(
-                futures_lite::future::or(successor.wait(), async {
-                    smol::Timer::after(TEST_TIMEOUT).await;
-                    panic!("waiting for successor settlement");
-                })
-                .await,
-                TurnOutcome::Completed { .. }
-            ));
+            if let Some(successor) = &successor {
+                assert!(successor.peek().is_none());
+            }
+            if deferred && cancel {
+                manager
+                    .cancel_correlation(
+                        root.id(),
+                        &format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID + 1),
+                        TurnCancellationReason::User,
+                    )
+                    .unwrap();
+            } else {
+                release.send(()).unwrap();
+            }
+            if let Some(successor) = successor {
+                assert!(matches!(
+                    futures_lite::future::or(successor.wait(), async {
+                        smol::Timer::after(TEST_TIMEOUT).await;
+                        panic!("waiting for successor settlement");
+                    })
+                    .await,
+                    TurnOutcome::Completed { .. }
+                ));
+            }
             assert_eq!(drain_rx.recv_async().await.unwrap(), RUN_ID + 1);
-            events.drain().for_each(drop);
-            actor.publish_if_empty(|| {
-                EventSender::new(agent_tx, RUN_ID + 1).try_send(AgentEvent::QueueDrained);
-            });
+            let settled = events.drain().collect::<Vec<_>>();
+            assert!(settled.iter().any(|envelope| {
+                envelope.run_id == RUN_ID + 1
+                    && matches!(&envelope.event, AgentEvent::TurnOutcome(outcome)
+                        if matches!(outcome, TurnOutcome::Cancelled { reason: TurnCancellationReason::User, .. }) == (deferred && cancel))
+            }));
+            for envelope in settled {
+                app.update(crate::app::Msg::Agent(Box::new(envelope)));
+            }
+            assert_eq!(app.status, crate::components::Status::Idle);
+            if !(deferred && cancel) {
+                crate::app::tests::assert_actor_response(&mut app, RESPONSE);
+            }
+            futures_lite::future::or(
+                async {
+                    loop {
+                        let mut published = false;
+                        actor.publish_if_empty(|| {
+                            EventSender::new(agent_tx.clone(), RUN_ID + 1)
+                                .try_send(AgentEvent::QueueDrained);
+                            published = true;
+                        });
+                        if published {
+                            break;
+                        }
+                        smol::future::yield_now().await;
+                    }
+                },
+                async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!("waiting for empty actor queue");
+                },
+            )
+            .await;
             assert!(matches!(
                 futures_lite::future::or(events.recv_async(), async {
                     smol::Timer::after(TEST_TIMEOUT).await;
@@ -1211,6 +1429,270 @@ mod tests {
             actor.close();
             manager.shutdown(std::time::Duration::from_secs(1)).await;
         });
+    }
+
+    #[test_case(false, false; "consumed_before_initialization")]
+    #[test_case(false, true; "displayed_root_adopts_without_duplicate_bubble")]
+    #[test_case(true, false; "cancelled_admission_cannot_bypass_fence")]
+    fn deferred_root_presentation_respects_admission_cancellation(
+        cancelled: bool,
+        displayed: bool,
+    ) {
+        smol::block_on(async {
+            const ADMISSION_RUN: u64 = 1;
+            const ALLOCATED_RUN: u64 = 7;
+            let (mut backend, mut input, events) = failing_backend();
+            input.prompt = None;
+            backend.initialized = false;
+            backend.run_id.store(ALLOCATED_RUN, Ordering::Relaxed);
+            let (trigger, cancel) = CancelToken::new();
+            let (reason_trigger, cancel_reason) = ReasonedCancelToken::new();
+            if cancelled {
+                reason_trigger.cancel(TurnCancellationReason::User);
+                trigger.cancel();
+            } else {
+                let (init_trigger, init_cancel) = CancelToken::new();
+                init_trigger.cancel();
+                backend.init_cancel = init_cancel;
+            }
+            let context = TurnContext {
+                agent_id: backend.agent_id,
+                turn_id: Some(TurnId::generate()),
+                output: Default::default(),
+                provenance: Default::default(),
+                cancel,
+                cancel_reason,
+                correlation: format!("{ROOT_CORRELATION_PREFIX}{ADMISSION_RUN}"),
+                generation: 0,
+                policy: None,
+                admission: None,
+                interrupt: None,
+                managed_turn: None,
+            };
+            let work = WorkKind::Root {
+                run_id: ADMISSION_RUN,
+                displayed,
+                text: input.message.clone(),
+                images: Vec::new(),
+                earlier: Vec::new(),
+                mcp_startup_notice: None,
+                already_displayed: displayed,
+            };
+            let mut history = History::new(Vec::new());
+            let result = backend.run_turn(&mut history, context, input, work).await;
+            assert!(matches!(result, BackendResult::EnteredRun(_)));
+            let emitted = events.drain().collect::<Vec<_>>();
+            let presentation_run = if cancelled {
+                ADMISSION_RUN
+            } else {
+                ALLOCATED_RUN + 1
+            };
+            assert!(emitted.iter().all(|event| event.run_id == presentation_run));
+            if displayed {
+                assert!(matches!(
+                    &emitted[0].event,
+                    AgentEvent::QueueItemConsumed {
+                        already_displayed: true,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(
+                emitted
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::QueueItemConsumed { .. })),
+                !cancelled
+            );
+            assert_eq!(
+                backend.run_id.load(Ordering::Relaxed),
+                if cancelled {
+                    ALLOCATED_RUN
+                } else {
+                    ALLOCATED_RUN + 1
+                }
+            );
+            if displayed {
+                crate::app::tests::assert_displayed_root_adoption(
+                    emitted.into_iter().next().unwrap(),
+                    presentation_run,
+                );
+            }
+        });
+    }
+
+    #[test_case(true, false; "enabled")]
+    #[test_case(false, false; "disabled")]
+    #[test_case(true, true; "restricted_parent")]
+    fn command_spawn_uses_production_mcp_template(enabled: bool, restricted: bool) {
+        use maki_lua::orchestration::TrustedTarget;
+
+        smol::block_on(async {
+            const COMMAND: &str = "/ui-mcp-spawn";
+            let (mut backend, _, _) = failing_backend();
+            let host = maki_lua::PluginHost::new(Arc::clone(ToolRegistry::global_arc())).unwrap();
+            backend.lua_handle = host.event_handle();
+            backend.permissions.set_yolo(true);
+            backend.mcp = Some(maki_agent::mcp::test_support::stub_session_with_result(
+                &[("stub.echo", "echo")],
+                "fake MCP executed",
+            ));
+            let mut template = backend.orchestration_template();
+            template.provider = Arc::new(CommandMcpProvider);
+            let mut config = maki_agent::EffectiveAgentConfig::new(
+                maki_agent::RunSettings {
+                    provider: Arc::clone(&template.provider),
+                    model: (*template.model).clone(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            );
+            if restricted {
+                let mut mode = maki_agent::ModeRegistry::builtin()
+                    .get(&maki_agent::ModeId::Build)
+                    .unwrap();
+                mode.restrict_write_to = Some(PathBuf::from("/tmp/ui-mcp-plan.md"));
+                config = config.with_mode_def(Some(mode));
+            }
+            let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |agent_id| {
+                    backend.agent_id = agent_id;
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                })
+                .unwrap();
+            let orchestration = Arc::new(crate::agent::orchestration::AgentOrchestration::new(
+                Arc::new(arc_swap::ArcSwapOption::empty()),
+            ));
+            orchestration.register_root(TrustedTarget {
+                target: root.clone(),
+                template,
+            });
+            orchestration.select(HashMap::new(), Some(root.clone()));
+            host.event_handle()
+                .install_orchestration_services(orchestration);
+            host.load_source(
+                "ui_mcp_spawn",
+                &format!(
+                    r#"
+                maki.api.register_command({{
+                    name = "{COMMAND}", tui_only = false,
+                    handler = function(_, ctx)
+                        assert(ctx ~= nil)
+                        local child = assert(maki.agent.spawn(ctx, {{
+                            inherit_provider = true, silent = true, mcp = {enabled},
+                        }}))
+                        local result = assert(assert(child:send(ctx, "invoke MCP")):wait(ctx))
+                        assert(result.text == "{expected}", result.text)
+                        assert(child:close(ctx))
+                    end,
+                }})
+            "#,
+                    expected = if enabled && !restricted {
+                        "fake MCP executed"
+                    } else {
+                        "MCP denied"
+                    }
+                ),
+            )
+            .unwrap();
+            let commands = host.command_registry();
+            let target = commands.bind_target(
+                maki_commands::TargetCapabilities::ALL,
+                Arc::new(McpCommandHost),
+            );
+            let outcome =
+                futures_lite::future::or(commands.dispatch_input(&target, COMMAND.into()), async {
+                    smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                    panic!("command-origin MCP spawn timed out");
+                })
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    maki_commands::InputDispatch::Dispatched(
+                        maki_commands::CommandOutcome::Completed
+                    )
+                ),
+                "{outcome:?}"
+            );
+            root.actor().unwrap().close();
+            manager.shutdown(std::time::Duration::from_secs(1)).await;
+        });
+    }
+
+    struct McpCommandHost;
+
+    impl maki_commands::CommandHost for McpCommandHost {
+        fn request(
+            &self,
+            _: maki_commands::HostRequest,
+        ) -> maki_commands::CommandFuture<
+            Result<maki_commands::HostResponse, maki_commands::CommandError>,
+        > {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
+    struct CommandMcpProvider;
+
+    impl maki_providers::provider::Provider for CommandMcpProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            Box::pin(async move {
+                let serialized = serde_json::to_string(messages).unwrap();
+                let answered = serialized.contains("tool_result");
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: if answered {
+                            vec![maki_providers::ContentBlock::Text {
+                                text: if serialized.contains("fake MCP executed") {
+                                    "fake MCP executed"
+                                } else {
+                                    "MCP denied"
+                                }
+                                .into(),
+                            }]
+                        } else {
+                            vec![maki_providers::ContentBlock::ToolUse {
+                                id: "ui-mcp-call".into(),
+                                name: "stub.echo".into(),
+                                input: serde_json::json!({}),
+                                thought_signature: None,
+                            }]
+                        },
+                        ..Default::default()
+                    },
+                    usage: Default::default(),
+                    stop_reason: Some(if answered {
+                        maki_providers::StopReason::EndTurn
+                    } else {
+                        maki_providers::StopReason::ToolUse
+                    }),
+                })
+            })
+        }
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     struct ExplicitProvider {

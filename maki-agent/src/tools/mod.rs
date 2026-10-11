@@ -484,6 +484,7 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
+    pub local_tool_capture: Option<Arc<Mutex<Option<Value>>>>,
     pub turn_bindings: Arc<TurnToolBindings>,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
@@ -878,6 +879,7 @@ pub fn interpreter_ctx(
         workflow: false,
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
+        local_tool_capture: None,
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
         file_write_locks: Arc::new(FileWriteLocks::new()),
