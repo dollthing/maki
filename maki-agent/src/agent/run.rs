@@ -517,6 +517,13 @@ impl<'h> Agent<'h> {
                         && let Some(message) =
                             check().map_err(|message| AgentError::Config { message })?
                     {
+                        if let Some(max) = self.config.max_turns
+                            && self.num_turns >= max
+                        {
+                            return Err(AgentError::Config {
+                                message: REQUIRED_OUTPUT_BUDGET_EXHAUSTED.into(),
+                            });
+                        }
                         if completion_recovery_attempts >= MAX_COMPLETION_RECOVERY_ATTEMPTS {
                             return Err(AgentError::Config {
                                 message: COMPLETION_RECOVERY_EXHAUSTED.into(),
@@ -1293,21 +1300,53 @@ mod tests {
         });
     }
 
-    #[test]
-    fn completion_recovery_respects_turn_budget() {
+    #[test_case(1; "no_recovery_turn_available")]
+    #[test_case(2; "one_recovery_turn_available")]
+    #[test_case(3; "turn_and_recovery_budgets_exhausted")]
+    fn completion_recovery_respects_turn_budget(max_turns: u32) {
+        const NUDGE: &str = "report required output";
         smol::block_on(async {
+            let checks = Arc::new(Mutex::new(0));
             let mut history = History::new(Vec::new());
             let (agent, events) = make_agent(
-                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                MockProvider::new(
+                    (0..max_turns)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
                 &mut history,
             );
-            let mut agent =
-                agent.with_completion_check(Arc::new(|| Ok(Some("report output".into()))));
-            agent.config.max_turns = Some(1);
+            let count = Arc::clone(&checks);
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                *count.lock().unwrap() += 1;
+                Ok(Some(NUDGE.into()))
+            }));
+            agent.config.max_turns = Some(max_turns);
             let outcome = agent.run(TurnId::generate(), default_input()).await;
-            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
-            assert_eq!(outcome.num_turns(), 1);
+            assert!(matches!(
+                &outcome,
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+            ));
+            assert_eq!(outcome.num_turns(), max_turns);
             drop(agent);
+            assert_eq!(*checks.lock().unwrap(), max_turns);
+            assert_eq!(history.as_slice().len(), 2 * max_turns as usize);
+            assert!(matches!(
+                history.as_slice().last().unwrap().role,
+                Role::Assistant
+            ));
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                (max_turns - 1) as usize
+            );
             assert_eq!(
                 events
                     .drain()
@@ -1315,6 +1354,50 @@ mod tests {
                     .count(),
                 1
             );
+        });
+    }
+
+    #[test_case(false; "complete_output_at_turn_limit")]
+    #[test_case(true; "callback_error_at_turn_limit")]
+    fn completion_check_preserves_result_at_turn_limit(fail: bool) {
+        const CALLBACK_ERROR: &str = "required output check failed";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                if fail {
+                    Err(CALLBACK_ERROR.into())
+                } else {
+                    Ok(None)
+                }
+            }));
+            agent.config.max_turns = Some(1);
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert_eq!(outcome.num_turns(), 1);
+            if fail {
+                assert!(matches!(
+                    outcome,
+                    TurnOutcome::Failed { failure, .. }
+                        if failure.diagnostic.contains(CALLBACK_ERROR)
+                ));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    TurnOutcome::Completed {
+                        reason: DoneReason::EndTurn,
+                        ..
+                    }
+                ));
+            }
+            drop(agent);
+            assert_eq!(history.as_slice().len(), 2);
+            assert!(matches!(
+                history.as_slice().last().unwrap().role,
+                Role::Assistant
+            ));
         });
     }
 

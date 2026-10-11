@@ -822,6 +822,83 @@ fn default_transcript_excludes_first_active_and_later_active_history() {
 }
 
 #[test]
+fn transcript_releases_locks_before_encoding_while_turn_settles() {
+    const FIRST: &str = "first";
+    const SECOND: &str = "second";
+    const MAX_BYTES: usize = 1024;
+    const LAST_MESSAGES: usize = 10;
+
+    std::thread::scope(|scope| {
+        smol::block_on(async {
+            let gate = Gate::new();
+            let backend = ScriptedBackend::gated(Arc::clone(&gate));
+            let state = Arc::clone(&backend.state);
+            let (actor, task) = spawn(backend);
+            let first = actor.admit_turn(input(FIRST), None, FIRST.into()).unwrap();
+            gate.open();
+            first.wait().await;
+            until(|| !actor.has_pending_work()).await;
+            gate.opened.store(false, Ordering::Release);
+            let second = actor
+                .admit_turn(input(SECOND), None, SECOND.into())
+                .unwrap();
+            until(|| state.entered.load(Ordering::SeqCst) == 2).await;
+            let epoch = actor.inner.history.load().epoch;
+            let request = super::TranscriptRequest {
+                through_turn: None,
+                last_messages: LAST_MESSAGES,
+                max_bytes: MAX_BYTES,
+            };
+            let (captured_tx, captured_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let reader = actor.clone();
+            let reader_request = request.clone();
+            let transcript = scope.spawn(move || {
+                reader
+                    .transcript_inner(reader_request, || {
+                        assert!(reader.inner.outcomes.try_lock().is_ok());
+                        assert!(reader.inner.state.try_lock().is_ok());
+                        assert!(reader.inner.coverage.try_lock().is_ok());
+                        assert!(reader.inner.tickets.try_lock().is_ok());
+                        captured_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                    .unwrap()
+            });
+            captured_rx.recv().unwrap();
+            gate.open();
+            second.wait().await;
+            let latest = actor.transcript(request.clone()).unwrap();
+            assert_eq!(latest.through_turn, Some(second.turn_id()));
+            assert_eq!(latest.total_messages, 2);
+            actor
+                .inner
+                .history
+                .store(Arc::new(crate::HistorySnapshot::new(Vec::new())));
+            release_tx.send(()).unwrap();
+            let snapshot = transcript.join().unwrap();
+            assert_eq!(snapshot.through_turn, Some(first.turn_id()));
+            assert_eq!(snapshot.epoch, epoch);
+            assert_eq!(snapshot.total_messages, 1);
+            assert_eq!(snapshot.omitted_messages, 0);
+            assert!(!snapshot.truncated);
+            assert_eq!(snapshot.messages[0]["content"][0]["text"], FIRST);
+            assert_eq!(
+                snapshot.bytes,
+                serde_json::to_string(&snapshot.messages).unwrap().len()
+            );
+            assert!(snapshot.bytes <= MAX_BYTES);
+            assert!(matches!(
+                actor.transcript(request),
+                Err(ActorError::CompactedTurn(id)) if id == second.turn_id()
+            ));
+            actor.close();
+            task.await;
+        });
+    });
+}
+
+#[test]
 fn transcript_exact_boundary_pending_unknown_and_rewrite() {
     smol::block_on(async {
         let gate = Gate::new();

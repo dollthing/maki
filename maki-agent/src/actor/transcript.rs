@@ -30,51 +30,68 @@ pub struct TranscriptSnapshot {
 
 impl AgentActorHandle {
     pub fn transcript(&self, request: TranscriptRequest) -> Result<TranscriptSnapshot, ActorError> {
+        self.transcript_inner(
+            request,
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    pub(super) fn transcript_inner(
+        &self,
+        request: TranscriptRequest,
+        #[cfg(test)] after_snapshot: impl FnOnce(),
+    ) -> Result<TranscriptSnapshot, ActorError> {
         if !(1..=MAX_MESSAGES).contains(&request.last_messages)
             || !(MIN_BYTES..=MAX_BYTES).contains(&request.max_bytes)
         {
             return Err(ActorError::InvalidTranscriptCaps);
         }
-        // Settlement takes outcomes before state, then coverage. Keep that order
-        // so a boundary and its history are captured in the same observation.
-        let _outcomes = self
-            .inner
-            .outcomes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let history = self.inner.history.load_full();
-        let through_turn = request
-            .through_turn
-            .or_else(|| state.latest.as_ref().map(crate::TurnOutcome::turn_id));
-        let end = if let Some(turn_id) = through_turn {
-            let coverage = self
+        let (history, through_turn, end) = {
+            // Settlement takes outcomes before state, then coverage. Keep that order
+            // so a boundary and its history are captured in the same observation.
+            let _outcomes = self
                 .inner
-                .coverage
+                .outcomes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            match coverage.get(&turn_id) {
-                Some(&Some((epoch, end)))
-                    if epoch == history.epoch && end <= history.messages.len() =>
-                {
-                    end
-                }
-                Some(None) => return Err(ActorError::UnavailableTurnHistory(turn_id)),
-                Some(Some(_)) => return Err(ActorError::CompactedTurn(turn_id)),
-                None if self
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let history = self.inner.history.load_full();
+            let through_turn = request
+                .through_turn
+                .or_else(|| state.latest.as_ref().map(crate::TurnOutcome::turn_id));
+            let end = if let Some(turn_id) = through_turn {
+                let coverage = self
                     .inner
-                    .tickets
+                    .coverage
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains_key(&turn_id) =>
-                {
-                    return Err(ActorError::PendingTurn(turn_id));
+                    .unwrap_or_else(|e| e.into_inner());
+                match coverage.get(&turn_id) {
+                    Some(&Some((epoch, end)))
+                        if epoch == history.epoch && end <= history.messages.len() =>
+                    {
+                        end
+                    }
+                    Some(None) => return Err(ActorError::UnavailableTurnHistory(turn_id)),
+                    Some(Some(_)) => return Err(ActorError::CompactedTurn(turn_id)),
+                    None if self
+                        .inner
+                        .tickets
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains_key(&turn_id) =>
+                    {
+                        return Err(ActorError::PendingTurn(turn_id));
+                    }
+                    None => return Err(ActorError::UnknownTurn(turn_id)),
                 }
-                None => return Err(ActorError::UnknownTurn(turn_id)),
-            }
-        } else {
-            0
+            } else {
+                0
+            };
+            (history, through_turn, end)
         };
+        #[cfg(test)]
+        after_snapshot();
         let messages = &history.messages[..end];
         let mut blocked_until = vec![0; end + 1];
         let mut calls = HashMap::new();
