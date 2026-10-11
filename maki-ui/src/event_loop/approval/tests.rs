@@ -775,7 +775,13 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         let identity = event_loop.sessions[index].handles.identity();
         assert_eq!(id != source_id, fresh);
         let run = event_loop.sessions[index].app.run_id;
-        event_loop.dispatch(index, vec![Action::CancelAgent { run_id: run }]);
+        event_loop.dispatch(
+            index,
+            vec![Action::CancelAgent {
+                turn_id: None,
+                run_id: run,
+            }],
+        );
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
         });

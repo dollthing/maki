@@ -58,6 +58,7 @@ impl AgentActorHandle {
         let id = state.next_operation_id;
         let failure = Arc::new(Mutex::new(None));
         let (trigger, cancel) = CancelToken::new();
+        state.idle_pending = true;
         state
             .operations
             .push_back(ActorOperation::Prepared(Box::new(PreparedOperation {
@@ -152,6 +153,7 @@ impl PreparedOperationTicket {
                 pending.fail(ActorError::PolicyCancelled);
             }
             drive_operations(&self.inner, &mut state);
+            state.publish_idle(&self.inner);
             self.inner.policy_changed.notify(usize::MAX);
         }
     }
@@ -219,6 +221,7 @@ impl PreparedOperationTicket {
             state.emit(super::ActorEvent::Config(commit.clone()));
         }
         drive_operations(&self.inner, &mut state);
+        state.publish_idle(&self.inner);
         self.inner.policy_changed.notify(usize::MAX);
         Ok(result)
     }
@@ -313,6 +316,7 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
             pending.fail(error);
             inner.policy_changed.notify(usize::MAX);
             drive_operations(inner, state);
+            state.publish_idle(inner);
             return;
         }
     };
@@ -390,6 +394,7 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
                     pending.fail(error);
                 }
                 drive_operations(&inner, &mut state);
+                state.publish_idle(&inner);
             }
         }
         inner.policy_changed.notify(usize::MAX);

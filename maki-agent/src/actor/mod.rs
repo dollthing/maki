@@ -184,6 +184,7 @@ pub(crate) struct ActorState {
     pub(crate) lifecycle: ActorLifecycle,
     close_pending: bool,
     pending_publications: usize,
+    idle_pending: bool,
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) processing: Option<ProcessingWork>,
@@ -390,9 +391,15 @@ fn settle_deferred(
             finalize_turn(inner, turn_id, outcome, Some(&admission), true);
         }
     }
+    inner
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .publish_idle(inner);
 }
 
 fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
+    state.idle_pending |= state.has_pending_work(&inner.queue);
     loop {
         if state.lifecycle != ActorLifecycle::Open {
             return;
@@ -621,6 +628,24 @@ fn materialize(
 }
 
 impl ActorState {
+    pub(super) fn publish_idle(&mut self, inner: &ActorInner) {
+        if self.idle_pending
+            && self.lifecycle == ActorLifecycle::Open
+            && self.pending_publications == 0
+            && !self.has_pending_work(&inner.queue)
+            && inner
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.idle_pending = false;
+            self.emit(ActorEvent::Idle {
+                agent_id: inner.agent_id,
+            });
+        }
+    }
+
     pub(super) fn emit(&mut self, event: ActorEvent) {
         self.event_observers
             .retain(|sender| sender.send(event.clone()).is_ok());
@@ -679,7 +704,6 @@ impl ActorState {
     pub(crate) fn settle_runner(&mut self) {
         self.active = None;
         self.status = ActorStatus::Idle;
-        self.processing = None;
     }
 
     /// A started run supersedes every precancel mark it could match: pushes
@@ -708,6 +732,7 @@ impl ActorState {
             lifecycle: ActorLifecycle::Open,
             close_pending: false,
             pending_publications: 0,
+            idle_pending: false,
             status: ActorStatus::Idle,
             active: None,
             processing: None,
@@ -726,6 +751,12 @@ impl ActorState {
             next_operation_id: 0,
         }
     }
+}
+
+pub(crate) struct TurnCancelCut {
+    active: Option<ActiveCancel>,
+    deferred: Vec<ActorOperation>,
+    queued: Option<TurnAdmission>,
 }
 
 pub(crate) struct CorrelationCancelCut {
@@ -885,6 +916,7 @@ fn retire_and_publish(
         }
         state.pending_publications -= 1;
         state.finish_close(inner);
+        state.publish_idle(inner);
     }
 }
 
@@ -895,6 +927,11 @@ fn terminalize_work(inner: &ActorInner, drained: Vec<ActorWork>, reason: TurnCan
             finalize_turn(inner, admission.turn_id, outcome, Some(&admission), true);
         }
     }
+    inner
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .publish_idle(inner);
 }
 
 pub(super) fn cancelled_outcome(
@@ -1049,6 +1086,17 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    /// Captures the nominal processing turn, including the pop/install gap.
+    pub fn processing_turn_id(&self) -> Option<TurnId> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .processing
+            .as_ref()
+            .and_then(|processing| processing.turn_id)
     }
 
     pub fn bind_active_correlation(
@@ -1498,6 +1546,11 @@ impl AgentActorHandle {
                 true,
             );
         }
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish_idle(&self.inner);
         Some(projection)
     }
 
@@ -1553,6 +1606,11 @@ impl AgentActorHandle {
                 true,
             );
         }
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish_idle(&self.inner);
         Some(projection)
     }
 
@@ -1609,12 +1667,20 @@ impl AgentActorHandle {
     /// affected.
     pub fn cancel_turn(&self, turn_id: TurnId) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let cut = self.capture_turn_cancel(&mut state, turn_id, TurnCancellationReason::User)?;
+        drop(state);
+        self.settle_turn_cancel(cut, TurnCancellationReason::User);
+        Ok(())
+    }
+
+    pub(crate) fn capture_turn_cancel(
+        &self,
+        state: &mut ActorState,
+        turn_id: TurnId,
+        reason: TurnCancellationReason,
+    ) -> Result<TurnCancelCut, ActorError> {
         if state.lifecycle != ActorLifecycle::Open {
-            return Err(match state.lifecycle {
-                ActorLifecycle::Closed => ActorError::Closed,
-                ActorLifecycle::Shutdown => ActorError::Shutdown,
-                ActorLifecycle::Open => unreachable!(),
-            });
+            return Err(lifecycle_error(state.lifecycle));
         }
         if !self
             .inner
@@ -1625,47 +1691,32 @@ impl AgentActorHandle {
         {
             return Err(ActorError::UnknownTurn(turn_id));
         }
-        let active = if state.status == ActorStatus::Running(turn_id) {
-            if let Some(processing) = &mut state.processing {
-                processing
-                    .cancellation_reason
-                    .get_or_insert(TurnCancellationReason::User);
-            }
-            state.active.take()
-        } else {
-            None
-        };
+        let running = state.status == ActorStatus::Running(turn_id);
+        if let Some(processing) = &mut state.processing
+            && (running || processing.turn_id == Some(turn_id))
+        {
+            processing.cancellation_reason.get_or_insert(reason);
+        }
+        let active = if running { state.active.take() } else { None };
         let queued = self.inner.queue.remove_turn(turn_id);
         let deferred = state.operations.iter().position(|admission| {
             matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id)
         }).and_then(|index| state.operations.remove(index));
-        if active.is_none()
-            && queued.is_none()
-            && deferred.is_none()
-            && state.status == ActorStatus::Idle
-            && state
-                .processing
-                .as_ref()
-                .is_some_and(|processing| processing.turn_id == Some(turn_id))
-        {
-            state.cancelled_turns.insert(turn_id);
+        drive_operations(&self.inner, state);
+        Ok(TurnCancelCut {
+            active,
+            deferred: deferred.into_iter().collect(),
+            queued,
+        })
+    }
+
+    pub(crate) fn settle_turn_cancel(&self, cut: TurnCancelCut, reason: TurnCancellationReason) {
+        settle_deferred(&self.inner, cut.deferred, reason);
+        if let Some(active) = cut.active {
+            active.fire(reason);
         }
-        drive_operations(&self.inner, &mut state);
-        drop(state);
-        settle_deferred(
-            &self.inner,
-            deferred.into_iter().collect(),
-            TurnCancellationReason::User,
-        );
-        if let Some(active) = active {
-            active.fire(TurnCancellationReason::User);
-        }
-        if let Some(admission) = queued {
-            let outcome = cancelled_outcome(
-                self.inner.agent_id,
-                admission.turn_id,
-                TurnCancellationReason::User,
-            );
+        if let Some(admission) = cut.queued {
+            let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
             finalize_turn(
                 &self.inner,
                 admission.turn_id,
@@ -1674,7 +1725,6 @@ impl AgentActorHandle {
                 true,
             );
         }
-        Ok(())
     }
 
     /// Closes the actor: admissions are rejected, the active turn is
@@ -1778,18 +1828,7 @@ impl AgentActorHandle {
     ) {
         settle_deferred(&self.inner, cut.deferred, reason);
 
-        for work in cut.matched {
-            if let ActorWork::Turn(admission) = work {
-                let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
-                finalize_turn(
-                    &self.inner,
-                    admission.turn_id,
-                    outcome,
-                    Some(&admission),
-                    true,
-                );
-            }
-        }
+        terminalize_work(&self.inner, cut.matched, reason);
         if let Some(active) = cut.active {
             active.fire(reason);
         }

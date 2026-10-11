@@ -1834,7 +1834,8 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
-        let cancelled_run = self.run_id;
+        let turn_id = self.queue.processing_turn_id();
+        let run_id = self.run_id;
         self.run_id = self
             .queue
             .current_run_id()
@@ -1860,9 +1861,7 @@ impl App {
         self.queue.clear();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
-        vec![Action::CancelAgent {
-            run_id: cancelled_run,
-        }]
+        vec![Action::CancelAgent { turn_id, run_id }]
     }
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {

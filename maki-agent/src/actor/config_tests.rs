@@ -341,6 +341,55 @@ fn prepared_turn_input_replacement_keeps_intent(action: &str) {
     });
 }
 
+#[test_case::test_case(false; "config_only_commit")]
+#[test_case::test_case(true; "invalid_initial_config")]
+fn prepared_config_terminal_transition_publishes_single_idle(invalid: bool) {
+    const FAILURE: &str = "actor configuration is not initialized";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        if !invalid {
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+        }
+        let events = actor.subscribe_events();
+        let prepared = actor.reserve_prepared_operation(None).unwrap();
+        prepared
+            .resolve((!invalid).then_some(ConfigChange::ToggleWorkflow))
+            .unwrap();
+        if invalid {
+            assert_eq!(
+                prepared.wait_ready().await,
+                Err(ActorError::InvalidConfig(FAILURE.into()))
+            );
+            drop(prepared);
+        } else {
+            prepared.wait_ready().await.unwrap();
+            assert!(events.is_empty());
+            assert!(prepared.commit().unwrap().ticket.is_none());
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                crate::actor::ActorEvent::Config(_)
+            ));
+        }
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            crate::actor::ActorEvent::Idle { .. }
+        ));
+        assert!(events.is_empty());
+        actor.cancel_all();
+        assert_eq!(actor.clear(), 0);
+        assert!(events.is_empty());
+        actor.close();
+        task.await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            crate::actor::ActorEvent::Close { .. }
+        ));
+        assert!(events.is_empty());
+    });
+}
+
 #[test]
 fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
     smol::block_on(async {
@@ -404,6 +453,7 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
         let before = actor.config_snapshot().unwrap();
+        let events = actor.subscribe_events();
         let reservation = actor
             .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
                 input: input(WORK),
@@ -415,6 +465,7 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
             .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         entered_rx.recv_async().await.unwrap();
+        assert!(events.is_empty());
         assert_eq!(actor.snapshot().queued, 1);
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         assert_eq!(
@@ -440,8 +491,19 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
         );
         assert_eq!(actor.snapshot().queued, 0);
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            crate::actor::ActorEvent::Idle { .. }
+        ));
+        drop(reservation);
+        assert!(events.is_empty());
         actor.close();
         task.await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            crate::actor::ActorEvent::Close { .. }
+        ));
+        assert!(events.is_empty());
     });
 }
 

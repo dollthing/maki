@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
 use super::{
-    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
-    settle_and_finalize_turn,
+    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, TurnTicket,
+    cancelled_outcome, settle_and_finalize_turn,
 };
 use crate::types::{TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -23,6 +23,11 @@ fn take_after_pop_hook(inner: &ActorInner) -> Option<(flume::Sender<()>, flume::
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take()
+}
+
+enum PoppedWork {
+    Work(ActorWork),
+    Root(RootWork, TurnTicket),
 }
 
 enum Step {
@@ -118,9 +123,27 @@ impl Runner {
                     .unwrap_or_else(|error| error.into_inner());
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
+                    state.idle_pending = true;
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(ProcessingWork::new);
+                let work = work.map(|work| {
+                    let ActorWork::Root(root) = work else {
+                        return PoppedWork::Work(work);
+                    };
+                    let ticket = TurnTicket::new_anonymous(Arc::clone(&self.inner.identity))
+                        .with_provenance(root.provenance.clone());
+                    let turn_id = ticket.turn_id();
+                    self.inner
+                        .tickets
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(turn_id, ticket.clone());
+                    if let Some(processing) = &mut state.processing {
+                        processing.turn_id = Some(turn_id);
+                    }
+                    PoppedWork::Root(root, ticket)
+                });
                 work.map(|work| (work, state.cancellation_generation))
             };
             let Some((work, cancellation_generation)) = popped else {
@@ -139,11 +162,7 @@ impl Runner {
                 .unwrap_or_else(|error| error.into_inner());
             state.processing = None;
             state.finish_close(&self.inner);
-            if state.lifecycle == ActorLifecycle::Open && !state.has_pending_work(&self.queue) {
-                state.emit(super::ActorEvent::Idle {
-                    agent_id: self.inner.agent_id,
-                });
-            }
+            state.publish_idle(&self.inner);
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
 
@@ -167,13 +186,20 @@ impl Runner {
         }
     }
 
-    async fn process(&mut self, work: ActorWork, cancellation_generation: u64) {
+    async fn process(&mut self, work: PoppedWork, cancellation_generation: u64) {
+        let work = match work {
+            PoppedWork::Root(root, ticket) => {
+                self.run_root(root, ticket, cancellation_generation).await;
+                return;
+            }
+            PoppedWork::Work(work) => work,
+        };
         match work {
             ActorWork::Turn(admission) => {
                 self.run_turn(admission, WorkKind::Turn, cancellation_generation)
                     .await
             }
-            ActorWork::Root(root) => self.run_root(root, cancellation_generation).await,
+            ActorWork::Root(_) => unreachable!("standalone roots are materialized at pop"),
             ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
             ActorWork::Compact {
                 run_id,
@@ -382,19 +408,12 @@ impl Runner {
     /// Runs a root input. The runner only ever sees a root when the actor is
     /// idle: a root popped during an active turn is folded by the interrupt
     /// source into the active run, so no orphan [`crate::TurnId`] exists here.
-    async fn run_root(&mut self, root: RootWork, cancellation_generation: u64) {
+    async fn run_root(&mut self, root: RootWork, ticket: TurnTicket, cancellation_generation: u64) {
         let mcp_startup_notice = root
             .admission
             .as_ref()
             .and_then(|admission| admission.mcp_startup_notice);
-        let ticket = super::TurnTicket::new_anonymous(Arc::clone(&self.inner.identity))
-            .with_provenance(root.provenance);
         let turn_id = ticket.turn_id();
-        self.inner
-            .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id, ticket.clone());
         let admission = TurnAdmission {
             turn_id,
             input: Some(root.input),

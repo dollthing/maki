@@ -1119,6 +1119,58 @@ impl AgentManagerHandle {
         Ok(())
     }
 
+    /// Cancels one nominal turn and retires descendants only if that turn is running.
+    pub fn cancel_turn(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+        reason: TurnCancellationReason,
+    ) -> Result<(), ManagerError> {
+        let (actor, cut, descendants) = {
+            let mut graph = self.lock_graph();
+            let node = graph
+                .nodes
+                .get(&agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent_id))?;
+            if !node.lifecycle.consumes_capacity() {
+                return Err(ManagerError::NonLiveAgent(agent_id));
+            }
+            let actor = node
+                .actor
+                .clone()
+                .ok_or(ManagerError::NonLiveAgent(agent_id))?;
+            let mut state = actor
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let running = state.status == ActorStatus::Running(turn_id);
+            let cut = actor
+                .capture_turn_cancel(&mut state, turn_id, reason)
+                .map_err(|error| match error {
+                    ActorError::Closed | ActorError::Shutdown => {
+                        ManagerError::NonLiveAgent(agent_id)
+                    }
+                    _ => ManagerError::InactiveTurn { agent_id, turn_id },
+                })?;
+            let descendants = if running {
+                Self::capture_subtree_locked(&mut graph, agent_id, false)?
+            } else {
+                Vec::new()
+            };
+            graph.active_turns.remove(&(agent_id, turn_id));
+            drop(state);
+            (actor, cut, descendants)
+        };
+        #[cfg(test)]
+        self.wait_at_descendant_cut_gate();
+        actor.settle_turn_cancel(cut, reason);
+        for descendant in descendants {
+            descendant.close();
+        }
+        Ok(())
+    }
+
     /// Cancels matching root work and atomically retires its descendant authority.
     pub fn cancel_correlation(
         &self,

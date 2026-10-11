@@ -16,7 +16,7 @@ use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
     McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
-    ToolOutputLines,
+    ToolOutputLines, TurnId,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -240,9 +240,14 @@ pub(crate) struct SystemPromptOverride {
 }
 
 pub(crate) enum AgentCommand {
-    Cancel { run_id: u64 },
+    Cancel {
+        turn_id: Option<TurnId>,
+        run_id: u64,
+    },
     CancelAll,
-    CancelSubagent { tool_use_id: String },
+    CancelSubagent {
+        tool_use_id: String,
+    },
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old

@@ -917,6 +917,193 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
     smol::block_on(task);
 }
 
+#[test_case::test_case(false, false, false; "cancel_pending")]
+#[test_case::test_case(true, false, false; "clear_pending_batch")]
+#[test_case::test_case(false, true, false; "cancel_pending_then_close")]
+#[test_case::test_case(true, true, false; "clear_pending_batch_then_close")]
+#[test_case::test_case(false, false, true; "remove_pending_at_index")]
+#[test_case::test_case(false, true, true; "remove_pending_at_index_then_close")]
+fn pending_cancellation_publishes_end_before_single_idle(
+    clear: bool,
+    close: bool,
+    remove_index: bool,
+) {
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        let observations = Arc::clone(&backend.state);
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            crate::agent::TurnAdmissionSnapshot {
+                mode_def: None,
+                prompt_inputs: None,
+                bindings: Arc::default(),
+                mcp_startup_notice: None,
+            }
+        }));
+        let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
+        let (presentation_tx, presentation) = flume::unbounded();
+        let ticket = handle
+            .admit_turn(
+                input("pending"),
+                Some(EventSender::new(presentation_tx, 0)),
+                "pending".into(),
+            )
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+        let second = clear.then(|| {
+            handle
+                .admit_turn(input("second"), None, "second".into())
+                .unwrap()
+        });
+        let (stale_tx, stale_rx) = flume::bounded(1);
+        *handle.inner.stale_preparation.lock().unwrap() = Some(stale_tx);
+        let (retired, publish) = handle.pause_after_next_finalization_retire();
+        let actor = handle.clone();
+        let turn_id = ticket.turn_id();
+        let cancellation = std::thread::spawn(move || {
+            if clear {
+                assert_eq!(actor.clear(), 2);
+            } else if remove_index {
+                assert!(actor.remove_at(0).is_some());
+            } else {
+                actor.cancel_turn(turn_id).unwrap();
+            }
+        });
+        retired.recv_async().await.unwrap();
+        assert!(ticket.peek_result().is_none());
+        assert!(presentation.is_empty());
+        assert!(events.is_empty());
+        if close {
+            handle.close();
+        } else {
+            assert_eq!(handle.clear(), 0);
+        }
+        assert!(events.is_empty());
+        publish.send(()).unwrap();
+        cancellation.join().unwrap();
+        let outcome = ticket.wait().await;
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert!(matches!(
+            presentation.try_recv().unwrap().event,
+            AgentEvent::TurnOutcome(delivered) if delivered == outcome
+        ));
+        assert!(presentation.is_empty());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::ActorEvent::End(result) if result.outcome == outcome
+        ));
+        if let Some(second) = second {
+            let second_outcome = second.wait().await;
+            assert!(matches!(
+                second_outcome,
+                TurnOutcome::Cancelled {
+                    reason: TurnCancellationReason::User,
+                    ..
+                }
+            ));
+            assert!(
+                matches!(events.try_recv().unwrap(), super::ActorEvent::End(result)
+                if result.outcome == second_outcome)
+            );
+        }
+        let transition = events.try_recv().unwrap();
+        if close {
+            assert!(matches!(transition, super::ActorEvent::Close { .. }));
+        } else {
+            assert!(
+                matches!(transition, super::ActorEvent::Idle { agent_id } if agent_id == handle.agent_id())
+            );
+        }
+        assert!(events.is_empty());
+        release_tx.send(()).unwrap();
+        stale_rx.recv_async().await.unwrap();
+        assert_eq!(observations.entered.load(Ordering::SeqCst), 0);
+        assert!(events.is_empty());
+        if !close {
+            handle.cancel_all();
+            assert_eq!(handle.clear(), 0);
+            assert!(events.is_empty());
+            handle.close();
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                super::ActorEvent::Close { .. }
+            ));
+        }
+        task.await;
+        assert!(events.is_empty());
+    });
+}
+
+#[test]
+fn clearing_pending_work_waits_for_processing_before_idle() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let observations = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
+        let (popped, release) = handle.pause_after_next_pop();
+        assert_eq!(handle.processing_turn_id(), None);
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        popped.recv_async().await.unwrap();
+        assert_eq!(handle.processing_turn_id(), Some(active.turn_id()));
+        let pending = handle
+            .admit_turn(input("pending"), None, "pending".into())
+            .unwrap();
+        assert_eq!(handle.clear(), 1);
+        assert!(matches!(
+            pending.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        assert!(
+            matches!(events.try_recv().unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == pending.turn_id())
+        );
+        assert!(events.is_empty());
+        release.send(()).unwrap();
+        until(|| observations.entered.load(Ordering::SeqCst) == 1).await;
+        handle
+            .bind_active_correlation(active.turn_id(), "presentation".into())
+            .unwrap();
+        assert_eq!(handle.processing_turn_id(), Some(active.turn_id()));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::ActorEvent::Start { .. }
+        ));
+        assert_eq!(handle.clear(), 0);
+        assert!(events.is_empty());
+        gate.open();
+        assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            super::ActorEvent::End(_)
+        ));
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            super::ActorEvent::Idle { .. }
+        ));
+        assert_eq!(handle.processing_turn_id(), None);
+        handle.close();
+        task.await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            super::ActorEvent::Close { .. }
+        ));
+        assert!(events.is_empty());
+    });
+}
+
 #[test]
 fn queued_turn_keeps_admitted_mode_and_tool_binding() {
     smol::block_on(async {

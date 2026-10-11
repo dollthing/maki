@@ -1066,7 +1066,21 @@ async fn build_session(
     }
     let trusted = ctx.trusted(&lua).ok().cloned();
     let agent_ctx = match &trusted {
-        Some(trusted) => AgentContext::from(&trusted.template),
+        Some(trusted) => {
+            let mut template = trusted.template.clone();
+            if let Some(config) = try_pair!(trusted.target.effective_config()) {
+                template.model = Arc::new(config.model.clone());
+                template.provider = Arc::clone(&config.provider);
+                template.opts = RequestOptions {
+                    thinking: config.thinking,
+                    fast: config.fast,
+                };
+                template.workflow = config.workflow;
+                template.mode = config.mode.clone();
+                template.mode_def = config.mode_def.clone().map(Arc::new);
+            }
+            AgentContext::from(&template)
+        }
         None => try_pair!(dispatch_ctx(&ctx, "session")).clone(),
     };
     let parent_mode = agent_ctx.mode.clone();

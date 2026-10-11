@@ -1065,7 +1065,7 @@ fn explicit_root_presentation_after_prior_ui_turn(cancel: bool) {
         let actions = app.handle_cancel();
         assert!(
             actions.iter().any(
-                |action| matches!(action, Action::CancelAgent { run_id } if *run_id == RUN_ID)
+                |action| matches!(action, Action::CancelAgent { turn_id: None, run_id } if *run_id == RUN_ID)
             )
         );
         assert_eq!(app.queue.current_run_id(), Some(RUN_ID + 1));
@@ -3102,11 +3102,18 @@ fn double_esc_idle_no_user_turns_flashes_error() {
 #[test]
 fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     let mut app = test_app();
+    const RUN_ID: u64 = 1;
+    const QUEUED_RUN_ID: u64 = 9;
     app.status = Status::Streaming;
-    app.run_id = 1;
+    app.run_id = RUN_ID;
+    app.queue.set_run_id(QUEUED_RUN_ID);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert!(matches!(
+        &actions[0],
+        Action::CancelAgent { turn_id: None, run_id } if *run_id == RUN_ID
+    ));
+    assert_eq!(app.run_id, QUEUED_RUN_ID + 1);
     assert_eq!(app.status, Status::Idle);
     assert_ne!(app.exit_request, ExitRequest::Success);
 }

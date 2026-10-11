@@ -4084,10 +4084,13 @@ impl<'t> EventLoop<'t> {
                     displayed: true,
                 });
             }
-            Action::CancelAgent { run_id } => {
+            Action::CancelAgent { turn_id, run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
-                let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
+                let _ = rt
+                    .handles
+                    .cmd_tx
+                    .try_send(AgentCommand::Cancel { turn_id, run_id });
             }
             Action::CancelSubagent { tool_use_id } => {
                 let _ = self.sessions[idx]

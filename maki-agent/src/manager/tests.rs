@@ -329,6 +329,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
             .unwrap();
         let actor = root.actor().unwrap();
         let identity = actor.identity();
+        let events = actor.subscribe_events();
         let (event_tx, event_rx) = flume::unbounded();
         let (popped, release) = actor.pause_after_next_pop();
         let ticket = match work {
@@ -424,6 +425,10 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                 .cancelled_correlations
                 .contains_key(CORRELATION)
         );
+        while !matches!(
+            events.recv_async().await.unwrap(),
+            crate::actor::ActorEvent::Idle { .. }
+        ) {}
         assert!(actor.inner.state.lock().unwrap().processing.is_none());
         if let Some(ticket) = ticket {
             let outcome = ticket.wait().await;
@@ -482,6 +487,7 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
             .unwrap();
         let actor = root.actor().unwrap();
         let identity = actor.identity();
+        let events = actor.subscribe_events();
         let (popped, release) = actor.pause_after_next_pop();
         for (run_id, correlation) in [(EARLIER_RUN, EARLIER), (LAST_RUN, LAST)] {
             actor
@@ -524,6 +530,10 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
                 .cancelled_correlations
                 .is_empty()
         );
+        while !matches!(
+            events.recv_async().await.unwrap(),
+            crate::actor::ActorEvent::Idle { .. }
+        ) {}
         assert!(actor.inner.state.lock().unwrap().processing.is_none());
         for correlation in [EARLIER, LAST] {
             let reused = actor.admit_turn(input(), None, correlation.into()).unwrap();
@@ -743,6 +753,7 @@ fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
     let (acquire_tx, acquire_rx) = flume::bounded(1);
     let (acquire_release_tx, acquire_release_rx) = flume::bounded(1);
     manager.set_managed_acquire_gate(acquire_tx, acquire_release_rx);
+    let events = actor.subscribe_events();
     let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
     acquire_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     assert!(manager.lock_graph().active_turns.is_empty());
@@ -763,6 +774,10 @@ fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
         smol::block_on(ticket.wait()),
         TurnOutcome::Completed { .. }
     ));
+    while !matches!(
+        events.recv_timeout(COMPLETION_TIMEOUT).unwrap(),
+        crate::actor::ActorEvent::Idle { .. }
+    ) {}
     drop(manager.prepare_idle_subtree(root.id()).unwrap());
     assert!(
         smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
@@ -771,10 +786,13 @@ fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
     );
 }
 
-#[test_case(crate::TurnCancellationReason::User; "user")]
-#[test_case(crate::TurnCancellationReason::Shutdown; "shutdown")]
-fn correlation_cancel_cut_prevents_late_managed_registration_before_trigger(
+#[test_case(crate::TurnCancellationReason::User, false; "correlation_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, false; "correlation_shutdown")]
+#[test_case(crate::TurnCancellationReason::User, true; "nominal_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, true; "nominal_shutdown")]
+fn cancel_cut_prevents_late_managed_registration_before_trigger(
     reason: crate::TurnCancellationReason,
+    nominal: bool,
 ) {
     const CORRELATION: &str = "cancel-before-registration";
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -798,8 +816,14 @@ fn correlation_cancel_cut_prevents_late_managed_registration_before_trigger(
     manager.set_descendant_cut_gate(cut_tx, cut_release_rx);
     let cancelling = manager.clone();
     let root_id = root.id();
-    let cancel =
-        std::thread::spawn(move || cancelling.cancel_correlation(root_id, CORRELATION, reason));
+    let turn_id = ticket.turn_id();
+    let cancel = std::thread::spawn(move || {
+        if nominal {
+            cancelling.cancel_turn(root_id, turn_id, reason)
+        } else {
+            cancelling.cancel_correlation(root_id, CORRELATION, reason)
+        }
+    });
     cut_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     assert!(actor.inner.state.try_lock().is_ok());
     assert!(manager.0.graph.try_lock().is_ok());
@@ -834,8 +858,9 @@ fn correlation_cancel_cut_prevents_late_managed_registration_before_trigger(
     );
 }
 
-#[test]
-fn correlation_cancel_cut_retires_authority_and_captures_children_before_close() {
+#[test_case(false; "correlation")]
+#[test_case(true; "nominal_turn")]
+fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool) {
     const CORRELATION: &str = "root";
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
@@ -854,8 +879,14 @@ fn correlation_cancel_cut_retires_authority_and_captures_children_before_close()
     manager.set_descendant_cut_gate(cut_tx, release_rx);
     let cancelling = manager.clone();
     let root_id = root.id();
+    let turn_id = current.turn_id();
+    assert_eq!(root.actor().unwrap().processing_turn_id(), Some(turn_id));
     let cancel = std::thread::spawn(move || {
-        cancelling.cancel_correlation(root_id, CORRELATION, crate::TurnCancellationReason::User)
+        if nominal {
+            cancelling.cancel_turn(root_id, turn_id, crate::TurnCancellationReason::User)
+        } else {
+            cancelling.cancel_correlation(root_id, CORRELATION, crate::TurnCancellationReason::User)
+        }
     });
     cut_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     let child_snapshot = child.snapshot().unwrap();
@@ -882,6 +913,206 @@ fn correlation_cancel_cut_retires_authority_and_captures_children_before_close()
         crate::ActorLifecycle::Closed
     );
     root_gate.release(1);
+    assert!(
+        smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
+            .timed_out
+            .is_empty()
+    );
+}
+
+#[test_case(crate::TurnCancellationReason::User, false; "admitted_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, false; "admitted_shutdown")]
+#[test_case(crate::TurnCancellationReason::User, true; "root_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, true; "root_shutdown")]
+fn exact_cancel_pop_gap_preserves_same_correlation_successor(
+    reason: crate::TurnCancellationReason,
+    root_work: bool,
+) {
+    const CORRELATION: &str = "reused";
+    const RUN_ID: u64 = 7;
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let (entered_tx, entered_rx) = flume::unbounded();
+    let root = manager
+        .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
+        .unwrap();
+    let actor = root.actor().unwrap();
+    assert_eq!(actor.processing_turn_id(), None);
+    let (popped, release) = actor.pause_after_next_pop();
+    let target = if root_work {
+        actor
+            .rush(RootWork::new(
+                input(),
+                RUN_ID,
+                false,
+                CORRELATION.into(),
+                Vec::new(),
+                CORRELATION.into(),
+            ))
+            .unwrap();
+        None
+    } else {
+        Some(actor.admit_turn(input(), None, CORRELATION.into()).unwrap())
+    };
+    popped.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let target_id = actor.processing_turn_id().unwrap();
+    let target = target.unwrap_or_else(|| actor.turn_ticket(target_id).unwrap());
+    assert_eq!(target_id, target.turn_id());
+    assert!(actor.turn_ticket(target_id).is_some());
+    assert!(target.peek().is_none());
+    assert!(entered_rx.is_empty());
+    let successor = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
+    manager
+        .cancel_turn(root.id(), target.turn_id(), reason)
+        .unwrap();
+    release.send(()).unwrap();
+    assert!(
+        matches!(smol::block_on(target.wait()), TurnOutcome::Cancelled { reason: actual, .. } if actual == reason)
+    );
+    assert!(matches!(
+        smol::block_on(successor.wait()),
+        TurnOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        entered_rx
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .unwrap()
+            .turn_id(),
+        successor.turn_id()
+    );
+    assert!(entered_rx.is_empty());
+    assert!(
+        smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
+            .timed_out
+            .is_empty()
+    );
+}
+
+#[test_case(false; "admitted")]
+#[test_case(true; "standalone_root")]
+fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bool) {
+    const CORRELATION: &str = "reused";
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const FIRST_RUN_ID: u64 = 7;
+    const SUCCESSOR_RUN_ID: u64 = 8;
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let (entered_tx, entered_rx) = flume::unbounded();
+    let root = manager
+        .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+            Ok::<Box<dyn ActorBackend>, String>(Box::new(ReportingCancellableBackend {
+                current: entered_tx,
+            }))
+        })
+        .unwrap();
+    let actor = root.actor().unwrap();
+    let first = if root_work {
+        actor
+            .rush(RootWork::new(
+                input(),
+                FIRST_RUN_ID,
+                false,
+                CORRELATION.into(),
+                Vec::new(),
+                CORRELATION.into(),
+            ))
+            .unwrap();
+        None
+    } else {
+        Some(actor.admit_turn(input(), None, CORRELATION.into()).unwrap())
+    };
+    let first_current = entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let captured = actor.processing_turn_id().unwrap();
+    let first = first.unwrap_or_else(|| actor.turn_ticket(captured).unwrap());
+    assert_eq!(captured, first_current.turn_id());
+    manager
+        .cancel_turn(root.id(), captured, crate::TurnCancellationReason::User)
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(first.wait()),
+        TurnOutcome::Cancelled {
+            reason: crate::TurnCancellationReason::User,
+            ..
+        }
+    ));
+    let successor = if root_work {
+        actor
+            .rush(RootWork::new(
+                input(),
+                SUCCESSOR_RUN_ID,
+                false,
+                CORRELATION.into(),
+                Vec::new(),
+                CORRELATION.into(),
+            ))
+            .unwrap();
+        None
+    } else {
+        Some(actor.admit_turn(input(), None, CORRELATION.into()).unwrap())
+    };
+    let current = entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let successor = successor.unwrap_or_else(|| actor.turn_ticket(current.turn_id()).unwrap());
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    let stale = manager.cancel_turn(root.id(), captured, crate::TurnCancellationReason::User);
+    assert_eq!(
+        stale,
+        Err(ManagerError::InactiveTurn {
+            agent_id: root.id(),
+            turn_id: captured
+        })
+    );
+    assert_eq!(actor.processing_turn_id(), Some(successor.turn_id()));
+    assert!(successor.peek().is_none());
+    assert_eq!(
+        child.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Live
+    );
+    assert_eq!(
+        child.actor().unwrap().snapshot().lifecycle,
+        crate::ActorLifecycle::Open
+    );
+    let another = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    let another_actor = another.actor().unwrap();
+    let child_turn = child
+        .actor()
+        .unwrap()
+        .admit_turn(input(), None, CORRELATION.into())
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(child_turn.wait()),
+        TurnOutcome::Completed { .. }
+    ));
+    manager
+        .cancel_turn(
+            root.id(),
+            successor.turn_id(),
+            crate::TurnCancellationReason::User,
+        )
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(successor.wait()),
+        TurnOutcome::Cancelled { .. }
+    ));
+    assert_eq!(
+        another_actor.snapshot().lifecycle,
+        crate::ActorLifecycle::Closed
+    );
     assert!(
         smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
             .timed_out
@@ -916,6 +1147,7 @@ fn idle_guard_rejects_child_factory_reservation() {
 fn idle_root_with_child(
     child_backend: Box<dyn ActorBackend>,
 ) -> (AgentManagerHandle, super::AgentRef, super::AgentRef) {
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -926,8 +1158,14 @@ fn idle_root_with_child(
             child_backend,
         )
         .unwrap();
+    let root_actor = root.actor().unwrap();
+    let events = root_actor.subscribe_events();
     gate.release(1);
-    smol::block_on(root.actor().unwrap().wait_outcome(current.turn_id())).unwrap();
+    smol::block_on(root_actor.wait_outcome(current.turn_id())).unwrap();
+    while !matches!(
+        events.recv_timeout(COMPLETION_TIMEOUT).unwrap(),
+        crate::actor::ActorEvent::Idle { .. }
+    ) {}
     assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Live
@@ -958,6 +1196,7 @@ fn idle_guard_rejects_busy_child(work: ChildWork) {
         Some(Arc::clone(&child_gate)),
     ));
     let child_actor = child.actor().unwrap();
+    let events = child_actor.subscribe_events();
     let (popped, release) = child_actor.pause_after_next_pop();
     let ticket = child_actor
         .admit_turn(input(), None, "child".into())
@@ -976,6 +1215,10 @@ fn idle_guard_rejects_busy_child(work: ChildWork) {
     }
     child_gate.release(1);
     smol::block_on(ticket.wait());
+    while !matches!(
+        events.recv_timeout(COMPLETION_TIMEOUT).unwrap(),
+        crate::actor::ActorEvent::Idle { .. }
+    ) {}
     drop(manager.prepare_idle_subtree(root.id()).unwrap());
     smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
 }

@@ -1,6 +1,6 @@
 //! Queue for messages typed while the agent is busy.
 
-use maki_agent::AgentInput;
+use maki_agent::{AgentInput, TurnId};
 
 use super::{Action, App, Status};
 
@@ -41,6 +41,12 @@ impl MessageQueue {
             && self
                 .current_run_id()
                 .is_some_and(|allocated| run_id <= allocated)
+    }
+
+    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
+        self.shared
+            .as_ref()
+            .and_then(QueueSender::processing_turn_id)
     }
 
     pub(crate) fn current_run_id(&self) -> Option<u64> {

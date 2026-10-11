@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, RootWork};
-use maki_agent::{AgentInput, ImageSource};
+use maki_agent::{AgentInput, ImageSource, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
 use tracing::warn;
 
@@ -124,6 +124,14 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
+    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.processing_turn_id(),
+            #[cfg(test)]
+            QueueBackend::Test(_) => None,
+        }
+    }
+
     pub(crate) fn current_run_id(&self) -> u64 {
         self.last_run_id.load(Ordering::Relaxed)
     }

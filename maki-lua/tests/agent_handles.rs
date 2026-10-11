@@ -11,8 +11,8 @@ use maki_lua::{
     test_support::InMemoryFs,
 };
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
-    StreamResponse,
+    AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
+    Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::id::SessionRef;
@@ -38,6 +38,7 @@ const SECOND_REPLY: &str = "second gated reply";
 const CAPTURE_TOOL: &str = "capture_result";
 const CAPTURE_REPLY: &str = "structured response committed";
 const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
+const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
 const SYNTHETIC_PLAN_PATH: &str = "/test/host-plan.md";
 
 async fn bounded<T>(future: impl Future<Output = T>, operation: &str) -> T {
@@ -892,6 +893,128 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 assert_eq!(config.mode, AgentMode::Build);
             }
         }
+        fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[test]
+fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr5_tool_spawn_config",
+            &format!(
+                r#"
+            local parent = assert(maki.agent.current(ctx))
+            assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
+            assert(parent:set_mode(ctx, "plan"))
+            local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
+            assert(assert(assert(child:send(ctx, "turn snapshot")):wait(ctx)).text == "{FIRST_REPLY}")
+            assert(child:close(ctx))
+        "#
+            ),
+        );
+        let request = fixture.request().await;
+        let child = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id.is_some())
+            .unwrap();
+        let config = fixture
+            .manager
+            .lookup(child.agent_id)
+            .unwrap()
+            .effective_config()
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.model.spec(), common::default_model().spec());
+        assert_eq!(config.thinking, ThinkingConfig::Off);
+        assert!(!config.fast);
+        assert_eq!(config.mode, AgentMode::Build);
+        assert_eq!(request.model, common::default_model().spec());
+        assert_eq!(request.options.thinking, config.thinking);
+        assert!(!request.options.fast);
+        request
+            .reply
+            .send(common::canned_reply(FIRST_REPLY))
+            .unwrap();
+        fixture.finish().await;
+    });
+}
+
+#[test]
+fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
+    smol::block_on(async {
+        let fixture = Fixture::start("pr5_spawn_config_setup", "");
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "root completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "root settlement").await;
+        fixture._host.load_source("pr5_spawn_config", &format!(r#"
+            maki.api.register_command({{
+                name = "/pr5_spawn_config", tui_only = false,
+                handler = function(_, ctx)
+                    local parent = assert(maki.agent.current(ctx))
+                    assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
+                    assert(parent:set_mode(ctx, "plan"))
+                    local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
+                    local selection = assert(child:model(ctx))
+                    assert(selection.spec == "{FAST_MODEL}")
+                    assert(selection.thinking.kind == "effort" and selection.thinking.level == "low" and selection.fast == true)
+                    assert(assert(assert(child:send(ctx, "inherited configuration")):wait(ctx)).text == "{FIRST_REPLY}")
+                    assert(child:close(ctx))
+                end,
+            }})
+        "#)).unwrap();
+        fixture._host.wait_for_worker_barrier_for_test();
+        let handle = fixture._host.event_handle();
+        let command = handle.run_command_for_test(
+            Arc::from("pr5_spawn_config"),
+            Arc::from("/pr5_spawn_config"),
+            String::new(),
+            0,
+        );
+        let request = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "trusted child first request",
+        )
+        .await;
+        let child = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id.is_some())
+            .unwrap();
+        let config = fixture
+            .manager
+            .lookup(child.agent_id)
+            .unwrap()
+            .effective_config()
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.model.spec(), FAST_MODEL);
+        assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::Low));
+        assert!(config.fast);
+        assert_eq!(config.mode, AgentMode::Plan(SYNTHETIC_PLAN_PATH.into()));
+        assert_eq!(config.mode_def.as_ref().unwrap().id.key(), "plan");
+        assert_eq!(request.model, FAST_MODEL);
+        assert_eq!(request.options.thinking, config.thinking);
+        assert!(request.options.fast);
+        assert!(request.tools.as_array().unwrap().is_empty());
+        request
+            .reply
+            .send(common::canned_reply(FIRST_REPLY))
+            .unwrap();
+        assert_eq!(
+            bounded(command.recv_async(), "trusted command completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
         fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
     });
 }
