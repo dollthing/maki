@@ -144,7 +144,7 @@ impl QueueSender {
 
     pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
         self.last_run_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
                 Some(allocated.max(displayed_run_id) + 1)
             })
             .unwrap_or_else(|allocated| allocated)

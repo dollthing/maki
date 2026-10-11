@@ -5549,7 +5549,7 @@ mod tests {
                 &lua,
                 Box::new(move || {
                     cleaned
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                             Some(value * 10 + index)
                         })
                         .unwrap();
