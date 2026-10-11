@@ -76,9 +76,12 @@ impl OrchestrationServices for AgentOrchestration {
         invocation: Option<&CommandInvocation>,
     ) -> Result<Option<TrustedTarget>, String> {
         if let Some(invocation) = invocation {
-            let pinned = invocation
-                .admission_context::<TrustedTarget>()
-                .ok_or("command agent admission context is unavailable")?;
+            let Some(pinned) = invocation.admission_context::<TrustedTarget>() else {
+                return Ok(None);
+            };
+            if pinned.target.validate_live().is_err() {
+                return Ok(None);
+            }
             self.validate_target(&pinned.target)?;
             return Ok(Some(pinned.clone()));
         }

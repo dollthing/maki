@@ -2074,6 +2074,168 @@ fn retained_unmanaged_tool_context_cannot_authorize_another_invocation() {
     );
 }
 
+#[test_case::test_case("error('reject candidate')"; "execution_failure")]
+#[test_case::test_case(r#"
+    maki.api.register_tool({
+        name = "pr5_reload_root", description = "conflicting candidate",
+        schema = { type = "object", properties = {} }, handler = function() end,
+    })
+"#; "publication_failure")]
+fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
+    smol::block_on(async {
+        const OWNER: &str = "pr5_reload_resources";
+        const BEGIN: &str = "/pr5_reload_begin";
+        const EXERCISE: &str = "/pr5_reload_exercise";
+        const REPLY: &str = "resources survived";
+        let fixture = Fixture::start("pr5_reload_root", "");
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "reload root completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        let handle = fixture._host.event_handle();
+        fixture._host.load_source(OWNER, r#"
+            local child, observer, subscription, ticket, observer_ticket
+            maki.api.register_command({
+                name = "/pr5_reload_begin", tui_only = false,
+                handler = function(_, ctx)
+                    child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    observer = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    subscription = assert(child:on_turn_start(ctx, function(_, callback_ctx)
+                        observer_ticket = assert(observer:send(callback_ctx, "subscription after rejected reload"))
+                        assert(observer_ticket:wait(callback_ctx))
+                    end))
+                    ticket = assert(child:send(ctx, "work across rejected reload"))
+                end,
+            })
+            maki.api.register_command({
+                name = "/pr5_reload_exercise", tui_only = false,
+                handler = function(_, ctx)
+                    assert(assert(ticket:wait(ctx)).text == "resources survived")
+                    assert(observer_ticket:wait(ctx))
+                    local next_ticket = assert(child:send(ctx, "child after rejected reload"))
+                    assert(assert(next_ticket:wait(ctx)).text == "resources survived")
+                end,
+            })
+        "#).unwrap();
+        let run = |command: &str| {
+            handle.run_command_for_test(Arc::from(OWNER), Arc::from(command), String::new(), 0)
+        };
+        assert_eq!(run(BEGIN).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let first = bounded(fixture.requests.recv_async(), "persistent reload request")
+            .await
+            .unwrap();
+        let second = bounded(fixture.requests.recv_async(), "parked callback request")
+            .await
+            .unwrap();
+        let (active, callback_work) = if serde_json::to_string(&first.messages)
+            .unwrap()
+            .contains("work across rejected reload")
+        {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let rejected = fixture
+            ._host
+            .queue_load_source_for_test(OWNER, candidate)
+            .unwrap();
+        assert!(rejected.recv_timeout(TEST_TIMEOUT).unwrap().is_err());
+        assert!(
+            !callback_work.reply.is_disconnected(),
+            "rejected reload cancelled callback work"
+        );
+        callback_work
+            .reply
+            .send(common::canned_reply(REPLY))
+            .unwrap();
+        assert!(
+            !active.reply.is_disconnected(),
+            "rejected reload cancelled old work"
+        );
+        active.reply.send(common::canned_reply(REPLY)).unwrap();
+        let command = run(EXERCISE);
+        let first = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "first preserved resource request",
+        )
+        .await;
+        let second = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "second preserved resource request",
+        )
+        .await;
+        let messages =
+            [&first, &second].map(|request| serde_json::to_string(&request.messages).unwrap());
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("child after rejected reload"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|text| text.contains("subscription after rejected reload"))
+        );
+        first.reply.send(common::canned_reply(REPLY)).unwrap();
+        second.reply.send(common::canned_reply(REPLY)).unwrap();
+        assert_eq!(command.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+
+        assert_eq!(run(BEGIN).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let replacement_work =
+            bounded(fixture.requests.recv_async(), "work before accepted reload")
+                .await
+                .unwrap();
+        let replacement_callback = bounded(
+            fixture.requests.recv_async(),
+            "parked callback before accepted reload",
+        )
+        .await
+        .unwrap();
+        fixture
+            ._host
+            .queue_load_source_for_test(OWNER, "")
+            .unwrap()
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        wait_for_gate_drop(&replacement_work, "accepted reload cancellation").await;
+        wait_for_gate_drop(
+            &replacement_callback,
+            "accepted reload callback cancellation",
+        )
+        .await;
+        bounded(
+            async {
+                loop {
+                    if fixture
+                        .manager
+                        .snapshot()
+                        .iter()
+                        .filter(|node| node.parent_id.is_some())
+                        .all(|node| {
+                            matches!(
+                                node.graph_lifecycle,
+                                maki_agent::GraphLifecycle::Closed
+                                    | maki_agent::GraphLifecycle::Removed
+                            )
+                        })
+                    {
+                        break;
+                    }
+                    smol::future::yield_now().await;
+                }
+            },
+            "accepted reload closes owned agents",
+        )
+        .await;
+        fixture.manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
 #[test]
 fn repeated_deferred_subtrees_close_and_release_provider_gates() {
     smol::block_on(async {

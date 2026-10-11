@@ -7781,6 +7781,105 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test_case(true; "closed_task_selected_before_dispatch")]
+    #[test_case(false; "pinned_task_closed_before_handler")]
+    fn lua_command_runs_without_authority_for_closed_task(closed_before_dispatch: bool) {
+        const SPAWNED: &str = "task spawned";
+        const OBSERVED: &str = "ordinary handler executed without authority";
+        const TASK_NAME: &str = "command regression task";
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "closed_task_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-command-task", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{
+                                inherit_provider = true, silent = true,
+                            }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/ordinary-command", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(ctx == nil)
+                            local ok, child = pcall(maki.agent.spawn, ctx, {{
+                                inherit_provider = true, silent = true,
+                            }})
+                            assert(not ok or child == nil)
+                            maki.ui.flash("{OBSERVED}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            smol::block_on(registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/spawn-command-task".into(),
+            ));
+            assert!(matches!(
+                actions.recv_timeout(Duration::from_secs(5)).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                TASK_NAME.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            chat.mark_finished(crate::components::DisplayRole::Assistant, "done");
+            app.chats.push(chat);
+            app.active_chat = 1;
+            assert_eq!(app.selected_agent_id(), Some(child_id));
+            if closed_before_dispatch {
+                manager.close_subtree(child_id).unwrap();
+            }
+            event_loop.sync_orchestration();
+            let queued = registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/ordinary-command".into(),
+            );
+            if !closed_before_dispatch {
+                manager.close_subtree(child_id).unwrap();
+            }
+            assert!(manager.lookup(child_id).is_err());
+            smol::block_on(queued);
+            assert!(matches!(
+                actions.recv_timeout(Duration::from_secs(5)).unwrap(),
+                UiAction::Flash(text) if text == OBSERVED
+            ));
+            assert!(manager.lookup(root_id).is_ok());
+            assert_eq!(manager.snapshot().len(), 2);
+        });
+    }
+
     #[test]
     fn queued_command_admission_keeps_agent_after_ui_selection_changes() {
         struct Probe(Arc<Mutex<Option<maki_agent::AgentId>>>);

@@ -1077,6 +1077,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::collections::HashMap;
     use std::pin::pin;
 
@@ -1704,13 +1705,20 @@ mod tests {
 
         smol::block_on(async {
             const COMMAND: &str = "/ui-mcp-spawn";
+            const MCP_EXECUTED: &str = "fake MCP executed";
+            const MCP_DENIED: &str = "MCP denied";
+            let expected = if enabled && !restricted {
+                MCP_EXECUTED
+            } else {
+                MCP_DENIED
+            };
             let (mut backend, _, _) = failing_backend();
             let host = maki_lua::PluginHost::new(Arc::clone(ToolRegistry::global_arc())).unwrap();
             backend.lua_handle = host.event_handle();
             backend.permissions.set_yolo(true);
             backend.mcp = Some(maki_agent::mcp::test_support::stub_session_with_result(
                 &[("stub.echo", "echo")],
-                "fake MCP executed",
+                MCP_EXECUTED,
             ));
             let mut template = backend.orchestration_template();
             template.provider = Arc::new(CommandMcpProvider);
@@ -1723,7 +1731,8 @@ mod tests {
                     thinking: Default::default(),
                 },
                 AgentMode::Build,
-            );
+            )
+            .with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
             if restricted {
                 let mut mode = maki_agent::ModeRegistry::builtin()
                     .get(&maki_agent::ModeId::Build)
@@ -1741,10 +1750,19 @@ mod tests {
             let orchestration = Arc::new(crate::agent::orchestration::AgentOrchestration::new(
                 Arc::new(arc_swap::ArcSwapOption::empty()),
             ));
-            orchestration.register_root(TrustedTarget {
+            let pinned = TrustedTarget {
                 target: root.clone(),
                 template,
-            });
+            };
+            orchestration.register_root(pinned.clone());
+            let pinned = TrustedTarget {
+                target: root.clone(),
+                template: maki_lua::orchestration::OrchestrationServices::template(
+                    &*orchestration,
+                    &root,
+                )
+                .unwrap(),
+            };
             orchestration.select(HashMap::new(), Some(root.clone()));
             host.event_handle()
                 .install_orchestration_services(orchestration);
@@ -1755,28 +1773,28 @@ mod tests {
                 maki.api.register_command({{
                     name = "{COMMAND}", tui_only = false,
                     handler = function(_, ctx)
-                        assert(ctx ~= nil)
-                        local child = assert(maki.agent.spawn(ctx, {{
-                            inherit_provider = true, silent = true, mcp = {enabled},
-                        }}))
-                        local result = assert(assert(child:send(ctx, "invoke MCP")):wait(ctx))
-                        assert(result.text == "{expected}", result.text)
-                        assert(child:close(ctx))
+                        local ok, err = pcall(function()
+                            assert(ctx ~= nil)
+                            local child = assert(maki.agent.spawn(ctx, {{
+                                inherit_provider = true, silent = true, mcp = {enabled},
+                            }}))
+                            local result = assert(assert(child:send(ctx, "invoke MCP")):wait(ctx))
+                            assert(result.text == "{expected}", maki.json.encode(result))
+                            assert(child:close(ctx))
+                            maki.ui.flash(result.text)
+                        end)
+                        if not ok then maki.ui.flash(tostring(err)) end
                     end,
                 }})
             "#,
-                    expected = if enabled && !restricted {
-                        "fake MCP executed"
-                    } else {
-                        "MCP denied"
-                    }
                 ),
             )
             .unwrap();
+            let actions = host.ui_action_rx();
             let commands = host.command_registry();
             let target = commands.bind_target(
                 maki_commands::TargetCapabilities::ALL,
-                Arc::new(McpCommandHost),
+                Arc::new(McpCommandHost(pinned)),
             );
             let outcome =
                 futures_lite::future::or(commands.dispatch_input(&target, COMMAND.into()), async {
@@ -1793,14 +1811,28 @@ mod tests {
                 ),
                 "{outcome:?}"
             );
+            let action = futures_lite::future::or(actions.recv_async(), async {
+                smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                panic!("command-origin MCP handler did not finish");
+            })
+            .await
+            .unwrap();
+            let maki_lua::UiAction::Flash(text) = action else {
+                panic!("unexpected command-origin MCP action");
+            };
+            assert_eq!(text, expected);
             root.actor().unwrap().close();
             manager.shutdown(std::time::Duration::from_secs(1)).await;
         });
     }
 
-    struct McpCommandHost;
+    struct McpCommandHost(maki_lua::orchestration::TrustedTarget);
 
     impl maki_commands::CommandHost for McpCommandHost {
+        fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+            Some(Arc::new(self.0.clone()))
+        }
+
         fn request(
             &self,
             _: maki_commands::HostRequest,
@@ -1820,7 +1852,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a serde_json::Value,
-            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            events: &'a flume::Sender<maki_providers::ProviderEvent>,
             _: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<
@@ -1830,18 +1862,21 @@ mod tests {
             Box::pin(async move {
                 let serialized = serde_json::to_string(messages).unwrap();
                 let answered = serialized.contains("tool_result");
+                let text = if serialized.contains("fake MCP executed") {
+                    "fake MCP executed"
+                } else {
+                    "MCP denied"
+                };
+                if answered {
+                    events
+                        .send(maki_providers::ProviderEvent::TextDelta { text: text.into() })
+                        .unwrap();
+                }
                 Ok(maki_providers::StreamResponse {
                     message: Message {
                         role: maki_providers::Role::Assistant,
                         content: if answered {
-                            vec![maki_providers::ContentBlock::Text {
-                                text: if serialized.contains("fake MCP executed") {
-                                    "fake MCP executed"
-                                } else {
-                                    "MCP denied"
-                                }
-                                .into(),
-                            }]
+                            vec![maki_providers::ContentBlock::Text { text: text.into() }]
                         } else {
                             vec![maki_providers::ContentBlock::ToolUse {
                                 id: "ui-mcp-call".into(),

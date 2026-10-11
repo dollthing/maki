@@ -3533,6 +3533,7 @@ impl LuaRuntime {
                 },
             });
         }
+        crate::orchestration::revoke_plugin(&self.lua, &name);
         activate_session_options(&self.lua, &pending_session_options);
         if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
             store.commit(Arc::clone(&name), generation);
@@ -4834,8 +4835,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             opts,
                             reply,
                         } => {
-                            crate::orchestration::revoke_plugin(&rt.lua, &name);
-                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx, callbacks.get(&name)).await;
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx, None).await;
                             let res = rt
                                 .load_source(
                                     (Arc::clone(&name), &name),
@@ -4846,6 +4846,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     None,
                                 )
                                 .await;
+                            if res.is_ok()
+                                && let Some(callbacks) = callbacks.get(&name)
+                            {
+                                callbacks.drain().await;
+                            }
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -5128,11 +5133,13 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin_dir,
                             reply,
                         } => {
-                            crate::orchestration::revoke_plugin(&rt.lua, &owner);
-                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx, callbacks.get(&owner)).await;
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx, None).await;
                             let res = rt
-                                .run_init_lua(&source, &source_name, owner, plugin_dir)
+                                .run_init_lua(&source, &source_name, Arc::clone(&owner), plugin_dir)
                                 .await;
+                            if res.is_ok() {
+                                drain_barrier(&rt.lua, &ex, &gate, &spawn_rx, callbacks.get(&owner)).await;
+                            }
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
