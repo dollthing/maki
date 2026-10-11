@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
-    ActorError, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig, QueueProjection,
+    ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
+    QueueProjection,
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
@@ -1118,6 +1119,68 @@ fn root_preparation_failure_is_visible_once_and_successors_progress() {
         actor.close();
         task.await;
         assert!(events.is_empty());
+    });
+}
+
+#[test]
+fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
+    const RUN_ID: u64 = 17;
+    const FAILURE: &str = "The agent could not start this turn: admission preparation failed.";
+    smol::block_on(async {
+        let (sender, errors) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        backend.root_preparation_error = Some(Arc::new(move |run_id, message| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            EventSender::new(sender.clone(), run_id)
+                .send(crate::AgentEvent::ControlError { message })
+                .unwrap();
+        }));
+        backend.preparation = Some(Arc::new(|_, _, _| panic!("preparation panic")));
+        let (actor, task) = spawn(backend);
+        let events = actor.subscribe_events();
+        actor
+            .rush(crate::RootWork::new(
+                input("panic"),
+                RUN_ID,
+                false,
+                "panic".into(),
+                Vec::new(),
+                "root".into(),
+            ))
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+        assert!(errors.is_empty());
+        assert!(events.is_empty());
+        assert_eq!(actor.clear(), 0);
+        assert!(events.is_empty());
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            ActorEvent::Idle { agent_id } if agent_id == actor.agent_id()
+        ));
+        let error = errors.try_recv().unwrap();
+        assert_eq!(error.run_id, RUN_ID);
+        assert!(
+            matches!(error.event, crate::AgentEvent::ControlError { message } if message == FAILURE)
+        );
+        assert!(observed.runs.lock().unwrap().is_empty());
+        assert!(actor.inner.outcomes.lock().unwrap().is_empty());
+        assert!(actor.snapshot().queue.is_empty());
+        actor.cancel_all();
+        assert_eq!(actor.clear(), 0);
+        assert!(events.is_empty());
+        actor.close();
+        task.await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ActorEvent::Close { .. }
+        ));
+        assert!(events.is_empty());
+        assert!(errors.is_empty());
     });
 }
 

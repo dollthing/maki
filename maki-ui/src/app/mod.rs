@@ -68,7 +68,7 @@ use crossterm::event::{
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
-    SharedMessages, SubagentInfo, TurnCompleteEvent,
+    SharedMessages, SubagentInfo, TurnCompleteEvent, TurnId,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -1833,17 +1833,30 @@ impl App {
         }
     }
 
-    fn handle_cancel(&mut self) -> Vec<Action> {
-        let turn_id = self.queue.processing_turn_id();
+    fn capture_cancel(&mut self) -> (Option<TurnId>, u64) {
         let run_id = self.run_id;
-        self.run_id = self
-            .queue
-            .current_run_id()
-            .unwrap_or(self.run_id)
-            .max(self.run_id)
-            + 1;
-        self.queue.set_run_id(self.run_id);
-        self.queue.fence_cancelled_presentations(self.run_id);
+        let (turn_id, fence) = self.queue.capture_cancel(self.run_id);
+        self.run_id = fence;
+        self.queue.fence_cancelled_presentations(fence);
+        (turn_id, run_id)
+    }
+
+    fn handle_cancel(&mut self) -> Vec<Action> {
+        let (turn_id, run_id) = self.capture_cancel();
+        self.finish_cancel(turn_id, run_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_cancel_after_capture(
+        &mut self,
+        after_capture: impl FnOnce(),
+    ) -> Vec<Action> {
+        let (turn_id, run_id) = self.capture_cancel();
+        after_capture();
+        self.finish_cancel(turn_id, run_id)
+    }
+
+    fn finish_cancel(&mut self, turn_id: Option<TurnId>, run_id: u64) -> Vec<Action> {
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;

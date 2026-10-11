@@ -43,10 +43,18 @@ impl MessageQueue {
                 .is_some_and(|allocated| run_id <= allocated)
     }
 
-    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
+    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
+        self.shared.as_ref().map_or(displayed_run_id + 1, |shared| {
+            shared.reserve_run_id(displayed_run_id)
+        })
+    }
+
+    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
         self.shared
             .as_ref()
-            .and_then(QueueSender::processing_turn_id)
+            .map_or((None, displayed_run_id + 1), |shared| {
+                shared.capture_cancel(displayed_run_id)
+            })
     }
 
     pub(crate) fn current_run_id(&self) -> Option<u64> {
@@ -312,13 +320,7 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        self.record_run_start(
-            self.queue
-                .current_run_id()
-                .unwrap_or(self.run_id)
-                .max(self.run_id)
-                + 1,
-        );
+        self.record_run_start(self.queue.reserve_run_id(self.run_id));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

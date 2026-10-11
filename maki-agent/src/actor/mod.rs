@@ -71,7 +71,10 @@ pub use types::{
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use event_listener::Event;
 
@@ -501,6 +504,7 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
                         drive_operations(&inner, &mut state);
                     }
                     Err(_) => {
+                        state.pending_publications += 1;
                         drive_operations(&inner, &mut state);
                         drop(state);
                         fail_preparation(&inner, work);
@@ -558,6 +562,10 @@ fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
         );
         finalize_turn(inner, turn_id, outcome, Some(&admission), true);
     }
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.pending_publications -= 1;
+    state.finish_close(inner);
+    state.publish_idle(inner);
 }
 
 fn preparation_input(input: &AgentInput) -> AgentInput {
@@ -1097,6 +1105,68 @@ impl AgentActorHandle {
             .processing
             .as_ref()
             .and_then(|processing| processing.turn_id)
+    }
+
+    pub fn capture_processing_presentation_cut(
+        &self,
+        presentation: &AtomicU64,
+        displayed: u64,
+    ) -> (Option<TurnId>, u64) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let turn_id = state
+            .processing
+            .as_ref()
+            .and_then(|processing| processing.turn_id);
+        if let Some(processing) = &mut state.processing
+            && processing.turn_id.is_some()
+        {
+            processing
+                .cancellation_reason
+                .get_or_insert(TurnCancellationReason::User);
+        }
+        let mut current = presentation.load(Ordering::Relaxed);
+        let fence = loop {
+            let next = current.max(displayed) + 1;
+            match presentation.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(updated) => current = updated,
+            }
+        };
+        (turn_id, fence)
+    }
+
+    pub fn allocate_processing_presentation(
+        &self,
+        turn_id: TurnId,
+        presentation: &AtomicU64,
+        displayed: Option<u64>,
+    ) -> Result<u64, ActorError> {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        let processing = state
+            .processing
+            .as_ref()
+            .filter(|processing| processing.turn_id == Some(turn_id))
+            .ok_or(ActorError::UnknownTurn(turn_id))?;
+        if processing.cancellation_reason.is_some() {
+            return Err(ActorError::PolicyCancelled);
+        }
+        if let Some(displayed) = displayed
+            && presentation
+                .compare_exchange(displayed, displayed, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Ok(displayed)
+        } else {
+            Ok(presentation.fetch_add(1, Ordering::Relaxed) + 1)
+        }
     }
 
     pub fn bind_active_correlation(

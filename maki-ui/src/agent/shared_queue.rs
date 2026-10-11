@@ -124,11 +124,13 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
-    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
+    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
         match &self.backend {
-            QueueBackend::Actor(actor) => actor.processing_turn_id(),
+            QueueBackend::Actor(actor) => {
+                actor.capture_processing_presentation_cut(&self.last_run_id, displayed_run_id)
+            }
             #[cfg(test)]
-            QueueBackend::Test(_) => None,
+            QueueBackend::Test(_) => (None, self.reserve_run_id(displayed_run_id)),
         }
     }
 
@@ -138,6 +140,16 @@ impl QueueSender {
 
     pub(crate) fn set_run_id(&self, run_id: u64) {
         self.last_run_id.fetch_max(run_id, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
+        self.last_run_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+                Some(allocated.max(displayed_run_id) + 1)
+            })
+            .unwrap_or_else(|allocated| allocated)
+            .max(displayed_run_id)
+            + 1
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {

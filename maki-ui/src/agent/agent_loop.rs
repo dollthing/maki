@@ -87,6 +87,8 @@ pub(crate) struct TuiActorBackend {
     vars: Vars,
     instructions: Instructions,
     tools: RequestTools,
+    #[cfg(test)]
+    before_presentation: Option<(flume::Sender<()>, flume::Receiver<()>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -144,6 +146,8 @@ pub(super) fn new_backend(
         vars: Vars::default(),
         instructions: Instructions::default(),
         tools: RequestTools::default(),
+        #[cfg(test)]
+        before_presentation: None,
     }
 }
 
@@ -752,6 +756,11 @@ impl ActorBackend for TuiActorBackend {
             let explicit = matches!(&work, WorkKind::Turn)
                 && !context.correlation.starts_with(ROOT_CORRELATION_PREFIX);
             let standalone_presentation = explicit || matches!(&work, WorkKind::Root { .. });
+            #[cfg(test)]
+            if let Some((entered, release)) = self.before_presentation.take() {
+                entered.send(()).unwrap();
+                release.recv_async().await.unwrap();
+            }
             let run_id = if standalone_presentation {
                 let displayed_run = match &work {
                     WorkKind::Root {
@@ -761,7 +770,24 @@ impl ActorBackend for TuiActorBackend {
                     } => Some(*run_id),
                     _ => None,
                 };
-                if let Some(displayed_run) = displayed_run
+                if let Some(current) = &context.managed_turn {
+                    let allocated = current.manager().actor(context.agent_id).and_then(|actor| {
+                        actor
+                            .allocate_processing_presentation(turn_id, &self.run_id, displayed_run)
+                            .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
+                    });
+                    match allocated {
+                        Ok(run_id) => run_id,
+                        Err(_) => {
+                            let _ = self.drain_tx.try_send(admission_run_id);
+                            return BackendResult::EnteredRun(self.cancel_setup(
+                                &context,
+                                turn_id,
+                                admission_run_id,
+                            ));
+                        }
+                    }
+                } else if let Some(displayed_run) = displayed_run
                     && self
                         .run_id
                         .compare_exchange(
@@ -1454,14 +1480,22 @@ mod tests {
         });
     }
 
-    #[test_case(false; "explicit_turn")]
-    #[test_case(true; "undisplayed_deferred_root")]
-    fn ui_cancel_targets_buffered_active_root_without_cancelling_future_turn(deferred: bool) {
+    #[test_case(false, 0; "explicit_turn")]
+    #[test_case(true, 0; "undisplayed_deferred_root")]
+    #[test_case(false, 1; "explicit_successor_after_capture")]
+    #[test_case(true, 1; "deferred_successor_after_capture")]
+    #[test_case(false, 2; "no_target_successor_after_capture")]
+    #[test_case(false, 3; "captured_target_before_allocation")]
+    fn ui_cancel_targets_buffered_active_root_without_cancelling_future_turn(
+        deferred: bool,
+        capture_race: u8,
+    ) {
         const FIRST_RUN: u64 = 7;
         const SECOND_RUN: u64 = FIRST_RUN + 1;
         const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const ROUTER_BARRIER: &str = "cancel-router-barrier";
         const SHARED_CORRELATION: &str = "plugin-shared-correlation";
+        const RESPONSE: &str = "visible explicit response";
 
         smol::block_on(futures_lite::future::or(
             async {
@@ -1478,6 +1512,11 @@ mod tests {
                 let provider = Arc::new(ExplicitProvider {
                     release: released.clone(),
                 });
+                let (allocation_entered, allocation_wait) = flume::bounded(1);
+                let (allocate, allocation_release) = flume::bounded(1);
+                if capture_race == 3 {
+                    backend.before_presentation = Some((allocation_entered, allocation_release));
+                }
                 backend.run_id.store(FIRST_RUN - 1, Ordering::Relaxed);
                 let actor_run_id = Arc::clone(&backend.run_id);
                 let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
@@ -1523,7 +1562,101 @@ mod tests {
                     Arc::clone(&subagent_cancels),
                     init_trigger,
                 );
+                if capture_race == 2 {
+                    let mut successor = None;
+                    let mut buffered = Vec::new();
+                    let actions = app.handle_cancel_after_capture(|| {
+                        successor = Some(
+                            actor
+                                .admit_turn(make_input(), None, SHARED_CORRELATION.into())
+                                .unwrap(),
+                        );
+                        loop {
+                            let envelope = events.recv_timeout(TEST_TIMEOUT).unwrap();
+                            let streaming = matches!(envelope.event, AgentEvent::TextDelta { .. });
+                            buffered.push(envelope);
+                            if streaming {
+                                break;
+                            }
+                        }
+                    });
+                    let [crate::components::Action::CancelAgent { turn_id, run_id }] =
+                        actions.as_slice()
+                    else {
+                        panic!("UI cancel did not dispatch cancellation");
+                    };
+                    assert!(turn_id.is_none());
+                    let (barrier_trigger, barrier) = CancelToken::new();
+                    subagent_cancels.insert(ROUTER_BARRIER.into(), barrier_trigger);
+                    cmd_tx
+                        .send(crate::agent::AgentCommand::Cancel {
+                            turn_id: *turn_id,
+                            run_id: *run_id,
+                        })
+                        .unwrap();
+                    cmd_tx
+                        .send(crate::agent::AgentCommand::CancelSubagent {
+                            tool_use_id: ROUTER_BARRIER.into(),
+                        })
+                        .unwrap();
+                    barrier.cancelled().await;
+                    for envelope in buffered {
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    }
+                    crate::app::tests::assert_actor_presentation(
+                        &mut app,
+                        FIRST_RUN + 1,
+                        RESPONSE,
+                        "explicit root",
+                    );
+                    let successor = successor.unwrap();
+                    assert!(successor.peek().is_none());
+                    release.send(()).unwrap();
+                    assert!(matches!(
+                        successor.wait().await,
+                        TurnOutcome::Completed { .. }
+                    ));
+                    for envelope in events.drain() {
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    }
+                    crate::app::tests::assert_actor_response(&mut app, RESPONSE);
+                    drop(cmd_tx);
+                    actor.close();
+                    manager.shutdown(std::time::Duration::from_secs(1)).await;
+                    return;
+                }
                 let first = actor.admit_turn(make_input(), None, String::new()).unwrap();
+                if capture_race == 3 {
+                    allocation_wait.recv_async().await.unwrap();
+                    let actions = app.handle_cancel_after_capture(|| {
+                        allocate.send(()).unwrap();
+                    });
+                    assert!(
+                        matches!(actions.as_slice(), [crate::components::Action::CancelAgent { turn_id: Some(id), .. }] if *id == first.turn_id())
+                    );
+                    assert!(matches!(
+                        first.wait().await,
+                        TurnOutcome::Cancelled {
+                            reason: TurnCancellationReason::User,
+                            ..
+                        }
+                    ));
+                    assert_eq!(actor_run_id.load(Ordering::Relaxed), FIRST_RUN);
+                    for envelope in events.drain() {
+                        assert!(!matches!(
+                            envelope.event,
+                            AgentEvent::QueueItemConsumed { .. }
+                        ));
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    }
+                    assert_eq!(app.run_id, FIRST_RUN);
+                    assert_eq!(app.status, crate::components::Status::Idle);
+                    assert!(released.is_empty());
+                    drop(cmd_tx);
+                    actor.close();
+                    manager.shutdown(std::time::Duration::from_secs(1)).await;
+                    return;
+                }
                 loop {
                     let envelope = events.recv_async().await.unwrap();
                     assert_eq!(envelope.run_id, FIRST_RUN);
@@ -1549,6 +1682,88 @@ mod tests {
                             .unwrap(),
                     )
                 };
+                if capture_race == 1 {
+                    let mut buffered = Vec::new();
+                    let mut pending = None;
+                    let actions = app.handle_cancel_after_capture(|| {
+                        assert_eq!(actor.processing_turn_id(), Some(first.turn_id()));
+                        release.send(()).unwrap();
+                        loop {
+                            let envelope = events.recv_timeout(TEST_TIMEOUT).unwrap();
+                            let streaming = envelope.run_id == SECOND_RUN + 1
+                                && matches!(envelope.event, AgentEvent::TextDelta { .. });
+                            buffered.push(envelope);
+                            if streaming {
+                                break;
+                            }
+                        }
+                        pending = Some(
+                            actor
+                                .admit_turn(make_input(), None, SHARED_CORRELATION.into())
+                                .unwrap(),
+                        );
+                    });
+                    let [crate::components::Action::CancelAgent { turn_id, run_id }] =
+                        actions.as_slice()
+                    else {
+                        panic!("UI cancel did not dispatch cancellation");
+                    };
+                    assert_eq!(*turn_id, Some(first.turn_id()));
+                    assert_eq!(*run_id, FIRST_RUN);
+                    assert!(matches!(first.peek(), Some(TurnOutcome::Completed { .. })));
+                    let second = second.unwrap_or_else(|| {
+                        actor
+                            .turn_ticket(actor.snapshot().active_turn.unwrap())
+                            .unwrap()
+                    });
+                    assert_eq!(actor.processing_turn_id(), Some(second.turn_id()));
+                    assert!(queue.is_empty());
+                    assert!(matches!(
+                        pending.unwrap().wait().await,
+                        TurnOutcome::Cancelled {
+                            reason: TurnCancellationReason::User,
+                            ..
+                        }
+                    ));
+                    let (barrier_trigger, barrier) = CancelToken::new();
+                    subagent_cancels.insert(ROUTER_BARRIER.into(), barrier_trigger);
+                    cmd_tx
+                        .send(crate::agent::AgentCommand::Cancel {
+                            turn_id: *turn_id,
+                            run_id: *run_id,
+                        })
+                        .unwrap();
+                    cmd_tx
+                        .send(crate::agent::AgentCommand::CancelSubagent {
+                            tool_use_id: ROUTER_BARRIER.into(),
+                        })
+                        .unwrap();
+                    barrier.cancelled().await;
+                    assert!(second.peek().is_none());
+                    for envelope in buffered {
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    }
+                    crate::app::tests::assert_actor_presentation(
+                        &mut app,
+                        SECOND_RUN + 1,
+                        RESPONSE,
+                        if deferred {
+                            "deferred root"
+                        } else {
+                            "explicit root"
+                        },
+                    );
+                    release.send(()).unwrap();
+                    assert!(matches!(second.wait().await, TurnOutcome::Completed { .. }));
+                    for envelope in events.drain() {
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    }
+                    crate::app::tests::assert_actor_response(&mut app, RESPONSE);
+                    drop(cmd_tx);
+                    actor.close();
+                    manager.shutdown(std::time::Duration::from_secs(1)).await;
+                    return;
+                }
                 release.send(()).unwrap();
                 assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
 
