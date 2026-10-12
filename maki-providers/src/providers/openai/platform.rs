@@ -49,6 +49,8 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
 
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
+// GPT-6.1 Sol's default context on Codex/Work went up to 500k (max 1M).
+const GPT_6_1_PLAN_CONTEXT_WINDOW: u32 = 500_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
 // a fresh model is missing from the list.
@@ -76,15 +78,19 @@ fn is_codex_model(model_id: &str) -> bool {
 // like `gpt-5.6-terra-preview`.
 fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     if model_id.contains("-codex") {
-        return Some(CODEX_PLAN_CONTEXT_WINDOW);
+        return Some(if model_id.starts_with("gpt-6.1-sol") {
+            GPT_6_1_PLAN_CONTEXT_WINDOW
+        } else {
+            CODEX_PLAN_CONTEXT_WINDOW
+        });
     }
     if !PLAN_MODELS.contains(&model_id) {
         return None;
     }
-    Some(if model_id.starts_with("gpt-5.6-") {
-        GPT_5_6_PLAN_CONTEXT_WINDOW
-    } else {
-        CODEX_PLAN_CONTEXT_WINDOW
+    Some(match model_id {
+        "gpt-6.1-sol" => GPT_6_1_PLAN_CONTEXT_WINDOW,
+        id if id.starts_with("gpt-5.6-") => GPT_5_6_PLAN_CONTEXT_WINDOW,
+        _ => CODEX_PLAN_CONTEXT_WINDOW,
     })
 }
 
@@ -613,7 +619,8 @@ mod tests {
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
-    #[test_case("gpt-6.1-sol", Some(272_000))]
+    #[test_case("gpt-6.1-sol", Some(500_000))]
+    #[test_case("gpt-6.1-sol-codex", Some(500_000) ; "codex suffix keeps the 6.1 bump")]
     #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
     #[test_case("gpt-6-luna", Some(272_000))]
