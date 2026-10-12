@@ -7,6 +7,7 @@ pub use platform::OpenAi;
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
+const GPT_6_1_CONTEXT_WINDOW: u32 = 500_000;
 const GPT_6_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
@@ -38,7 +39,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
             },
             max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
-            context_window: GPT_6_CONTEXT_WINDOW,
+            context_window: GPT_6_1_CONTEXT_WINDOW,
         },
         ModelEntry {
             prefixes: &["gpt-6-astra"],
@@ -403,7 +404,7 @@ mod tests {
         0.1,
         2.5,
         10.0,
-        GPT_6_CONTEXT_WINDOW
+        GPT_6_1_CONTEXT_WINDOW
     )]
     #[test_case(
         "gpt-6-astra",
