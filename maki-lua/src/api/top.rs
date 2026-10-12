@@ -11,7 +11,9 @@ use std::time::Duration;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::api::timer::require_trusted_authority;
 use crate::api::util::command::{UiAction, ui_send};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{DeferQueue, DeferredCallback};
 
 /// The one `maki.notify` override for the whole process. `create_maki_global`
@@ -31,11 +33,13 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 /// You get back a handle. Its `:stop()` cancels a callback that has not
 /// fired yet, which is how you debounce: schedule, then stop and
 /// reschedule on every new event. An error raised by the callback is
-/// logged and dropped, since nobody is waiting for a result.
+/// logged and dropped, since nobody is waiting for a result. Delegated tool
+/// tasks, including their async children, cannot schedule deferred callbacks.
 ///
 /// @param callback function Called with no arguments.
 /// @param ms integer Delay in milliseconds. Zero fires on the next tick.
-/// @return (maki.Timer) Handle with `:stop()` to cancel before it fires.
+/// @return maki.Timer|nil Handle with `:stop()` to cancel before it fires.
+/// @return string|nil Error on failure.
 /// @example
 /// -- A toast that dismisses itself 4 seconds later:
 /// local buf = maki.ui.buf({ scratch = true })
@@ -52,11 +56,18 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 ///   pending = maki.defer_fn(repaint, 500)
 /// end
 #[lua_fn]
-fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> LuaResult<Timer> {
-    let queue = lua
-        .app_data_ref::<DeferQueue>()
-        .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;
-    let func = lua.create_registry_value(callback)?;
+fn defer_fn(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    callback: Function,
+    ms: u64,
+) -> LuaResult<Pair<Timer>> {
+    try_pair!(require_trusted_authority(lua));
+    let queue = try_pair!(
+        lua.app_data_ref::<DeferQueue>()
+            .ok_or("defer queue not initialized")
+    );
+    let func = try_pair!(lua.create_registry_value(callback));
     let cancel = Arc::new(AtomicBool::new(false));
     if let Err(rejected) = queue.push(DeferredCallback {
         func,
@@ -66,9 +77,9 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
     }) {
         // Reclaim the registry slot, the runtime never got the callback.
         let _ = lua.remove_registry_value(rejected.func);
-        return Err(mlua::Error::runtime("defer queue closed"));
+        return Ok(err_pair("defer queue closed"));
     }
-    Ok(Timer { cancel })
+    Ok((Some(Timer { cancel }), None))
 }
 
 /// Handle returned by `maki.defer_fn`. The runtime reads the flag once the

@@ -7,16 +7,13 @@ use maki_agent::{
 };
 use maki_commands::{CommandInvocation, InvocationTargetId};
 use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Targets {
     roots: Vec<TrustedTarget>,
     children: Vec<TrustedTarget>,
-    commands: HashMap<InvocationTargetId, AgentRef>,
     focused: Option<AgentRef>,
 }
 
@@ -46,14 +43,13 @@ impl AgentOrchestration {
 
     pub(crate) fn select(
         &self,
-        commands: HashMap<InvocationTargetId, AgentRef>,
+        _commands: HashMap<InvocationTargetId, AgentRef>,
         focused: Option<AgentRef>,
     ) {
         let mut targets = self
             .targets
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        targets.commands = commands;
         targets.focused = focused;
         targets
             .roots

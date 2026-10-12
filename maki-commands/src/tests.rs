@@ -83,6 +83,159 @@ fn queued_dispatch_pins_host_admission_before_focus_changes() {
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
 
+#[test_case("openai/gpt-5{thinking=high,fast=false}"; "embedded")]
+#[test_case("openai/gpt-5{thinking=high, fast=false}"; "embedded_spaced")]
+#[test_case("openai/gpt-5 thinking=high fast=false"; "trailing")]
+#[test_case("\"openai/gpt-5\" thinking=high fast=false"; "quoted_spec_trailing_options")]
+#[test_case("'openai/gpt-5' thinking=high fast=false"; "single_quoted_spec_trailing_options")]
+#[test_case("\"openai/\"'gpt-5' thinking=high fast=false"; "concatenated_quoted_spec_trailing_options")]
+#[test_case("openai/\"gpt-5\" thinking=high fast=false"; "partially_quoted_spec_trailing_options")]
+fn model_selection_braces_and_trailing_options_agree(input: &str) {
+    assert_eq!(
+        parse_model_selection(input).unwrap(),
+        ModelSelection {
+            spec: Some(Arc::from("openai/gpt-5")),
+            thinking: Some(maki_domain::ThinkingConfig::Effort(
+                maki_domain::Effort::High
+            )),
+            fast: Some(false),
+        }
+    );
+}
+
+#[test_case("\"openai/gpt-5\"{thinking=high}"; "quoted_spec_with_options")]
+#[test_case("openai/\"gpt-5\"{thinking=high}"; "partially_quoted_spec")]
+#[test_case("openai/gpt-5{fast=true} fast=false"; "duplicate_fast")]
+#[test_case("openai/gpt-5{thinking=high} thinking=off"; "duplicate_thinking")]
+#[test_case("fast=true fast=false"; "duplicate_options_only")]
+#[test_case("thinking=off thinking=high"; "duplicate_thinking_only")]
+#[test_case("unknown=true"; "unknown_options_only")]
+#[test_case("fast=maybe"; "invalid_bool")]
+#[test_case("thinking=unknown"; "invalid_thinking")]
+#[test_case("openai/gpt-5{unknown=true}"; "unknown")]
+#[test_case("openai/gpt-5{fast=true"; "unclosed")]
+#[test_case("openai/gpt-5{}"; "empty")]
+#[test_case("openai/gpt-5{fast=true,}"; "trailing_comma")]
+#[test_case("openai/gpt-5{fast=true}{thinking=high}"; "multiple_blocks")]
+fn model_selection_rejects_duplicate_and_malformed_options(input: &str) {
+    assert!(parse_model_selection(input).is_err());
+}
+
+#[test_case("\"openai/gpt-5{thinking=high}\"", "openai/gpt-5{thinking=high}"; "quoted_options_literal")]
+#[test_case("\"fast=true\"", "fast=true"; "quoted_option_literal")]
+#[test_case("\"openai/\"'gpt-5'", "openai/gpt-5"; "concatenated_quotes")]
+#[test_case("'openai/gpt-5'", "openai/gpt-5"; "single_quoted_spec")]
+#[test_case("\"openai/gpt-5\"", "openai/gpt-5"; "double_quoted_spec")]
+fn fully_quoted_model_token_preserves_literal(input: &str, expected: &str) {
+    let selection = parse_model_selection(input).unwrap();
+    assert_eq!(selection.spec.as_deref(), Some(expected));
+    assert_eq!(selection.thinking, None);
+    assert_eq!(selection.fast, None);
+}
+
+#[test]
+fn quoted_model_selection_token_is_literal() {
+    assert_eq!(
+        parse_model_selection("\"fast=true\"")
+            .unwrap()
+            .spec
+            .as_deref(),
+        Some("fast=true")
+    );
+}
+
+#[test_case(1, Some(1); "pinned_subject")]
+#[test_case(0, None; "pinned_absence")]
+fn nested_dispatch_preserves_admission_after_focus_changes(initial: u64, expected: Option<u64>) {
+    struct FocusHost {
+        focus: Arc<AtomicU64>,
+        seen: Arc<Mutex<Option<Option<u64>>>>,
+    }
+    impl CommandHost for FocusHost {
+        fn admission_context(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            let focus = self.focus.load(Ordering::SeqCst);
+            (focus != 0).then(|| Arc::new(focus) as Arc<dyn std::any::Any + Send + Sync>)
+        }
+        fn request(&self, _: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+            panic!("nested request must carry admission")
+        }
+        fn request_with_admission(
+            &self,
+            _: HostRequest,
+            admission: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ) -> CommandFuture<Result<HostResponse, CommandError>> {
+            *self.seen.lock().unwrap() =
+                Some(admission.and_then(|value| value.downcast_ref::<u64>().copied()));
+            Box::pin(async { Ok(HostResponse::Completed) })
+        }
+    }
+    struct Nested(Arc<AtomicU64>);
+    impl CommandBehavior for Nested {
+        fn execute(
+            &self,
+            invocation: CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let focus = self.0.clone();
+            Box::pin(async move {
+                focus.store(2, Ordering::SeqCst);
+                match invocation.dispatch("/probe".into()).await {
+                    InputDispatch::Dispatched(outcome) => Ok(outcome),
+                    InputDispatch::LiteralInput(_) => panic!("nested command did not dispatch"),
+                }
+            })
+        }
+    }
+    struct Probe(Arc<Mutex<Option<Option<u64>>>>);
+    impl CommandBehavior for Probe {
+        fn execute(
+            &self,
+            invocation: CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            *self.0.lock().unwrap() = Some(invocation.admission_context::<u64>().copied());
+            Box::pin(async move {
+                invocation
+                    .host_request(HostRequest::Builtin(BuiltinOperation::OpenModelPicker))
+                    .await?;
+                Ok(CommandOutcome::Completed)
+            })
+        }
+    }
+    let registry = CommandRegistry::new();
+    let focus = Arc::new(AtomicU64::new(initial));
+    let seen = Arc::new(Mutex::new(None));
+    let host_seen = Arc::new(Mutex::new(None));
+    let target = registry.bind_target(
+        TargetCapabilities::NONE,
+        Arc::new(FocusHost {
+            focus: focus.clone(),
+            seen: host_seen.clone(),
+        }),
+    );
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    producer
+        .replace(vec![
+            registration_with(
+                "/nested",
+                &[],
+                Arc::new(Nested(focus)),
+                TargetCapabilities::NONE,
+            ),
+            registration_with(
+                "/probe",
+                &[],
+                Arc::new(Probe(seen.clone())),
+                TargetCapabilities::NONE,
+            ),
+        ])
+        .unwrap();
+    assert!(matches!(
+        futures_lite::future::block_on(registry.dispatch_input(&target, "/nested".into())),
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+    assert_eq!(*seen.lock().unwrap(), Some(expected));
+    assert_eq!(*host_seen.lock().unwrap(), Some(expected));
+}
+
 #[test]
 fn prepared_target_is_stale_until_activation() {
     let registry = CommandRegistry::new();

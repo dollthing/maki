@@ -1123,6 +1123,21 @@ fn clears_queue(terminate: fn(&mut App)) {
     assert!(app.queue.is_empty());
 }
 
+#[test]
+fn cancel_cut_preserves_work_admitted_after_capture() {
+    const SUCCESSOR: &str = "successor after cancellation cut";
+    let mut app = app_with_queued_message();
+    let (turn_id, run_id) = app.capture_cancel();
+    assert!(app.queue.is_empty());
+    assert!(app.queue_and_notify(queued_msg(SUCCESSOR)));
+
+    app.finish_cancel(turn_id, run_id);
+
+    assert_eq!(app.queue.text_messages(), [SUCCESSOR]);
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.queue.focus().is_none());
+}
+
 #[test_case("/compact" ; "slash_command")]
 #[test_case("exit" ; "exit_keyword")]
 #[test_case("!ls" ; "shell_prefix")]
@@ -3165,7 +3180,7 @@ fn model_structured_selection_emits_one_atomic_action() {
         format!("{LATE_MODEL_SPEC} thinking=high fast=true"),
         "thinking=off fast=false".into(),
     ] {
-        let expected = maki_commands::ModelSelection::parse(&args).unwrap();
+        let expected = maki_commands::parse_model_selection(&args).unwrap();
         let actions = app.execute_command(
             ParsedCommand {
                 name: "/model".into(),
@@ -7111,13 +7126,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         subagent: Some(info.clone()),
         run_id: 1,
     })));
-    assert_eq!(
-        app.queue.text_messages(),
-        [format!(
-            "{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}recovered reply"
-        )],
-        "old-run recovered history must queue a main-agent turn"
-    );
+    assert!(app.queue.text_messages().is_empty());
     app.update(envelope(TurnOutcome::failed(
         AgentId::generate(),
         TurnId::generate(),
@@ -7214,14 +7223,10 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     assert_eq!(app.chats[1].last_message_text(), "provider unavailable");
 }
 
-#[test_case(false, true,  false ; "grandchild")]
-#[test_case(true,  false, false ; "auto_delivery_disabled")]
-#[test_case(true,  true,  true  ; "eligible_direct_child")]
-fn failed_subagent_delivery_obeys_ownership_policy(
-    parent_is_root: bool,
-    auto_deliver: bool,
-    expect_delivery: bool,
-) {
+#[test_case(false, true ; "grandchild")]
+#[test_case(true, false ; "auto_delivery_disabled")]
+#[test_case(true, true ; "eligible_direct_child")]
+fn failed_subagent_is_presented_without_ui_delivery(parent_is_root: bool, auto_deliver: bool) {
     const FAILURE_MESSAGE: &str = "provider unavailable";
 
     let mut app = test_app();
@@ -7252,10 +7257,7 @@ fn failed_subagent_delivery_obeys_ownership_policy(
 
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
-    assert_eq!(
-        app.queue.text_messages().len(),
-        usize::from(expect_delivery)
-    );
+    assert!(app.queue.text_messages().is_empty());
 }
 
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
@@ -9706,16 +9708,12 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
 }
 
 #[test]
-fn subagent_closed_prunes_only_its_delivery_state() {
+fn subagent_closed_prunes_only_its_presentation_state() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     let other_agent_id = AgentId::generate();
     let turn_id = TurnId::generate();
     let other_turn_id = TurnId::generate();
-    app.delivered_subagent_histories
-        .insert(agent_id, b"closed history".to_vec());
-    app.delivered_subagent_histories
-        .insert(other_agent_id, b"live history".to_vec());
     app.stamped_subagent_outcomes.insert((agent_id, turn_id));
     app.stamped_subagent_outcomes
         .insert((other_agent_id, other_turn_id));
@@ -9733,11 +9731,6 @@ fn subagent_closed_prunes_only_its_delivery_state() {
         run_id: 1,
     })));
 
-    assert!(!app.delivered_subagent_histories.contains_key(&agent_id));
-    assert_eq!(
-        app.delivered_subagent_histories.get(&other_agent_id),
-        Some(&b"live history".to_vec())
-    );
     assert!(
         !app.stamped_subagent_outcomes
             .iter()
@@ -9775,7 +9768,7 @@ fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
 }
 
 #[test]
-fn subagent_completion_queues_each_distinct_history_once() {
+fn subagent_history_updates_storage_without_queuing_parent_work() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
     let message = |text: &str| Message {
         role: Role::Assistant,
@@ -9796,20 +9789,21 @@ fn subagent_completion_queues_each_distinct_history_once() {
     app.update(history_event(first_messages.clone()));
     app.update(history_event(first_messages));
 
-    let first = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the answer");
-    assert_eq!(app.queue.text_messages(), std::slice::from_ref(&first));
+    assert!(app.queue.text_messages().is_empty());
 
     let changed_messages = vec![message("revised answer")];
     app.update(history_event(changed_messages.clone()));
     app.update(history_event(changed_messages.clone()));
-    let second = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}revised answer");
-    assert_eq!(app.queue.text_messages(), [first.clone(), second.clone()]);
+    assert!(app.queue.text_messages().is_empty());
 
     let mut grown_messages = changed_messages;
     grown_messages.push(message("the follow-up"));
-    app.update(history_event(grown_messages));
-    let third = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the follow-up");
-    assert_eq!(app.queue.text_messages(), [first, second, third]);
+    app.update(history_event(grown_messages.clone()));
+    assert!(app.queue.text_messages().is_empty());
+    assert_eq!(
+        serde_json::to_value(app.state.session.subagent_messages()[TASK_ID].as_ref()).unwrap(),
+        serde_json::to_value(&grown_messages).unwrap()
+    );
 }
 
 #[test]

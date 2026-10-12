@@ -15,6 +15,7 @@ use crate::{AgentMode, InterruptSource, RunSettings};
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+    pub(crate) parent_delivery: Option<super::delivery::ParentDelivery>,
 }
 
 /// The actor's immutable per-admission configuration snapshot.
@@ -50,7 +51,11 @@ impl std::ops::Deref for EffectiveAgentConfig {
 
 impl ManagedTurnAdmission {
     pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
-        Self { manager, agent_id }
+        Self {
+            manager,
+            agent_id,
+            parent_delivery: None,
+        }
     }
 }
 
@@ -264,6 +269,8 @@ pub type PreparedReadiness = Arc<
 >;
 
 pub trait ActorBackend: Send {
+    fn on_work_settled(&mut self) {}
+
     fn prepared_readiness(&self) -> Option<PreparedReadiness> {
         None
     }

@@ -3,10 +3,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{RequestTools, ToolAudience, ToolContext, ToolRegistry};
+use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{
-    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
-    AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, GraphLifecycle, History,
+    ActorBackend, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
+    AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope, GraphLifecycle, History,
     RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
@@ -34,11 +34,11 @@ const RETRY_NESTED_TOOL_NAME: &str = "managed_session_retry_nested";
 const CAPTURE_UNMANAGED_CTX_TOOL_NAME: &str = "capture_unmanaged_ctx";
 const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
 const MANAGED_AUTHORITY_ERROR: &str = "managed agent authority is not active in this invocation";
+const EXPIRED_CONTEXT_ERROR: &str = "context invocation expired";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
 const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const PREPARATION_ERROR: &str = "provider preparation rejected";
-const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
 const CORRELATION: &str = "managed-root";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -56,11 +56,13 @@ maki.api.mode.get = function() return "build" end
 local real_session = maki.agent.session
 maki.agent.session = function(ctx, opts)
   opts.inherit_provider = true
+  opts.auto_deliver = false
   return real_session(ctx, opts)
 end
 local real_spawn = maki.agent.spawn
 maki.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
+  opts.auto_deliver = false
   return real_spawn(ctx, opts)
 end
 
@@ -106,7 +108,7 @@ maki.api.register_tool({
       audience = {},
       model_spec = "not/a/model",
     })
-    if session ~= nil or err ~= "managed agent authority is not active in this invocation" then
+    if session ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected foreign context result: " .. tostring(err), is_error = true }
     end
     return "ok"
@@ -122,6 +124,7 @@ maki.api.register_tool({
     local session = assert(maki.agent.session(ctx, {
       name = "managed-joined-child",
       inherit_provider = true,
+      auto_deliver = false,
     }))
     local result, prompt_err
     maki.async.join(1, {
@@ -211,6 +214,7 @@ maki.api.register_tool({
     retained_session = assert(maki.agent.session(ctx, {
       name = "managed-retained-child",
       inherit_provider = true,
+      auto_deliver = false,
     }))
     return "ok"
   end,
@@ -218,13 +222,13 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "managed_session_outside_timeout",
-  description = "time out a retained managed child",
+  description = "reject a retained managed child outside its turn",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
     local result, err = retained_session:prompt("wait", { timeout = 1 })
-    if result ~= nil or err ~= "session prompt timed out after 1s" then
-      return { llm_output = "unexpected retained timeout result", is_error = true }
+    if result ~= nil or err ~= "$MANAGED_AUTHORITY_ERROR" then
+      return { llm_output = "unexpected retained authority result: " .. tostring(err), is_error = true }
     end
     return "ok"
   end,
@@ -239,6 +243,7 @@ maki.api.register_tool({
     retained_session = assert(maki.agent.session(ctx, {
       name = "managed-retained-nested-child",
       inherit_provider = true,
+      auto_deliver = false,
     }))
     local result, err = retained_session:prompt("nested initial prompt")
     if not result then
@@ -255,7 +260,7 @@ maki.api.register_tool({
   audiences = { "main" },
   handler = function()
     local result, err = retained_session:prompt("must reject")
-    if result ~= nil or err ~= "session closed" then
+    if result ~= nil or err ~= "$MANAGED_AUTHORITY_ERROR" then
       return { llm_output = "unexpected retained close result: " .. tostring(err), is_error = true }
     end
     return "ok"
@@ -271,6 +276,7 @@ maki.api.register_tool({
     local session, err = maki.agent.session(ctx, {
       name = "managed-timeout-child",
       inherit_provider = true,
+      auto_deliver = false,
     })
     if not session then
       return { llm_output = err, is_error = true }
@@ -292,6 +298,7 @@ maki.api.register_tool({
     local session, err = maki.agent.session(ctx, {
       name = "managed-child",
       inherit_provider = true,
+      auto_deliver = false,
     })
     if not session then
       return { llm_output = err, is_error = true }
@@ -314,6 +321,7 @@ maki.api.register_tool({
     local session, err = maki.agent.session(ctx, {
       name = "managed-silent-child",
       inherit_provider = true,
+      auto_deliver = false,
       silent = true,
     })
     if not session then
@@ -331,6 +339,12 @@ maki.api.register_tool({
   end,
 })
 "#;
+
+fn session_plugin_source() -> String {
+    PLUGIN_SRC
+        .replace("$EXPIRED_CONTEXT_ERROR", EXPIRED_CONTEXT_ERROR)
+        .replace("$MANAGED_AUTHORITY_ERROR", MANAGED_AUTHORITY_ERROR)
+}
 
 struct LuaToolBackend {
     registry: Arc<ToolRegistry>,
@@ -358,8 +372,8 @@ impl ActorBackend for LuaToolBackend {
             );
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
-            self.context.request_tools = Some(RequestTools::default());
             self.context.managed_turn = context.managed_turn;
+            self.context = common::with_request_tools(&self.registry, &self.context);
             let invocation = self
                 .registry
                 .get(self.tool_name)
@@ -432,9 +446,9 @@ impl ActorBackend for NestedTaskBackend {
             );
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
-            self.context.request_tools = Some(RequestTools::default());
             self.context.managed_turn = context.managed_turn;
             self.context.audience = ToolAudience::GENERAL_SUB;
+            self.context = common::with_request_tools(&self.registry, &self.context);
             let invocation = self
                 .registry
                 .get(self.tool_name)
@@ -573,7 +587,36 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
     host.load_source(
         "managed-nested-task",
-        &format!("{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}"),
+        &format!(
+            "{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}\n{}",
+            r#"
+            maki.api.register_tool({
+                name = "nested_async_task",
+                description = "spawn and wait for a managed descendant",
+                schema = { type = "object", properties = {} },
+                audiences = { "general_sub" },
+                handler = function(_, ctx)
+                    local spawned = test_task_handlers.task_spawn({
+                        description = "nested-child", prompt = "nested prompt",
+                        subagent_type = "general",
+                    }, ctx)
+                    if spawned.is_error then return spawned end
+                    local ids = maki.json.decode(spawned.llm_output)
+                    assert(ids.task_id and ids.turn_id)
+                    local waited = test_task_handlers.task_wait({
+                        task_id = ids.task_id, turn_id = ids.turn_id,
+                    }, ctx)
+                    if waited.is_error then return waited end
+                    local result = maki.json.decode(waited.llm_output)
+                    assert(result.status == "done")
+                    assert(result.result.turn_id == ids.turn_id)
+                    local closed = test_task_handlers.task_despawn({ task_id = ids.task_id }, ctx)
+                    if closed.is_error then return closed end
+                    return result.result.text
+                end,
+            })
+            "#
+        ),
     )
     .unwrap();
     (registry, host)
@@ -698,7 +741,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 audiences = { "general_sub" },
                 handler = function(_, ctx)
                     assert(ctx:workflow() == true)
-                    local nested = assert(maki.agent.session(ctx, { inherit_provider = true }))
+                    local nested = assert(maki.agent.session(ctx, { inherit_provider = true, auto_deliver = false }))
                     local result = assert(nested:prompt("nested"))
                     nested:close()
                     return result.text
@@ -714,7 +757,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     local failed, preparation_err = maki.agent.session(ctx, { model_spec = "anthropic/claude-opus-5" })
                     assert(failed == nil and preparation_err == "$PREPARATION_ERROR")
                     child = assert(maki.agent.session(ctx, {
-                        model_spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off",
+                        model_spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off", auto_deliver = false,
                         tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},
                     }))
                     assert(child:prompt("first"))
@@ -724,7 +767,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
         "#.replace("$PREPARATION_ERROR", PREPARATION_ERROR),
         )
         .unwrap();
-        let (mut context, _events, _cancel) = common::ctx_with_canned_provider();
+        let (mut context, events, _cancel) = common::ctx_with_canned_provider();
         let (parent_tx, parent_rx) = flume::unbounded();
         context.provider = Arc::new(RecordingProvider {
             requests: parent_tx,
@@ -809,14 +852,17 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
             assert!(!opts.fast);
             assert_eq!(opts.thinking, updated.thinking);
         }
-        let nested = manager
-            .snapshot()
-            .into_iter()
-            .find(|node| node.parent_id == Some(child_id))
-            .unwrap();
-        assert_eq!(nested.depth, 2);
+        let nested_id = closed_child(&events, child_id).await;
+        wait_for_runner_finished(&manager, nested_id).await;
+        assert!(
+            manager
+                .snapshot()
+                .iter()
+                .all(|node| node.agent_id != nested_id)
+        );
         assert!(first_rx.is_empty());
-        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
     });
 }
 
@@ -870,11 +916,50 @@ fn input() -> AgentInput {
     }
 }
 
-#[test]
-fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_one() {
+async fn closed_child(events: &flume::Receiver<Envelope>, parent_id: AgentId) -> AgentId {
+    futures_lite::future::race(
+        async {
+            loop {
+                let envelope = events.recv_async().await.unwrap();
+                if matches!(envelope.event, AgentEvent::SubagentClosed)
+                    && let Some(info) = envelope.subagent
+                    && info.parent_agent_id == Some(parent_id)
+                {
+                    return info.agent_id;
+                }
+            }
+        },
+        async {
+            smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+            panic!("managed child of {parent_id} did not close");
+        },
+    )
+    .await
+}
+
+async fn wait_for_runner_finished(manager: &AgentManagerHandle, agent_id: AgentId) {
+    let finished = futures_lite::future::race(
+        async {
+            while !manager.runner_finished(agent_id).unwrap() {
+                smol::future::yield_now().await;
+            }
+            true
+        },
+        async {
+            smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+            false
+        },
+    )
+    .await;
+    assert!(finished, "managed agent {agent_id} runner did not finish");
+}
+
+#[test_case::test_case("task" ; "deprecated_blocking_adapter")]
+#[test_case::test_case("nested_async_task" ; "managed_nested_async_wait_capacity_one")]
+fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one(tool_name: &'static str) {
     smol::block_on(async {
         let (registry, _host) = load_task_host();
-        let (context, _events, _cancel) =
+        let (context, events, _cancel) =
             common::ctx_with_replies(vec![common::canned_reply(NESTED_RESULT)]);
         let manager = AgentManagerHandle::new(AgentLimits {
             max_concurrent_agent_turns: 1,
@@ -889,8 +974,12 @@ fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_on
             Box::new(NestedTaskBackend {
                 registry,
                 context,
-                tool_name: "task",
-                input: task_input(),
+                tool_name,
+                input: if tool_name == "task" {
+                    task_input()
+                } else {
+                    json!({})
+                },
                 completed: completed_tx,
                 release: release_rx,
             }),
@@ -911,19 +1000,14 @@ fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_on
             parent_ticket.peek().is_none(),
             "parent A turn ended before inspection"
         );
-        let nested = manager
-            .snapshot()
-            .into_iter()
-            .find(|node| node.parent_id == Some(parent.id()))
-            .expect("managed nested child B");
-        assert_eq!(nested.depth, 2);
-        let nested_id = nested.agent_id;
-        while !manager.runner_finished(nested_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-        assert_eq!(
-            manager.node(nested_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
+        assert_eq!(parent.snapshot().unwrap().depth, 1);
+        let nested_id = closed_child(&events, parent.id()).await;
+        wait_for_runner_finished(&manager, nested_id).await;
+        assert!(
+            manager
+                .snapshot()
+                .iter()
+                .all(|node| node.agent_id != nested_id)
         );
 
         release_tx.send(()).unwrap();
@@ -941,7 +1025,8 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        host.load_source("managed-session", &session_plugin_source())
+            .unwrap();
         let (context, events, _cancel) =
             common::ctx_with_replies(vec![common::canned_reply(NESTED_RESULT)]);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -971,6 +1056,7 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
             .find(|node| node.parent_id == Some(parent.id()))
             .expect("retained nested managed session")
             .agent_id;
+        let descendant = manager.lookup(descendant_id).unwrap();
         manager.close_subtree(parent.id()).unwrap();
 
         let closed = futures_lite::future::race(
@@ -1004,65 +1090,19 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
             .execute(&context)
             .await;
         assert!(retry.output.is_ok(), "retained descendant accepted input");
-        while !manager.runner_finished(descendant_id).unwrap() {
-            smol::future::yield_now().await;
-        }
+        wait_for_runner_finished(&manager, descendant_id).await;
         assert_eq!(
-            manager.node(descendant_id).unwrap().graph_lifecycle,
+            descendant.snapshot().unwrap().graph_lifecycle,
             GraphLifecycle::Closed
         );
-
-        release_tx.send(()).unwrap();
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
-        assert!(report.timed_out.is_empty());
-    });
-}
-
-#[test]
-fn managed_nested_task_spawn_rejects_before_creating_child() {
-    smol::block_on(async {
-        let (registry, _host) = load_task_host();
-        let (context, _events, _cancel) = common::ctx_with_canned_provider();
-        let manager = AgentManagerHandle::new(AgentLimits {
-            max_concurrent_agent_turns: 1,
-            ..AgentLimits::default()
-        })
-        .unwrap();
-        let (completed_tx, completed_rx) = flume::bounded(1);
-        let (release_tx, release_rx) = flume::bounded(1);
-        let (_parent, parent_ticket) = spawn_managed_parent(
-            &manager,
-            parent_policy(&context),
-            Box::new(NestedTaskBackend {
-                registry,
-                context,
-                tool_name: "task_spawn",
-                input: task_input(),
-                completed: completed_tx,
-                release: release_rx,
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            completed_rx.recv_async().await.unwrap(),
-            Err(MANAGED_NESTED_SPAWN_ERR.into())
-        );
         assert!(
-            parent_ticket.peek().is_none(),
-            "parent A turn ended before inspection"
-        );
-        assert_eq!(
-            manager.snapshot().len(),
-            2,
-            "nested child was created before rejection"
+            manager
+                .snapshot()
+                .iter()
+                .all(|node| node.agent_id != descendant_id)
         );
 
         release_tx.send(()).unwrap();
-        assert!(matches!(
-            parent_ticket.wait().await,
-            TurnOutcome::Failed { .. }
-        ));
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
@@ -1073,8 +1113,9 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
-        let (context, _events, _cancel) =
+        host.load_source("managed-session", &session_plugin_source())
+            .unwrap();
+        let (context, events, _cancel) =
             common::ctx_with_replies(vec![common::canned_reply(SILENT_REPLY)]);
         let manager = AgentManagerHandle::new(AgentLimits {
             max_concurrent_agent_turns: 1,
@@ -1108,12 +1149,13 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
         .expect("joined child starved behind its parent's turn permit");
         assert_eq!(completed, Ok(SILENT_REPLY.into()));
         assert!(parent_ticket.peek().is_none());
+        let child_id = closed_child(&events, parent.id()).await;
+        wait_for_runner_finished(&manager, child_id).await;
         assert!(
             manager
                 .snapshot()
                 .iter()
-                .any(|node| node.parent_id == Some(parent.id())),
-            "managed joined child missing"
+                .all(|node| node.agent_id != child_id)
         );
 
         release_tx.send(()).unwrap();
@@ -1133,7 +1175,10 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         host.load_source(
             "managed-session",
-            &format!("{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}\n{PLUGIN_SRC}"),
+            &format!(
+                "{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}\n{}",
+                session_plugin_source()
+            ),
         )
         .unwrap();
         let (mut context, _events, _cancel) = common::ctx_with_canned_provider();
@@ -1173,11 +1218,9 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
             async {
                 loop {
                     let child = manager.node(child_id).unwrap();
-                    if child
-                        .actor
-                        .as_ref()
-                        .is_some_and(|actor| actor.latest.is_some())
-                    {
+                    if child.actor.as_ref().is_some_and(|actor| {
+                        actor.latest.is_some() && actor.active_turn.is_none() && actor.queued == 0
+                    }) {
                         break Some(child);
                     }
                     smol::future::yield_now().await;
@@ -1241,7 +1284,8 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        host.load_source("managed-session", &session_plugin_source())
+            .unwrap();
         let (mut unmanaged_context, unmanaged_events, _cancel) = common::ctx_with_canned_provider();
         let (live_tx, live_rx) = flume::unbounded();
         unmanaged_context.live_sink = Some(live_tx);
@@ -1282,7 +1326,7 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         assert_eq!(
             completed_rx.recv_async().await.unwrap(),
             Ok(()),
-            "{MANAGED_AUTHORITY_ERROR}"
+            "{EXPIRED_CONTEXT_ERROR}"
         );
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         let after = manager.node(root.id()).unwrap();
@@ -1307,7 +1351,9 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let _host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        _host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        _host
+            .load_source("managed-session", &session_plugin_source())
+            .unwrap();
         let (context, events, _cancel) = common::ctx_with_canned_provider();
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
@@ -1333,33 +1379,18 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             "managed Lua tool failed"
         );
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-        let nodes = manager.snapshot();
-        assert_eq!(nodes.len(), 2);
-        let root_node = nodes
-            .iter()
-            .find(|node| node.agent_id == root.id())
-            .unwrap();
-        let child = nodes
-            .iter()
-            .find(|node| node.parent_id == Some(root.id()))
-            .unwrap();
-        assert_eq!(root_node.graph_lifecycle, GraphLifecycle::Live);
-        assert_eq!(root_node.children, vec![child.agent_id]);
-        assert_eq!(child.root_id, root.id());
-        assert_eq!(child.depth, 1);
-        let child_id = child.agent_id;
-        while !manager.runner_finished(child_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-        assert_eq!(
-            manager.node(child_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
-        );
         let envelope = events
             .try_iter()
             .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
             .expect("managed child history envelope");
-        assert_eq!(envelope.subagent.unwrap().agent_id, child.agent_id);
+        let child = envelope.subagent.unwrap();
+        assert_eq!(child.parent_agent_id, Some(root.id()));
+        assert!(child.parent_is_root);
+        wait_for_runner_finished(&manager, child.agent_id).await;
+        let root_node = root.snapshot().unwrap();
+        assert_eq!(root_node.graph_lifecycle, GraphLifecycle::Live);
+        assert!(root_node.children.is_empty());
+        assert_eq!(manager.snapshot().len(), 1);
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
@@ -1371,7 +1402,8 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        host.load_source("managed-session", &session_plugin_source())
+            .unwrap();
         let (context, events, _cancel) =
             common::ctx_with_replies(vec![common::canned_reply(SILENT_REPLY)]);
         assert!(events.is_empty(), "parent event stream must start empty");
@@ -1395,19 +1427,27 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
 
         assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-        let child_id = manager
-            .snapshot()
-            .into_iter()
-            .find(|node| node.parent_id == Some(root.id()))
-            .expect("silent managed child")
-            .agent_id;
-        while !manager.runner_finished(child_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-        assert_eq!(
-            manager.node(child_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
-        );
+        let reclaimed = futures_lite::future::race(
+            async {
+                loop {
+                    let children = root.snapshot().unwrap().children;
+                    if children.is_empty() {
+                        break true;
+                    }
+                    for child_id in children {
+                        wait_for_runner_finished(&manager, child_id).await;
+                    }
+                    smol::future::yield_now().await;
+                }
+            },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                false
+            },
+        )
+        .await;
+        assert!(reclaimed, "silent child was not reclaimed");
+        assert_eq!(manager.snapshot().len(), 1);
         assert!(
             events.is_empty(),
             "silent child emitted parent envelopes: {:?}",
@@ -1420,14 +1460,15 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
 }
 
 #[test]
-fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
+fn retained_managed_prompt_outside_turn_is_rejected_without_mutation() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
-        let (dropped_tx, dropped_rx) = flume::bounded(1);
-        let provider = Arc::new(PendingProvider {
-            dropped: dropped_tx,
+        host.load_source("managed-session", &session_plugin_source())
+            .unwrap();
+        let (requests_tx, requests_rx) = flume::unbounded();
+        let provider = Arc::new(RecordingProvider {
+            requests: requests_tx,
         });
         let (context, _events, _cancel) = common::ctx_with_provider(provider);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -1450,6 +1491,9 @@ fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
 
         assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let child_id = root.snapshot().unwrap().children[0];
+        let child = manager.lookup(child_id).unwrap();
+        let before = child.snapshot().unwrap();
         let invocation = registry
             .get(OUTSIDE_TIMEOUT_TOOL_NAME)
             .unwrap()
@@ -1458,24 +1502,21 @@ fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
             .unwrap();
         assert!(
             invocation.execute(&context).await.output.is_ok(),
-            "{TIMEOUT_ERROR}"
+            "{MANAGED_AUTHORITY_ERROR}"
         );
-        dropped_rx
-            .recv_async()
-            .await
-            .expect("timed-out retained provider request remained alive");
-        let child_id = manager
-            .snapshot()
-            .into_iter()
-            .find(|node| node.parent_id == Some(root.id()))
-            .expect("retained managed child")
-            .agent_id;
-        while !manager.runner_finished(child_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-        assert_eq!(
-            manager.node(child_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
+        let after = child.snapshot().unwrap();
+        assert_eq!(after.graph_lifecycle, before.graph_lifecycle);
+        let before_actor = before.actor.unwrap();
+        let after_actor = after.actor.unwrap();
+        assert_eq!(after_actor.lifecycle, before_actor.lifecycle);
+        assert_eq!(after_actor.status, before_actor.status);
+        assert_eq!(after_actor.active_turn, before_actor.active_turn);
+        assert_eq!(after_actor.queued, before_actor.queued);
+        assert_eq!(after_actor.latest, before_actor.latest);
+        assert_eq!(after_actor.cumulative_usage, before_actor.cumulative_usage);
+        assert!(
+            requests_rx.is_empty(),
+            "unauthorized prompt entered provider"
         );
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
@@ -1488,12 +1529,14 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let _host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        _host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        _host
+            .load_source("managed-session", &session_plugin_source())
+            .unwrap();
         let (dropped_tx, dropped_rx) = flume::bounded(1);
         let provider = Arc::new(PendingProvider {
             dropped: dropped_tx,
         });
-        let (mut context, _events, _cancel) = common::ctx_with_provider(provider);
+        let (mut context, events, _cancel) = common::ctx_with_provider(provider);
         let manager = AgentManagerHandle::new(AgentLimits {
             max_concurrent_agent_turns: 1,
             ..AgentLimits::default()
@@ -1527,19 +1570,10 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
             .recv_async()
             .await
             .expect("timed-out managed provider request remained alive");
-        let child_id = manager
-            .snapshot()
-            .into_iter()
-            .find(|node| node.parent_id == Some(root.id()))
-            .expect("managed timeout child")
-            .agent_id;
-        while !manager.runner_finished(child_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-        assert_eq!(
-            manager.node(child_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
-        );
+        let child_id = closed_child(&events, root.id()).await;
+        wait_for_runner_finished(&manager, child_id).await;
+        assert!(root.snapshot().unwrap().children.is_empty());
+        assert_eq!(manager.snapshot().len(), 1);
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

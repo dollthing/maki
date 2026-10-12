@@ -100,6 +100,8 @@ struct Node {
     reservation: u64,
     reservation_pending: bool,
     cancel_on_commit: bool,
+    turn_owner: Option<(AgentId, TurnId)>,
+    terminal: Arc<Mutex<Option<AgentNodeSnapshot>>>,
 }
 
 struct CapturedNodeSnapshot {
@@ -273,16 +275,24 @@ impl AgentManagerHandle {
         };
         actor
             .turn_ticket(turn_id)
-            .ok_or(ManagerError::TicketActorMismatch {
+            .ok_or(ManagerError::TurnResultUnavailable {
                 agent_id: agent.agent_id,
                 turn_id,
             })
     }
 
     pub fn lookup(&self, agent_id: AgentId) -> Result<AgentRef, ManagerError> {
+        let terminal = self
+            .lock_graph()
+            .nodes
+            .get(&agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?
+            .terminal
+            .clone();
         let agent = AgentRef {
             manager: self.clone(),
             agent_id,
+            terminal,
         };
         self.validate_live_ref(&agent)?;
         Ok(agent)
@@ -407,6 +417,8 @@ impl AgentManagerHandle {
                     reservation,
                     reservation_pending: true,
                     cancel_on_commit: false,
+                    turn_owner: None,
+                    terminal: Arc::new(Mutex::new(None)),
                 },
             );
             graph.revision += 1;
@@ -483,7 +495,6 @@ impl AgentManagerHandle {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn_child_with_config<F, E>(
         &self,
         current: &CurrentManagedTurn,
@@ -510,7 +521,6 @@ impl AgentManagerHandle {
     }
 
     /// Host-only admission. Do not expose this as model tool authority.
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn_child_trusted_with_config<F, E>(
         &self,
         parent: &AgentRef,
@@ -536,7 +546,7 @@ impl AgentManagerHandle {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn spawn_child_inner<F, E>(
         &self,
         parent_id: AgentId,
@@ -585,20 +595,7 @@ impl AgentManagerHandle {
                 {
                     return Err(ManagerError::NonLiveAgent(parent_id));
                 }
-                (
-                    parent.root_id,
-                    parent.depth + 1,
-                    parent
-                        .children
-                        .iter()
-                        .filter(|id| {
-                            graph
-                                .nodes
-                                .get(id)
-                                .is_some_and(|node| node.lifecycle.consumes_capacity())
-                        })
-                        .count(),
-                )
+                (parent.root_id, parent.depth + 1, parent.children.len())
             };
             if depth > self.0.limits.max_agent_depth {
                 return Err(ManagerError::DepthExceeded {
@@ -612,12 +609,8 @@ impl AgentManagerHandle {
                     max: self.0.limits.max_children_per_agent,
                 });
             }
-            let live_count = graph
-                .nodes
-                .values()
-                .filter(|node| node.lifecycle.consumes_capacity())
-                .count();
-            if live_count >= self.0.limits.max_live_agents {
+            let retained_nodes = graph.nodes.len();
+            if retained_nodes >= self.0.limits.max_live_agents {
                 return Err(ManagerError::LiveAgentLimit {
                     max: self.0.limits.max_live_agents,
                 });
@@ -643,6 +636,8 @@ impl AgentManagerHandle {
                     reservation,
                     reservation_pending: true,
                     cancel_on_commit: false,
+                    turn_owner: current.map(|current| (parent_id, current.turn_id())),
+                    terminal: Arc::new(Mutex::new(None)),
                 },
             );
             graph.revision += 1;
@@ -894,10 +889,42 @@ impl AgentManagerHandle {
         reservation: u64,
         spawn: impl FnOnce(ManagedTurnAdmission) -> (AgentActorHandle, RunnerTask),
     ) -> Result<AgentRef, ManagerError> {
-        let (actor, task) = spawn(ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id));
+        let mut admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
+        {
+            let graph = self.lock_graph();
+            if let Some(node) = graph.nodes.get(&agent_id)
+                && let Some(parent_id) = node.parent_id
+                && let Some(parent) = graph
+                    .nodes
+                    .get(&parent_id)
+                    .and_then(|node| node.actor.as_ref())
+            {
+                admission.parent_delivery = Some(crate::actor::delivery::ParentDelivery {
+                    parent_id,
+                    parent: Arc::downgrade(&parent.inner),
+                    metadata: node.metadata.clone(),
+                });
+            }
+        }
+        let (actor, task) = spawn(admission);
         let manager = Arc::downgrade(&self.0);
+        let callback_actor = actor.clone();
         let task = smol::spawn(async move {
             task.await;
+            if let Some(manager) = manager.upgrade() {
+                let mut graph = manager
+                    .graph
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(node) = graph.nodes.get_mut(&agent_id)
+                    && node.reservation == reservation
+                {
+                    node.lifecycle = GraphLifecycle::Closed;
+                    graph.revision += 1;
+                }
+                manager.reaped.notify(usize::MAX);
+            }
+            callback_actor.wait_callback_drain().await;
             let Some(manager) = manager.upgrade() else {
                 return;
             };
@@ -917,6 +944,8 @@ impl AgentManagerHandle {
                 node.lifecycle = GraphLifecycle::Closed;
                 graph.revision += 1;
             }
+            Self::reclaim_finished_closings(&mut graph);
+            manager.reaped.notify(usize::MAX);
         });
         let mut graph = self.lock_graph();
         let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
@@ -946,6 +975,7 @@ impl AgentManagerHandle {
             graph.revision += 1;
             let revision = graph.revision;
             let depth = graph.nodes[&agent_id].depth;
+            let terminal = graph.nodes[&agent_id].terminal.clone();
             let live_count = graph
                 .nodes
                 .values()
@@ -956,6 +986,7 @@ impl AgentManagerHandle {
             return Ok(AgentRef {
                 manager: self.clone(),
                 agent_id,
+                terminal,
             });
         }
         drop(graph);
@@ -1005,6 +1036,7 @@ impl AgentManagerHandle {
         graph.revision += 1;
         let revision = graph.revision;
         let depth = graph.nodes[&agent_id].depth;
+        let terminal = graph.nodes[&agent_id].terminal.clone();
         let live_count = graph
             .nodes
             .values()
@@ -1015,6 +1047,7 @@ impl AgentManagerHandle {
         Ok(AgentRef {
             manager: self.clone(),
             agent_id,
+            terminal,
         })
     }
 
@@ -1025,16 +1058,16 @@ impl AgentManagerHandle {
         {
             node.reservation_pending = false;
         }
+        Self::reclaim_finished_closings(&mut graph);
     }
 
+    /// Removed nodes have no runner resources remaining.
     pub fn runner_finished(&self, agent_id: AgentId) -> Result<bool, ManagerError> {
         let mut graph = self.lock_graph();
         Self::reclaim_finished_closings(&mut graph);
-        let node = graph
-            .nodes
-            .get(&agent_id)
-            .ok_or(ManagerError::UnknownAgent(agent_id))?;
-        Ok(!node.reservation_pending && node.task.as_ref().is_none_or(smol::Task::is_finished))
+        Ok(graph.nodes.get(&agent_id).is_none_or(|node| {
+            !node.reservation_pending && node.task.as_ref().is_none_or(smol::Task::is_finished)
+        }))
     }
 
     pub fn actor(&self, agent_id: AgentId) -> Result<AgentActorHandle, ManagerError> {
@@ -1119,7 +1152,7 @@ impl AgentManagerHandle {
         Ok(())
     }
 
-    /// Cancels one nominal turn and retires descendants only if that turn is running.
+    /// Cancels one nominal turn and closes only its delegated child subtrees.
     pub fn cancel_turn(
         &self,
         agent_id: AgentId,
@@ -1144,7 +1177,6 @@ impl AgentManagerHandle {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let running = state.status == ActorStatus::Running(turn_id);
             let cut = actor
                 .capture_turn_cancel(&mut state, turn_id, reason)
                 .map_err(|error| match error {
@@ -1153,12 +1185,7 @@ impl AgentManagerHandle {
                     }
                     _ => ManagerError::InactiveTurn { agent_id, turn_id },
                 })?;
-            let descendants = if running {
-                Self::capture_subtree_locked(&mut graph, agent_id, false)?
-            } else {
-                Vec::new()
-            };
-            graph.active_turns.remove(&(agent_id, turn_id));
+            let descendants = Self::capture_turn_children(&mut graph, agent_id, Some(turn_id));
             drop(state);
             (actor, cut, descendants)
         };
@@ -1196,16 +1223,8 @@ impl AgentManagerHandle {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let matched_active = state.active_matches_correlation(correlation);
-            let descendants = if matched_active {
-                Self::capture_subtree_locked(&mut graph, agent_id, false)?
-            } else {
-                Vec::new()
-            };
             let cut = actor.capture_correlation_cancel(&mut state, correlation, reason);
-            if let Some(turn_id) = cut.active_turn {
-                graph.active_turns.remove(&(agent_id, turn_id));
-            }
+            let descendants = Self::capture_turn_children(&mut graph, agent_id, cut.active_turn);
             drop(state);
             (actor, cut, descendants)
         };
@@ -1365,17 +1384,48 @@ impl AgentManagerHandle {
     }
 
     fn reclaim_finished_closings(graph: &mut GraphState) {
-        let mut reclaimed = false;
-        for node in graph.nodes.values_mut() {
-            if node.lifecycle == GraphLifecycle::Closing
-                && !node.reservation_pending
-                && node.task.as_ref().is_some_and(smol::Task::is_finished)
-            {
+        loop {
+            let retired = graph
+                .nodes
+                .iter()
+                .filter_map(|(&id, node)| {
+                    (!node.reservation_pending
+                        && node.children.is_empty()
+                        && node
+                            .actor
+                            .as_ref()
+                            .is_none_or(AgentActorHandle::callbacks_drained)
+                        && (node.lifecycle == GraphLifecycle::Closed
+                            || (node.lifecycle == GraphLifecycle::Closing
+                                && node.task.as_ref().is_some_and(smol::Task::is_finished))))
+                    .then_some(id)
+                })
+                .collect::<Vec<_>>();
+            if retired.is_empty() {
+                break;
+            }
+            for id in retired {
+                let Some(mut node) = graph.nodes.remove(&id) else {
+                    continue;
+                };
                 node.lifecycle = GraphLifecycle::Closed;
-                reclaimed = true;
+                *node
+                    .terminal
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    Some(Self::capture_node_snapshot(id, &node).snapshot());
+                if let Some(task) = node.task.take() {
+                    task.detach();
+                }
+                if let Some(parent) = node.parent_id.and_then(|id| graph.nodes.get_mut(&id)) {
+                    parent.children.retain(|child| *child != id);
+                }
+                graph
+                    .active_turns
+                    .retain(|(agent_id, _), _| *agent_id != id);
+                graph.revision += 1;
             }
         }
-        graph.revision += u64::from(reclaimed);
     }
 
     fn finished_nodes(&self, ids: &[AgentId]) -> HashSet<AgentId> {
@@ -1395,6 +1445,7 @@ impl AgentManagerHandle {
                 node.lifecycle = GraphLifecycle::Closed;
             }
         }
+        Self::reclaim_finished_closings(&mut graph);
         done
     }
 
@@ -1487,6 +1538,37 @@ impl AgentManagerHandle {
             .collect();
         graph.revision += u64::from(transitioned);
         Ok(actors)
+    }
+
+    fn capture_turn_children(
+        graph: &mut GraphState,
+        agent_id: AgentId,
+        turn_id: Option<TurnId>,
+    ) -> Vec<AgentActorHandle> {
+        let Some(turn_id) = turn_id else {
+            return Vec::new();
+        };
+        graph.active_turns.remove(&(agent_id, turn_id));
+        let owned = graph
+            .nodes
+            .get(&agent_id)
+            .map(|node| {
+                node.children
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        graph.nodes.get(id).is_some_and(|child| {
+                            child.turn_owner == Some((agent_id, turn_id))
+                                && child.lifecycle.consumes_capacity()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        owned
+            .into_iter()
+            .flat_map(|id| Self::capture_subtree_locked(graph, id, true).unwrap_or_default())
+            .collect()
     }
 
     fn subtree_ids(graph: &GraphState, root: AgentId) -> Vec<AgentId> {

@@ -602,6 +602,36 @@ pub struct CompletionInput {
     pub mode: Arc<str>,
 }
 
+impl CompletionInput {
+    pub fn normalized(mut self, command: &str, cursor: usize) -> Self {
+        if command != "/model" {
+            return self;
+        }
+        let Some(prefix) = self.arguments.get(..cursor) else {
+            return self;
+        };
+        let Some(open) = prefix.rfind('{') else {
+            return self;
+        };
+        if prefix[open..].contains('}') || prefix[..open].contains(['\'', '"', '\\']) {
+            return self;
+        }
+        let start = prefix[open + 1..]
+            .rfind(',')
+            .map_or(open + 1, |comma| open + comma + 2);
+        let start = start + prefix[start..].len() - prefix[start..].trim_start().len();
+        let end = self.arguments[cursor..]
+            .find([',', '}'])
+            .map_or(self.arguments.len(), |end| cursor + end);
+        let end =
+            end - self.arguments[start..end].len() + self.arguments[start..end].trim_end().len();
+        self.argument = Arc::from(&self.arguments[start..cursor]);
+        self.argument_range = Some(start..end.max(cursor));
+        self.argument_index = 1;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct CompletionSession {
     pub(super) command: ResolvedCommand,
@@ -686,6 +716,21 @@ impl CompletionSession {
         input: CompletionInput,
         sink: Option<CompletionSnapshotSink>,
     ) -> CommandFuture<CompletionResult> {
+        let cursor = input.argument_range.as_ref().map(|range| {
+            if input.argument_index == 1 {
+                range.start + input.argument.len()
+            } else {
+                range.end
+            }
+        });
+        let input = cursor.map_or_else(
+            || input.clone(),
+            |cursor| {
+                input
+                    .clone()
+                    .normalized(self.command.spec().name.as_ref(), cursor)
+            },
+        );
         let core = Arc::clone(&self.owner.core);
         let (context, cancellation, request_id, providers, old_callback) = {
             let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());

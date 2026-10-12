@@ -2,7 +2,7 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
@@ -19,15 +19,12 @@ use serde_json::{Value, json};
 mod common;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const WAIT_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(1);
+const SCHEMA_MISSING_ERROR: &str = "agent finished without calling structured_output";
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const MAX_STRUCTURED_RETRIES: usize = 2;
-const MAX_SCHEMA_ERRORS: usize = 3;
-const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
-const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
-const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
-const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
@@ -51,9 +48,6 @@ const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
-const SCENARIO_INVALID_THEN_VALID: &str = "invalid_then_valid";
-const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
-const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
 const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
@@ -62,7 +56,7 @@ const SCENARIO_NO_SUMMARY: &str = "no_summary";
 const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
-/// `maki.async` stay real so schema validation and semaphore behavior are tested.
+/// `maki.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
 
@@ -90,31 +84,8 @@ local behaviors = {}
 behaviors.plain = function(sess, msg)
   return { text = "@PLAIN_TEXT@" }
 end
+behaviors.happy = behaviors.plain
 
-behaviors.happy = function(sess, msg)
-  local h = sess.opts.local_tools.structured_output.handler
-  recorder.first_ack, recorder.first_err = h({ answer = "42" })
-  recorder.captured = { answer = "42" }
-  return { text = "raw text ignored" }
-end
-
-behaviors.invalid_then_valid = function(sess, msg)
-  local h = sess.opts.local_tools.structured_output.handler
-  recorder.first_ack, recorder.first_err = h({ answer = 42 })
-  recorder.second_ack, recorder.second_err = h({ answer = "42" })
-  recorder.captured = { answer = "42" }
-  return { text = "raw text ignored" }
-end
-
-behaviors.never_structured = function(sess, msg)
-  return { text = "no structured call" }
-end
-
-behaviors.invalid_only = function(sess, msg)
-  local h = sess.opts.local_tools.structured_output.handler
-  recorder.first_ack, recorder.first_err = h({ a = 1, b = 2, c = 3, d = 4 })
-  return { text = "still invalid" }
-end
 
 behaviors.prompt_error = function(sess, msg)
   return nil, "@PROMPT_ERR@"
@@ -146,31 +117,33 @@ behaviors.raise = function(sess, msg)
   error("@RAISE_MSG@")
 end
 
-maki.agent.session = function(ctx, opts)
+maki.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
+  recorder.output_schema = opts.output_schema
   recorder.auto_deliver = opts.auto_deliver
   local sess = { opts = opts }
-  function sess:prompt(msg)
+  function sess:enqueue(call_ctx, msg)
     recorder.prompts[#recorder.prompts + 1] = msg
     local res, err = behaviors[opts.name](self, msg)
-    if res and recorder.captured ~= nil then
-      res.captured = recorder.captured
-    end
-    return res, err
+    if not res then return nil, err end
+    res.status = err and "cancelled" or "completed"
+    res.error = err
+    res.usage = { input_tokens = 0, output_tokens = 0 }
+    local turn_id = tostring(#recorder.prompts)
+    res.turn_id = turn_id
+    res.agent_id = opts.name
+    return {
+      id = function() return turn_id end,
+      result = function(_, ticket_ctx) return res end,
+      wait = function(_, ticket_ctx, wait_opts) return res end,
+    }
   end
-  function sess:send(msg)
-    return self:prompt(msg)
+  function sess:status(call_ctx)
+    return { status = "idle", queued = 0, input_tokens = 0, output_tokens = 0 }
   end
-  function sess:status()
-    local result, err = sess:prompt(recorder.last or "")
-    return { status = "done", result = result, error = err }
-  end
-  function sess:session_id()
+  function sess:_maki_session_id()
     return opts.name
-  end
-  function sess:_maki_managed()
-    return false
   end
   function sess:_maki_task_owner()
     return {
@@ -178,6 +151,9 @@ maki.agent.session = function(ctx, opts)
         return recorder.can_control ~= false
       end,
     }
+  end
+  function sess:defer_close(call_ctx)
+    return true
   end
   function sess:close()
     recorder.closed = recorder.closed + 1
@@ -213,6 +189,7 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       auto_deliver = recorder.auto_deliver,
+      output_schema = recorder.output_schema,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -368,26 +345,7 @@ fn answer_schema() -> Value {
     })
 }
 
-/// Four wrong-typed properties, one more than MAX_SCHEMA_ERRORS, so
-/// truncation in `bounded_errors` is observable.
-fn multi_error_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "a": { "type": "string" },
-            "b": { "type": "string" },
-            "c": { "type": "string" },
-            "d": { "type": "string" },
-        },
-        "required": ["a", "b", "c", "d"],
-    })
-}
-
 #[test_case::test_case(json!({"subagent_type": "bogus"}), UNKNOWN_SUBAGENT_ERR ; "unknown_subagent_type")]
-#[test_case::test_case(json!({"output_schema": {"type": "object", "properties": {"x": {"type": 42}}}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
-#[test_case::test_case(json!({"output_schema": {"type": "array"}}), SCHEMA_ROOT_ERROR ; "non_object_output_schema")]
-#[test_case::test_case(json!({"output_schema": "not an object"}), SCHEMA_ROOT_ERROR ; "non_table_output_schema")]
-#[test_case::test_case(json!({"output_schema": {"description": "missing type"}}), SCHEMA_ROOT_ERROR ; "output_schema_missing_type")]
 fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
@@ -439,100 +397,6 @@ fn plan_reviewer_blocked_outside_plan_mode() {
     assert!(err.contains("only available in plan mode"), "got: {err}");
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(0));
-}
-
-#[test]
-fn structured_happy_path_returns_validated_json() {
-    let (reg, _host) = load_task_host();
-    let out = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_HAPPY, Some(answer_schema())),
-    )
-    .expect("structured task failed");
-    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
-    assert_eq!(parsed, json!({ "answer": "42" }));
-
-    let snap = probe(&reg);
-    assert_eq!(snap["sessions"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
-    assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["has_local_tools"], json!(true));
-    assert!(snap["first_ack"].is_string(), "valid input must be acked");
-    assert!(snap.get("first_err").is_none_or(Value::is_null));
-    let prompt = snap["prompts"][0].as_str().expect("prompt missing");
-    assert!(prompt.starts_with(TASK_PROMPT), "got: {prompt}");
-    assert!(
-        prompt.contains(STRUCTURED_OUTPUT_TOOL),
-        "prompt must point at the structured_output tool: {prompt}"
-    );
-}
-
-#[test]
-fn invalid_then_valid_recovers_within_one_prompt() {
-    let (reg, _host) = load_task_host();
-    let out = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_INVALID_THEN_VALID, Some(answer_schema())),
-    )
-    .expect("task should succeed after inline retry");
-    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
-    assert_eq!(parsed, json!({ "answer": "42" }));
-
-    let snap = probe(&reg);
-    assert!(snap.get("first_ack").is_none_or(Value::is_null));
-    let first_err = snap["first_err"].as_str().expect("first_err missing");
-    assert!(
-        first_err.contains("/answer"),
-        "inline error should point at the failing path: {first_err}"
-    );
-    assert!(snap["second_ack"].is_string(), "valid retry must be acked");
-    assert!(snap.get("second_err").is_none_or(Value::is_null));
-    assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
-}
-
-#[test]
-fn missing_structured_output_nudges_then_errors() {
-    let (reg, _host) = load_task_host();
-    let err = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_NEVER_STRUCTURED, Some(answer_schema())),
-    )
-    .unwrap_err();
-    assert_eq!(err, STRUCTURED_MISSING_ERROR);
-
-    let snap = probe(&reg);
-    assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
-    for i in 1..=MAX_STRUCTURED_RETRIES {
-        let nudge = snap["prompts"][i].as_str().expect("nudge prompt missing");
-        assert!(nudge.contains(STRUCTURED_OUTPUT_TOOL), "got: {nudge}");
-    }
-    assert_eq!(snap["closed"], json!(1));
-}
-
-#[test]
-fn invalid_only_errors_with_bounded_schema_errors() {
-    let (reg, _host) = load_task_host();
-    let err = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_INVALID_ONLY, Some(multi_error_schema())),
-    )
-    .unwrap_err();
-    assert!(err.starts_with(STRUCTURED_INVALID_ERROR), "got: {err}");
-    assert_eq!(err.lines().count(), 1 + MAX_SCHEMA_ERRORS, "got: {err}");
-
-    let snap = probe(&reg);
-    assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
-    let first_err = snap["first_err"].as_str().expect("first_err missing");
-    assert_eq!(
-        first_err.lines().count(),
-        1 + MAX_SCHEMA_ERRORS,
-        "inline error must carry at most MAX_SCHEMA_ERRORS validation lines: {first_err}"
-    );
 }
 
 #[test]
@@ -612,7 +476,7 @@ fn recursive_unmanaged_blocking_task_rejects_before_capacity_wait() {
     assert_eq!(error, RECURSIVE_UNMANAGED_TASK_ERR);
     let snapshot = probe(&reg);
     assert_eq!(snapshot["prompt_count"], json!(0));
-    assert_eq!(snapshot["closed"], json!(1));
+    assert_eq!(snapshot["closed"], json!(0));
     assert_eq!(snapshot["sem_size"], json!(1));
 }
 
@@ -656,7 +520,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
         workflow: false,
         mcp: false,
     };
-    for name in ["task_spawn", "task_get", "task_send", "task_despawn"] {
+    for name in ["task_spawn", "task_wait", "task_send", "task_despawn"] {
         assert!(
             !reg.get(name)
                 .expect("lifecycle tool is registered")
@@ -672,14 +536,44 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
 fn spawn_returns_task_id_immediately() {
     let (reg, _host) = load_task_host();
     let out = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
-    assert!(
-        out.get("task_id").and_then(Value::as_str).is_some(),
-        "task_spawn must return a task_id: {out}"
-    );
+    assert!(out["task_id"].is_string(), "missing task_id: {out}");
+    assert!(out["turn_id"].is_string(), "missing turn_id: {out}");
 }
 
 #[test]
-fn nested_spawn_contract_directs_managed_callers_to_blocking_task() {
+fn task_ticket_cache_evicts_oldest_settled_turn() {
+    const RETAINED_TURN_LIMIT: usize = 64;
+    const TURN_UNAVAILABLE: &str = "turn_result_unavailable";
+    let (reg, _host) = load_task_host();
+    let first = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let task_id = first["task_id"].as_str().unwrap();
+    let mut latest = first["turn_id"].clone();
+    for _ in 0..RETAINED_TURN_LIMIT {
+        latest = exec_tool_json(
+            &reg,
+            "task_send",
+            json!({"task_id": task_id, "message": TASK_PROMPT}),
+        )["turn_id"]
+            .clone();
+    }
+    assert_eq!(
+        exec_tool(
+            &reg,
+            "task_wait",
+            json!({"task_id": task_id, "turn_id": first["turn_id"]})
+        )
+        .unwrap_err(),
+        TURN_UNAVAILABLE
+    );
+    let result = exec_tool_json(&reg, "task_wait", json!({"task_id": task_id}));
+    assert_eq!(result["result"]["turn_id"], latest);
+    assert_eq!(result["result"]["text"], PLAIN_TEXT);
+    exec_tool_json(&reg, "task_despawn", json!({"task_id": task_id}));
+    assert_eq!(probe(&reg)["closed"], json!(1));
+}
+
+#[test]
+fn deprecated_task_tools_are_callable_but_hidden() {
     let (reg, _host) = load_task_host();
     let filter = ToolFilter::All;
     let description_ctx = DescriptionContext {
@@ -688,15 +582,54 @@ fn nested_spawn_contract_directs_managed_callers_to_blocking_task() {
         workflow: false,
         mcp: false,
     };
-    let spawn_tool = reg.get("task_spawn").unwrap();
-    let spawn_description = spawn_tool.tool.description(&description_ctx);
-    let get_tool = reg.get("task_get").unwrap();
-    let get_description = get_tool.tool.description(&description_ctx);
-    assert!(spawn_description.contains("must use the blocking task tool"));
-    assert!(
-        spawn_description.contains("Unmanaged callers retain task_spawn/task_get compatibility")
-    );
-    assert!(get_description.contains("must use the blocking task tool instead"));
+    let definitions = reg.definitions(&maki_agent::template::Vars::new(), &description_ctx, false);
+    for name in ["task", "task_get"] {
+        assert!(
+            !definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|definition| definition["name"] == name)
+        );
+        assert!(
+            reg.get(name)
+                .unwrap()
+                .tool
+                .description(&description_ctx)
+                .is_empty()
+        );
+    }
+    let reference_ctx = DescriptionContext {
+        audience: ToolAudience::empty(),
+        ..description_ctx
+    };
+    let reference_definitions =
+        reg.definitions(&maki_agent::template::Vars::new(), &reference_ctx, false);
+    for name in [
+        "task",
+        "task_get",
+        "task_spawn",
+        "task_wait",
+        "task_send",
+        "task_despawn",
+    ] {
+        assert!(
+            reference_definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|definition| definition["name"] == name)
+        );
+    }
+    for name in ["task_spawn", "task_wait"] {
+        assert!(
+            !reg.get(name)
+                .unwrap()
+                .tool
+                .description(&description_ctx)
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -724,7 +657,7 @@ fn unmanaged_nested_task_lifecycle_remains_compatible() {
 }
 
 #[test]
-fn spawn_structured_task_registers_commit_tool() {
+fn spawn_forwards_output_schema_without_lua_local_tools() {
     let (reg, _host) = load_task_host();
     let out = exec_tool_json(
         &reg,
@@ -736,7 +669,8 @@ fn spawn_structured_task_registers_commit_tool() {
         "structured spawn must return a task_id: {out}"
     );
     let snap = probe(&reg);
-    assert_eq!(snap["has_local_tools"], json!(true));
+    assert_eq!(snap["has_local_tools"], json!(false));
+    assert_eq!(snap["output_schema"], answer_schema());
 }
 
 #[test]
@@ -775,7 +709,7 @@ fn failed_initial_admission_closes_new_session() {
 }
 
 #[test]
-fn failed_later_admission_keeps_existing_session_open() {
+fn failed_later_admission_closes_existing_session() {
     let (reg, _host) = load_task_host();
     let spawned = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_NESTED_FAILED, None));
     let task_id = spawned["task_id"].as_str().unwrap();
@@ -788,7 +722,7 @@ fn failed_later_admission_keeps_existing_session_open() {
         .unwrap_err(),
         PROMPT_ERR_MSG
     );
-    assert_eq!(probe(&reg)["closed"], json!(0));
+    assert_eq!(probe(&reg)["closed"], json!(1));
     let despawned = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
     assert_eq!(despawned["ok"], json!(true));
     assert_eq!(probe(&reg)["closed"], json!(1));
@@ -803,7 +737,7 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
     let task_id = spawn["task_id"].as_str().unwrap();
     exec_tool(&reg, "set_task_access", json!({ "allowed": false })).unwrap();
 
-    for tool in ["task_get", "task_send", "task_despawn"] {
+    for tool in ["task_get", "task_wait", "task_send", "task_despawn"] {
         let input = if tool == "task_send" {
             json!({ "task_id": task_id, "message": "forbidden" })
         } else {
@@ -853,7 +787,7 @@ fn send_queues_and_reactivates() {
 #[test]
 fn unknown_task_errors_across_lifecycle_tools() {
     let (reg, _host) = load_task_host();
-    for tool in ["task_get", "task_send", "task_despawn"] {
+    for tool in ["task_get", "task_wait", "task_send", "task_despawn"] {
         let input = match tool {
             "task_send" => json!({ "task_id": "missing", "message": "x" }),
             _ => json!({ "task_id": "missing" }),
@@ -863,30 +797,26 @@ fn unknown_task_errors_across_lifecycle_tools() {
     }
 }
 
-// --- Real-driver pair (AC.3, AC.4) ------------------------------------------
-//
-// The stub suite above tests the task plugin's policy logic with a Lua
-// `maki.agent.session` stand-in. These tests swap that stand-in for the REAL
-// bound `maki.agent.session` (wrapped only to set `inherit_provider = true`, so
-// the spawned driver reuses the parent's canned provider instead of building
-// one from `model_spec` over the network). The plugin's gating and
-// structured-output policy run unchanged; we assert the gating matrix holds AND
-// that the granted session is actually served by the canned provider (real
-// driver, not the stub).
-
-/// Like [`STUB_PRELUDE`] but the real `maki.agent.session` is preserved (only
-/// wrapped to force `inherit_provider = true`). `resolve_model`/`system_prompt`/
-/// `tools` stay stubbed so no real model lookup, file read, or registry scan is
-/// needed; only the session spawn and its driver run for real against the canned
-/// provider. Structured-output capture flows through the real session driver.
+/// The real agent reuses the canned provider; model lookup and tool discovery stay stubbed.
 const REAL_DRIVER_PRELUDE: &str = r#"
 recorder = { sessions = 0 }
+local real_register_tool = maki.api.register_tool
+maki.api.register_tool = function(spec)
+  if spec.name == "task_wait" then
+    local handler = spec.handler
+    spec.handler = function(input, ctx)
+      recorder.wait_entered = true
+      return handler(input, ctx)
+    end
+  end
+  return real_register_tool(spec)
+end
 
-local real_session = maki.agent.session
-maki.agent.session = function(ctx, opts)
+local real_spawn = maki.agent.spawn
+maki.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   opts.inherit_provider = true
-  return real_session(ctx, opts)
+  return real_spawn(ctx, opts)
 end
 
 maki.agent.resolve_model = function(ctx, opts)
@@ -907,7 +837,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    return maki.json.encode({ sessions = recorder.sessions })
+    return maki.json.encode({ sessions = recorder.sessions, wait_entered = recorder.wait_entered })
   end,
 })
 "#;
@@ -959,7 +889,7 @@ impl Provider for GatedProvider {
                 })
                 .unwrap_or_default();
             self.started_tx.send(message).unwrap();
-            self.release_rx.recv_async().await.unwrap();
+            common::bounded(self.release_rx.recv_async()).await.unwrap();
             Ok(common::canned_reply("done"))
         })
     }
@@ -973,12 +903,7 @@ fn probe_real(reg: &ToolRegistry, ctx: &ToolContext) -> Value {
     common::exec_tool(reg, ctx, "probe", json!({})).expect("probe failed")
 }
 
-/// Run the blocking `task` composite (which drives the real `maki.agent.session`
-/// via `:prompt`) against the canned provider. Mirrors the passing automode
-/// pattern: `:prompt` blocks on the driver's `done_rx`, and `smol::block_on`
-/// pumps the background driver to completion. No `task_spawn`/`task_get` polling.
-/// Returns the raw tool output text: the plain path yields prose, the
-/// structured path yields a JSON string (parsed by the caller when needed).
+/// Run the deprecated blocking adapter against the real agent and canned provider.
 fn run_task(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<String, String> {
     common::exec_tool_text(reg, ctx, TASK_TOOL, input)
 }
@@ -1034,6 +959,181 @@ fn task_policy_spawn_honors_mode_gating_real() {
 }
 
 #[test]
+fn pending_ticket_backpressure_preserves_accepted_turns() {
+    const RETAINED_TURN_LIMIT: usize = 64;
+    const TURN_LIMIT_ERROR: &str = "task turn ticket limit reached";
+    smol::block_on(async {
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let provider = Arc::new(GatedProvider {
+            started_tx,
+            release_rx,
+        });
+        let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+        let (reg, _host) = load_real_driver_host("build");
+        let spawned = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let task_id = spawned["task_id"].as_str().unwrap();
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
+        let mut turns = vec![spawned["turn_id"].clone()];
+        for _ in 1..RETAINED_TURN_LIMIT {
+            let admitted = exec_tool_json_with_ctx(
+                &reg,
+                &ctx,
+                "task_send",
+                json!({"task_id": task_id, "message": TASK_PROMPT}),
+            );
+            turns.push(admitted["turn_id"].clone());
+        }
+        assert_eq!(
+            common::exec_tool_text(
+                &reg,
+                &ctx,
+                "task_send",
+                json!({"task_id": task_id, "message": TASK_PROMPT})
+            )
+            .unwrap_err(),
+            TURN_LIMIT_ERROR
+        );
+        for (index, turn_id) in turns.iter().enumerate() {
+            release_tx.send(()).unwrap();
+            let settled = exec_tool_json_with_ctx(
+                &reg,
+                &ctx,
+                "task_wait",
+                json!({"task_id": task_id, "turn_id": turn_id}),
+            );
+            assert_eq!(settled["result"]["turn_id"], *turn_id);
+            assert_eq!(settled["result"]["status"], "completed");
+            assert_eq!(settled["result"]["text"], "done");
+            if index + 1 < RETAINED_TURN_LIMIT {
+                assert_eq!(
+                    common::bounded(started_rx.recv_async()).await.unwrap(),
+                    TASK_PROMPT
+                );
+            }
+        }
+        exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({"task_id": task_id}));
+    });
+}
+
+#[test]
+fn zero_timeout_task_wait_preserves_child_and_exact_ticket() {
+    smol::block_on(async {
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let provider = Arc::new(GatedProvider {
+            started_tx,
+            release_rx,
+        });
+        let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+        let (reg, _host) = load_real_driver_host("build");
+        let spawned = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let task_id = spawned["task_id"].as_str().unwrap();
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
+        let pending = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_wait",
+            json!({"task_id": task_id, "turn_id": spawned["turn_id"], "timeout": 0}),
+        );
+        assert_eq!(pending["status"], "running");
+        release_tx.send(()).unwrap();
+        let settled = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_wait",
+            json!({"task_id": task_id, "turn_id": spawned["turn_id"]}),
+        );
+        assert_eq!(settled["result"]["turn_id"], spawned["turn_id"]);
+        assert_eq!(settled["result"]["text"], "done");
+        exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({"task_id": task_id}));
+    });
+}
+
+#[test_case::test_case(false ; "snapshots_latest_once")]
+#[test_case::test_case(true ; "explicit_exact_ticket")]
+fn task_wait_pins_exact_turn(explicit_turn: bool) {
+    smol::block_on(async {
+        let (started_tx, started_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let provider = Arc::new(GatedProvider {
+            started_tx,
+            release_rx,
+        });
+        let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+        let (reg, _host) = load_real_driver_host("build");
+        let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let task_id = first["task_id"].as_str().unwrap();
+        assert!(first["turn_id"].is_string());
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
+
+        let mut wait_input = json!({ "task_id": task_id });
+        if explicit_turn {
+            wait_input["turn_id"] = first["turn_id"].clone();
+        }
+        let invocation = reg
+            .get("task_wait")
+            .unwrap()
+            .tool
+            .parse(&wait_input)
+            .unwrap();
+        let wait_ctx = common::with_request_tools(&reg, &ctx);
+        let wait = invocation.execute(&wait_ctx);
+        futures_lite::pin!(wait);
+        assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
+        common::bounded(async {
+            while probe_real(&reg, &ctx)["wait_entered"] != json!(true) {
+                smol::future::yield_now().await;
+            }
+        })
+        .await;
+
+        let second = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_send",
+            json!({ "task_id": task_id, "message": "second turn" }),
+        );
+        assert_eq!(second["queued"], json!(true));
+        assert!(second["turn_id"].is_string());
+        assert_ne!(first["turn_id"], second["turn_id"]);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            "second turn"
+        );
+
+        let completed = futures_lite::future::race(wait, async {
+            smol::Timer::after(WAIT_DEADLOCK_TIMEOUT).await;
+            panic!("wait for A was retargeted to gated B");
+        })
+        .await
+        .output
+        .unwrap();
+        let (ToolOutput::Plain(completed) | ToolOutput::Markdown(completed)) = completed else {
+            panic!("unexpected task_wait output");
+        };
+        let result: Value = serde_json::from_str(&completed.text).unwrap();
+        assert_eq!(result["status"], json!("done"));
+        assert_eq!(result["result"]["turn_id"], first["turn_id"]);
+        assert_eq!(result["result"]["text"], json!("done"));
+        release_tx.send(()).unwrap();
+        let closed =
+            exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": task_id }));
+        assert_eq!(closed["ok"], json!(true));
+    });
+}
+
+#[test]
 fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
@@ -1049,7 +1149,10 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(started_rx.recv_async().await.unwrap(), TASK_PROMPT);
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
 
         let queued = exec_tool_json_with_ctx(
             &reg,
@@ -1067,12 +1170,12 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
         assert!(started_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
-        let next = started_rx.recv_async().await.unwrap();
+        let next = common::bounded(started_rx.recv_async()).await.unwrap();
         assert!(matches!(next.as_str(), "second turn" | TASK_PROMPT));
         assert!(started_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
-        let last = started_rx.recv_async().await.unwrap();
+        let last = common::bounded(started_rx.recv_async()).await.unwrap();
         assert_ne!(last, next);
         assert!(matches!(last.as_str(), "second turn" | TASK_PROMPT));
         release_tx.send(()).unwrap();
@@ -1101,7 +1204,10 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(started_rx.recv_async().await.unwrap(), TASK_PROMPT);
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
 
         let mut waiting_input = task_input("waiting", None);
         waiting_input["prompt"] = json!("waiting prompt");
@@ -1117,7 +1223,10 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
         third_input["prompt"] = json!("third prompt");
         let third = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", third_input);
         let third_id = third["task_id"].as_str().unwrap();
-        assert_eq!(started_rx.recv_async().await.unwrap(), "third prompt");
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            "third prompt"
+        );
         release_tx.send(()).unwrap();
 
         for task_id in [first_id, third_id] {
@@ -1144,7 +1253,10 @@ fn despawn_releases_capacity_from_an_active_turn() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(started_rx.recv_async().await.unwrap(), TASK_PROMPT);
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
 
         let second = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("second", None));
         let second_id = second["task_id"].as_str().unwrap();
@@ -1156,7 +1268,10 @@ fn despawn_releases_capacity_from_an_active_turn() {
         let error =
             common::exec_tool(&reg, &ctx, "task_get", json!({ "task_id": first_id })).unwrap_err();
         assert!(error.contains("unknown task_id"), "got: {error}");
-        assert_eq!(started_rx.recv_async().await.unwrap(), TASK_PROMPT);
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
 
         let out =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": second_id }));
@@ -1213,6 +1328,58 @@ fn plan_mode_task_supports_structured_output_real_driver() {
         .find(|tool| tool["name"] == STRUCTURED_OUTPUT_TOOL)
         .expect("session tools must include structured_output");
     assert_eq!(structured_output["input_schema"], answer_schema());
+}
+
+#[test_case::test_case(json!({"type": "array"}), "output_schema must have type object" ; "non_object")]
+#[test_case::test_case(json!({"description": "missing type"}), "output_schema must have type object" ; "missing_type")]
+#[test_case::test_case(json!({"type": "object", "properties": {"x": {"type": 42}}}), "invalid output_schema" ; "invalid_schema")]
+fn real_schema_validation_rejects_before_provider_request(schema: Value, expected: &str) {
+    let provider = Arc::new(common::CannedProvider::new(vec![]));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (reg, _host) = load_real_driver_host("build");
+    let error = run_task(&reg, &ctx, task_input(SCENARIO_HAPPY, Some(schema))).unwrap_err();
+    assert!(error.contains(expected), "got: {error}");
+    assert!(provider.captured_tools().is_empty());
+}
+
+#[test]
+fn real_schema_invalid_report_recovers() {
+    let provider = Arc::new(common::CannedProvider::new(vec![
+        common::canned_tool_use(STRUCTURED_OUTPUT_TOOL, json!({ "answer": 42 })),
+        common::canned_tool_use(STRUCTURED_OUTPUT_TOOL, json!({ "answer": "42" })),
+        common::canned_reply("done"),
+    ]));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+    let (reg, _host) = load_real_driver_host("build");
+    let out = run_task(
+        &reg,
+        &ctx,
+        task_input(SCENARIO_HAPPY, Some(answer_schema())),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({ "answer": "42" })
+    );
+}
+
+#[test]
+fn real_schema_missing_report_fails_boundedly() {
+    let provider = Arc::new(common::CannedProvider::new(vec![
+        common::canned_reply("no report"),
+        common::canned_reply("no report"),
+        common::canned_reply("no report"),
+    ]));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (reg, _host) = load_real_driver_host("build");
+    let error = run_task(
+        &reg,
+        &ctx,
+        task_input(SCENARIO_HAPPY, Some(answer_schema())),
+    )
+    .unwrap_err();
+    assert!(error.contains(SCHEMA_MISSING_ERROR), "got: {error}");
+    assert_eq!(provider.captured_tools().len(), 1 + MAX_STRUCTURED_RETRIES);
 }
 
 #[test]

@@ -37,6 +37,7 @@ pub use spec::{
     CommandDocs, CommandFuture, CommandId, CommandSpec, CompletionKey, CompletionSessionId,
     HostContextRequest, HostContextResponse, InvocationTargetId, MAX_COMMAND_DEPTH, ModelSelection,
     ProducerId, Registration, StaticArgumentCompletion, TargetCapabilities, TargetCapability,
+    parse_model_selection,
 };
 
 #[cfg(test)]

@@ -1332,7 +1332,6 @@ pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
     output: Option<crate::TurnOutput>,
-    best_effort: bool,
 }
 
 impl EventSender {
@@ -1341,13 +1340,11 @@ impl EventSender {
             tx,
             run_id,
             output: None,
-            best_effort: false,
         }
     }
 
     pub fn with_output(mut self, output: crate::TurnOutput) -> Self {
         self.output = Some(output);
-        self.best_effort = true;
         self
     }
 
@@ -1356,7 +1353,6 @@ impl EventSender {
             tx: self.tx.clone(),
             run_id: self.run_id,
             output: None,
-            best_effort: self.best_effort,
         }
     }
 
@@ -1383,13 +1379,7 @@ impl EventSender {
                 subagent: None,
                 run_id: self.run_id,
             })
-            .or_else(|_| {
-                if self.best_effort {
-                    Ok(())
-                } else {
-                    Err(AgentError::Channel)
-                }
-            })
+            .map_err(|_| AgentError::Channel)
     }
 
     pub fn send_envelope(&self, envelope: Envelope) -> Result<(), AgentError> {
@@ -1421,7 +1411,6 @@ impl EventSender {
             tx: self.tx.clone(),
             run_id,
             output: self.output.clone(),
-            best_effort: self.best_effort,
         }
     }
 }
@@ -1525,7 +1514,7 @@ mod tests {
         const FIRST: &str = "first";
         const FAILED: &str = "discarded";
         const SECOND: &str = "second";
-        const EXPECTED: &str = "firstsecond";
+        const EXPECTED: &str = SECOND;
         let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
         let (tx, rx) = flume::unbounded();
         drop(rx);
@@ -1534,7 +1523,7 @@ mod tests {
             if best_effort {
                 sender.try_send(event);
             } else {
-                sender.send(event).unwrap();
+                assert!(matches!(sender.send(event), Err(AgentError::Channel)));
             }
         };
         sender.output().unwrap().begin_text_attempt();
@@ -1567,6 +1556,38 @@ mod tests {
             delay_ms: 0,
         });
         assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+    }
+
+    #[test_case(false; "full_channel")]
+    #[test_case(true; "disconnected_channel")]
+    fn output_capture_preserves_channel_errors_in_derived_senders(disconnected: bool) {
+        const TEXT: &str = "captured despite channel failure";
+        const RUN_ID: u64 = 7;
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, rx) = flume::bounded(1);
+        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        if disconnected {
+            drop(rx);
+        } else {
+            sender.send(AgentEvent::Nudge).unwrap();
+        }
+        let derived = sender.with_run_id(RUN_ID);
+        assert!(matches!(
+            derived.send(AgentEvent::TextDelta { text: TEXT.into() }),
+            Err(AgentError::Channel)
+        ));
+        assert!(matches!(
+            derived.without_output().send(AgentEvent::Nudge),
+            Err(AgentError::Channel)
+        ));
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        ));
+        assert_eq!(ticket.peek_result().unwrap().text, TEXT);
     }
 
     #[test]

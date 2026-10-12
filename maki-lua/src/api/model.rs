@@ -2,13 +2,19 @@
 //! read their own model without a UI.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{Model, RequestOptions};
-use mlua::{Error as LuaError, Lua, Result as LuaResult, UserDataRef, Value};
+use maki_providers::{
+    CompleteModelSelection, Model, ModelSelection, RequestOptions, ThinkingConfig,
+    ThinkingConfigExt,
+};
+use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
+use crate::host_root::HostRootServices;
+use crate::orchestration::HostRootServicesSlot;
 use crate::runtime::{TaskHandle, lock_cell};
+use std::sync::Arc;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -28,8 +34,7 @@ async fn roundtrip(
 /// a UI is attached. `thinking` uses the spelling `set` accepts.
 ///
 /// @param ctx userdata|nil Optional tool handler context.
-/// @return (table|nil, string|nil) `{spec, id, provider, thinking, fast,
-///   supports_thinking, supports_fast}`, or nil and an error.
+/// @return (table|nil, string|nil) `{spec, thinking, fast}`, or nil and an error.
 /// @example
 /// local m = maki.model.get(ctx)
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end
@@ -40,12 +45,21 @@ async fn get(
     ctx: Option<UserDataRef<LuaCtx>>,
 ) -> LuaResult<Pair<Value>> {
     if let Some(ctx) = ctx {
+        if let Err(error) = ctx.validate_origin(&lua) {
+            return Ok(err_pair(error));
+        }
         let Some(agent) = ctx.agent() else {
             return Ok(err_pair(ctx.cap_err("maki.model.get")));
         };
         return model_value(&lua, &agent.model, &agent.opts);
     }
     if tx.is_none() {
+        if let Some(services) = host_root_services(&lua) {
+            return match services.model(&services.reference()) {
+                Ok(selection) => Ok((Some(lua.to_value(&selection)?), None)),
+                Err(error) => Ok(err_pair(error.to_string())),
+            };
+        }
         if let Some(handle) = lua.app_data_ref::<TaskHandle>()
             && let Some(policy) = lock_cell(&handle)
                 .managed_turn
@@ -91,15 +105,8 @@ async fn get(
 }
 
 fn model_value(lua: &Lua, model: &Model, opts: &RequestOptions) -> LuaResult<Pair<Value>> {
-    let result = lua.create_table()?;
-    result.set("spec", model.spec())?;
-    result.set("id", model.id.as_str())?;
-    result.set("provider", model.provider.to_string())?;
-    result.set("thinking", opts.thinking.to_string())?;
-    result.set("fast", opts.fast)?;
-    result.set("supports_thinking", model.supports_thinking())?;
-    result.set("supports_fast", model.supports_fast())?;
-    Ok((Some(Value::Table(result)), None))
+    let selection = CompleteModelSelection::from_model(model, *opts);
+    Ok((Some(lua.to_value(&selection)?), None))
 }
 
 /// Lists the model specs you can switch to: what the providers you are logged
@@ -111,15 +118,24 @@ fn model_value(lua: &Lua, model: &Model, opts: &RequestOptions) -> LuaResult<Pai
 /// local specs = maki.model.available()
 #[lua_fn]
 async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+    if tx.is_none()
+        && let Some(services) = host_root_services(&lua)
+    {
+        return match services.available_models(&services.reference()) {
+            Ok(specs) => Ok((Some(lua.to_value(&specs)?), None)),
+            Err(error) => Ok(err_pair(error.to_string())),
+        };
+    }
     roundtrip(lua, tx, ModelRequest::Available).await
 }
 
 /// Switches the focused session's model, thinking level, or fast mode. Fields
 /// you leave out stay as they are, so this doubles as a thinking-only switch.
 /// Answers with the committed state, in the same shape `get` returns. Changes
-/// apply to subsequent admissions; saving runs asynchronously after commit.
-/// See [Configuration changes](/docs/modes/#configuration-changes) for save
-/// warnings, retry behavior, and crash limitations.
+/// apply to subsequent admissions. UI actors save asynchronously after commit;
+/// SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
+/// print roots reject all patches. Prefer `Agent:set_model(ctx, patch)` for an
+/// explicit target.
 ///
 /// @param opts string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
@@ -143,11 +159,26 @@ async fn set(
             thinking: None,
             fast: None,
         },
-        Value::Table(opts) => ModelRequest::Set {
-            spec: opts.get("spec")?,
-            thinking: opts.get("thinking")?,
-            fast: opts.get("fast")?,
-        },
+        Value::Table(opts) => {
+            let toggle = matches!(opts.get::<Value>("thinking")?, Value::String(value) if value.to_str()?.is_empty());
+            let mut value = crate::api::util::convert::lua_to_json(&lua, &Value::Table(opts))?;
+            if toggle && let Some(value) = value.as_object_mut() {
+                value.remove("thinking");
+            }
+            let selection: ModelSelection = match serde_json::from_value(value) {
+                Ok(selection) => selection,
+                Err(error) => return Ok(err_pair(error.to_string())),
+            };
+            ModelRequest::Set {
+                spec: selection.spec.map(|spec| spec.to_string()),
+                thinking: if toggle {
+                    Some(String::new())
+                } else {
+                    selection.thinking.map(|thinking| thinking.to_string())
+                },
+                fast: selection.fast,
+            }
+        }
         other => {
             return Err(LuaError::runtime(format!(
                 "{SET_ARG_ERR}, got {}",
@@ -155,12 +186,81 @@ async fn set(
             )));
         }
     };
+    if tx.is_none()
+        && let Some(services) = host_root_services(&lua)
+    {
+        let authority = match LuaCtx::current_host_root_context(&lua) {
+            Ok(ctx) => ctx,
+            Err(error) => return Ok(err_pair(error)),
+        };
+        if let Err(error) = authority.trusted_host_root(&lua) {
+            return Ok(err_pair(error));
+        }
+        let ModelRequest::Set {
+            spec,
+            thinking,
+            fast,
+        } = req
+        else {
+            unreachable!()
+        };
+        let reference = services.reference();
+        let validator = match authority.host_model_validator(&lua, &services, &reference) {
+            Ok(validator) => validator,
+            Err(error) => return Ok(err_pair(error)),
+        };
+        let thinking = match thinking {
+            Some(value) => {
+                let current = match services.model(&reference) {
+                    Ok(selection) => selection.thinking,
+                    Err(error) => return Ok(err_pair(error.to_string())),
+                };
+                match ThinkingConfig::parse(&value, current) {
+                    Ok(thinking) => Some(thinking),
+                    Err(error) => return Ok(err_pair(error.to_string())),
+                }
+            }
+            None => None,
+        };
+        let result = services
+            .set_model_guarded(
+                &reference,
+                ModelSelection {
+                    spec: spec.map(Arc::from),
+                    thinking,
+                    fast,
+                },
+                Some(validator),
+            )
+            .await;
+        if let Err(error) = authority.validate_origin(&lua) {
+            return Ok(err_pair(error));
+        }
+        return match result {
+            Ok(selection) => {
+                if let Err(error) = authority.trusted_host_root(&lua) {
+                    return Ok(err_pair(error));
+                }
+                Ok((Some(lua.to_value(&selection)?), None))
+            }
+            Err(error) => Ok(err_pair(error.to_string())),
+        };
+    }
     roundtrip(lua, tx, req).await
+}
+
+fn host_root_services(lua: &Lua) -> Option<Arc<HostRootServices>> {
+    if crate::runtime::current_managed_turn(lua).is_some() {
+        return None;
+    }
+    lua.app_data_ref::<HostRootServicesSlot>()
+        .and_then(|slot| slot.services.clone())
 }
 
 lua_table! {
     /// Read a tool context's model without a UI, or the focused session's
-    /// model for a keybind. `available` and `set` require an interactive UI.
+    /// model for a keybind. Non-UI hosts supply root reads and discovery; SDK
+    /// and ACP also support selection updates. Fixed print roots reject updates.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [get(tx), available(tx), set(tx)]
 }
@@ -228,10 +328,7 @@ mod tests {
         (lua_to_json(lua, &val).unwrap(), err)
     }
 
-    /// `set` forwards only the fields it was given, so whatever you leave out
-    /// the UI leaves alone. `false` and `""` are values though, not omissions:
-    /// `""` is the thinking toggle. The last case is the documented loop, `get`
-    /// straight back into `set`, read-only extras and all.
+    /// Omitted fields stay unchanged; the legacy empty-string toggle is preserved.
     #[test_case("return model.get()", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "get")]
     #[test_case("return model.available()", json!([SPEC]) ; "available")]
     #[test_case("return model.set('anthropic/claude-opus-4-6')", json!({ "spec": SPEC }) ; "set_bare_spec_string")]
@@ -242,6 +339,15 @@ mod tests {
         assert_eq!(eval(&stub_ui(echo), script), (expected, None));
     }
 
+    #[test_case("return model.set({ unknown = true })" ; "unknown_key")]
+    #[test_case("return model.set({ thinking = 'not-a-setting' })" ; "invalid_thinking")]
+    #[test_case("return model.set({ fast = 'true' })" ; "non_boolean_fast")]
+    fn invalid_selection_is_rejected_before_ui_request(script: &str) {
+        let (value, error) = eval(&lua_with_model(None), script);
+        assert_eq!(value, Json::Null);
+        assert!(error.is_some_and(|error| error != NO_UI_ERR));
+    }
+
     #[test]
     fn test_lua_model_get_without_ui() {
         let lua = lua_with_model(None);
@@ -250,17 +356,88 @@ mod tests {
         ctx.opts.fast = false;
         let model = &ctx.model;
         let expected = json!({
-            "spec": model.spec(), "id": model.id, "provider": model.provider.to_string(),
-            "thinking": ctx.opts.thinking.to_string(), "fast": ctx.opts.fast,
-            "supports_thinking": model.supports_thinking(), "supports_fast": model.supports_fast(),
+            "spec": model.spec(), "thinking": "off", "fast": false,
         });
         lua.globals()
             .set("ctx", lua.create_userdata(LuaCtx::handler(&ctx)).unwrap())
             .unwrap();
-        assert_eq!(eval(&lua, "return model.get(ctx)"), (expected, None));
+        let (value, error) = model_value(&lua, &ctx.model, &ctx.opts).unwrap();
+        assert_eq!(error, None);
+        assert_eq!(lua_to_json(&lua, &value.unwrap()).unwrap(), expected);
+        assert_eq!(
+            eval(&lua, "return model.get(ctx)"),
+            (
+                Json::Null,
+                Some("context is not bound to an invocation".into())
+            )
+        );
         assert_eq!(
             eval(&lua, "return model.get()"),
             (Json::Null, Some(NO_UI_ERR.to_owned()))
+        );
+    }
+
+    #[test_case("return model.set({ fast = false })"; "options_only")]
+    #[test_case("return model.set({})"; "empty")]
+    #[test_case("return model.set({ thinking = '' })"; "toggle")]
+    fn fixed_host_compatibility_setter_rejects_without_mutation(script: &str) {
+        let lua = lua_with_model(None);
+        let services = Arc::new(HostRootServices::fixed(
+            maki_agent::AgentId::generate(),
+            &Model::from_spec(SPEC).unwrap(),
+            RequestOptions::default(),
+            Arc::new(maki_config::ModelPolicy::default()),
+        ));
+        let reference = services.reference();
+        let before = services.model(&reference).unwrap();
+        lua.set_app_data(HostRootServicesSlot {
+            services: Some(Arc::clone(&services)),
+            template: None,
+        });
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        LuaCtx::trusted_host_root_context(&lua, Arc::from("model-test"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            eval(&lua, script),
+            (Json::Null, Some(crate::host_root::FIXED_MODEL_ERROR.into()))
+        );
+        assert_eq!(services.model(&reference).unwrap(), before);
+        drop(scope);
+    }
+
+    #[test]
+    fn installed_host_root_reads_discovery_and_retirement_without_ui() {
+        let lua = lua_with_model(None);
+        let services = Arc::new(HostRootServices::fixed(
+            maki_agent::AgentId::generate(),
+            &Model::from_spec(SPEC).unwrap(),
+            RequestOptions::default(),
+            Arc::new(maki_config::ModelPolicy::default()),
+        ));
+        lua.set_app_data(HostRootServicesSlot {
+            services: Some(Arc::clone(&services)),
+            template: None,
+        });
+        let (selection, error) = eval(&lua, "return model.get()");
+        assert_eq!(error, None);
+        assert_eq!(selection["spec"], SPEC);
+        assert_eq!(selection["fast"], false);
+        let (available, error) = eval(&lua, "return model.available()");
+        assert_eq!(error, None);
+        assert_eq!(
+            available,
+            json!(services.available_models(&services.reference()).unwrap())
+        );
+        services.retire();
+        let stale = crate::host_root::HostRootError::Stale.to_string();
+        assert_eq!(
+            eval(&lua, "return model.get()"),
+            (Json::Null, Some(stale.clone()))
+        );
+        assert_eq!(
+            eval(&lua, "return model.available()"),
+            (Json::Null, Some(stale))
         );
     }
 
@@ -275,8 +452,7 @@ mod tests {
         let (actual, error) = eval(&lua, "return model.get()");
         assert_eq!(error, None);
         assert_eq!(actual["spec"], model.spec());
-        assert_eq!(actual["provider"], model.provider.to_string());
-        assert_eq!(actual["fast"], true);
+        assert_eq!(actual["fast"], false);
         assert_eq!(actual["thinking"], THINKING);
     }
 

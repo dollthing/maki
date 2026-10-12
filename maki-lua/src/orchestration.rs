@@ -1,3 +1,4 @@
+use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::{AgentRef, tools::ToolContext};
@@ -22,10 +23,33 @@ pub(crate) struct PluginAuthority {
     generation: u64,
 }
 
+impl PluginAuthority {
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) fn existing_plugin_authority(
+    lua: &Lua,
+    plugin: &str,
+    generation: u64,
+) -> Result<Arc<PluginAuthority>, String> {
+    lua.app_data_ref::<PluginAuthorities>()
+        .and_then(|owners| owners.0.get(plugin).cloned())
+        .filter(|owner| owner.generation == generation && owner.is_alive())
+        .ok_or_else(|| EXPIRED_CONTEXT.into())
+}
+
 pub struct AgentEventRequest {
     pub callback_id: u64,
     pub payload: serde_json::Value,
     pub target: TrustedTarget,
+    pub lease: maki_agent::actor::ActorEventLease,
 }
 
 struct EventCallback {
@@ -139,6 +163,68 @@ pub trait OrchestrationServices: Send + Sync + 'static {
 
 #[derive(Clone, Default)]
 pub struct OrchestrationServicesSlot(pub Option<Arc<dyn OrchestrationServices>>);
+
+#[derive(Clone, Default)]
+pub struct HostRootServicesSlot {
+    pub services: Option<Arc<HostRootServices>>,
+    pub template: Option<ToolContext>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TrustedHostRootContext {
+    pub(crate) services: Arc<HostRootServices>,
+    pub(crate) template: Option<ToolContext>,
+    pub(crate) plugin: Arc<str>,
+    pub(crate) generation: u64,
+    authority: ScopeAuthority,
+}
+
+impl TrustedHostRootContext {
+    pub(crate) fn new(
+        lua: &Lua,
+        task: &TaskHandle,
+        plugin: Arc<str>,
+        owner: Arc<PluginAuthority>,
+    ) -> Result<Option<Self>, String> {
+        let Some(slot) = lua.app_data_ref::<HostRootServicesSlot>() else {
+            return Ok(None);
+        };
+        let Some(services) = slot.services.clone() else {
+            return Ok(None);
+        };
+        services
+            .validate(&services.reference())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(Self {
+            services,
+            template: slot.template.clone(),
+            plugin,
+            generation: owner.generation,
+            authority: ScopeAuthority {
+                task: Arc::downgrade(task),
+                owner,
+            },
+        }))
+    }
+
+    pub(crate) fn plugin_authority(&self) -> Arc<PluginAuthority> {
+        self.authority.owner.clone()
+    }
+
+    pub(crate) fn validate(&self, lua: &Lua) -> Result<(), String> {
+        self.authority.validate(lua)?;
+        let current = lua
+            .app_data_ref::<HostRootServicesSlot>()
+            .and_then(|slot| slot.services.clone())
+            .ok_or("host root services expired")?;
+        if !Arc::ptr_eq(&self.services, &current) {
+            return Err("host root context does not belong to this host scope".into());
+        }
+        self.services
+            .validate(&self.services.reference())
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Default)]
 struct PluginAuthorities(HashMap<Arc<str>, Arc<PluginAuthority>>);

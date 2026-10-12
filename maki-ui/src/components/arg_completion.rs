@@ -12,6 +12,8 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_providers::{FAST_VALUES, MODEL_FAST_KEY, MODEL_THINKING_KEY};
+
 const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
 pub(crate) struct ModelArgSource {
@@ -191,15 +193,44 @@ impl CommandCompletion for ModelArgSource {
         if preceding.iter().any(|value| !value.contains('=')) || context.argument.contains('=') {
             items.clear();
         }
+        let range = context.argument_range.as_ref();
+        let embedded_options = range
+            .and_then(|range| context.arguments[..range.start].rfind('{'))
+            .map(|open| {
+                let end = context.arguments[open..]
+                    .find('}')
+                    .map_or(context.arguments.len(), |end| open + end);
+                (open + 1, end)
+            });
+        if embedded_options.is_some() {
+            items.clear();
+        }
         for (key, values) in [
             (
-                "thinking",
+                MODEL_THINKING_KEY,
                 maki_providers::ThinkingConfig::options().as_slice(),
             ),
-            ("fast", &["true", "false"][..]),
+            (MODEL_FAST_KEY, FAST_VALUES.as_slice()),
         ] {
             let prefix = format!("{key}=");
-            if !preceding.iter().any(|value| value.starts_with(&prefix))
+            let duplicate = embedded_options.map_or_else(
+                || preceding.iter().any(|value| value.starts_with(&prefix)),
+                |(start, end)| {
+                    context.arguments[start..end]
+                        .split(',')
+                        .scan(start, |offset, option| {
+                            let option_start = *offset;
+                            *offset += option.len() + 1;
+                            Some((option_start, option))
+                        })
+                        .any(|(start, option)| {
+                            let start = start + option.len() - option.trim_start().len();
+                            range.is_none_or(|range| start != range.start)
+                                && option.trim_start().starts_with(&prefix)
+                        })
+                },
+            );
+            if !duplicate
                 && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
             {
                 items.extend(values.iter().map(|value| {
@@ -440,8 +471,21 @@ mod tests {
         target.id()
     }
 
-    #[test]
-    fn model_completion_offers_only_remaining_selection_fields() {
+    #[test_case("", "", 0, true, true, true ; "empty")]
+    #[test_case("openai/gpt-5 ", "", 1, false, true, true ; "spec")]
+    #[test_case(r#""openai/gpt-5" "#, "", 1, false, true, true ; "quoted_spec")]
+    #[test_case("fast=false ", "", 1, true, true, false ; "fast_selected")]
+    #[test_case("thinking=high fast=true ", "", 2, true, false, false ; "options_selected")]
+    #[test_case("thinking=", "thinking=", 0, false, true, false ; "thinking_value")]
+    #[test_case("fast=", "fast=", 0, false, false, true ; "fast_value")]
+    fn model_completion_offers_only_remaining_selection_fields(
+        input: &str,
+        argument: &str,
+        index: usize,
+        model: bool,
+        thinking: bool,
+        fast: bool,
+    ) {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Application);
         let definition = maki_commands::BUILTIN_COMMANDS
@@ -460,56 +504,34 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
         let command = registry.resolve_for(&target, "/model").unwrap();
         let session = registry.open_completion(command, target.id()).unwrap();
-        for (input, index, model, thinking, fast) in [
-            ("", 0, true, true, true),
-            ("openai/gpt-5 ", 1, false, true, true),
-            (r#""openai/gpt-5" "#, 1, false, true, true),
-            ("fast=false ", 1, true, true, false),
-            ("thinking=high fast=true ", 2, true, false, false),
-        ] {
-            let CompletionResult::Items(items) = smol::block_on(session.complete(
-                Arc::from(input),
-                Arc::from(""),
-                index,
-                Arc::from("insert"),
-            )) else {
-                panic!("expected model completions");
-            };
-            assert_eq!(
-                items
-                    .iter()
-                    .any(|item| item.item().insertion.as_ref() == "openai/gpt-5"),
-                model
-            );
-            assert_eq!(
-                items
-                    .iter()
-                    .any(|item| item.item().insertion.starts_with("thinking=")),
-                thinking
-            );
-            assert_eq!(
-                items
-                    .iter()
-                    .any(|item| item.item().insertion.starts_with("fast=")),
-                fast
-            );
-        }
-        for (argument, expected_prefix) in [("thinking=", "thinking="), ("fast=", "fast=")] {
-            let CompletionResult::Items(items) = smol::block_on(session.complete(
-                Arc::from(argument),
-                Arc::from(argument),
-                0,
-                Arc::from("insert"),
-            )) else {
-                panic!("expected option completions");
-            };
-            assert!(!items.is_empty());
-            assert!(
-                items
-                    .iter()
-                    .all(|item| item.item().insertion.starts_with(expected_prefix))
-            );
-        }
+        let CompletionResult::Items(items) = smol::block_on(session.complete(
+            Arc::from(input),
+            Arc::from(argument),
+            index,
+            Arc::from("insert"),
+        )) else {
+            panic!("expected model completions");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .any(|item| item.item().insertion.as_ref() == "openai/gpt-5"),
+            model
+        );
+        assert_eq!(
+            items.iter().any(|item| item
+                .item()
+                .insertion
+                .starts_with(&format!("{MODEL_THINKING_KEY}="))),
+            thinking
+        );
+        assert_eq!(
+            items.iter().any(|item| item
+                .item()
+                .insertion
+                .starts_with(&format!("{MODEL_FAST_KEY}="))),
+            fast
+        );
     }
 
     const BASE_THEME: &str = "dracula";

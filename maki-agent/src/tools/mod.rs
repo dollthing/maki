@@ -40,7 +40,9 @@ use crate::mcp::{
     McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
 };
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf};
+use crate::{
+    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
+};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -138,14 +140,14 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 /// the `code_execution` sandbox) cannot drift from what the model was shown.
 #[derive(Debug, Clone)]
 pub struct RequestTools {
-    definitions: Value,
+    definitions: Arc<Value>,
     filter: Arc<ToolFilter>,
 }
 
 impl Default for RequestTools {
     fn default() -> Self {
         Self {
-            definitions: Value::Array(Vec::new()),
+            definitions: Arc::new(Value::Array(Vec::new())),
             filter: Arc::default(),
         }
     }
@@ -172,7 +174,7 @@ impl RequestTools {
             mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: Arc::new(registry.definitions(vars, &ctx, model.supports_tool_examples())),
             filter: Arc::new(filter),
         }
     }
@@ -200,7 +202,7 @@ impl RequestTools {
             ToolFilter::Only,
         );
         Self {
-            definitions,
+            definitions: Arc::new(definitions),
             filter: Arc::new(filter),
         }
     }
@@ -450,6 +452,7 @@ pub struct OutputFinalization {
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub execution_agent_id: Option<AgentId>,
     pub provider: Arc<dyn Provider>,
     pub model: Arc<Model>,
     pub event_tx: EventSender,
@@ -841,6 +844,7 @@ pub fn interpreter_ctx(
         LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
     let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
+        execution_agent_id: None,
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
@@ -1103,6 +1107,22 @@ mod tests {
 
     const LINE_LIMIT: usize = 500;
     const PINNED_TOOL: &str = "pinned";
+
+    #[test]
+    fn cloned_tool_context_shares_published_definitions() {
+        let mut context = cli_tool_ctx();
+        context.request_tools = Some(RequestTools::assembled(
+            serde_json::json!([{ "name": PINNED_TOOL }]),
+            &context.config,
+            &context.model,
+        ));
+        let cloned = context.clone();
+        let original = context.request_tools.as_ref().unwrap();
+        let copied = cloned.request_tools.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original.definitions, &copied.definitions));
+        assert!(copied.filter().matches(PINNED_TOOL));
+        assert!(!copied.filter().matches(READ_TOOL_NAME));
+    }
 
     #[test_case(false ; "removed")]
     #[test_case(true ; "replaced")]

@@ -65,6 +65,11 @@ impl WakeFlag {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn consume(&self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+
     pub(super) fn wake(&self) {
         self.flag.store(true, std::sync::atomic::Ordering::Release);
         self.event.notify(usize::MAX);
@@ -163,8 +168,20 @@ impl Runner {
             state.processing = None;
             state.finish_close(&self.inner);
             state.publish_idle(&self.inner);
+            drop(state);
+            self.backend.on_work_settled();
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
+        if self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lifecycle
+            != ActorLifecycle::Open
+        {
+            return Step::Exit;
+        }
 
         future::or(
             async {
@@ -329,6 +346,10 @@ impl Runner {
                 );
                 return;
             }
+            if let Some(delivery) = state.deliveries.get_mut(&turn_id) {
+                delivery.started = true;
+            }
+            admission.ticket.mark_started();
             state.emit(super::ActorEvent::Start {
                 agent_id,
                 turn_id,

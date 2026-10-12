@@ -95,6 +95,38 @@ with full debug info.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
 - Reusable helpers ship with makima; see "Shared helper modules" in the API reference.
 
+## Agent context and lifetime
+
+Tool handlers receive `handler(input, ctx)`. Slash-command handlers receive `handler(opts, ctx)`. Keymap callbacks receive `callback(nil, ctx)`. A command or keymap context can be nil when the host has no agent target. Existing callbacks that omit the second argument remain valid.
+
+`maki.agent.current(ctx)` and `ctx:agent()` resolve the invocation's agent. A tool context refers to the executing agent, not UI focus. A trusted command context pins its target. A resolved keymap context also retains its target across later focus changes. `ctx:defer_close(agent)` registers authorized host-held cleanup at callback exit, including cancellation. Context authority expires when its invocation ends or is cancelled, or when its plugin generation is revoked. Storing a context for a later handler does not extend that authority.
+
+In a tool handler, `ctx:model()` reads the selection admitted for the executing turn. `agent:model(ctx)` reads the agent's committed selection. These can differ after a configuration update while the turn is running. Both selections contain `spec`, `thinking`, and `fast`; descriptive model metadata is separate.
+
+`Agent` handles do not close their agents when garbage-collected. `AgentSubscription` handles do not unsubscribe when garbage-collected. A subscription requires trusted authority; delegated tool handlers cannot register one. Call `subscription:close()` to revoke future deliveries and cancel active handlers. Plugin unload also revokes registrations. Delegated tool handlers cannot enter the trusted `maki.api.run_command()` route.
+
+The compatibility `Session` API has different lifetime and admission rules. A trusted-created Session remains usable only by same-plugin handlers with current authority in the same host generation. A tool-created Session expires with its creating invocation. Passing userdata to another coroutine does not transfer authority. Context-free Session methods validate current coroutine authority against the creation policy ceiling. Plugin revocation cancels owned work. `Session:send(message)` queues and returns a boolean; `Agent:send(ctx, message)` requires idle admission and returns an exact-turn ticket. `Agent:enqueue(ctx, message)` queues and returns a ticket.
+
+`Agent:prompt(ctx, message, { timeout = seconds })` admits an idle-only turn and waits. A timeout stops observation, not execution. Its error table contains `kind = "timeout"`, `message`, and the exact `ticket`. `timeout = 0` is nonblocking and returns that table while the turn is pending. The ticket can be waited on or cancelled from a current valid context. `send` or `enqueue` followed by `ticket:wait` keeps observation and execution ownership explicit.
+
+### Host-root operations
+
+Non-TUI hosts expose a stable root reference without a managed graph. The current host-root adapter supports the following operations:
+
+| Operation | ACP and SDK root | Fixed print/headless root |
+|-----------|------------------|---------------------------|
+| `current`, `root`, `get`, `ctx:agent` | Supported | Supported |
+| `list` | Root and accessible live plugin-owned standalone children | Root and accessible live plugin-owned standalone children |
+| Tool `ctx:model()` admitted selection | Supported | Supported |
+| `Agent:model` committed selection and `available_models` | Supported | Supported |
+| `Agent:set_model`, including options-only updates | Supported through the session coordinator | Rejected before mutation |
+| Root turns, transcript, mode, cancellation, close, subscriptions | Unsupported | Unsupported |
+| Child spawn | Standalone child | Standalone child |
+
+Host-root `status` contains only `id` and `status = "running"`. It does not expose actor queue or usage fields. Unsupported operations return `operation is unavailable for this host root`. Fixed-root model updates return `model changes are unavailable for this fixed host root`. Host shutdown retires the reference; it cannot resolve a replacement runtime. Standalone children have their own turn APIs; this does not imply managed graph support for their host root.
+
+The [Lua API reference](/docs/lua-api/) defines the method signatures and returned fields. The Context concepts page describes model context windows, not Lua invocation authority.
+
 ## A complete real example
 
 The bundled `glob` tool, verbatim: schema, header and restore hooks, error

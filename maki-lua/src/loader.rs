@@ -566,6 +566,22 @@ impl PluginHost {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn collect_garbage_for_test(&self) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestCollectGarbage { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx
+            .recv()
+            .map_err(|_| PluginError::HostDead)?
+            .map_err(|source| PluginError::Lua {
+                plugin: "<test-gc>".to_owned(),
+                source,
+            })
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn wait_for_worker_barrier_for_test(&self) {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -1049,10 +1065,7 @@ impl EventHandle {
         rx
     }
 
-    /// Headless drivers install their own provider so `maki.session.read` has
-    /// something to answer with instead of "no interactive UI attached". The UI
-    /// leaves the slot empty and answers through its event loop, which owns the
-    /// live session runtimes.
+    /// Install explicit agent target and discovery services supplied by the host.
     pub fn install_orchestration_services(
         &self,
         services: Arc<dyn crate::orchestration::OrchestrationServices>,
@@ -1062,6 +1075,24 @@ impl EventHandle {
         ));
     }
 
+    pub fn install_host_root_services(&self, services: Arc<crate::host_root::HostRootServices>) {
+        self.install_host_root_services_with_template(services, None);
+    }
+
+    pub fn install_host_root_services_with_template(
+        &self,
+        services: Arc<crate::host_root::HostRootServices>,
+        template: Option<maki_agent::tools::ToolContext>,
+    ) {
+        let _ = self.tx.try_send(Request::InstallHostRootServices(Box::new(
+            crate::orchestration::HostRootServicesSlot {
+                services: Some(services),
+                template,
+            },
+        )));
+    }
+
+    /// Supply session snapshots for hosts without an interactive event loop.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self
             .tx

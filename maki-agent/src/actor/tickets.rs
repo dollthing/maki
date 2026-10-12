@@ -7,6 +7,7 @@
 
 use std::mem::take;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use event_listener::Event;
 
@@ -18,6 +19,7 @@ pub struct TurnResult {
     pub text: String,
     pub output: Vec<serde_json::Value>,
     pub provenance: TurnProvenance,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,9 +42,9 @@ pub struct TurnProvenance {
 #[derive(Debug, Default)]
 struct OutputState {
     text: String,
-    attempt_start: usize,
     output: Vec<serde_json::Value>,
     result: Option<TurnResult>,
+    started: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,23 +54,21 @@ impl TurnOutput {
     pub fn begin_message(&self) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
-            state.attempt_start = state.text.len();
+            state.text.clear();
         }
     }
 
     pub fn reset_message(&self) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
-            let start = state.attempt_start;
-            state.text.truncate(start);
+            state.text.clear();
         }
     }
 
     pub fn complete_message(&self, text: &str) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
-            let start = state.attempt_start;
-            state.text.truncate(start);
+            state.text.clear();
             state.text.push_str(text);
         }
     }
@@ -169,6 +169,13 @@ impl TurnTicket {
         self.turn_id
     }
 
+    pub(crate) fn mark_started(&self) {
+        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.result.is_none() && state.started.is_none() {
+            state.started = Some(Instant::now());
+        }
+    }
+
     pub(crate) fn resolve(&self, outcome: TurnOutcome) {
         let mut outcome_slot = self
             .shared
@@ -182,6 +189,9 @@ impl TurnTicket {
                 text: take(&mut state.text),
                 output: take(&mut state.output),
                 provenance: self.provenance.clone(),
+                duration_ms: state.started.map_or(0, |start| {
+                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }),
             });
             *outcome_slot = Some(outcome);
             self.shared.event.notify(usize::MAX);

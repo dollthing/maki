@@ -526,7 +526,6 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
-        let model = maki_commands::ModelSelection::parse(&arguments);
         let theme = parsed_string_argument(&invocation, "theme");
         let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
@@ -549,7 +548,7 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let mut selection = model?;
+                    let mut selection = maki_commands::parse_model_selection(&arguments)?;
                     let model = selection.spec.as_deref().unwrap_or("");
                     let specs = if model.is_empty() || model.contains('/') {
                         Arc::from([])
@@ -1247,7 +1246,7 @@ mod tests {
         let host = Arc::new(RecordingCommandHost::default());
         let target = registry.bind_target(portable_capabilities(), host.clone());
         for input in [
-            r#"/model "openai/gpt-5" thinking="high" fast=true"#,
+            "/model openai/gpt-5{thinking=high, fast=true}",
             "/model fast=false",
             "/model thinking=2048",
         ] {

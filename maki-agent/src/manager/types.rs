@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
@@ -61,6 +61,7 @@ pub struct AgentNodeSnapshot {
 pub struct AgentRef {
     pub(crate) manager: super::AgentManagerHandle,
     pub(crate) agent_id: AgentId,
+    pub(crate) terminal: Arc<Mutex<Option<AgentNodeSnapshot>>>,
 }
 
 impl std::fmt::Debug for AgentRef {
@@ -98,7 +99,21 @@ impl AgentRef {
     }
 
     pub fn snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {
-        self.manager.node(self.agent_id)
+        if let Some(snapshot) = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return Ok(snapshot);
+        }
+        self.manager.node(self.agent_id).or_else(|error| {
+            self.terminal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or(error)
+        })
     }
 
     pub fn effective_config(
@@ -276,6 +291,25 @@ impl TurnPermitLease {
         admission: PromptAdmission,
         timeout: Option<Duration>,
     ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
+        self.admit_and_wait_for_descendant_with_options(
+            current,
+            child_id,
+            actor,
+            admission,
+            timeout,
+            crate::TurnAdmissionOptions::default(),
+        )
+    }
+
+    pub fn admit_and_wait_for_descendant_with_options(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        admission: PromptAdmission,
+        timeout: Option<Duration>,
+        options: crate::TurnAdmissionOptions,
+    ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
         if !Arc::ptr_eq(&self.inner, &current.lease.inner) {
             return Err(super::ManagerError::WrongManager);
         }
@@ -289,10 +323,11 @@ impl TurnPermitLease {
                 actual_id: actor.agent_id(),
             });
         }
-        let Ok(ticket) = managed_actor.admit_turn(
+        let Ok(ticket) = managed_actor.admit_turn_with_options(
             admission.input,
             admission.event_sender,
             admission.correlation,
+            options,
         ) else {
             return Ok(None);
         };

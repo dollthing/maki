@@ -123,6 +123,8 @@ Use existing in-memory/test-support hosts, Gate/ScriptedBackend/canned provider 
 
 Run plan_reviewer on this revised contract before PR 5 submission; the older review does not apply. Fix/rebut findings and repeat after high/critical findings. After implementation and all automated checks, dispatch independent general review focusing on authority propagation/expiry, concurrent callbacks and cancellation cleanup, settlement/provenance, FIFO/preparation, actual-root coverage, tool-schema output and compatibility. Fix or explicitly rebut findings; repeat for critical findings until resolved or operator decision required.
 
+Verification status: the exhaustive original-review disposition ledger is in [the delta Verification section](../../PR_COMMENT_IMPLEMENTATION_PLAN.md#verification-and-review-ledger). Documentation metadata is updated but remote regeneration and generated-drift checks remain pending. The latest main-reported run covered 7,100 tests: 7,096 passed and four failed; no AC or CI completion is claimed. Runtime findings remain pending until their owner records exact passing test evidence.
+
 ## Documentation Strategy
 
 Update API metadata/classes and regenerate existing Lua API/command references. Explain ctx authority tiers/lifetime, send versus enqueue, tickets/results/timeouts, concurrent typed events and plugin origin, defer_close, transcript truncation/compaction, custom prompt composition, schema-reporting tools and model selection/persistence semantics. Document legacy Session/task mappings and unmanaged-root limitations without claiming frontend migration. Update delivery ledger only after implementation evidence. No new documentation file or /goal plugin is required by PR 5.

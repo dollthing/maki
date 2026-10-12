@@ -16,6 +16,80 @@ pub fn generate() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    #[test_case("maki.api.register_command()", &[
+        "`handler(opts, ctx)`",
+        "trusted invocation-scoped LuaCtx",
+        "pinned agent",
+        "Existing one-argument handlers still work.",
+    ]; "command_context")]
+    #[test_case("maki.keymap.set()", &[
+        "`rhs(nil, ctx)`",
+        "trusted invocation-scoped LuaCtx",
+        "`maki.agent.current(ctx)`",
+        "Retaining the context does not extend its authority beyond the callback.",
+    ]; "keymap_context")]
+    #[test_case("maki.api.run_command()", &[
+        "Delegated tool handlers cannot call this trusted command executor.",
+        "Nested trusted command calls retain the invoking command's pinned agent target.",
+    ]; "nested_command_authority")]
+    #[test_case("Agent:status()", &["active_turn", "cumulative integers", "closed snapshot", "Host roots expose only id"]; "agent_status")]
+    #[test_case("Agent:model()", &["{spec, thinking, fast}", "Descriptive model metadata is not included."]; "agent_selection")]
+    #[test_case("Agent:available_models()", &["Array of available model spec strings."]; "model_discovery")]
+    #[test_case("maki.agent.spawn()", &["model_spec", "local_tools", "output_schema", "auto_deliver", "inherit_provider"]; "spawn_options")]
+    #[test_case("Agent:transcript()", &["transcript_unavailable", "omitted_tool_groups", "compacted", "max_bytes"]; "transcript_fields")]
+    #[test_case("Agent:prompt()", &["kind = \"timeout\"", "exact ticket remains usable", "Timeout does not cancel execution."]; "prompt_ticket")]
+    #[test_case("Agent:on_turn_start()", &["handler(payload, ctx)", "source_turn?", "plugin_generation?", "selection"]; "start_event")]
+    #[test_case("Agent:on_turn_end()", &["same fields as AgentTurn:result and AgentTurn:wait"]; "end_event")]
+    #[test_case("Agent:on_idle()", &["handler({agent_id}, ctx)", "not a reservation"]; "idle_event")]
+    #[test_case("Agent:on_config_change()", &["generation", "selection", "mode (registered name)"]; "config_event")]
+    #[test_case("Agent:on_close()", &["lifecycle is \"closed\" or \"shutdown\""]; "close_event")]
+    #[test_case("LuaCtx:agent()", &["pinned invocation subject", "maki.agent.current(ctx)"]; "context_agent")]
+    #[test_case("LuaCtx:model()", &["admitted selection", "{spec, thinking, fast}", "unsupported-capability error"]; "context_model")]
+    #[test_case("LuaCtx:defer_close()", &["including cancellation", "host-held cleanup", "Host roots do not support"]; "context_cleanup")]
+    #[test_case("Session:status()", &["cumulative session counters", "retryable", "Authority failure"]; "session_status")]
+    fn generated_docs_contain_callback_authority_contract(signature: &str, required: &[&str]) {
+        let page = generate();
+        let heading = format!("### `{signature}`");
+        let start = page.find(&heading).expect("API section must be rendered");
+        let end = page[start..]
+            .find("\n---\n")
+            .map(|offset| start + offset)
+            .expect("API section must have a separator");
+        let rendered = page[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for text in required {
+            assert!(
+                rendered.contains(text),
+                "rendered {signature} docs must contain {text:?}"
+            );
+        }
+    }
+
+    #[test_case("maki.agent.AgentTurn", &["lookup eviction", "cancellation_reason", "user_message", "retryable", "per-turn counters", "last assistant message", "duration_ms", "immutable elapsed milliseconds for this turn"]; "ticket_result_fields")]
+    #[test_case("maki.agent.AgentSubscription", &["Garbage collection does not unsubscribe", "Close explicitly"]; "subscription_lifetime")]
+    fn generated_class_docs_contain_lifetime_and_result_contract(name: &str, required: &[&str]) {
+        let module = maki_lua::docs::api_docs()
+            .into_iter()
+            .find(|module| module.name == name)
+            .expect("class metadata must be registered");
+        let page = generate();
+        let description = module.desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let rendered = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            rendered.contains(&description),
+            "class description must be rendered"
+        );
+        for text in required {
+            assert!(
+                description.contains(text),
+                "{name} description must contain {text:?}"
+            );
+        }
+    }
 
     const MUTABLE_PATH_CONTRACT: &str = "same-path mutation is already in progress";
     const SERIALIZATION_CONTRACT: &str = "same-process per-path mutation serialization";

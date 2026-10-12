@@ -16,6 +16,7 @@ pub(crate) enum CommandEvent {
     Host {
         target: maki_commands::InvocationTargetId,
         request: HostRequest,
+        admission: Option<Box<TrustedTarget>>,
         reply: flume::Sender<Result<HostResponse, CommandError>>,
     },
     Outcome {
@@ -65,6 +66,15 @@ impl CommandHost for UiCommandHost {
             .map(|target| Arc::new(target) as Arc<dyn Any + Send + Sync>)
     }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        self.request_with_admission(request, self.admission_context())
+    }
+
+    fn request_with_admission(
+        &self,
+        request: HostRequest,
+        admission: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let admission = admission.and_then(|value| value.downcast_ref::<TrustedTarget>().cloned());
         let Some(target) = self.target.get().copied() else {
             return Box::pin(async { Err(CommandError::StaleTarget) });
         };
@@ -74,6 +84,7 @@ impl CommandHost for UiCommandHost {
             tx.send_async(CommandEvent::Host {
                 target,
                 request,
+                admission: admission.map(Box::new),
                 reply,
             })
             .await
@@ -222,6 +233,14 @@ impl CommandRuntime {
                 .await;
         })
         .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<CommandEvent> {
+        self.event_rx.recv_timeout(timeout).ok()
     }
 
     #[cfg(test)]

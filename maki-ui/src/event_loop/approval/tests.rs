@@ -236,11 +236,38 @@ fn rejects_active_managed_child_without_cancelling_it() {
         });
         apply_patch(&actor, model_patch(SOURCE_MODEL, provider));
         event_loop.submit_text(index, HISTORY.into()).unwrap();
-        pump_until(event_loop, |_| !entry.is_empty());
-        entry.recv_timeout(WAIT).unwrap();
         pump_until(event_loop, |event_loop| {
-            actor.snapshot().status == ActorStatus::Idle
-                && event_loop.sessions[index].app.status == Status::Idle
+            if let Some(maki_agent::TurnOutcome::Failed { failure, .. }) = actor.snapshot().latest {
+                panic!("root failed before child start: {}", failure.diagnostic);
+            }
+            let history = event_loop.sessions[index].coordinator.read().history();
+            for message in history.iter() {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    } = block
+                    {
+                        panic!("child tool failed before provider start: {content:?}");
+                    }
+                }
+            }
+            !entry.is_empty()
+        });
+        entry.recv_timeout(WAIT).unwrap();
+        let root_deadline = Instant::now() + WAIT;
+        pump_until(event_loop, |event_loop| {
+            let ready = actor.snapshot().status == ActorStatus::Idle
+                && event_loop.sessions[index].app.status == Status::Idle;
+            assert!(
+                ready || Instant::now() < root_deadline,
+                "root did not settle after child start: actor={:?}, app={:?}, graph={:?}",
+                actor.snapshot(),
+                event_loop.sessions[index].app.status,
+                manager.snapshot()
+            );
+            ready
         });
         let children: Vec<_> = manager
             .snapshot()

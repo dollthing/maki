@@ -1,4 +1,4 @@
-use maki_domain::ThinkingConfig;
+pub use maki_domain::ModelSelection;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -137,48 +137,88 @@ pub enum BuiltinOperation {
     Trust,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModelSelection {
-    pub spec: Option<Arc<str>>,
-    pub thinking: Option<ThinkingConfig>,
-    pub fast: Option<bool>,
-}
-
-impl ModelSelection {
-    pub fn parse(arguments: &str) -> Result<Self, crate::CommandError> {
-        let invalid = |message: String| crate::CommandError::Producer(Arc::from(message));
-        let mut selection = Self::default();
-        for token in crate::lex_strict(arguments).map_err(|error| invalid(error.to_string()))? {
-            if let Some((key, value)) = token.value.split_once('=') {
-                match key {
-                    "thinking" if selection.thinking.is_none() => {
-                        selection.thinking = Some(
-                            ThinkingConfig::parse_setting(value)
-                                .map_err(|error| invalid(error.to_string()))?,
-                        );
-                    }
-                    "fast" if selection.fast.is_none() => {
-                        selection.fast = Some(match value {
-                            "true" => true,
-                            "false" => false,
-                            _ => return Err(invalid("fast must be true or false".into())),
-                        });
-                    }
-                    "thinking" | "fast" => {
-                        return Err(invalid(format!("duplicate model option: {key}")));
-                    }
-                    _ => return Err(invalid(format!("unknown model option: {key}"))),
+pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::CommandError> {
+    let invalid = |message: String| crate::CommandError::Producer(Arc::from(message));
+    let mut selection = ModelSelection::default();
+    // Quotes and escapes make a token literal; option values may still be quoted.
+    let tokens = crate::lex_strict(arguments).map_err(|error| invalid(error.to_string()))?;
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        let mut end = token.range.end;
+        let token_raw = &arguments[token.range.clone()];
+        let literal = token_raw.starts_with(['\'', '"']);
+        if literal && token_raw.contains(['{', '}']) {
+            let quote = token_raw.chars().next().unwrap();
+            let mut escaped = false;
+            let close = token_raw.char_indices().skip(1).find_map(|(index, ch)| {
+                if escaped {
+                    escaped = false;
+                    None
+                } else if ch == '\\' {
+                    escaped = true;
+                    None
+                } else {
+                    (ch == quote).then_some(index)
                 }
-            } else if token.value.is_empty() {
-                return Err(invalid("model spec must not be empty".into()));
-            } else if selection.spec.is_none() {
-                selection.spec = Some(token.value);
-            } else {
-                return Err(invalid("expected at most one model spec".into()));
+            });
+            if close.is_none_or(|close| close + quote.len_utf8() != token_raw.len()) {
+                return Err(invalid("mixed quoted model syntax".into()));
             }
         }
-        Ok(selection)
+        if !literal && arguments[token.range.clone()].contains('{') {
+            while !arguments[token.range.start..end].ends_with('}') {
+                let Some(next) = tokens.next() else {
+                    return Err(invalid("malformed model options".into()));
+                };
+                end = next.range.end;
+            }
+        }
+        let raw = &arguments[token.range.start..end];
+        if raw.starts_with(['\'', '"', '\\']) {
+            selection
+                .set_spec(token.value)
+                .map_err(|error| invalid(error.to_string()))?;
+        } else if let Some(open) = raw.find('{') {
+            if !raw.ends_with('}') || raw[..open].contains('}') {
+                return Err(invalid("malformed model options".into()));
+            }
+            let spec = &raw[..open];
+            if spec.contains(['\'', '"', '\\']) {
+                return Err(invalid("mixed quoted model syntax".into()));
+            }
+            let options = &raw[open + 1..raw.len() - 1];
+            if options.is_empty() || options.contains(['{', '}']) {
+                return Err(invalid("malformed model options".into()));
+            }
+            selection
+                .set_spec(spec)
+                .map_err(|error| invalid(error.to_string()))?;
+            for option in options.split(',') {
+                let tokens =
+                    crate::lex_strict(option).map_err(|error| invalid(error.to_string()))?;
+                let [token] = tokens.as_slice() else {
+                    return Err(invalid("malformed model options".into()));
+                };
+                let Some((key, value)) = token.value.split_once('=') else {
+                    return Err(invalid("expected model option key=value".into()));
+                };
+                selection
+                    .set_option(key, value)
+                    .map_err(|error| invalid(error.to_string()))?;
+            }
+        } else if raw.contains('}') {
+            return Err(invalid("malformed model options".into()));
+        } else if let Some((key, value)) = token.value.split_once('=') {
+            selection
+                .set_option(key, value)
+                .map_err(|error| invalid(error.to_string()))?;
+        } else {
+            selection
+                .set_spec(token.value)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
     }
+    Ok(selection)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

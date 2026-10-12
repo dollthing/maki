@@ -370,7 +370,7 @@ impl AgentHandles {
         let mut handles = Self::prepare(
             model_slot,
             initial_config,
-            initial_history,
+            HistorySnapshot::new(initial_history),
             config,
             tool_output_lines,
             permissions,
@@ -393,7 +393,7 @@ impl AgentHandles {
     pub(crate) fn prepare(
         model_slot: &Arc<ProviderSlot>,
         initial_config: maki_agent::EffectiveAgentConfig,
-        initial_history: Vec<Message>,
+        initial_history: HistorySnapshot,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -515,7 +515,10 @@ impl AgentHandles {
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             None,
-            history,
+            HistorySnapshot {
+                messages: Arc::new(history),
+                ..(*self.history.load_full()).clone()
+            },
             config,
             tool_output_lines,
             permissions,
@@ -586,7 +589,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ProviderSlot>,
     initial_config: Option<maki_agent::EffectiveAgentConfig>,
-    initial_history: Vec<Message>,
+    initial_history: HistorySnapshot,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -607,8 +610,8 @@ fn spawn_agent_internal(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
     // snapshot synchronously, before any handle escapes.
-    let shared_history: SharedMessages =
-        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    let initial_history = Arc::unwrap_or_clone(initial_history.messages);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let prepared_mailbox = mailbox

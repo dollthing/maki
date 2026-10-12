@@ -7,6 +7,7 @@ mod config_tests;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -34,6 +35,8 @@ use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, Tur
 use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 use std::borrow::Cow;
 
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const CONDITION_TIMEOUT: &str = "condition never became true";
 const BILLED_RESPONSE: &str = "billed response";
 const BILLED_COST: f64 = 0.007;
 const BILLED_LIST_COST: f64 = 0.009;
@@ -68,7 +71,7 @@ fn fast_change(fast: bool) -> super::ConfigChange {
     })
 }
 
-fn policy(fast: bool) -> crate::RunSettings {
+pub(super) fn policy(fast: bool) -> crate::RunSettings {
     let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
     model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
     crate::RunSettings {
@@ -255,7 +258,12 @@ impl ActorBackend for ScriptedBackend {
                     .is_some_and(|snapshot| snapshot.bindings.get("queued_tool").is_some()),
             ));
             self.state.entered.fetch_add(1, Ordering::SeqCst);
-            history.push(Message::user(input.message));
+            for message in input.preamble {
+                history.push(message);
+            }
+            if !input.message.is_empty() {
+                history.push(Message::user(input.message));
+            }
 
             // Poll the interrupt source exactly once per turn, after the
             // gate, so a test can queue a root mid-run and the fold is
@@ -611,7 +619,7 @@ fn typed_actor_events_are_ordered_future_only_and_broadcast() {
 
 #[test_case::test_case(true; "streamed_response")]
 #[test_case::test_case(false; "response_without_deltas")]
-fn text_attempt_retry_and_reconcile_preserve_prior_responses(streamed: bool) {
+fn text_attempt_retry_and_reconcile_returns_last_response(streamed: bool) {
     const PRIOR: &str = "prior";
     const FAILED: &str = "failed";
     const FINAL: &str = "final";
@@ -637,10 +645,7 @@ fn text_attempt_retry_and_reconcile_preserve_prior_responses(streamed: bool) {
     output.complete_message(LATE);
     output.append_text(LATE);
     ticket.resolve(outcome);
-    assert_eq!(
-        ticket.peek_result().unwrap().text,
-        format!("{PRIOR}{FINAL}")
-    );
+    assert_eq!(ticket.peek_result().unwrap().text, FINAL);
 }
 
 #[test_case::test_case(false; "complete")]
@@ -899,6 +904,216 @@ fn transcript_releases_locks_before_encoding_while_turn_settles() {
 }
 
 #[test]
+fn terminal_runner_exits_without_requiring_another_wake() {
+    smol::block_on(async {
+        const CORRELATION: &str = "terminal runner";
+        let (actor, task) = spawn(ScriptedBackend::new());
+        let (popped, release) = actor.pause_after_next_pop();
+        let ticket = actor
+            .admit_turn(input(CORRELATION), None, CORRELATION.into())
+            .unwrap();
+        popped.recv_async().await.unwrap();
+        actor.close();
+        actor.wake.consume();
+        release.send(()).unwrap();
+        ticket.wait().await;
+        futures_lite::future::or(task, async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("terminal runner waited for another wake");
+        })
+        .await;
+    });
+}
+
+#[test_case::test_case(false; "queued_cancel_zero")]
+#[test_case::test_case(true; "started_duration_frozen")]
+fn ticket_duration_is_measured_once_at_settlement(started: bool) {
+    let ticket = super::TurnTicket::new(crate::TurnId::generate(), Arc::new(()));
+    if started {
+        ticket.mark_started();
+    }
+    ticket.resolve(super::cancelled_outcome(
+        AgentId::generate(),
+        ticket.turn_id(),
+        TurnCancellationReason::User,
+    ));
+    let duration = ticket.peek_result().unwrap().duration_ms;
+    if !started {
+        assert_eq!(duration, 0);
+    }
+    ticket.mark_started();
+    assert_eq!(ticket.peek_result().unwrap().duration_ms, duration);
+}
+
+#[test]
+fn admission_constraint_revalidates_fifo_predecessor_before_backend() {
+    smol::block_on(async {
+        const DENIED: &str = "admitted configuration exceeds captured ceiling";
+        const CORRELATION: &str = "constrained turn";
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(crate::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let barrier = actor.reserve_config_update().unwrap();
+        let constraint_actor = actor.clone();
+        let ticket = actor
+            .admit_turn_with_options(
+                input(CORRELATION),
+                None,
+                CORRELATION.into(),
+                super::TurnAdmissionOptions {
+                    policy_constraint: Some(Arc::new(move |config| {
+                        assert!(constraint_actor.inner.state.try_lock().is_ok());
+                        if config.fast {
+                            Err(DENIED.into())
+                        } else {
+                            Ok(())
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(ticket.peek().is_none());
+        barrier.resolve(Ok(fast_change(true))).unwrap();
+        let outcome = ticket.wait().await;
+        assert!(matches!(outcome, TurnOutcome::Failed { failure, .. }
+            if failure.diagnostic == DENIED && !failure.retryable));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        assert!(actor.effective_config().unwrap().fast);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn presentation_counter_is_actor_owned_and_cancel_fences_late_allocation() {
+    smol::block_on(async {
+        const CORRELATION: &str = "presentation";
+        let gate = Gate::new();
+        let (actor, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        assert_eq!(actor.reserve_presentation(4), 5);
+        actor.observe_presentation(9);
+        assert_eq!(actor.presentation_id(), 9);
+        let ticket = actor
+            .admit_turn(input(CORRELATION), None, CORRELATION.into())
+            .unwrap();
+        until(|| actor.processing_turn_id() == Some(ticket.turn_id())).await;
+        assert_eq!(
+            actor
+                .allocate_processing_presentation(ticket.turn_id(), Some(9))
+                .unwrap(),
+            9
+        );
+        let (turn, fence) = actor.capture_processing_presentation_cut(9);
+        assert_eq!(turn, Some(ticket.turn_id()));
+        assert_eq!(fence, 10);
+        assert!(matches!(
+            actor.allocate_processing_presentation(ticket.turn_id(), None),
+            Err(ActorError::PolicyCancelled)
+        ));
+        gate.open();
+        ticket.wait().await;
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn retained_results_evict_without_invalidating_held_tickets() {
+    smol::block_on(async {
+        const TEXT: &str = "retained";
+        let (actor, task) = spawn(ScriptedBackend::new());
+        let first = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
+        first.wait().await;
+        for _ in 0..super::MAX_RETAINED_TURN_RESULTS {
+            actor
+                .admit_turn(input(TEXT), None, TEXT.into())
+                .unwrap()
+                .wait()
+                .await;
+        }
+        assert!(actor.turn_ticket(first.turn_id()).is_none());
+        assert!(actor.outcome(first.turn_id()).is_none());
+        assert_eq!(
+            actor.inner.outcomes.lock().unwrap().len(),
+            super::MAX_RETAINED_TURN_RESULTS
+        );
+        assert_eq!(
+            actor.inner.retained_tickets.lock().unwrap().len(),
+            super::MAX_RETAINED_TURN_RESULTS
+        );
+        assert_eq!(
+            actor.inner.coverage.lock().unwrap().len(),
+            super::MAX_RETAINED_TURN_RESULTS
+        );
+        assert!(first.peek_result().is_some());
+        actor.close();
+        task.await;
+        assert!(first.peek_result().is_some());
+    });
+}
+
+#[test]
+fn default_transcript_ignores_cancelled_queued_turn() {
+    smol::block_on(async {
+        const TEXT: &str = "terminal history";
+        let (actor, task) = spawn(ScriptedBackend::new());
+        let first = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
+        first.wait().await;
+        let barrier = actor.reserve_config_update().unwrap();
+        for _ in 0..=super::MAX_RETAINED_TURN_RESULTS {
+            let queued = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
+            actor.cancel_turn(queued.turn_id()).unwrap();
+            queued.wait().await;
+        }
+        assert!(actor.turn_ticket(first.turn_id()).is_none());
+        assert!(
+            !actor
+                .inner
+                .coverage
+                .lock()
+                .unwrap()
+                .contains_key(&first.turn_id())
+        );
+        let snapshot = actor
+            .transcript(super::TranscriptRequest {
+                through_turn: None,
+                last_messages: 10,
+                max_bytes: 1024,
+            })
+            .unwrap();
+        assert_eq!(snapshot.through_turn, Some(first.turn_id()));
+        assert_eq!(snapshot.messages[0]["content"][0]["text"], TEXT);
+        drop(barrier);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn failed_turn_keeps_partial_last_assistant_message() {
+    const NARRATION: &str = "earlier narration";
+    const PARTIAL: &str = "partial final answer";
+    let ticket = super::TurnTicket::new(crate::TurnId::generate(), Arc::new(()));
+    let output = ticket.output();
+    output.complete_message(NARRATION);
+    output.begin_message();
+    output.append_text(PARTIAL);
+    ticket.resolve(super::cancelled_outcome(
+        AgentId::generate(),
+        ticket.turn_id(),
+        TurnCancellationReason::User,
+    ));
+    assert_eq!(ticket.peek_result().unwrap().text, PARTIAL);
+}
+
+#[test]
 fn transcript_exact_boundary_pending_unknown_and_rewrite() {
     smol::block_on(async {
         let gate = Gate::new();
@@ -948,20 +1163,160 @@ fn transcript_exact_boundary_pending_unknown_and_rewrite() {
     });
 }
 
+#[test]
+fn busy_parent_delivery_runs_after_queued_user_and_config_fifo() {
+    smol::block_on(async {
+        const ACTIVE: &str = "active parent";
+        const BEFORE: &str = "queued before config";
+        const AFTER: &str = "queued after delivery";
+        const CHILD: &str = "child response";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (parent, task) = spawn(backend);
+        parent
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let events = parent.subscribe_events();
+        let active = parent
+            .admit_turn(input(ACTIVE), None, ACTIVE.into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let before = parent
+            .admit_turn(input(BEFORE), None, BEFORE.into())
+            .unwrap();
+        let config = parent.reserve_config_update().unwrap();
+        let source_agent = AgentId::generate();
+        let source_turn = crate::TurnId::generate();
+        let envelope = Arc::new(super::ChildDelivery {
+            parent_id: parent.agent_id(),
+            compatibility_id: Some(CHILD.into()),
+            label: None,
+            child_config: None,
+            correlation: CHILD.into(),
+            result: super::TurnResult {
+                outcome: TurnOutcome::cancelled(
+                    source_agent,
+                    source_turn,
+                    TokenUsage::default(),
+                    0,
+                    TurnCancellationReason::User,
+                ),
+                text: CHILD.into(),
+                output: Vec::new(),
+                provenance: super::TurnProvenance::default(),
+                duration_ms: 0,
+            },
+        });
+        let delivered = super::delivery::admit_delivery(&parent.inner, envelope).unwrap();
+        let after = parent.admit_turn(input(AFTER), None, AFTER.into()).unwrap();
+        config.resolve(Ok(fast_change(true))).unwrap();
+        assert!(delivered.peek().is_none());
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        gate.open();
+        active.wait().await;
+        before.wait().await;
+        config.wait().await.unwrap();
+        delivered.wait().await;
+        after.wait().await;
+        assert_eq!(
+            *state.policies.lock().unwrap(),
+            vec![
+                (ACTIVE.into(), Some(false), 0),
+                (BEFORE.into(), Some(false), 0),
+                (String::new(), Some(true), 1),
+                (AFTER.into(), Some(true), 1),
+            ]
+        );
+        assert_eq!(delivered.provenance().source_agent, Some(source_agent));
+        assert_eq!(delivered.provenance().source_turn, Some(source_turn));
+        let history = parent.inner.history.load_full();
+        let observation = history
+            .messages
+            .iter()
+            .find(|message| message.is_observation())
+            .unwrap();
+        assert_eq!(
+            observation.observation_source,
+            Some(maki_providers::ObservationSource::ChildResult {
+                agent_id: source_agent.to_string(),
+                turn_id: source_turn.to_string(),
+            })
+        );
+        let restored: Message =
+            serde_json::from_value(serde_json::to_value(observation).unwrap()).unwrap();
+        assert_eq!(restored.observation_source, observation.observation_source);
+        let statuses: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                super::ActorEvent::Delivery(event) => Some(event.status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                super::DeliveryStatus::Accepted {
+                    parent_turn_id: delivered.turn_id()
+                },
+                super::DeliveryStatus::Executed {
+                    parent_turn_id: delivered.turn_id()
+                },
+            ]
+        );
+        parent.close();
+        task.await;
+    });
+}
+
+#[test]
+fn parent_delivery_policy_is_creation_time_only() {
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .configure_parent_delivery(true, Some("compatibility".into()))
+            .unwrap();
+        assert!(matches!(
+            actor.configure_parent_delivery(false, None),
+            Err(ActorError::Busy)
+        ));
+        let ticket = actor
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        ticket.wait().await;
+        assert!(matches!(
+            actor.configure_parent_delivery(false, None),
+            Err(ActorError::Busy)
+        ));
+        actor.close();
+        assert!(matches!(
+            actor.configure_parent_delivery(false, None),
+            Err(ActorError::Closed)
+        ));
+        task.await;
+    });
+}
+
 fn spawn(backend: impl ActorBackend + 'static) -> (AgentActorHandle, smol::Task<()>) {
     AgentActorHandle::spawn(AgentId::generate(), Vec::new(), None, Box::new(backend))
 }
 
-/// Yields to the single-threaded executor until `cond` holds. Bounded only
-/// so a broken test cannot hang; never sleeps.
 async fn until(cond: impl Fn() -> bool) {
-    for _ in 0..100_000 {
-        if cond() {
-            return;
-        }
-        smol::future::yield_now().await;
-    }
-    panic!("condition never became true");
+    futures_lite::future::or(
+        async {
+            while !cond() {
+                smol::future::yield_now().await;
+            }
+        },
+        async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("{CONDITION_TIMEOUT}");
+        },
+    )
+    .await;
 }
 
 #[test]

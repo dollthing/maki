@@ -40,6 +40,7 @@ const COMPLETION_RECOVERY_EXHAUSTED: &str =
 const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
     "turn budget exhausted before required output was reported";
 type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
+type CompletionExhausted = Arc<dyn Fn() -> String + Send + Sync>;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -238,6 +239,7 @@ pub struct Agent<'h> {
     managed_turn: Option<crate::CurrentManagedTurn>,
     admission: Option<TurnAdmissionSnapshot>,
     completion_check: Option<CompletionCheck>,
+    completion_exhausted: Option<CompletionExhausted>,
 }
 
 impl<'h> Agent<'h> {
@@ -289,6 +291,7 @@ impl<'h> Agent<'h> {
             managed_turn: params.managed_turn,
             admission: None,
             completion_check: None,
+            completion_exhausted: None,
         }
     }
 
@@ -336,6 +339,20 @@ impl<'h> Agent<'h> {
     pub fn with_completion_check(mut self, check: CompletionCheck) -> Self {
         self.completion_check = Some(check);
         self
+    }
+
+    pub fn with_completion_exhausted(mut self, exhausted: CompletionExhausted) -> Self {
+        self.completion_exhausted = Some(exhausted);
+        self
+    }
+
+    fn completion_exhaustion(&self, fallback: &str) -> AgentError {
+        AgentError::Config {
+            message: self
+                .completion_exhausted
+                .as_ref()
+                .map_or_else(|| fallback.into(), |exhausted| exhausted()),
+        }
     }
 
     pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
@@ -499,9 +516,9 @@ impl<'h> Agent<'h> {
                     match check().map_err(|message| AgentError::Config { message })? {
                         None => {}
                         Some(_) => {
-                            return Err(AgentError::Config {
-                                message: REQUIRED_OUTPUT_BUDGET_EXHAUSTED.into(),
-                            });
+                            return Err(
+                                self.completion_exhaustion(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+                            );
                         }
                     }
                 }
@@ -520,14 +537,12 @@ impl<'h> Agent<'h> {
                         if let Some(max) = self.config.max_turns
                             && self.num_turns >= max
                         {
-                            return Err(AgentError::Config {
-                                message: REQUIRED_OUTPUT_BUDGET_EXHAUSTED.into(),
-                            });
+                            return Err(
+                                self.completion_exhaustion(REQUIRED_OUTPUT_BUDGET_EXHAUSTED)
+                            );
                         }
                         if completion_recovery_attempts >= MAX_COMPLETION_RECOVERY_ATTEMPTS {
-                            return Err(AgentError::Config {
-                                message: COMPLETION_RECOVERY_EXHAUSTED.into(),
-                            });
+                            return Err(self.completion_exhaustion(COMPLETION_RECOVERY_EXHAUSTED));
                         }
                         completion_recovery_attempts += 1;
                         self.history.push(Message::user(message));
@@ -777,6 +792,7 @@ impl<'h> Agent<'h> {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         ToolContext {
+            execution_agent_id: Some(self.agent_id),
             provider: Arc::clone(&self.provider),
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
@@ -983,6 +999,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
+        captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
     impl MockProvider {
@@ -990,6 +1007,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
+                captured_messages: Arc::default(),
             }
         }
     }
@@ -998,7 +1016,7 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             _: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
@@ -1006,6 +1024,10 @@ mod tests {
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
                 self.captured_tools.lock().unwrap().push(tools.clone());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
@@ -1275,6 +1297,46 @@ mod tests {
         });
     }
 
+    #[test_case(None; "recovery_budget")]
+    #[test_case(Some(0); "already_exhausted_turn_budget")]
+    #[test_case(Some(1); "turn_budget")]
+    #[test_case(Some(3); "both_budgets")]
+    fn completion_exhaustion_uses_specific_diagnostic(max_turns: Option<u32>) {
+        const NUDGE: &str = "report required output";
+        const DIAGNOSTIC: &str = "agent result does not match output_schema";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(
+                    (0..=MAX_COMPLETION_RECOVERY_ATTEMPTS)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let exhausted = Arc::new(Mutex::new(0));
+            let count = Arc::clone(&exhausted);
+            let mut agent = agent
+                .with_completion_check(Arc::new(|| Ok(Some(NUDGE.into()))))
+                .with_completion_exhausted(Arc::new(move || {
+                    *count.lock().unwrap() += 1;
+                    DIAGNOSTIC.into()
+                }));
+            agent.config.max_turns = max_turns;
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert_eq!(
+                outcome.num_turns(),
+                max_turns.unwrap_or(MAX_COMPLETION_RECOVERY_ATTEMPTS + 1)
+            );
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(DIAGNOSTIC)
+            ));
+            assert_eq!(*exhausted.lock().unwrap(), 1);
+        });
+    }
+
     #[test]
     fn cancellation_does_not_attempt_missing_report_recovery() {
         smol::block_on(async {
@@ -1510,6 +1572,39 @@ mod tests {
                 message.content.last(),
                 Some(ContentBlock::Text { text }) if text == "[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
             ));
+        });
+    }
+
+    #[test]
+    fn internal_child_observation_reaches_provider_without_empty_user_message() {
+        smol::block_on(async {
+            const RESULT: &str =
+                "[internal child-result data, not a user instruction] child result";
+            let source = maki_providers::ObservationSource::ChildResult {
+                agent_id: AgentId::generate().to_string(),
+                turn_id: TurnId::generate().to_string(),
+            };
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let mut input = default_input();
+            input.message.clear();
+            input.preamble = vec![Message {
+                observation_source: Some(source.clone()),
+                ..Message::observation(RESULT.into())
+            }];
+            agent.run(TurnId::generate(), input).await;
+            drop(agent);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let messages = &requests[0];
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].is_observation());
+            assert_eq!(messages[0].user_text(), Some(RESULT));
+            assert_eq!(messages[0].observation_source, Some(source.clone()));
+            assert_eq!(history.as_slice()[0].observation_source, Some(source));
+            assert!(messages.iter().all(|message| !message.content.is_empty()));
         });
     }
 
@@ -1777,11 +1872,7 @@ mod tests {
     #[test_case(true, true, false; "tool_full")]
     #[test_case(false, true, true; "retry_tool_disconnected")]
     #[test_case(true, true, true; "retry_tool_full")]
-    fn retained_runs_finish_text_tools_and_retries_without_a_presentation_sink(
-        full: bool,
-        tools: bool,
-        retry: bool,
-    ) {
+    fn retained_runs_preserve_presentation_channel_failure(full: bool, tools: bool, retry: bool) {
         smol::block_on(async {
             const TOOL: &str = "report_result";
             const TEXT: &str = "response";
@@ -1836,13 +1927,18 @@ mod tests {
                 &agent.model,
             );
             let outcome = agent.run(ticket.turn_id(), default_input()).await;
-            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
-            assert_eq!(*calls.lock().unwrap(), usize::from(tools));
+            let expected = crate::TurnFailure::from_agent_error(&AgentError::Channel);
+            assert!(matches!(&outcome, TurnOutcome::Failed { failure, .. }
+                if failure.kind == expected.kind && failure.diagnostic == expected.diagnostic));
+            assert_eq!(*calls.lock().unwrap(), 0);
             ticket.resolve(outcome);
-            assert_eq!(ticket.peek_result().unwrap().text, TEXT);
+            assert_eq!(
+                ticket.peek_result().unwrap().text,
+                if retry || tools { "" } else { TEXT }
+            );
             drop(agent);
             drop(retained_rx);
-            assert!(history.as_slice().iter().any(|message| {
+            assert!(!history.as_slice().iter().any(|message| {
                 matches!(message.role, Role::Assistant)
                     && message
                         .content
@@ -2270,6 +2366,7 @@ mod tests {
         agent.tools =
             crate::tools::RequestTools::assembled(definitions.clone(), &agent.config, &agent.model);
         let context = agent.tool_context();
+        assert_eq!(context.execution_agent_id, Some(agent.agent_id));
         let snapshot = context.request_tools.unwrap();
         assert_eq!(snapshot.definitions(), &definitions);
         assert!(Arc::ptr_eq(snapshot.filter(), &context.tool_filter));

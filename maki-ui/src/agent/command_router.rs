@@ -317,7 +317,7 @@ mod tests {
             );
             assert!(matches!(
                 manager.actor(child.id()),
-                Err(ManagerError::NonLiveAgent(id)) if id == child.id()
+                Err(ManagerError::UnknownAgent(id)) if id == child.id()
             ));
             assert!(matches!(
                 child_actor.admit_turn(input(), None, "retained-task".into()),

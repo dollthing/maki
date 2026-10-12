@@ -95,6 +95,7 @@ pub(crate) struct QueueSender {
 
 /// Actor-backed facade used by production `AgentHandles`.
 pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>, run_id: Arc<AtomicU64>) -> QueueSender {
+    actor.observe_presentation(run_id.load(Ordering::Relaxed));
     QueueSender {
         backend: QueueBackend::Actor(actor),
         last_run_id: run_id,
@@ -127,34 +128,56 @@ impl QueueSender {
     pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
         match &self.backend {
             QueueBackend::Actor(actor) => {
-                actor.capture_processing_presentation_cut(&self.last_run_id, displayed_run_id)
+                let cut = actor.capture_processing_presentation_cut(displayed_run_id);
+                self.last_run_id.fetch_max(cut.1, Ordering::Relaxed);
+                cut
             }
             #[cfg(test)]
-            QueueBackend::Test(_) => (None, self.reserve_run_id(displayed_run_id)),
+            QueueBackend::Test(items) => {
+                let mut items = lock(items);
+                items.clear();
+                (None, self.reserve_run_id(displayed_run_id))
+            }
         }
     }
 
     pub(crate) fn current_run_id(&self) -> u64 {
-        self.last_run_id.load(Ordering::Relaxed)
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.presentation_id(),
+            #[cfg(test)]
+            QueueBackend::Test(_) => self.last_run_id.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn set_run_id(&self, run_id: u64) {
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.observe_presentation(run_id),
+            #[cfg(test)]
+            QueueBackend::Test(_) => {}
+        }
         self.last_run_id.fetch_max(run_id, Ordering::Relaxed);
     }
 
     pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
-        self.last_run_id
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
-                Some(allocated.max(displayed_run_id) + 1)
-            })
-            .unwrap_or_else(|allocated| allocated)
-            .max(displayed_run_id)
-            + 1
+        let id = match &self.backend {
+            QueueBackend::Actor(actor) => actor.reserve_presentation(displayed_run_id),
+            #[cfg(test)]
+            QueueBackend::Test(_) => {
+                self.last_run_id
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+                        Some(allocated.max(displayed_run_id) + 1)
+                    })
+                    .unwrap_or_else(|allocated| allocated)
+                    .max(displayed_run_id)
+                    + 1
+            }
+        };
+        self.last_run_id.fetch_max(id, Ordering::Relaxed);
+        id
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
-        self.last_run_id
-            .fetch_max(entry.run_id(), Ordering::Relaxed);
+        self.set_run_id(entry.run_id());
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).push_back(entry),

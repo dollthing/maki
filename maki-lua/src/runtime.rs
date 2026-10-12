@@ -183,11 +183,10 @@ pub(crate) struct HookRun {
     pub call: Value,
 }
 
-/// Load/clear drain in-flight tools first so we never mutate a
-/// plugin environment while a tool call is still running.
 #[derive(Clone)]
 pub(crate) struct RequestTx(pub(crate) flume::Sender<Request>);
 
+/// Load/clear drain in-flight tools before mutating plugin environments.
 pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
@@ -198,6 +197,7 @@ pub enum Request {
         provider: crate::api::session::SessionSnapshotFn,
     },
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
+    InstallHostRootServices(Box<crate::orchestration::HostRootServicesSlot>),
     SetClockFormat(maki_config::ClockFormat),
     LoadSource {
         name: Arc<str>,
@@ -270,9 +270,6 @@ pub enum Request {
         completion: Option<flume::Sender<Result<(), String>>>,
     },
     AgentEvent(Box<crate::orchestration::AgentEventRequest>),
-    CloseAgentEventCallback {
-        id: u64,
-    },
     ExecuteCommand {
         plugin: Arc<str>,
         command: Arc<str>,
@@ -287,6 +284,10 @@ pub enum Request {
     #[cfg(feature = "test-support")]
     TestBarrier {
         reply: flume::Sender<()>,
+    },
+    #[cfg(feature = "test-support")]
+    TestCollectGarbage {
+        reply: flume::Sender<mlua::Result<()>>,
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedSlots>,
@@ -548,6 +549,8 @@ pub(crate) struct TaskCell {
     pub(crate) managed_turn: Option<CurrentManagedTurn>,
     pub(crate) plugin_origin: Option<(Arc<str>, u64)>,
     pub(crate) scope_alive: bool,
+    pub(crate) delegated_tool: bool,
+    pub(crate) agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
     defer_close: Vec<Box<dyn FnOnce() + Send>>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
@@ -597,6 +600,8 @@ impl TaskCell {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
             managed_turn: None,
+            delegated_tool: false,
+            agent_parent: None,
             plugin_origin: None,
             scope_alive: true,
             defer_close: Vec::new(),
@@ -1459,19 +1464,21 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
-        Some(h) => {
-            let cell = lock_cell(h);
-            (
-                cell.cancel.clone(),
-                cell.live.clone(),
-                cell.managed_turn.clone(),
-                cell.command_depth,
-                cell.command_invocation.clone(),
-            )
-        }
-        None => (CancelToken::none(), None, None, 0, None),
-    };
+    let (cancel, live_ctx, managed_turn, agent_parent, command_depth, command_invocation) =
+        match &handle {
+            Some(h) => {
+                let cell = lock_cell(h);
+                (
+                    cell.cancel.clone(),
+                    cell.live.clone(),
+                    cell.managed_turn.clone(),
+                    cell.agent_parent.clone(),
+                    cell.command_depth,
+                    cell.command_invocation.clone(),
+                )
+            }
+            None => (CancelToken::none(), None, None, None, 0, None),
+        };
 
     let mut task = PendingAsyncTask {
         work_fn,
@@ -1480,6 +1487,10 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         live_ctx,
         owner: None,
         managed_turn,
+        agent_parent,
+        delegated_tool: handle
+            .as_ref()
+            .is_some_and(|handle| lock_cell(handle).delegated_tool),
         command_depth,
         command_invocation,
         timer_id: None,
@@ -1709,6 +1720,8 @@ pub(crate) struct PendingAsyncTask {
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
     pub managed_turn: Option<CurrentManagedTurn>,
+    pub agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
+    pub delegated_tool: bool,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
@@ -1924,6 +1937,8 @@ fn spawn_async_task(
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
         cell.managed_turn = task.managed_turn;
+        cell.agent_parent = task.agent_parent;
+        cell.delegated_tool = task.delegated_tool;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         cell.plugin_origin = task
@@ -4348,10 +4363,12 @@ async fn run_tool_start(
     tool: &str,
     input: Value,
     live: LiveCtx,
-    ctx: Box<LuaCtx>,
+    mut ctx: Box<LuaCtx>,
 ) {
-    let cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    cell.delegated_tool = true;
     let scope = TaskScope::new(lua, cell);
+    ctx.bind_origin(scope.handle());
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
@@ -4420,11 +4437,13 @@ async fn run_tool_call(
     };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
+    cell.delegated_tool = true;
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
     cell.plugin_origin = Some((plugin.clone(), generation));
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
+    ctx.pin_host_root(&lua);
     ctx.bind_origin(&handle);
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
@@ -4820,6 +4839,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
+                        Request::InstallHostRootServices(services) => {
+                            if let Some(previous) = rt.lua.app_data_ref::<crate::orchestration::HostRootServicesSlot>().and_then(|slot| slot.services.clone())
+                                && !services.services.as_ref().is_some_and(|current| Arc::ptr_eq(&previous, current))
+                            {
+                                previous.retire();
+                            }
+                            rt.lua.set_app_data(*services);
+                        }
                         Request::InstallOrchestrationServices(services) => {
                             rt.lua.set_app_data(services);
                         }
@@ -4985,8 +5012,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                             parsed.as_ref(),
                                             typed,
                                         )?;
-                                        let ctx = target.map_err(mlua::Error::runtime)?
-                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
+                                        let ctx = match target.map_err(mlua::Error::runtime)? {
+                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin.clone())),
+                                            None => LuaCtx::trusted_host_root_context(&lua, plugin.clone())
+                                                .map_err(mlua::Error::runtime)?,
+                                        };
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
@@ -5014,8 +5044,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::TestBarrier { reply } => {
                             let _ = reply.send(());
                         }
-                        Request::CloseAgentEventCallback { id } => {
-                            crate::orchestration::close_event_callback(&rt.lua, id);
+                        #[cfg(feature = "test-support")]
+                        Request::TestCollectGarbage { reply } => {
+                            let result = rt.lua.gc_collect().and_then(|()| rt.lua.gc_collect());
+                            let _ = reply.send(result);
                         }
                         Request::AgentEvent(request) => {
                             if let Some((function, plugin, cancel)) = crate::orchestration::event_callback(&rt.lua, request.callback_id) {
@@ -5026,6 +5058,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     if crate::orchestration::event_callback(&lua, request.callback_id).is_none() {
                                         return;
                                     }
+                                    let _event_lease = request.lease;
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
                                     let mut target = request.target;
                                     if let Some(services) = lua.app_data_ref::<crate::orchestration::OrchestrationServicesSlot>().and_then(|slot| slot.0.clone())
@@ -5067,8 +5100,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let run = async {
                                         let opts = lua.create_table()?;
                                         set_lua_command_options(&lua, &opts, &options_invocation)?;
-                                        let ctx = target.map_err(mlua::Error::runtime)?
-                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
+                                        let ctx = match target.map_err(mlua::Error::runtime)? {
+                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin.clone())),
+                                            None => LuaCtx::trusted_host_root_context(&lua, plugin.clone())
+                                                .map_err(mlua::Error::runtime)?,
+                                        };
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
@@ -5334,8 +5370,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 ex.spawn(async move {
                                     let scope = TaskScope::detached(&lua);
                                     let run = async {
-                                        let ctx = target.map_err(mlua::Error::runtime)?
-                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin));
+                                        let ctx = match target.map_err(mlua::Error::runtime)? {
+                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin)),
+                                            None => LuaCtx::trusted_host_root_context(&lua, plugin)
+                                                .map_err(mlua::Error::runtime)?,
+                                        };
                                         func.call_async::<()>((LuaValue::Nil, ctx)).await
                                     };
                                     if let Err(e) = run_scoped(&lua, scope, run).await {
@@ -6338,6 +6377,8 @@ mod tests {
             live_ctx: None,
             owner: None,
             managed_turn: None,
+            agent_parent: None,
+            delegated_tool: false,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
@@ -6870,11 +6911,12 @@ mod tests {
             live_ctx: None,
             owner: None,
             managed_turn: None,
+            agent_parent: None,
+            delegated_tool: false,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
         };
-
         let ex = Rc::new(smol::LocalExecutor::new());
         block_on_or_fail(ex.run(async {
             spawn_async_task(&lua, &ex, &Rc::new(gate()), task);

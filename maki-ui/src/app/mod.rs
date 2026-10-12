@@ -81,7 +81,7 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, Role, add_cost, format_tokens};
+use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -128,10 +128,6 @@ const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
-/// Wraps an auto-queued subagent reply with its task id so the main agent can
-/// tell it apart from a directly typed user message.
-const SUBAGENT_REPLY_HEADER: &str = "[msg from ";
-const SUBAGENT_REPLY_SUFFIX: &str = "] ";
 /// Length cap for the `/tasks` row message snippet (AC.10).
 const SNIPPET_CHARS: usize = 64;
 
@@ -282,21 +278,6 @@ fn ago(since: Instant) -> String {
     maki_lua::format_ago(since.elapsed().as_secs())
 }
 
-/// Last assistant text block in a subagent's flushed history, used to feed an
-/// async subagent's reply back into the main agent's queue.
-fn terminal_reply(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::Assistant))
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-        })
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) enum PendingInput {
     #[default]
@@ -440,8 +421,6 @@ pub struct App {
     subagent_channels: HashMap<maki_agent::AgentId, SubagentChannels>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(maki_agent::AgentId, maki_agent::TurnId)>,
-    /// Last cumulative history delivered to the root for each live child.
-    delivered_subagent_histories: HashMap<maki_agent::AgentId, Vec<u8>>,
 }
 
 pub(crate) struct PreparedApp {
@@ -595,7 +574,6 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
-            delivered_subagent_histories: HashMap::new(),
             pending_dirty: Dirty::NO,
         };
         app.model_picker.set_recents(
@@ -1846,16 +1824,6 @@ impl App {
         self.finish_cancel(turn_id, run_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn handle_cancel_after_capture(
-        &mut self,
-        after_capture: impl FnOnce(),
-    ) -> Vec<Action> {
-        let (turn_id, run_id) = self.capture_cancel();
-        after_capture();
-        self.finish_cancel(turn_id, run_id)
-    }
-
     fn finish_cancel(&mut self, turn_id: Option<TurnId>, run_id: u64) -> Vec<Action> {
         self.retry_info = None;
         self.close_all_overlays();
@@ -1871,7 +1839,7 @@ impl App {
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.queue.clear();
+        self.queue.unfocus();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent { turn_id, run_id }]
@@ -1980,7 +1948,6 @@ impl App {
                 if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                     channels.closed = true;
                 }
-                self.delivered_subagent_histories.remove(&subagent.agent_id);
                 self.stamped_subagent_outcomes
                     .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
                 self.cleanup_subagent_input(subagent.agent_id);
@@ -1998,7 +1965,6 @@ impl App {
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
             (&envelope.subagent, &envelope.event)
         {
-            let tool_use_id = subagent.parent_tool_use_id.clone();
             let agent_id = subagent.agent_id;
             let turn_id = match outcome {
                 maki_agent::TurnOutcome::Completed { turn_id, .. }
@@ -2018,19 +1984,6 @@ impl App {
                 }
                 maki_agent::TurnOutcome::Failed { failure, .. } => {
                     self.chats[chat_idx].mark_failed(&failure.user_message);
-                    if subagent.auto_deliver
-                        && subagent.parent_is_root
-                        && subagent.input_tx.is_some()
-                    {
-                        let text = format!(
-                            "{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}failed: {}",
-                            truncate_snippet(&failure.user_message)
-                        );
-                        self.queue_and_notify(QueuedMessage {
-                            text,
-                            images: Vec::new(),
-                        });
-                    }
                 }
             }
             self.sync_task_picker();
@@ -2055,44 +2008,6 @@ impl App {
                 && !self.chats[sub_idx].is_finished()
             {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
-            }
-            // An async subagent's reply is delivered to the main agent so it
-            // becomes a new turn; one-shot subagents already see their reply as
-            // the tool result, so only async (input_tx-named) subtasks queue it.
-            let auto_deliver = envelope
-                .subagent
-                .as_ref()
-                .is_some_and(|subagent| subagent.auto_deliver && subagent.parent_is_root);
-            let reply = subagent_agent_id
-                .filter(|_| auto_deliver)
-                .filter(|agent_id| {
-                    self.subagent_channels
-                        .get(agent_id)
-                        .is_some_and(|channels| channels.input_tx.is_some())
-                })
-                .filter(|agent_id| {
-                    let Ok(history) = serde_json::to_vec(&messages) else {
-                        tracing::warn!(%agent_id, "subagent history dedup serialization failed");
-                        return true;
-                    };
-                    if self.delivered_subagent_histories.get(agent_id) == Some(&history) {
-                        false
-                    } else {
-                        self.delivered_subagent_histories.insert(*agent_id, history);
-                        true
-                    }
-                })
-                .and_then(|_| terminal_reply(&messages))
-                .filter(|reply| !reply.is_empty());
-            if let Some(reply) = reply {
-                // Header the reply with the task id so it reads as subagent
-                // output rather than a message typed by the user.
-                let text =
-                    format!("{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}{reply}");
-                self.queue_and_notify(QueuedMessage {
-                    text,
-                    images: Vec::new(),
-                });
             }
             self.sync_task_picker();
             self.state

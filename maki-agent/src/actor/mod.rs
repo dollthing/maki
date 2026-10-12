@@ -17,6 +17,8 @@
 mod actor_error;
 mod config;
 pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
+pub(crate) mod delivery;
+pub use delivery::{ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus};
 mod idle;
 pub use idle::ActorIdleGuard;
 use idle::IdleReservation;
@@ -36,11 +38,43 @@ pub use actor_error::ActorError;
 pub use queue::{ActorQueue, InterruptQueue, QueueProjection};
 pub use tickets::{TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket};
 
+pub const MAX_RETAINED_TURN_RESULTS: usize = 128;
+
+pub type AdmissionPolicyConstraint =
+    Arc<dyn Fn(&EffectiveAgentConfig) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct TurnAdmissionOptions {
     pub idle_only: bool,
     pub after_turn: Option<TurnId>,
     pub provenance: TurnProvenance,
+    pub policy_constraint: Option<AdmissionPolicyConstraint>,
+}
+
+#[derive(Default)]
+struct CallbackDrain {
+    pending: Mutex<usize>,
+    changed: Event,
+}
+
+pub struct ActorEventLease(Arc<CallbackDrain>);
+
+impl Drop for ActorEventLease {
+    fn drop(&mut self) {
+        *self.0.pending.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.changed.notify(usize::MAX);
+    }
+}
+
+pub struct LeasedActorEvent {
+    event: ActorEvent,
+    _lease: ActorEventLease,
+}
+
+impl LeasedActorEvent {
+    pub fn into_parts(self) -> (ActorEvent, ActorEventLease) {
+        (self.event, self._lease)
+    }
 }
 
 #[derive(Clone)]
@@ -52,6 +86,7 @@ pub enum ActorEvent {
         config: Option<ConfigCommit>,
     },
     End(TurnResult),
+    Delivery(DeliveryEvent),
     Idle {
         agent_id: AgentId,
     },
@@ -71,10 +106,7 @@ pub use types::{
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 
@@ -129,6 +161,7 @@ impl ActorWork {
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
     pub(crate) identity: Arc<()>,
+    callback_drain: Arc<CallbackDrain>,
     pub(crate) state: Mutex<ActorState>,
     pub(crate) policy_changed: Event,
     pub(crate) queue: Arc<ActorQueue>,
@@ -137,6 +170,7 @@ pub(crate) struct ActorInner {
     retained_tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     history: SharedMessages,
     coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
+    delivery_records: Mutex<HashMap<TurnId, (Option<ConfigCommit>, String)>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     admission_preparation: Option<AdmissionPreparation>,
     prepared_readiness: Option<PreparedReadiness>,
@@ -184,6 +218,9 @@ impl ProcessingWork {
 /// run starts; runs always push with the latest run id, so an older mark can
 /// never match again.
 pub(crate) struct ActorState {
+    pub(super) deliveries: HashMap<TurnId, delivery::PendingDelivery>,
+    pub(super) parent_delivery_policy: Option<delivery::ParentDeliveryPolicy>,
+
     pub(crate) lifecycle: ActorLifecycle,
     close_pending: bool,
     pending_publications: usize,
@@ -198,11 +235,15 @@ pub(crate) struct ActorState {
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     latest: Option<TurnOutcome>,
+    latest_history_turn: Option<(TurnId, u64, usize)>,
+    retained_order: VecDeque<TurnId>,
+    presentation: u64,
     usage: TokenUsage,
     operations: VecDeque<ActorOperation>,
     preparing: Option<u64>,
     config_observers: Vec<flume::Sender<ConfigCommit>>,
     event_observers: Vec<flume::Sender<ActorEvent>>,
+    leased_event_observers: Vec<(flume::Sender<LeasedActorEvent>, Arc<CallbackDrain>)>,
     next_operation_id: u64,
 }
 
@@ -225,6 +266,7 @@ enum ActorOperation {
         event_sender: Option<EventSender>,
         correlation: String,
         ticket: TurnTicket,
+        policy_constraint: Option<AdmissionPolicyConstraint>,
     },
     Root {
         id: u64,
@@ -455,6 +497,55 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
             inner.policy_changed.notify(usize::MAX);
             continue;
         }
+        if let ActorOperation::Turn {
+            policy_constraint: Some(constraint),
+            ..
+        } = head
+        {
+            let constraint = Arc::clone(constraint);
+            let policy = state.policy.clone();
+            let inner = Arc::clone(inner);
+            state.preparing = Some(id);
+            smol::spawn(async move {
+                let result = smol::unblock(move || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let policy = policy
+                            .ok_or_else(|| "actor configuration is not initialized".to_string())?;
+                        constraint(&policy)
+                    }))
+                    .unwrap_or_else(|_| Err("admission policy constraint panicked".into()))
+                })
+                .await;
+                let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.preparing != Some(id)
+                    || state.operations.front().is_none_or(|work| work.id() != id)
+                {
+                    return;
+                }
+                state.preparing = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(ActorOperation::Turn {
+                            policy_constraint, ..
+                        }) = state.operations.front_mut()
+                        {
+                            *policy_constraint = None;
+                        }
+                        drive_operations(&inner, &mut state);
+                    }
+                    Err(diagnostic) => {
+                        let work = state.operations.pop_front().unwrap();
+                        state.pending_publications += 1;
+                        drop(state);
+                        fail_admission(&inner, work, diagnostic, false);
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        drive_operations(&inner, &mut state);
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
         let input = match head {
             ActorOperation::Turn { input, .. } => Some(input),
             ActorOperation::Root { root, .. } if root.admission.is_none() => Some(&root.input),
@@ -520,6 +611,10 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
 }
 
 fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
+    fail_admission(inner, work, "admission preparation panicked".into(), true);
+}
+
+fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, retryable: bool) {
     tracing::error!(agent_id = %inner.agent_id, "admission preparation panicked");
     if let ActorOperation::Root { root, .. } = &work
         && let Some(report) = &inner.root_preparation_error
@@ -555,9 +650,9 @@ fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
             0,
             crate::types::TurnFailure {
                 kind: crate::types::TurnFailureKind::Internal,
-                diagnostic: "admission preparation panicked".into(),
+                diagnostic,
                 user_message: "The agent could not start this turn.".into(),
-                retryable: true,
+                retryable,
             },
         );
         finalize_turn(inner, turn_id, outcome, Some(&admission), true);
@@ -600,6 +695,13 @@ fn materialize(
             if let Some(config) = &state.policy {
                 input.mode = config.mode.clone();
             }
+            delivery::record(
+                inner,
+                ticket.turn_id(),
+                state.policy_generation,
+                state.policy.clone(),
+                correlation.clone(),
+            );
             inner.queue.push(ActorWork::Turn(TurnAdmission {
                 turn_id: ticket.turn_id(),
                 input: Some(input),
@@ -655,8 +757,33 @@ impl ActorState {
     }
 
     pub(super) fn emit(&mut self, event: ActorEvent) {
+        if let ActorEvent::Delivery(event) = &event {
+            let delivery = &event.delivery;
+            info!(
+                parent_id = %delivery.parent_id,
+                child_id = %delivery.result.outcome.agent_id(),
+                child_turn_id = %delivery.result.outcome.turn_id(),
+                compatibility_id = ?delivery.compatibility_id,
+                correlation = %delivery.correlation,
+                status = ?event.status,
+                config_generation = ?delivery.child_config.as_ref().map(|config| config.generation),
+                origin = ?delivery.result.provenance.origin,
+                plugin = ?delivery.result.provenance.plugin,
+                plugin_generation = ?delivery.result.provenance.plugin_generation,
+                "child lifecycle delivery"
+            );
+        }
         self.event_observers
             .retain(|sender| sender.send(event.clone()).is_ok());
+        self.leased_event_observers.retain(|(sender, drain)| {
+            *drain.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            sender
+                .send(LeasedActorEvent {
+                    event: event.clone(),
+                    _lease: ActorEventLease(Arc::clone(drain)),
+                })
+                .is_ok()
+        });
     }
     pub(super) fn finish_close(&mut self, inner: &ActorInner) {
         if self.close_pending
@@ -737,6 +864,8 @@ impl ActorState {
 
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
+            deliveries: HashMap::new(),
+            parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
             close_pending: false,
             pending_publications: 0,
@@ -751,11 +880,15 @@ impl ActorState {
             policy_generation: 0,
             policy,
             latest: None,
+            latest_history_turn: None,
+            retained_order: VecDeque::new(),
+            presentation: 0,
             usage: TokenUsage::default(),
             operations: VecDeque::new(),
             preparing: None,
             config_observers: Vec::new(),
             event_observers: Vec::new(),
+            leased_event_observers: Vec::new(),
             next_operation_id: 0,
         }
     }
@@ -846,6 +979,25 @@ fn retire_turn(
             history_ready.then_some((history.epoch, history.messages.len())),
         );
     state.latest = Some(outcome.clone());
+    if history_ready {
+        state.latest_history_turn = Some((turn_id, history.epoch, history.messages.len()));
+    }
+    state.retained_order.push_back(turn_id);
+    if state.retained_order.len() > MAX_RETAINED_TURN_RESULTS
+        && let Some(evicted) = state.retained_order.pop_front()
+    {
+        outcomes.remove(&evicted);
+        inner
+            .retained_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&evicted);
+        inner
+            .coverage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&evicted);
+    }
     state.usage += outcome.usage();
     state.pending_publications += 1;
     let ticket = tickets.remove(&turn_id);
@@ -915,6 +1067,18 @@ fn retire_and_publish(
         if let Some(sender) = presentation {
             let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
         }
+        if let Some(ticket) = &ticket {
+            ticket.resolve(outcome.clone());
+            delivery::publish(inner, ticket, admission);
+        }
+        delivery::settle(
+            inner,
+            turn_id,
+            match &outcome {
+                TurnOutcome::Cancelled { reason, .. } => Some(*reason),
+                _ => None,
+            },
+        );
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ticket) = ticket {
             ticket.resolve(outcome);
@@ -1033,6 +1197,7 @@ impl AgentActorHandle {
         let inner = Arc::new(ActorInner {
             agent_id,
             identity: Arc::new(()),
+            callback_drain: Arc::default(),
             state: Mutex::new(ActorState::idle(initial_config)),
             policy_changed: Event::new(),
             queue: Arc::new(ActorQueue::new()),
@@ -1042,6 +1207,7 @@ impl AgentActorHandle {
             history: mirror,
             coverage: Mutex::new(HashMap::new()),
             managed_admission,
+            delivery_records: Mutex::new(HashMap::new()),
             admission_preparation,
             prepared_readiness: backend.prepared_readiness(),
             root_preparation_error,
@@ -1092,6 +1258,30 @@ impl AgentActorHandle {
         (handle, task)
     }
 
+    /// Sets child-result routing before any work is admitted.
+    pub fn configure_parent_delivery(
+        &self,
+        auto_deliver: bool,
+        compatibility_id: Option<String>,
+    ) -> Result<(), ActorError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if state.next_operation_id != 0 || state.parent_delivery_policy.is_some() {
+            return Err(ActorError::Busy);
+        }
+        state.parent_delivery_policy = Some(delivery::ParentDeliveryPolicy {
+            auto_deliver,
+            compatibility_id,
+        });
+        Ok(())
+    }
+
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
     }
@@ -1107,11 +1297,7 @@ impl AgentActorHandle {
             .and_then(|processing| processing.turn_id)
     }
 
-    pub fn capture_processing_presentation_cut(
-        &self,
-        presentation: &AtomicU64,
-        displayed: u64,
-    ) -> (Option<TurnId>, u64) {
+    pub fn capture_processing_presentation_cut(&self, displayed: u64) -> (Option<TurnId>, u64) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let turn_id = state
             .processing
@@ -1124,29 +1310,46 @@ impl AgentActorHandle {
                 .cancellation_reason
                 .get_or_insert(TurnCancellationReason::User);
         }
-        let mut current = presentation.load(Ordering::Relaxed);
-        let fence = loop {
-            let next = current.max(displayed) + 1;
-            match presentation.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break next,
-                Err(updated) => current = updated,
-            }
-        };
+        state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
+        let deferred = state.drain_work();
+        if let Some(active) = state.active.take() {
+            active.fire(TurnCancellationReason::User);
+        }
+        let drained = self.inner.queue.drain_all();
+        drive_operations(&self.inner, &mut state);
+        state.presentation = state.presentation.max(displayed) + 1;
+        let fence = state.presentation;
+        drop(state);
+        settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
+        terminalize_work(&self.inner, drained, TurnCancellationReason::User);
         (turn_id, fence)
+    }
+
+    pub fn presentation_id(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .presentation
+    }
+
+    pub fn observe_presentation(&self, id: u64) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.presentation = state.presentation.max(id);
+    }
+
+    pub fn reserve_presentation(&self, displayed: u64) -> u64 {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.presentation = state.presentation.max(displayed) + 1;
+        state.presentation
     }
 
     pub fn allocate_processing_presentation(
         &self,
         turn_id: TurnId,
-        presentation: &AtomicU64,
         displayed: Option<u64>,
     ) -> Result<u64, ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -1158,15 +1361,11 @@ impl AgentActorHandle {
         if processing.cancellation_reason.is_some() {
             return Err(ActorError::PolicyCancelled);
         }
-        if let Some(displayed) = displayed
-            && presentation
-                .compare_exchange(displayed, displayed, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            Ok(displayed)
-        } else {
-            Ok(presentation.fetch_add(1, Ordering::Relaxed) + 1)
+        if displayed == Some(state.presentation) {
+            return Ok(state.presentation);
         }
+        state.presentation += 1;
+        Ok(state.presentation)
     }
 
     pub fn bind_active_correlation(
@@ -1204,6 +1403,44 @@ impl AgentActorHandle {
 
     pub fn identity(&self) -> Arc<()> {
         Arc::clone(&self.inner.identity)
+    }
+
+    pub fn subscribe_leased_events(&self) -> flume::Receiver<LeasedActorEvent> {
+        let (sender, receiver) = flume::unbounded();
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .leased_event_observers
+            .push((sender, Arc::clone(&self.inner.callback_drain)));
+        receiver
+    }
+
+    pub(crate) fn callbacks_drained(&self) -> bool {
+        *self
+            .inner
+            .callback_drain
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            == 0
+    }
+
+    pub(crate) async fn wait_callback_drain(&self) {
+        loop {
+            let listener = self.inner.callback_drain.changed.listen();
+            if *self
+                .inner
+                .callback_drain
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                == 0
+            {
+                return;
+            }
+            listener.await;
+        }
     }
 
     pub fn subscribe_events(&self) -> flume::Receiver<ActorEvent> {
@@ -1354,12 +1591,20 @@ impl AgentActorHandle {
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
         let reason = state.cancelled_correlations.get(&correlation).copied();
+        delivery::record(
+            &self.inner,
+            turn_id,
+            state.policy_generation,
+            state.policy.clone(),
+            correlation.clone(),
+        );
         let work = ActorOperation::Turn {
             id: after,
             input,
             event_sender,
             correlation,
             ticket: ticket.clone(),
+            policy_constraint: options.policy_constraint,
         };
         self.inner
             .tickets

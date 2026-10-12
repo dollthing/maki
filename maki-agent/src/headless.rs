@@ -57,6 +57,7 @@ pub struct HeadlessParams {
 }
 
 pub struct HeadlessHandle {
+    pub agent_id: AgentId,
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
     pub session_id: SessionRef,
@@ -191,6 +192,7 @@ fn spawn_initialized(
     let raw_tx = guard.tx().clone();
     let event_rx = events.into_receiver();
 
+    let agent_id = AgentId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::new(session_id);
@@ -279,7 +281,7 @@ fn spawn_initialized(
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
-                    agent_id: AgentId::generate(),
+                    agent_id,
                     provider,
                     model,
                     config: params.config,
@@ -330,6 +332,7 @@ fn spawn_initialized(
     };
 
     Ok(HeadlessHandle {
+        agent_id,
         event_rx,
         tool_names,
         session_id: session_ref,
@@ -846,6 +849,7 @@ impl InteractiveInputSender {
 }
 
 pub struct InteractiveHandle {
+    pub agent_id: AgentId,
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
     pub input_tx: InteractiveInputSender,
@@ -884,9 +888,33 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     )
 }
 
+pub fn spawn_interactive_with_history(
+    params: InteractiveParams,
+    history: crate::agent::HistorySnapshot,
+) -> InteractiveHandle {
+    spawn_interactive_with_preparation_and_history(
+        params,
+        Box::new(|mut model, timeouts| {
+            Box::pin(async move {
+                let provider = provider::from_model_async(&mut model, timeouts).await?;
+                Ok((model, Arc::from(provider)))
+            })
+        }),
+        Some(history),
+    )
+}
+
 pub fn spawn_interactive_with_preparation(
     params: InteractiveParams,
     prepare: ProviderPreparation,
+) -> InteractiveHandle {
+    spawn_interactive_with_preparation_and_history(params, prepare, None)
+}
+
+fn spawn_interactive_with_preparation_and_history(
+    params: InteractiveParams,
+    prepare: ProviderPreparation,
+    history: Option<crate::agent::HistorySnapshot>,
 ) -> InteractiveHandle {
     let initial_tools = RequestTools::build(
         ToolRegistry::global(),
@@ -965,6 +993,7 @@ pub fn spawn_interactive_with_preparation(
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let offload = session_offload(params.state_dir.as_deref(), &session_ref);
 
+    let agent_id = AgentId::generate();
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
@@ -990,10 +1019,12 @@ pub fn spawn_interactive_with_preparation(
             };
             admit_pending_inputs(&pending_rx, &admission_sender, &settings, &input_ready);
 
-            let mut history = History::restored(params.initial_history);
+            let mut history = match history {
+                Some(snapshot) => History::restored_snapshot(snapshot),
+                None => History::restored(params.initial_history),
+            };
             let mut working_dir = PathBuf::from(working_dir);
             let permissions = permissions;
-            let agent_id = AgentId::generate();
             let mut run_id: u64 = 0;
             let mut directory_pending = false;
 
@@ -1298,6 +1329,7 @@ pub fn spawn_interactive_with_preparation(
     });
 
     InteractiveHandle {
+        agent_id,
         event_rx,
         tool_names,
         input_tx,

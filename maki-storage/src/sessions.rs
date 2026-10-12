@@ -141,6 +141,8 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compacted: bool,
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -171,9 +173,10 @@ pub struct SessionMeta {
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
 /// an append from a rewrite, with no need to diff the lists.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
+    pub compacted: bool,
     pub messages: Arc<Vec<M>>,
 }
 
@@ -187,6 +190,7 @@ impl<M> HistorySnapshot<M> {
     pub fn new(messages: Vec<M>) -> Self {
         Self {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(messages),
         }
     }
@@ -1374,6 +1378,7 @@ where
     pub fn history_snapshot(&self) -> HistorySnapshot<M> {
         HistorySnapshot {
             epoch: self.epoch,
+            compacted: self.meta.compacted,
             messages: Arc::clone(&self.messages),
         }
     }
@@ -1455,6 +1460,7 @@ where
     pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
+        self.meta.compacted = snapshot.compacted;
         self.touch();
     }
 
@@ -1465,14 +1471,17 @@ where
     pub fn checkpoint(
         this: &mut Arc<Self>,
         history: Option<&HistorySnapshot<M>>,
-        meta: SessionMeta,
+        mut meta: SessionMeta,
         token_usage: U,
     ) where
         M: Clone,
         U: PartialEq + Clone,
         T: Clone,
     {
-        let history = history.filter(|h| !Arc::ptr_eq(&this.messages, &h.messages));
+        meta.compacted = history.map_or(this.meta.compacted, |snapshot| snapshot.compacted);
+        let history = history.filter(|h| {
+            !Arc::ptr_eq(&this.messages, &h.messages) || h.compacted != this.meta.compacted
+        });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
         }
@@ -2120,12 +2129,32 @@ mod tests {
     /// not erase the void minted by a same-frame in-place replacement, or the
     /// writer appends onto a stale prefix and persists a mixed transcript.
     #[test]
+    fn compacted_history_metadata_round_trips_and_survives_meta_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message("summary")]);
+        snapshot.compacted = true;
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            SessionMeta::default(),
+            Value::Null,
+        );
+        Session::checkpoint(&mut session, None, SessionMeta::default(), Value::Null);
+        assert!(session.history_snapshot().compacted);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.history_snapshot().compacted);
+    }
+
+    #[test]
     fn snapshot_adoption_does_not_erase_a_local_rewrite() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let run = HistorySnapshot {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(vec![user_message("hi")]),
         };
         let meta = session.meta.clone();
@@ -2138,6 +2167,7 @@ mod tests {
             .set_subagent_messages("sub-1".into(), vec![user_message("new")]);
         let advanced = HistorySnapshot {
             epoch: run.epoch,
+            compacted: run.compacted,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);

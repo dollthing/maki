@@ -19,10 +19,11 @@ use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool_text, to
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const PLAN_REVIEWER_ONLY_ERR: &str = "plan_reviewer is only available in plan mode";
-const TASK_FAMILY: [&str; 5] = [
+const TASK_FAMILY: [&str; 6] = [
     "task",
     "task_spawn",
     "task_get",
+    "task_wait",
     "task_send",
     "task_despawn",
 ];
@@ -32,10 +33,10 @@ const TASK_FAMILY: [&str; 5] = [
 /// needed. `maki.agent.tools` is left real when `real_tools` is set (so the
 /// reviewer's tool set can be inspected); otherwise it is stubbed to empty.
 const SESSION_WRAPPER: &str = r#"
-local real_session = maki.agent.session
-maki.agent.session = function(ctx, opts)
+local real_spawn = maki.agent.spawn
+maki.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
-  return real_session(ctx, opts)
+  return real_spawn(ctx, opts)
 end
 maki.agent.resolve_model = function(ctx, opts)
   return { spec = "anthropic/claude-sonnet-4-20250514" }
@@ -57,7 +58,7 @@ maki.api.register_tool({
   description = "fake read",
   kind = "execute",
   schema = { type = "object", properties = {}, additionalProperties = false },
-  audiences = { "research_sub" },
+  audiences = { "main", "research_sub" },
   handler = function() return "read-only" end,
 })
 maki.api.register_tool({
@@ -134,8 +135,25 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
 #[test]
 fn plan_reviewer_is_read_only_even_when_asked_to_write() {
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
-    let (ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     let (reg, _host) = load_reviewer_host("plan", true);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(maki_agent::tools::TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let parent = common::with_request_tools(&reg, &ctx);
+    assert!(
+        maki_agent::agent::tool_dispatch::callable(&parent)
+            .iter()
+            .any(|tool| tool.name == "read")
+    );
+    assert!(
+        tool_names(parent.request_tools.as_ref().unwrap().definitions())
+            .iter()
+            .any(|name| name == "read")
+    );
 
     run_reviewer(&reg, &ctx, "readonly-review").expect("reviewer must run in plan mode");
 

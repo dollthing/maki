@@ -21,8 +21,10 @@ use crate::{
     TurnOutcome, WorkKind,
 };
 
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[test]
-fn retained_ticket_observation_checks_manager_and_survives_graph_close() {
+fn held_ticket_observation_checks_manager_and_survives_graph_removal() {
     smol::block_on(async {
         const CORRELATION: &str = "retained";
         const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -43,18 +45,11 @@ fn retained_ticket_observation_checks_manager_and_survives_graph_close() {
         ));
         assert!(matches!(
             root.turn_ticket(crate::TurnId::generate()),
-            Err(ManagerError::TicketActorMismatch { .. })
+            Err(ManagerError::TurnResultUnavailable { .. })
         ));
         manager.close_subtree(root.id()).unwrap();
         assert!(root.validate_live().is_err());
-        assert_eq!(
-            root.turn_ticket(ticket.turn_id())
-                .unwrap()
-                .wait_result()
-                .await
-                .outcome,
-            result.outcome
-        );
+        assert_eq!(ticket.wait_result().await.outcome, result.outcome);
         assert!(
             manager
                 .shutdown(SHUTDOWN_TIMEOUT)
@@ -62,13 +57,9 @@ fn retained_ticket_observation_checks_manager_and_survives_graph_close() {
                 .timed_out
                 .is_empty()
         );
-        assert_eq!(
-            root.turn_ticket(ticket.turn_id())
-                .unwrap()
-                .wait_result()
-                .await
-                .text,
-            result.text
+        assert_eq!(ticket.wait_result().await.text, result.text);
+        assert!(
+            matches!(root.turn_ticket(ticket.turn_id()), Err(ManagerError::UnknownAgent(id)) if id == root.id())
         );
         assert!(other.shutdown(SHUTDOWN_TIMEOUT).await.timed_out.is_empty());
     });
@@ -201,7 +192,6 @@ fn deferred_runtime_drop_settles_admissions() {
                 start_rx,
             )
             .unwrap();
-        const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
         let actor = root.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
         drop(start_tx);
@@ -236,7 +226,6 @@ fn deferred_runtime_drop_settles_admissions() {
 fn deferred_runtime_terminal_lifecycle_exits_with_start_sender_retained(shutdown: bool) {
     smol::block_on(async {
         const CORRELATION: &str = "deferred-terminal";
-        const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (start_tx, start_rx) = flume::bounded(1);
         let (entered_tx, entered_rx) = flume::unbounded();
@@ -319,7 +308,6 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
         const UNRELATED: &str = "unrelated";
         const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
         const RUN_ID: u64 = 7;
-        const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (entered_tx, entered_rx) = flume::unbounded();
         let root = manager
@@ -472,7 +460,6 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
         const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
         const EARLIER_RUN: u64 = 7;
         const LAST_RUN: u64 = 8;
-        const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (start_tx, start_rx) = flume::bounded(1);
         let (entered_tx, entered_rx) = flume::unbounded();
@@ -559,7 +546,6 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
 fn queued_only_correlation_cancel_does_not_precancel_later_work() {
     smol::block_on(async {
         const CORRELATION: &str = "queued-only";
-        const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (start_tx, start_rx) = flume::bounded(1);
         let (entered_tx, entered_rx) = flume::unbounded();
@@ -658,6 +644,96 @@ fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: b
     });
 }
 
+#[test_case(true; "child_limit")]
+#[test_case(false; "graph_limit")]
+fn closed_callback_leases_hold_admission_capacity_until_drained(child_limit: bool) {
+    smol::block_on(async {
+        const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+        let limits = AgentLimits {
+            max_children_per_agent: if child_limit { 1 } else { 2 },
+            max_live_agents: 2,
+            ..Default::default()
+        };
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        for _ in 0..3 {
+            let spawn = || {
+                manager.spawn_child_trusted_with_config(
+                    &root,
+                    config(MODEL, false),
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<_, String>(TestBackend::boxed()),
+                )
+            };
+            let child = spawn().unwrap();
+            let actor = child.actor().unwrap();
+            let events = actor.subscribe_leased_events();
+            actor.close();
+            let (event, lease) = events.recv_async().await.unwrap().into_parts();
+            assert!(matches!(event, crate::ActorEvent::Close { .. }));
+            yield_until(|| child.snapshot().unwrap().graph_lifecycle == GraphLifecycle::Closed)
+                .await;
+            let error = spawn().unwrap_err();
+            if child_limit {
+                assert_eq!(
+                    error,
+                    ManagerError::ChildLimit {
+                        parent_id: root.id(),
+                        max: 1
+                    }
+                );
+            } else {
+                assert_eq!(error, ManagerError::LiveAgentLimit { max: 2 });
+            }
+            assert_eq!(manager.snapshot().len(), 2);
+            drop(lease);
+            drop(events);
+            yield_until(|| manager.runner_finished(child.id()).unwrap()).await;
+            assert_eq!(manager.snapshot().len(), 1);
+        }
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn closed_node_waits_for_queued_event_callback_lease() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let events = actor.subscribe_leased_events();
+        actor.close();
+        let (event, lease) = events.recv_async().await.unwrap().into_parts();
+        assert!(matches!(event, crate::ActorEvent::Close { .. }));
+        assert!(!manager.runner_finished(root.id()).unwrap());
+        assert!(manager.node(root.id()).is_ok());
+        drop(lease);
+        drop(events);
+        let report = manager.shutdown(COMPLETION_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+        assert!(matches!(
+            manager.node(root.id()),
+            Err(ManagerError::UnknownAgent(_))
+        ));
+        assert_eq!(
+            root.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+    });
+}
+
 #[test]
 fn idle_guard_reports_closed_actor_as_non_live() {
     smol::block_on(async {
@@ -681,11 +757,14 @@ fn idle_guard_reports_closed_actor_as_non_live() {
             Err(ActorError::Closed)
         ));
         drop(guard);
+        drop(start_tx);
+        while !manager.runner_finished(root.id()).unwrap() {
+            smol::future::yield_now().await;
+        }
         assert!(matches!(
             manager.prepare_idle_subtree(root.id()),
-            Err(ManagerError::NonLiveAgent(id)) if id == root.id()
+            Err(ManagerError::UnknownAgent(id)) if id == root.id()
         ));
-        drop(start_tx);
         manager.shutdown(Duration::from_secs(1)).await;
     });
 }
@@ -693,7 +772,6 @@ fn idle_guard_reports_closed_actor_as_non_live() {
 #[test]
 fn root_cancelled_before_managed_admission_has_no_start_and_resolves_end() {
     const CORRELATION: &str = "root-before-permit";
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::bounded(1);
     let root = manager
@@ -743,7 +821,6 @@ fn root_cancelled_before_managed_admission_has_no_start_and_resolves_end() {
 #[test]
 fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
     const CORRELATION: &str = "before-registration";
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
@@ -795,7 +872,6 @@ fn cancel_cut_prevents_late_managed_registration_before_trigger(
     nominal: bool,
 ) {
     const CORRELATION: &str = "cancel-before-registration";
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits {
         max_concurrent_agent_turns: 1,
         ..AgentLimits::default()
@@ -860,9 +936,119 @@ fn cancel_cut_prevents_late_managed_registration_before_trigger(
 
 #[test_case(false; "correlation")]
 #[test_case(true; "nominal_turn")]
+fn turn_cancel_preserves_trusted_child(nominal: bool) {
+    const CORRELATION: &str = "root";
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let delegated = current
+        .spawn_child(
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    let trusted = manager
+        .spawn_child_trusted_with_config(
+            &root,
+            config("anthropic/claude-sonnet-4-20250514", false),
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(TestBackend::boxed()),
+        )
+        .unwrap();
+    if nominal {
+        manager
+            .cancel_turn(
+                root.id(),
+                current.turn_id(),
+                crate::TurnCancellationReason::User,
+            )
+            .unwrap();
+    } else {
+        manager
+            .cancel_correlation(root.id(), CORRELATION, crate::TurnCancellationReason::User)
+            .unwrap();
+    }
+    assert!(current.validate_active().is_err());
+    assert!(trusted.validate_live().is_ok());
+    assert_eq!(
+        trusted.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Live
+    );
+    assert!(delegated.validate_live().is_err());
+    gate.release(1);
+    let report = smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+    assert!(report.timed_out.is_empty());
+    assert_eq!(
+        trusted.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Closed
+    );
+}
+
+#[test]
+fn spawn_close_cycles_reclaim_nodes_and_share_terminal_snapshots() {
+    const CYCLES: usize = 32;
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    for _ in 0..CYCLES {
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let held = child.clone();
+        let terminal = Arc::downgrade(&child.terminal);
+        child.close_subtree().unwrap();
+        smol::block_on(async {
+            loop {
+                let listener = manager.0.reaped.listen();
+                if !manager.lock_graph().nodes.contains_key(&child.id()) {
+                    break;
+                }
+                listener.await;
+            }
+        });
+        assert_eq!(manager.lock_graph().nodes.len(), 1);
+        assert!(root.snapshot().unwrap().children.is_empty());
+        assert!(
+            matches!(manager.lookup(child.id()), Err(ManagerError::UnknownAgent(id)) if id == child.id())
+        );
+        assert!(child.actor().is_err());
+        assert!(child.validate_live().is_err());
+        assert!(child.cancel().is_err());
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+        assert_eq!(
+            held.snapshot().unwrap().actor.unwrap().lifecycle,
+            crate::ActorLifecycle::Closed
+        );
+        drop(child);
+        assert!(terminal.upgrade().is_some());
+        drop(held);
+        assert!(terminal.upgrade().is_none());
+    }
+    gate.release(1);
+    assert!(
+        smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
+            .timed_out
+            .is_empty()
+    );
+    assert!(manager.lock_graph().nodes.is_empty());
+    assert_eq!(
+        root.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Closed
+    );
+}
+
+#[test_case(false; "correlation")]
+#[test_case(true; "nominal_turn")]
 fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool) {
     const CORRELATION: &str = "root";
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -930,7 +1116,6 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
 ) {
     const CORRELATION: &str = "reused";
     const RUN_ID: u64 = 7;
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
@@ -995,7 +1180,6 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bo
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const FIRST_RUN_ID: u64 = 7;
     const SUCCESSOR_RUN_ID: u64 = 8;
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
@@ -1147,7 +1331,6 @@ fn idle_guard_rejects_child_factory_reservation() {
 fn idle_root_with_child(
     child_backend: Box<dyn ActorBackend>,
 ) -> (AgentManagerHandle, super::AgentRef, super::AgentRef) {
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -1188,7 +1371,6 @@ enum ChildWork {
 #[test_case(ChildWork::Popped; "popped")]
 #[test_case(ChildWork::Running; "running")]
 fn idle_guard_rejects_busy_child(work: ChildWork) {
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let (entered_tx, entered_rx) = flume::unbounded();
     let child_gate = Gate::new();
     let (manager, root, child) = idle_root_with_child(TestBackend::reporting(
@@ -2392,10 +2574,7 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
         factory.join().unwrap(),
         Err(ManagerError::NonLiveAgent(id)) if id == root_id
     ));
-    assert_eq!(
-        manager.node(root_id).unwrap().actor.unwrap().lifecycle,
-        crate::ActorLifecycle::Closed
-    );
+    assert!(manager.lookup(root_id).is_err());
     smol::block_on(async {
         while !manager.runner_finished(root_id).unwrap() {
             smol::future::yield_now().await;
@@ -2405,14 +2584,11 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
     assert!(report.joined.is_empty());
     assert!(report.timed_out.is_empty());
     assert!(manager.runner_finished(root_id).unwrap());
-    assert_eq!(
-        manager.node(root_id).unwrap().graph_lifecycle,
-        GraphLifecycle::Closed
-    );
+    assert!(matches!(manager.node(root_id), Err(ManagerError::UnknownAgent(id)) if id == root_id));
 }
 
 #[test]
-fn shutdown_excludes_closed_tombstone_and_drains_its_finished_task() {
+fn shutdown_excludes_removed_child_and_preserves_held_snapshot() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -2433,7 +2609,7 @@ fn shutdown_excludes_closed_tombstone_and_drains_its_finished_task() {
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
     );
-    assert!(manager.lock_graph().nodes[&child.id()].task.is_some());
+    assert!(!manager.lock_graph().nodes.contains_key(&child.id()));
     gate.release(1);
 
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
@@ -2444,7 +2620,7 @@ fn shutdown_excludes_closed_tombstone_and_drains_its_finished_task() {
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
     );
-    assert!(manager.lock_graph().nodes[&child.id()].task.is_none());
+    assert!(!manager.lock_graph().nodes.contains_key(&child.id()));
 }
 
 #[test]
@@ -2921,8 +3097,6 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
 
 #[test]
 fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
-    const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
     let root_actor = root.actor().unwrap();
     let (snapshot_entered, snapshot_release) = root_actor.pause_before_next_snapshot_state();
@@ -3399,6 +3573,270 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
         assert!(
             manager
                 .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "discard_accepted_before_start")]
+#[test_case(true; "reject_closed_parent")]
+fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
+    smol::block_on(async {
+        const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+        const COMPATIBILITY_ID: &str = "nested child";
+        let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+        let parent = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(MODEL, false),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            )
+            .unwrap();
+        let parent_actor = parent.actor().unwrap();
+        let barrier = parent_actor.reserve_config_update().unwrap();
+        let parent_events = parent_actor.subscribe_events();
+        let root_events = root.actor().unwrap().subscribe_events();
+        let child = manager
+            .spawn_child_trusted_with_config(
+                &parent,
+                config(MODEL, false),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        child_actor
+            .configure_parent_delivery(true, Some(COMPATIBILITY_ID.into()))
+            .unwrap();
+        let child_events = child_actor.subscribe_events();
+        if closed {
+            parent_actor.close();
+        }
+        let ticket = child_actor
+            .admit_turn(input(), None, COMPATIBILITY_ID.into())
+            .unwrap();
+        ticket.wait().await;
+        if closed {
+            let event = loop {
+                if let crate::ActorEvent::Delivery(event) = child_events.recv_async().await.unwrap()
+                {
+                    break event;
+                }
+            };
+            assert_eq!(event.delivery.parent_id, parent.id());
+            assert_eq!(
+                event.status,
+                crate::actor::DeliveryStatus::Rejected(
+                    crate::actor::DeliveryRejection::ParentClosed
+                )
+            );
+        } else {
+            let event = loop {
+                if let crate::ActorEvent::Delivery(event) =
+                    parent_events.recv_async().await.unwrap()
+                {
+                    break event;
+                }
+            };
+            assert_eq!(event.delivery.parent_id, parent.id());
+            let crate::actor::DeliveryStatus::Accepted { parent_turn_id } = event.status else {
+                panic!("delivery was not admitted")
+            };
+            parent_actor.clear();
+            parent_actor
+                .turn_ticket(parent_turn_id)
+                .unwrap()
+                .wait()
+                .await;
+            let event = loop {
+                if let crate::ActorEvent::Delivery(event) =
+                    parent_events.recv_async().await.unwrap()
+                {
+                    break event;
+                }
+            };
+            assert_eq!(
+                event.status,
+                crate::actor::DeliveryStatus::Discarded(crate::TurnCancellationReason::User)
+            );
+        }
+        assert!(
+            root_events
+                .try_iter()
+                .all(|event| !matches!(event, crate::ActorEvent::Delivery(_)))
+        );
+        drop(barrier);
+        current.validate_active().unwrap();
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn real_child_settlement_reports_parent_delivery_overflow() {
+    smol::block_on(async {
+        const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+        const CHILD: &str = "overflow child";
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let parent = root.actor().unwrap();
+        let barrier = parent.reserve_config_update().unwrap();
+        let parent_events = parent.subscribe_events();
+        let child = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(MODEL, false),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        actor
+            .configure_parent_delivery(true, Some(CHILD.into()))
+            .unwrap();
+        let child_events = actor.subscribe_events();
+        for _ in 0..crate::actor::delivery::MAX_PENDING_DELIVERIES {
+            let ticket = actor.admit_turn(input(), None, CHILD.into()).unwrap();
+            ticket.wait().await;
+            let event = loop {
+                if let crate::ActorEvent::Delivery(event) =
+                    parent_events.recv_async().await.unwrap()
+                {
+                    break event;
+                }
+            };
+            assert!(matches!(
+                event.status,
+                crate::actor::DeliveryStatus::Accepted { .. }
+            ));
+            assert_eq!(event.delivery.result.outcome.turn_id(), ticket.turn_id());
+        }
+        let rejected = actor.admit_turn(input(), None, CHILD.into()).unwrap();
+        rejected.wait().await;
+        let event = loop {
+            if let crate::ActorEvent::Delivery(event) = child_events.recv_async().await.unwrap() {
+                break event;
+            }
+        };
+        assert_eq!(
+            event.status,
+            crate::actor::DeliveryStatus::Rejected(crate::actor::DeliveryRejection::Overflow)
+        );
+        assert_eq!(event.delivery.result.outcome.turn_id(), rejected.turn_id());
+        assert_eq!(
+            parent.snapshot().queued,
+            crate::actor::delivery::MAX_PENDING_DELIVERIES
+        );
+        parent.clear();
+        assert_eq!(parent.snapshot().queued, 0);
+        drop(barrier);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn managed_delivery_wait_capacity_one_follows_parent_fifo_once() {
+    smol::block_on(async {
+        const CHILD: &str = "delivery child";
+        const USER: &str = "queued user";
+        const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+        let limits = AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..Default::default()
+        };
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let root_gate = Gate::new();
+        let (root_tx, root_rx) = flume::unbounded();
+        let root = manager
+            .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(
+                    root_tx,
+                    Some(Arc::clone(&root_gate)),
+                ))
+            })
+            .unwrap();
+        let parent = root.actor().unwrap();
+        parent.admit_turn(input(), None, "root".into()).unwrap();
+        let current = root_rx.recv_async().await.unwrap();
+        let events = parent.subscribe_events();
+        let child_gate = Gate::new();
+        let (tx, rx) = flume::unbounded();
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(tx, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        child_actor
+            .configure_parent_delivery(true, Some(CHILD.into()))
+            .unwrap();
+        let user = parent.admit_turn(input(), None, USER.into()).unwrap();
+        let ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
+        let wait = current
+            .lease()
+            .observe_descendant(&current, child.id(), &child_actor, ticket.clone(), None)
+            .unwrap();
+        rx.recv_async().await.unwrap();
+        child_gate.release(1);
+        let result = wait.wait_result().await.unwrap();
+        assert_eq!(result.outcome, ticket.peek().unwrap());
+        let delivery = loop {
+            if let crate::ActorEvent::Delivery(event) = events.recv_async().await.unwrap() {
+                break event;
+            }
+        };
+        assert_eq!(delivery.delivery.parent_id, root.id());
+        assert_eq!(delivery.delivery.result.outcome, result.outcome);
+        assert_eq!(delivery.delivery.compatibility_id.as_deref(), Some(CHILD));
+        let crate::actor::DeliveryStatus::Accepted { parent_turn_id } = delivery.status else {
+            panic!("delivery was not admitted")
+        };
+        let delivered = parent.turn_ticket(parent_turn_id).unwrap();
+        assert!(delivered.peek().is_none());
+        root_gate.release(3);
+        user.wait().await;
+        delivered.wait().await;
+        let mut end_ids = Vec::new();
+        loop {
+            if let crate::ActorEvent::End(result) = events.recv_async().await.unwrap() {
+                let turn_id = result.outcome.turn_id();
+                end_ids.push(turn_id);
+                if turn_id == delivered.turn_id() {
+                    break;
+                }
+            }
+        }
+        assert!(end_ids.ends_with(&[user.turn_id(), delivered.turn_id()]));
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
                 .await
                 .timed_out
                 .is_empty()
@@ -3955,7 +4393,7 @@ fn shutdown_timeout_reaper_eventually_joins_timed_out_node() {
         manager.wait_until_reaped().await;
         assert!(manager.runner_finished(root.id()).unwrap());
         assert_eq!(
-            manager.node(root.id()).unwrap().graph_lifecycle,
+            root.snapshot().unwrap().graph_lifecycle,
             GraphLifecycle::Closed
         );
     });

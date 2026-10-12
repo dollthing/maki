@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 
 pub(super) const TOOL_NAME: &str = "structured_output";
 const ACK: &str = "Output recorded.";
-const MAX_NUDGES: usize = 2;
 const MAX_ERRORS: usize = 3;
 const MAX_ERROR_BYTES: usize = 2048;
 const MISSING: &str = "agent finished without calling structured_output";
@@ -19,7 +18,6 @@ struct ReportState {
     output: Option<TurnOutput>,
     reports: Vec<Value>,
     last_errors: Option<String>,
-    nudges: usize,
 }
 
 pub(super) struct StructuredOutput {
@@ -43,7 +41,7 @@ impl StructuredOutput {
     }
 
     pub(super) fn definition(&self) -> Value {
-        json!({ "name": TOOL_NAME, "description": "Report your final result when your task is complete.", "input_schema": self.schema })
+        json!({ "name": TOOL_NAME, "description": "When your task is complete, call structured_output with your final result matching this schema. A valid report is required to finish.", "input_schema": self.schema })
     }
 
     pub(super) fn local_tool(self: &Arc<Self>) -> LocalTool {
@@ -100,18 +98,16 @@ impl StructuredOutput {
     }
 
     pub(super) fn completion_check(&self) -> Result<Option<String>, String> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.reports.is_empty() {
-            return Ok(None);
-        }
-        if state.nudges == MAX_NUDGES {
-            return Err(state.last_errors.as_ref().map_or_else(
-                || MISSING.into(),
-                |errors| format!("agent result does not match output_schema:\n{errors}"),
-            ));
-        }
-        state.nudges += 1;
-        Ok(Some(NUDGE.into()))
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        Ok(state.reports.is_empty().then(|| NUDGE.into()))
+    }
+
+    pub(super) fn completion_exhausted(&self) -> String {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.last_errors.as_ref().map_or_else(
+            || MISSING.into(),
+            |errors| format!("agent result does not match output_schema:\n{errors}"),
+        )
     }
 }
 
@@ -121,11 +117,18 @@ mod tests {
 
     #[test]
     fn validates_reports_recovers_and_resets_between_turns() {
+        const INVALID: &str = "agent result does not match output_schema:\n";
+        const ANSWER_PATH: &str = "/answer";
+        const REPEATED_CHECKS: usize = 4;
         let reports = StructuredOutput::compile(json!({"type":"object", "properties":{"answer":{"type":"string"}}, "required":["answer"]})).unwrap();
         reports.begin_turn(TurnOutput::default());
         assert!(reports.record(json!({"answer": 3})).is_err());
         assert!(reports.reports().is_empty());
-        assert_eq!(reports.completion_check().unwrap(), Some(NUDGE.into()));
+        assert!(reports.completion_exhausted().starts_with(INVALID));
+        assert!(reports.completion_exhausted().contains(ANSWER_PATH));
+        for _ in 0..REPEATED_CHECKS {
+            assert_eq!(reports.completion_check().unwrap(), Some(NUDGE.into()));
+        }
         assert_eq!(reports.record(json!({"answer":"yes"})).unwrap(), ACK);
         assert_eq!(reports.record(json!({"answer":"also"})).unwrap(), ACK);
         assert_eq!(
@@ -135,10 +138,8 @@ mod tests {
         assert_eq!(reports.completion_check().unwrap(), None);
         reports.begin_turn(TurnOutput::default());
         assert!(reports.reports().is_empty());
-        for _ in 0..MAX_NUDGES {
-            assert_eq!(reports.completion_check().unwrap(), Some(NUDGE.into()));
-        }
-        assert_eq!(reports.completion_check().unwrap_err(), MISSING);
+        assert_eq!(reports.completion_check().unwrap(), Some(NUDGE.into()));
+        assert_eq!(reports.completion_exhausted(), MISSING);
     }
 
     #[test]

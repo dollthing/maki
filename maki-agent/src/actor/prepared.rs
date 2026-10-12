@@ -205,6 +205,7 @@ impl PreparedOperationTicket {
                     event_sender: turn.event_sender,
                     correlation: turn.correlation,
                     ticket: ticket.clone(),
+                    policy_constraint: None,
                 },
                 snapshot,
             );

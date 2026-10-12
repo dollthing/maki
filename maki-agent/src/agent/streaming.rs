@@ -346,10 +346,10 @@ mod tests {
     }
 
     #[test]
-    fn retry_reconciliation_preserves_prior_messages_and_all_final_text_blocks() {
+    fn retry_reconciliation_returns_last_message_with_all_final_text_blocks() {
         smol::block_on(async {
             const PRIOR: &str = "prior message";
-            const EXPECTED: &str = "prior messageaccepted responseaccepted response";
+            const EXPECTED: &str = "accepted response";
             let provider = CapturedProvider {
                 attempt: std::sync::atomic::AtomicUsize::new(0),
             };
