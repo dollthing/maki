@@ -806,6 +806,7 @@ impl ActorState {
             self.event_observers.clear();
             self.leased_event_observers.clear();
             self.config_observers.clear();
+            inner.callback_drain.changed.notify(usize::MAX);
         }
     }
 
@@ -1435,27 +1436,25 @@ impl AgentActorHandle {
         receiver
     }
 
+    /// Close has been emitted and every leased event handed out, Close
+    /// included, has been released. Until Close is emitted a closing actor
+    /// can still lease events, so an empty count alone is not enough.
     pub(crate) fn callbacks_drained(&self) -> bool {
-        *self
-            .inner
-            .callback_drain
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            == 0
-    }
-
-    pub(crate) async fn wait_callback_drain(&self) {
-        loop {
-            let listener = self.inner.callback_drain.changed.listen();
-            if *self
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.close_emitted()
+            && *self
                 .inner
                 .callback_drain
                 .pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 == 0
-            {
+    }
+
+    pub(crate) async fn wait_callback_drain(&self) {
+        loop {
+            let listener = self.inner.callback_drain.changed.listen();
+            if self.callbacks_drained() {
                 return;
             }
             listener.await;

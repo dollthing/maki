@@ -1017,10 +1017,14 @@ fn presentation_counter_is_actor_owned_and_cancel_fences_late_allocation() {
         let (turn, fence) = actor.capture_processing_presentation_cut(9);
         assert_eq!(turn, Some(ticket.turn_id()));
         assert_eq!(fence, 10);
-        assert!(matches!(
-            actor.allocate_processing_presentation(ticket.turn_id(), None),
-            Err(ActorError::PolicyCancelled)
-        ));
+        // The cut cancels the run, which may settle before this call; either
+        // way the late allocation is refused.
+        let refused = actor.allocate_processing_presentation(ticket.turn_id(), None);
+        assert!(
+            matches!(refused, Err(ActorError::PolicyCancelled))
+                || matches!(refused, Err(ActorError::UnknownTurn(id)) if id == ticket.turn_id()),
+            "{refused:?}"
+        );
         gate.open();
         ticket.wait().await;
         actor.close();
