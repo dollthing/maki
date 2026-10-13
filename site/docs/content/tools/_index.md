@@ -198,7 +198,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 
 ### `task_wait` {#task_wait}
 
-Wait for one exact task turn. Omitted turn_id snapshots the latest admitted turn once. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.
+Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent should finish its work before ending a turn; follow-up turns it runs after its own subagents report are not delivered on their own. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

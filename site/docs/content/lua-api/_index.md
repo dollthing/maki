@@ -1851,6 +1851,23 @@ Read the stable agent ID.
 
 ---
 
+### `Agent:latest_turn()` {#Agent-latest_turn}
+
+```lua
+Agent:latest_turn({ctx})
+```
+
+Read the most recently admitted turn, including turns the runtime admitted
+to deliver a child's result.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+
+**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket, or nil without an error when no turn was admitted or it is no longer retained.
+
+---
+
 ### `Agent:status()` {#Agent-status}
 
 ```lua

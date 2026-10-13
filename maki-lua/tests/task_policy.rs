@@ -145,6 +145,9 @@ maki.agent.spawn = function(ctx, opts)
   function sess:status(call_ctx)
     return { status = "idle", queued = 0, input_tokens = 0, output_tokens = 0 }
   end
+  function sess:latest_turn(call_ctx)
+    return nil
+  end
   function sess:_maki_session_id()
     return opts.name
   end

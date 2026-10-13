@@ -139,11 +139,7 @@ impl Runner {
                     let ticket = TurnTicket::new_anonymous(Arc::clone(&self.inner.identity))
                         .with_provenance(root.provenance.clone());
                     let turn_id = ticket.turn_id();
-                    self.inner
-                        .tickets
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .insert(turn_id, ticket.clone());
+                    self.inner.admit_ticket(turn_id, ticket.clone());
                     if let Some(processing) = &mut state.processing {
                         processing.turn_id = Some(turn_id);
                     }

@@ -170,6 +170,7 @@ pub(crate) struct ActorInner {
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     retained_tickets: Mutex<HashMap<TurnId, TurnTicket>>,
+    latest_admitted: Mutex<Option<TurnId>>,
     history: SharedMessages,
     coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
     delivery_records: Mutex<HashMap<TurnId, (Option<ConfigCommit>, String)>>,
@@ -185,6 +186,20 @@ pub(crate) struct ActorInner {
     before_snapshot_state: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     stale_preparation: Mutex<Option<flume::Sender<()>>>,
+}
+
+impl ActorInner {
+    /// Registers a live ticket and records it as the most recently admitted turn.
+    pub(crate) fn admit_ticket(&self, turn_id: TurnId, ticket: TurnTicket) {
+        self.tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(turn_id, ticket);
+        *self
+            .latest_admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(turn_id);
+    }
 }
 
 pub(crate) struct ProcessingWork {
@@ -1223,6 +1238,7 @@ impl AgentActorHandle {
             outcomes: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             retained_tickets: Mutex::new(HashMap::new()),
+            latest_admitted: Mutex::new(None),
             history: mirror,
             coverage: Mutex::new(HashMap::new()),
             managed_admission,
@@ -1470,6 +1486,17 @@ impl AgentActorHandle {
         receiver
     }
 
+    /// The ticket of the most recently admitted turn, whatever admitted it,
+    /// while it is live or retained.
+    pub fn latest_ticket(&self) -> Option<TurnTicket> {
+        let turn_id = (*self
+            .inner
+            .latest_admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        self.turn_ticket(turn_id)
+    }
+
     pub fn turn_ticket(&self, turn_id: TurnId) -> Option<TurnTicket> {
         self.inner
             .tickets
@@ -1621,11 +1648,7 @@ impl AgentActorHandle {
             ticket: ticket.clone(),
             policy_constraint: options.policy_constraint,
         };
-        self.inner
-            .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id, ticket.clone());
+        self.inner.admit_ticket(turn_id, ticket.clone());
         if let Some(reason) = reason {
             drop(state);
             settle_deferred(&self.inner, vec![work], reason);

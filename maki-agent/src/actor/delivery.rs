@@ -162,11 +162,7 @@ pub(super) fn admit_delivery(
             source_turn: Some(delivery.result.outcome.turn_id()),
             ..TurnProvenance::default()
         });
-    inner
-        .tickets
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(turn_id, ticket.clone());
+    inner.admit_ticket(turn_id, ticket.clone());
     state.deliveries.insert(
         turn_id,
         PendingDelivery {
@@ -501,6 +497,43 @@ mod tests {
             assert!(matches!(user.wait().await, TurnOutcome::Cancelled { .. }));
             assert!(delivered.peek().is_none());
             assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn latest_ticket_includes_runtime_admitted_deliveries() {
+        smol::block_on(async {
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            assert!(actor.latest_ticket().is_none());
+            let user = actor
+                .admit_turn(
+                    AgentInput::from_defaults(
+                        String::new(),
+                        crate::AgentMode::Build,
+                        Vec::new(),
+                        Default::default(),
+                    ),
+                    None,
+                    CORRELATION.into(),
+                )
+                .unwrap();
+            assert_eq!(actor.latest_ticket().unwrap().turn_id(), user.turn_id());
+            let delivered = admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            assert_eq!(
+                actor.latest_ticket().unwrap().turn_id(),
+                delivered.turn_id()
+            );
             actor.close();
             task.await;
         });

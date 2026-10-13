@@ -322,6 +322,27 @@ async fn agent_prompt(
     Ok((result, error))
 }
 
+/// Read the most recently admitted turn, including turns the runtime admitted
+/// to deliver a child's result.
+/// @param ctx LuaCtx Invocation context.
+/// @return (AgentTurn?, string?) Exact-turn ticket, or nil without an error when no turn was admitted or it is no longer retained.
+#[lua_fn(name = "latest_turn")]
+fn agent_latest_turn(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+) -> mlua::Result<Pair<LuaAgentTurn>> {
+    try_pair!(observe(lua, &ctx, this));
+    let actor = try_pair!(this.manager.actor(this.id));
+    Ok((
+        actor.latest_ticket().map(|ticket| LuaAgentTurn {
+            agent: this.clone(),
+            ticket,
+        }),
+        None,
+    ))
+}
+
 /// Switch model through a reserved actor configuration operation.
 /// @param ctx LuaCtx Invocation context.
 /// @param patch string|table Spec string or partial spec/thinking/fast selection.
@@ -586,7 +607,7 @@ lua_class! {
     /// Third-party plugins should use id(), explicit references and public scoped operations;
     /// these underscore-prefixed adapters are not a stable public API.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
-        agent_id, agent_status, agent_mode, agent_model, agent_available_models,
+        agent_id, agent_latest_turn, agent_status, agent_mode, agent_model, agent_available_models,
         agent_transcript, agent_ref, agent_send, agent_enqueue, agent_prompt, agent_set_model,
         agent_set_mode, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,

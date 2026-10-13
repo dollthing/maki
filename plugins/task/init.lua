@@ -287,7 +287,14 @@ local function create_session(ctx, options, blocking)
     return latest
   end
   function adapter:wait(call_ctx, turn_id, timeout, cumulative)
-    local ticket = tickets[turn_id or latest]
+    -- Without an id, wait on the child's latest turn, which may be one the
+    -- runtime admitted to hand it a result from its own subagents.
+    local ticket
+    if turn_id then
+      ticket = tickets[turn_id]
+    else
+      ticket = agent:latest_turn(call_ctx) or tickets[latest]
+    end
     if not ticket then
       return nil, TURN_UNAVAILABLE_ERR
     end
@@ -665,7 +672,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_wait",
-  description = "Wait for one exact task turn. Omitted turn_id snapshots the latest admitted turn once. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.",
+  description = "Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent should finish its work before ending a turn; follow-up turns it runs after its own subagents report are not delivered on their own. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = wait_schema,
