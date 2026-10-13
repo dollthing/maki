@@ -161,6 +161,18 @@ Read the executing turn's admitted selection. This can differ from Agent:model(c
 
 ---
 
+### `LuaCtx:mode()` {#LuaCtx-mode}
+
+```lua
+LuaCtx:mode()
+```
+
+Read the executing turn's admitted mode. This can differ from Agent:mode(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
+
+**Returns:** (`string?`, `string?`) Registered mode name.
+
+---
+
 ### `LuaCtx:defer_close()` {#LuaCtx-defer_close}
 
 ```lua
@@ -1525,7 +1537,7 @@ and tool set.
     selection, validated like `Agent:set_model`. Omitted fields inherit the
     parent's; thinking is capped at the parent's level. A query result from
     `Agent:model` can be passed as is.
-  - `system` (`string?`) system prompt. Defaults to empty.
+  - `system` (`string?`) custom text appended after the admitted mode's prompt contribution. Defaults to empty; does not inherit the parent's full system prompt.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
@@ -1678,7 +1690,7 @@ Unmanaged children use the current host task's authority, not a managed graph.
   - `model` (`string|table`) a spec or `{spec, thinking, fast}` selection, validated
     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
     parent's level, and `Agent:model` results can be passed as is.
-  - `system` (`string`) custom system prompt contribution; defaults to empty.
+  - `system` (`string`) custom text appended after the admitted mode's prompt contribution; defaults to empty and does not inherit the parent's full system prompt.
   - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
   - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
     handler(input), and optional capture_input for successful input capture.
@@ -1970,13 +1982,13 @@ Return another nonowning handle to this agent.
 Agent:send({ctx}, {message}, {opts?})
 ```
 
-Admit a turn only when this agent and its descendants are idle.
+Admit a turn only when this agent has no active, preparing, or queued work.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{message}` (`string`) User message.
-- `{opts?}` (`table?`) Optional after_turn ID required to match the latest completed turn.
+- `{opts?}` (`table?`) Optional after_turn ID required to match the latest terminal turn, including failure or cancellation.
 
 **Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
 

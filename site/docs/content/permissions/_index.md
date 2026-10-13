@@ -58,6 +58,8 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task_spawn`   | `*`        | Subagent spawning always allowed      |
 
+Earlier task-keyed permission rules and saved allow entries must use `task_spawn`. See [task and Session migration](/docs/plugins/#migration-from-the-previous-task-and-session-apis) for the tool and configuration changes.
+
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 
 These tools have no builtin allow rule, so they prompt (or follow your `default`) every time unless you add rules:

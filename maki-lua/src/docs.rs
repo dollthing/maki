@@ -70,6 +70,15 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
             guard: None,
         },
         FnDoc {
+            name: "mode",
+            args: "",
+            desc: "Read the executing turn's admitted mode. This can differ from Agent:mode(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            params: &[],
+            returns: "(string?, string?) Registered mode name.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
             name: "defer_close",
             args: "{agent}",
             desc: "Register agent close at the end of the current host task, including cancellation. Validates current close authority before registration; host-held cleanup does not depend on a retained context remaining valid.",
