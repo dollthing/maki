@@ -142,10 +142,6 @@ pub trait OrchestrationServices: Send + Sync + 'static {
     fn available_models(&self, _target: &AgentRef) -> Result<Vec<String>, String> {
         Err("host model catalog is unavailable".into())
     }
-
-    fn plan_path_preparer(&self) -> Option<crate::api::agent::PlanPathPreparer> {
-        None
-    }
 }
 
 #[derive(Clone, Default)]

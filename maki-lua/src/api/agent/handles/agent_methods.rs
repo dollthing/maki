@@ -398,13 +398,8 @@ fn agent_mode(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Res
     Ok((Some(config.mode.id().key().to_string()), None))
 }
 
-/// Prepares a fresh plan file path through the host, or the state directory without one.
+/// Allocates a fresh plan file in the state directory, as the UI does.
 async fn prepare_plan_path(lua: &Lua) -> Result<PathBuf, String> {
-    if let Some(prepare) =
-        orchestration::services(lua).and_then(|service| service.plan_path_preparer())
-    {
-        return prepare();
-    }
     let state_dir = lua
         .app_data_ref::<StateDirOverride>()
         .map(|dir| StateDir::from_path(dir.0.clone()));
@@ -416,6 +411,8 @@ async fn prepare_plan_path(lua: &Lua) -> Result<PathBuf, String> {
     .map_err(|error| error.to_string())
 }
 
+// The build and plan names below are native modes that move into guest
+// plugins in PR 8A; until then set_mode keeps their special handling here.
 /// Switch mode through the actor configuration FIFO.
 /// @param ctx LuaCtx Invocation context.
 /// @param name string Registered mode name.

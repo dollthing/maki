@@ -27,7 +27,6 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 use std::{
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -47,7 +46,6 @@ const CAPTURE_TOOL: &str = "capture_result";
 const CAPTURE_REPLY: &str = "structured response committed";
 const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
-const SYNTHETIC_PLAN_PATH: &str = "/test/host-plan.md";
 const MODEL_CATALOG_UNAVAILABLE: &str = "host model catalog is unavailable";
 const TOOLS_ONLY_MODE: &str = "pr5_tools_only";
 
@@ -140,10 +138,6 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
                     .map(|template| TrustedTarget { target, template })
             })
             .transpose()
-    }
-
-    fn plan_path_preparer(&self) -> Option<Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>> {
-        Some(Arc::new(|| Ok(PathBuf::from(SYNTHETIC_PLAN_PATH))))
     }
 
     fn register_target(&self, target: TrustedTarget) -> Result<(), String> {
@@ -413,6 +407,7 @@ async fn shutdown_manager(manager: &AgentManagerHandle) {
 
 struct Fixture {
     _host: PluginHost,
+    _state_dir: tempfile::TempDir,
     manager: AgentManagerHandle,
     requests: flume::Receiver<CapturedRequest>,
     completed: flume::Receiver<Result<(), String>>,
@@ -455,12 +450,13 @@ impl Fixture {
             requests: requests_tx,
         });
         let prepared_provider: Arc<dyn Provider> = provider.clone();
+        let state_dir = tempfile::tempdir().unwrap();
         let host = PluginHost::with_session_provider_preparer(
             Arc::clone(&registry),
             Default::default(),
             true,
             Arc::new(InMemoryFs::new()),
-            None,
+            Some(state_dir.path().to_path_buf()),
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&prepared_provider)))
             })),
@@ -677,6 +673,7 @@ impl Fixture {
             .unwrap();
         Self {
             _host: host,
+            _state_dir: state_dir,
             manager,
             requests,
             completed,
@@ -1428,7 +1425,11 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
         assert_eq!(config.model.spec(), FAST_MODEL);
         assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::Low));
         assert!(config.fast);
-        assert_eq!(config.mode, AgentMode::Plan(SYNTHETIC_PLAN_PATH.into()));
+        assert!(
+            matches!(&config.mode, AgentMode::Plan(path) if path.starts_with(fixture._state_dir.path())),
+            "{:?}",
+            config.mode
+        );
         assert_eq!(config.mode_def.as_ref().unwrap().id.key(), "plan");
         assert_eq!(request.model, FAST_MODEL);
         assert_eq!(request.options.thinking, config.thinking);

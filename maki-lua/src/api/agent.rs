@@ -3,7 +3,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -72,8 +71,6 @@ const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admi
 const SESSION_CLOSED_ERR: &str = "session closed";
 const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
-
-pub type PlanPathPreparer = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 
 pub type SessionProviderPreparer =
     Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
@@ -3283,7 +3280,7 @@ mod tests {
         };
         assert!(session_policy_matches(&policy, &ceiling, &current));
         current = ceiling.clone();
-        current.mode = AgentMode::Plan(PathBuf::from("/project/plan.md"));
+        current.mode = AgentMode::Plan(std::path::PathBuf::from("/project/plan.md"));
         assert!(session_policy_matches(&policy, &ceiling, &current));
         current = ceiling.clone();
         let mut model = current.settings.model.clone();
