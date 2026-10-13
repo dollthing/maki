@@ -3863,6 +3863,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         cmdline,
         depth,
         reply_tx,
+        ..
     } = rx
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION)
@@ -6233,6 +6234,7 @@ fn session_picker_requested_routes_through_sessions_command() {
         cmdline,
         depth,
         reply_tx,
+        ..
     } = next_picker_action(&actions)
     else {
         panic!("SessionPickerRequested did not route through RunCommand");

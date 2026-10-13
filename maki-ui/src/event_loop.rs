@@ -3011,6 +3011,15 @@ impl<'t> EventLoop<'t> {
             UiAction::RunCommand {
                 cmdline,
                 depth,
+                target: Some(target),
+                reply_tx,
+            } => {
+                let _ = reply_tx.send(self.run_pinned_cmdline(&cmdline, depth, *target));
+            }
+            UiAction::RunCommand {
+                cmdline,
+                depth,
+                target: None,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
@@ -4560,6 +4569,48 @@ impl<'t> EventLoop<'t> {
             },
             None,
         );
+    }
+
+    /// Runs a command for a keymap or event callback against the agent that
+    /// callback was pinned to, in the session that owns it.
+    fn run_pinned_cmdline(
+        &self,
+        cmdline: &str,
+        depth: u8,
+        target: maki_lua::orchestration::TrustedTarget,
+    ) -> Result<(), String> {
+        target
+            .target
+            .validate_live()
+            .map_err(|_| CLOSED_TARGET_ERR.to_owned())?;
+        let runtime = self
+            .sessions
+            .iter()
+            .find(|runtime| {
+                let (manager, _) = runtime.handles.manager_and_root();
+                target.target.manager().same_manager(&manager)
+            })
+            .ok_or_else(|| NOT_LIVE_ERR.to_owned())?;
+        let input = format!("/{}", cmdline.trim().trim_start_matches('/'));
+        let resolved = self
+            .ctx
+            .command_runtime
+            .registry
+            .resolve_input_for(&runtime.app.command_target, &input)
+            .map_err(|error| match error {
+                maki_commands::ResolutionError::UnknownCommand(name) => {
+                    format!("unknown command '{name}'")
+                }
+                maki_commands::ResolutionError::StaleTarget => error.to_string(),
+            })?;
+        self.ctx.command_runtime.dispatch_command_pinned(
+            &runtime.app.command_target,
+            resolved.command,
+            resolved.arguments,
+            depth.into(),
+            target,
+        );
+        Ok(())
     }
 
     /// Pins the keymap callback to the agent selected when the key was
@@ -8153,6 +8204,115 @@ mod tests {
                 },
             ));
             assert_eq!(manager.snapshot().len(), 1);
+        });
+    }
+
+    #[test]
+    fn keymap_run_command_addresses_its_pinned_target_after_focus_moves() {
+        const PINNED_THINKING: &str = "high";
+        const CHILD_CHAT: &str = "keymap pin child";
+        const SPAWNED: &str = "keymap pin child spawned";
+        const INNER_DONE: &str = "keymap pin command finished";
+        const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            event_loop.sessions[0].app.lua_event_handle = host.event_handle();
+            host.load_source(
+                "keymap_pin_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-keymap-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/keymap-inner", tui_only = false,
+                        handler = function(_, ctx)
+                            local target = assert(maki.agent.current(ctx))
+                            assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
+                            maki.ui.flash("{INNER_DONE}")
+                        end,
+                    }})
+                    maki.keymap.set("n", "<C-y>", function()
+                        assert(maki.api.run_command("/keymap-inner"))
+                    end)
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            let command_target = event_loop.sessions[0].app.command_target.clone();
+            smol::block_on(registry.dispatch_input(&command_target, "/spawn-keymap-child".into()));
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let thinking = |id| {
+                manager
+                    .actor(id)
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .thinking
+            };
+            let pinned_thinking = DomainThinkingConfig::Effort(Effort::High);
+            let root_thinking = thinking(root_id);
+            assert_ne!(root_thinking, pinned_thinking);
+            assert_ne!(thinking(child_id), pinned_thinking);
+
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                CHILD_CHAT.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            app.chats.push(chat);
+            app.active_chat = 1;
+            event_loop.sync_orchestration();
+            let keymap = host.keymap_reader().load().entries[0].id;
+            event_loop.run_keybind(0, keymap);
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            let action = actions.recv_timeout(ACTION_TIMEOUT).unwrap();
+            assert!(matches!(
+                &action,
+                UiAction::RunCommand {
+                    target: Some(_),
+                    ..
+                }
+            ));
+            event_loop.handle_ui_action(action);
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == INNER_DONE
+            ));
+            assert_eq!(thinking(child_id), pinned_thinking);
+            assert_eq!(thinking(root_id), root_thinking);
         });
     }
 

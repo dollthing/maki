@@ -1173,6 +1173,7 @@ async fn run_command(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
                 cmdline,
                 depth,
+                target: crate::runtime::pinned_target(&lua).map(Box::new),
                 reply_tx,
             })
             .await

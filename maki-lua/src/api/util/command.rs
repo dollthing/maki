@@ -639,6 +639,9 @@ pub enum UiAction {
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// The agent a keymap or event callback was pinned to; `None` runs
+        /// against the focused session.
+        target: Option<Box<crate::orchestration::TrustedTarget>>,
         reply_tx: flume::Sender<Result<(), String>>,
     },
 }

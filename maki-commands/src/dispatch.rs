@@ -120,6 +120,27 @@ impl CommandRegistry {
         self.dispatch_resolved(command, arguments, content, target.clone(), depth, None)
     }
 
+    /// Dispatches with an admission the caller pinned earlier, instead of
+    /// the target's current one.
+    pub fn dispatch_command_with_admission(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+        depth: usize,
+        admission: Arc<dyn Any + Send + Sync>,
+    ) -> CommandFuture<CommandOutcome> {
+        self.dispatch_resolved(
+            command,
+            arguments,
+            content,
+            target.clone(),
+            depth,
+            Some(Some(admission)),
+        )
+    }
+
     fn dispatch_resolved(
         &self,
         command: ResolvedCommand,

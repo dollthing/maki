@@ -198,6 +198,26 @@ impl CommandRuntime {
         self.send_outcome(target.id(), future);
     }
 
+    /// Dispatches with an admission pinned before the request arrived.
+    pub(crate) fn dispatch_command_pinned(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        depth: usize,
+        admission: TrustedTarget,
+    ) {
+        let future = self.registry.dispatch_command_with_admission(
+            target,
+            command,
+            arguments,
+            CommandContent::default(),
+            depth,
+            Arc::new(admission),
+        );
+        self.send_outcome(target.id(), future);
+    }
+
     pub(crate) fn dispatch_input(&self, target: &TargetHandle, content: CommandContent) {
         let future = self.registry.dispatch_input(target, content);
         self.send_dispatched(target.id(), future);

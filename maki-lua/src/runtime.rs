@@ -589,6 +589,9 @@ pub(crate) struct TaskCell {
     /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
     pub(crate) command_invocation: Option<CommandTaskInvocation>,
+    /// The agent a keymap or event callback was pinned to, so nested
+    /// `run_command` calls address it rather than current focus.
+    pub(crate) pinned_target: Option<crate::orchestration::TrustedTarget>,
 }
 
 impl TaskCell {
@@ -621,6 +624,7 @@ impl TaskCell {
             owns_jobs: true,
             command_depth: 0,
             command_invocation: None,
+            pinned_target: None,
         }
     }
 
@@ -1416,6 +1420,11 @@ pub(crate) fn command_depth(lua: &Lua) -> u8 {
         .map_or(0, |handle| lock_cell(&handle).command_depth)
 }
 
+pub(crate) fn pinned_target(lua: &Lua) -> Option<crate::orchestration::TrustedTarget> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).pinned_target.clone())
+}
+
 pub(crate) fn command_invocation(lua: &Lua) -> Option<CommandTaskInvocation> {
     lua.app_data_ref::<TaskHandle>()
         .and_then(|handle| lock_cell(&handle).command_invocation.clone())
@@ -1511,6 +1520,9 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
             .is_some_and(|handle| lock_cell(handle).delegated_tool),
         command_depth,
         command_invocation,
+        pinned_target: handle
+            .as_ref()
+            .and_then(|handle| lock_cell(handle).pinned_target.clone()),
         timer_id: None,
     };
 
@@ -1742,6 +1754,7 @@ pub(crate) struct PendingAsyncTask {
     pub delegated_tool: bool,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
+    pub pinned_target: Option<crate::orchestration::TrustedTarget>,
     /// Timer fires pass their id as the first callback argument.
     pub timer_id: Option<u64>,
 }
@@ -1959,6 +1972,7 @@ fn spawn_async_task(
         cell.delegated_tool = task.delegated_tool;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
+        cell.pinned_target = task.pinned_target;
         cell.plugin_origin = task
             .owner
             .as_ref()
@@ -5086,6 +5100,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     {
                                         target.template = template;
                                     }
+                                    lock_cell(scope.handle()).pinned_target = Some(target.clone());
                                     let ctx = LuaCtx::trusted_event_context(&lua, target, plugin.clone());
                                     let run = async {
                                         let payload = json_to_lua(&lua, &request.payload)?;
@@ -5389,6 +5404,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let scope = TaskScope::detached(&lua);
+                                    if let Ok(Some(target)) = &target {
+                                        lock_cell(scope.handle()).pinned_target = Some(target.clone());
+                                    }
                                     let run = async {
                                         let ctx = match target.map_err(mlua::Error::runtime)? {
                                             Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin)),
@@ -6401,6 +6419,7 @@ mod tests {
             delegated_tool: false,
             command_depth: 0,
             command_invocation: None,
+            pinned_target: None,
             timer_id: None,
         }
     }
@@ -6935,6 +6954,7 @@ mod tests {
             delegated_tool: false,
             command_depth: 0,
             command_invocation: None,
+            pinned_target: None,
             timer_id: None,
         };
         let ex = Rc::new(smol::LocalExecutor::new());

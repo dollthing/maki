@@ -178,6 +178,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     delegated_tool: false,
                     command_depth: 0,
                     command_invocation: None,
+                    pinned_target: None,
                     timer_id: Some(timer_id),
                 }),
                 Err(e) => {
