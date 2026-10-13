@@ -626,8 +626,8 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = description
-    .. "\nStart a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait. Managed nested waits yield turn capacity. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.",
+  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait. Managed nested waits yield turn capacity. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
+    .. description,
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},

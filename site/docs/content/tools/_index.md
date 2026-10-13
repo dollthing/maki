@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -185,7 +185,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 ### `task_spawn` {#task_spawn}
 
-Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Managed general subagents must use the blocking task tool for nested work so their turn capacity is yielded while the child runs. Unmanaged callers retain task_spawn/task_get compatibility. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.
+Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait. Managed nested waits yield turn capacity. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -196,9 +196,19 @@ Start a background subagent and return its task_id immediately. Each task's mess
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
 | `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
+### `task_wait` {#task_wait}
+
+Wait for one exact task turn. Omitted turn_id snapshots the latest admitted turn once. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task_id` | string | yes | Task id returned by task_spawn. |
+| `timeout` | integer | no | Observation timeout in seconds. Zero checks without waiting; timeout never cancels work. |
+| `turn_id` | string | no | Exact admitted turn. Omit to snapshot the latest retained turn once. |
+
 ### `task_get` {#task_get}
 
-Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Managed general subagents cannot spawn background nested tasks and must use the blocking task tool instead. Unmanaged callers retain task_spawn/task_get compatibility. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.
+Deprecated nonblocking task observation. Returns {status, result?, error?, retryable?}. Use task_wait instead.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -206,7 +216,7 @@ Poll a background subagent. Returns { status = "running" | "done" | "closed", re
 
 ### `task_send` {#task_send}
 
-Queue a message to a background subagent in per-task FIFO order and return immediately. A done subagent processes it as a new turn, acquiring concurrency capacity when the turn starts. Returns { queued = true }, or a session error if queueing fails. Also callable from a code_execution script as a Python async function.
+Queue a message to a background subagent in per-task FIFO order and return immediately. A done subagent processes it as a new turn, acquiring concurrency capacity when the turn starts. Returns { queued = true, turn_id }, or a session error if queueing fails. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

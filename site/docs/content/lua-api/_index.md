@@ -84,16 +84,17 @@ The rules:
 
 | Module | What it is for |
 | --- | --- |
+| [`LuaCtx`](#LuaCtx) | Host-issued invocation context. |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
-| [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
-| [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning live agent handle. |
+| [`maki.agent.Session`](#maki-agent-Session) | A compatibility subagent session with its own conversation history. |
+| [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning agent handle. |
 | [`maki.agent.AgentRef`](#maki-agent-AgentRef) | Visibility-only identity. |
 | [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | A revocable subscription. |
-| [`maki.agent.AgentTurn`](#maki-agent-AgentTurn) | A nonowning exact-turn ticket with repeatable result reads. |
+| [`maki.agent.AgentTurn`](#maki-agent-AgentTurn) | An exact-turn ticket with repeatable retained result reads. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
@@ -129,6 +130,51 @@ The rules:
 | [`maki.ui.Buf`](#maki-ui-Buf) | A content buffer that holds styled lines of text. |
 | [`maki.uv`](#maki-uv) | System and environment utilities, modelled after `vim.uv`. |
 | [`maki.yaml`](#maki-yaml) | YAML encoding and decoding. |
+
+## LuaCtx {#LuaCtx}
+
+Host-issued invocation context. Tool contexts have delegated authority over the executing agent and allowed descendants. Command/keymap/event contexts have trusted plugin authority over their pinned host target. Authority expires on invocation exit, cancellation or plugin-generation revocation; retaining userdata does not extend it. Unsupported capabilities return nil and an error.
+
+---
+
+### `LuaCtx:agent()` {#LuaCtx-agent}
+
+```lua
+LuaCtx:agent()
+```
+
+Resolve the pinned invocation subject, not current UI focus. Equivalent to maki.agent.current(ctx).
+
+**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle with no authority independent of this context.
+
+---
+
+### `LuaCtx:model()` {#LuaCtx-model}
+
+```lua
+LuaCtx:model()
+```
+
+Read the executing turn's admitted selection. This can differ from Agent:model(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
+
+**Returns:** (`table?`, `string?`) Complete normalized selection {spec, thinking, fast}; thinking is a setting string or budget integer. Disabled values are off and false.
+
+---
+
+### `LuaCtx:defer_close()` {#LuaCtx-defer_close}
+
+```lua
+LuaCtx:defer_close({agent})
+```
+
+Register agent close at the end of the current host task, including cancellation. Validates current close authority before registration; host-held cleanup does not depend on a retained context remaining valid.
+
+**Parameters:**
+
+- `{agent}` ([`Agent`](#maki-agent-Agent)) Agent to close. Host roots do not support this operation.
+
+**Returns:** (`boolean?`, `string?`) true when cleanup is registered, or nil and an error.
+
 
 ## maki {#maki}
 
@@ -226,14 +272,15 @@ needs to dismiss itself, and the difference from `maki.async.sleep`.
 You get back a handle. Its `:stop()` cancels a callback that has not
 fired yet, which is how you debounce: schedule, then stop and
 reschedule on every new event. An error raised by the callback is
-logged and dropped, since nobody is waiting for a result.
+logged and dropped, since nobody is waiting for a result. Delegated tool
+tasks, including their async children, cannot schedule deferred callbacks.
 
 **Parameters:**
 
 - `{callback}` (`function`) Called with no arguments.
 - `{ms}` (`integer`) Delay in milliseconds. Zero fires on the next tick.
 
-**Returns:** (`maki.Timer`) Handle with `:stop()` to cancel before it fires.
+**Returns:** string|nil Error on failure.
 
 **Example:**
 
@@ -503,8 +550,14 @@ browsing memory files or toggling settings.
   - `arguments` (`table`) Use `{ raw = true }` for an unparsed argument
     remainder. Add `required = true` to reject empty
     input. Raw handlers receive `opts.args` only.
-  - `handler` (`function`) Required. Called with one opts table after the
-    command arguments pass validation. `opts.args` is
+  - `handler` (`function`) Required. Called as `handler(opts, ctx)` after the
+    command arguments pass validation. `ctx` is a trusted
+    invocation-scoped LuaCtx, or nil if the host has no
+    agent target. `maki.agent.current(ctx)` resolves its
+    pinned agent; later focus changes do not retarget it.
+    Retaining ctx does not extend its authority beyond
+    the handler. Existing one-argument handlers still work.
+    `opts.args` is
     the outer-trimmed original argument remainder. It
     keeps inner whitespace and source quotes. For typed
     commands, `opts.fargs` is the decoded token array
@@ -751,6 +804,9 @@ aliases stops with one too.
 This returns as soon as the command has been dispatched, not when it
 finishes, so aliasing something long-running like `/compact` does not
 block your handler.
+
+Delegated tool handlers cannot call this trusted command executor. Nested
+trusted command calls retain the invoking command's pinned agent target.
 
 Called from inside another command's handler there is no frontend waiting
 on the result, so a command that needs one to run it -- a model turn, a
@@ -1196,7 +1252,7 @@ The returned table has fields: `id` (string), `tier` (string),
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts?}` (`table?`) Optional fields:
   - `tier` (`string?`) target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
     the parent tier so you cannot escalate.
@@ -1227,7 +1283,7 @@ prompt for a subagent session.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts}` (`table`) Required fields:
   - `prompt_id` (`string`) one of `"research"`, `"general"`, `"system"`.
 
@@ -1263,7 +1319,7 @@ available.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts}` (`table`) Required fields:
   - `audience` (`string`) tool audience filter, e.g. `"general"`, `"subagent"`,
     `"general_sub"`.
@@ -1312,7 +1368,7 @@ than the shadowed one's.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 
 **Returns:** (`table?`, `string?`) Array of `{ name, alias?, source, audiences, schema? }`,
   or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
@@ -1346,7 +1402,7 @@ through optional callbacks while the tool runs.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{name}` (`string`) Tool name, e.g. `"bash"`, `"read"`.
 - `{input}` (`table|any`) Tool input (JSON-serializable). Must match the tool's `input_schema`.
 - `{opts?}` (`table?`) Optional fields:
@@ -1389,7 +1445,7 @@ Allow and deny rules apply exactly as they do for a plain tool call.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts}` (`table`) Required fields:
   - `tool` (`string`) tool key to prompt for, e.g. `"bash"`.
   - `scopes` (`string[]`) permission scopes to prompt for.
@@ -1428,7 +1484,7 @@ than caching it.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 
 **Returns:** (`boolean`) `true` when YOLO mode is active.
 
@@ -1444,12 +1500,16 @@ Create a new subagent session. The session inherits the parent model and
 MCP handle unless you override them. You get back a `Session` object that
 you can send messages to with `:prompt()`.
 
+Trusted sessions remain usable by same-plugin handlers until host/plugin
+revocation. Tool-created sessions expire when their creating invocation ends.
+Passing a Session to another coroutine does not transfer authority.
+
 This is the main way to spin up a sub-conversation with its own history
 and tool set.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts}` (`table`) Optional fields:
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
   - `system` (`string?`) system prompt. Defaults to empty.
@@ -1478,10 +1538,11 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
-  - `auto_deliver` (`boolean?`) queue completed output for the root agent only
-    for asynchronous direct-root children. Blocking `prompt()` returns its
-    result to the caller. Nested asynchronous completion is not automatically
-    delivered to the parent. Default: `true`.
+  - `auto_deliver` (`boolean?`) for managed children, queue one structured
+    lifecycle observation per settled turn to the recorded parent, independently
+    of `prompt()` or ticket waits. Nested children notify their own parent.
+    Silent children disable delivery. Rejection and discard are observable in
+    host logs; delivery is in-memory, without retry. Default: `true`.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
     driver immediately before each unmanaged turn and released when that turn
     ends. Managed sessions ignore it and use the parent manager's limit.
@@ -1530,7 +1591,7 @@ Read the agent associated with an explicit invocation context.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning agent handle.
 
@@ -1546,9 +1607,9 @@ Read the root agent of this context's graph.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Root agent, subject to caller authority.
+**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Visibility-only root reference.
 
 ---
 
@@ -1562,9 +1623,9 @@ List accessible live agents in this context's graph.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Array of nonowning handles.
+**Returns:** (`table?`, `string?`) Array of visibility-only AgentRef values. Visibility does not grant control. Non-TUI hosts include their root and accessible live plugin-owned standalone children.
 
 ---
 
@@ -1574,11 +1635,11 @@ List accessible live agents in this context's graph.
 maki.agent.get({ctx}, {reference})
 ```
 
-Look up a live agent by ID in this context's graph.
+Resolve an AgentRef with current control authority. String IDs are not accepted.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{reference}` ([`AgentRef`](#maki-agent-AgentRef)) Visibility-only reference.
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle or error.
@@ -1601,15 +1662,38 @@ Unmanaged children use the current host task's authority, not a managed graph.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Active agent context or trusted pinned parent.
-- `{opts}` (`table`) Spawn options; tools is an optional array of request definitions.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Active agent context or trusted pinned parent.
+- `{opts}` (`table`) Optional creation fields:
+  - `model_spec` (`string`) override the inherited model; no command brace grammar.
+  - `thinking` (`string|integer`) and fast (boolean): override inherited options.
+  - `system` (`string`) custom system prompt contribution; defaults to empty.
+  - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
+  - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
+    handler(input), and optional capture_input for successful input capture.
+  - `name` (`string`) display name. audience (string): defaults to "general_sub";
+    the child cannot widen the parent's capability ceiling.
+  - `mcp` (`boolean`) defaults to true, subject to inherited restrictions.
+  - `output_schema` (`table`) validated before creation; requires a valid final
+    report each turn through the Rust structured-output reporting tool.
+  - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
+  - `auto_deliver` (`boolean`) defaults to true; managed children notify their
+    recorded parent once per settled turn, independently of ticket waits.
+  - `semaphore` (`maki.async.Semaphore`) unmanaged concurrency limit; managed
+    children use their manager's capacity instead.
+  - `inherit_provider` (`boolean`) defaults to false; reuse the caller's provider
+    and model, ignoring model_spec, when true.
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
 
 
 ## maki.agent.Session {#maki-agent-Session}
 
-A subagent session with its own conversation history.
+A compatibility subagent session with its own conversation history.
+Context-free methods validate current host-assigned coroutine authority.
+Trusted-created sessions require the same plugin and host generation;
+delegated-created sessions expire with their creating invocation.
+Operations cannot widen the immutable creation policy ceiling. Plugin
+revocation cancels owned work; passing userdata does not transfer authority.
 
 Create one with `maki.agent.session()`, then send messages with
 `:prompt()` or `:send()`. The session remembers previous turns, so you
@@ -1636,8 +1720,9 @@ invocation, the same managed session uses an ordinary exact-turn wait. The
 child still uses manager capacity, but no parent permit is yielded. A timeout
 closes the child's managed subtree.
 
-The returned table has fields: `text` (string), `duration_ms` (integer),
-`input_tokens` (integer), `output_tokens` (integer). `text` is an empty
+The returned table has fields: `text` (string), `captured` (optional value),
+`input_tokens` (integer), `output_tokens` (integer). Counters are cumulative
+for the session, unlike AgentTurn's per-turn counters. `text` is an empty
 string when the subagent produced no text block (e.g. it only called
 tools).
 
@@ -1687,9 +1772,11 @@ Session:status()
 
 Read the subagent's current status without blocking.
 
-**Returns:** (`table?`) Table with `status` ("running" | "done" | "closed"), and
-  when done, `result` `{ text, input_tokens, output_tokens, duration_ms, captured? }`
-  and possibly `error`.
+**Returns:** (`table?`, `string?`) Table with status ("running", "done", or "closed").
+  When done, result contains text, input_tokens, output_tokens (cumulative
+  session counters), and optional captured. error is present on failure or
+  cancellation; retryable is present on failure. Authority failure returns nil
+  and an error instead of a status table.
 
 ---
 
@@ -1719,7 +1806,17 @@ Return this session's stable id, used as a `task_id` by the task plugin.
 
 ## maki.agent.Agent {#maki-agent-Agent}
 
-A nonowning live agent handle. Garbage collection never closes its actor.
+A nonowning agent handle. Garbage collection never closes its actor.
+Reads and effects require current invocation authority; identity is context-free.
+A held managed handle retains authorized closed-status reads, not mutation rights.
+Internal compatibility adapters are supported only for the bundled task plugin:
+_maki_session_id() reads the existing task/UI identity without granting control;
+_maki_task_owner() returns a host-stamped owner guard whose _maki_can_control()
+checks the current invocation's plugin generation, host and permitted parent branch.
+The guard cannot authorize effects, transfer control or revive expired authority.
+Each effect still uses the public ctx-taking Agent or AgentTurn operation.
+Third-party plugins should use id(), explicit references and public scoped operations;
+these underscore-prefixed adapters are not a stable public API.
 
 ---
 
@@ -1745,9 +1842,25 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Current actor snapshot.
+**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal. Host roots expose only id and status = "running".
+
+---
+
+### `Agent:mode()` {#Agent-mode}
+
+```lua
+Agent:mode({ctx})
+```
+
+Read the currently committed mode.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+
+**Returns:** (`string?`, `string?`) Registered mode name.
 
 ---
 
@@ -1761,9 +1874,9 @@ Read the actor's committed model configuration.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Model descriptor.
+**Returns:** (`table?`, `string?`) Complete normalized selection {spec, thinking, fast}. thinking is a setting string or budget integer; disabled options are "off" and false. Descriptive model metadata is not included.
 
 ---
 
@@ -1773,13 +1886,13 @@ Read the actor's committed model configuration.
 Agent:available_models({ctx})
 ```
 
-List authenticated host model descriptors without changing focus.
+List authenticated, policy-filtered model spec strings without changing focus.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Available model catalog.
+**Returns:** (`table?`, `string?`) Array of available model spec strings.
 
 ---
 
@@ -1790,13 +1903,17 @@ Agent:transcript({ctx}, {opts})
 ```
 
 Read a bounded committed transcript, optionally through a completed turn.
+Omitted through_turn selects the latest history-bearing terminal turn; no
+completed history returns an empty snapshot. Pending and unknown turns fail
+explicitly. A boundary removed by compaction returns transcript_unavailable.
+Snapshots are bounded history views, not an archive immune to compaction.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
-- `{opts}` (`table`) Required positive last_messages and max_bytes; optional through_turn.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{opts}` (`table`) Required last_messages (1..1000) and max_bytes (2..1048576); optional through_turn. max_bytes bounds compact JSON of the messages array, not metadata.
 
-**Returns:** (`table?`, `string?`) Messages and truncation metadata.
+**Returns:** (`table?`, `string?`) agent_id, through_turn, messages, epoch, total_messages, omitted_messages, omitted_tool_groups, compacted, bytes, truncated. Tool-call/response groups are indivisible; omitted_tool_groups counts omitted groups, not calls. compacted identifies a history containing a compaction summary, independently of bounded truncation.
 
 ---
 
@@ -1822,7 +1939,7 @@ Admit a turn only when this agent and its descendants are idle.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{message}` (`string`) User message.
 - `{opts?}` (`table?`) Optional after_turn ID required to match the latest completed turn.
 
@@ -1840,7 +1957,7 @@ Queue a turn behind already admitted work.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{message}` (`string`) User message.
 
 **Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
@@ -1857,11 +1974,11 @@ Send an idle-only turn and wait for its exact result.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{message}` (`string`) User message.
-- `{opts?}` (`table?`) Optional timeout and after_turn.
+- `{opts?}` (`table?`) timeout is a nonnegative integer number of seconds; zero is nonblocking. after_turn must match the latest terminal turn.
 
-**Returns:** (`table?`, `string?`) Per-turn result.
+**Returns:** (`table?`, `string|table?`) AgentTurn result, or an admission/wait error. A pending timeout returns nil and {kind = "timeout", message, ticket}; the exact ticket remains usable with current valid authority. Timeout does not cancel execution.
 
 ---
 
@@ -1875,10 +1992,10 @@ Switch model through a reserved actor configuration operation.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{patch}` (`string|table`) Spec string or partial spec/thinking/fast selection.
 
-**Returns:** (`table?`, `string?`) Committed model descriptor.
+**Returns:** (`table?`, `string?`) Complete normalized committed selection {spec, thinking, fast}, accepted as a subsequent patch subject to destination policy.
 
 ---
 
@@ -1892,10 +2009,10 @@ Switch mode through the actor configuration FIFO.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 - `{name}` (`string`) Registered mode name.
 
-**Returns:** (`boolean?`, `string?`) Success or error.
+**Returns:** (`string?`, `string?`) Committed mode name or error.
 
 ---
 
@@ -1909,7 +2026,7 @@ Cancel existing work without closing the agent.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
 
@@ -1925,7 +2042,7 @@ Cancel existing work in this agent and its descendants.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
 
@@ -1941,7 +2058,7 @@ Permanently close this agent and its descendants.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
 
@@ -1957,7 +2074,7 @@ Close this agent at the end of the current host task, even on cancellation.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Cleanup registered.
 
@@ -1973,8 +2090,8 @@ Subscribe to future turn admissions. Handlers may overlap.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Trusted invocation context.
-- `{handler}` (`function`) Receives immutable event payload and a fresh scoped ctx.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler(payload, ctx) with a fresh trusted scoped context. Payload fields: agent_id, turn_id, origin, selection (normalized {spec, thinking, fast}, when available). origin contains kind ("user", "plugin", or "internal"), plugin?, plugin_generation?, source_agent?, source_turn?. Provenance does not grant authority.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -1990,8 +2107,8 @@ Subscribe to exact settled turn results. Handlers may overlap.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Trusted invocation context.
-- `{handler}` (`function`) Receives result payload and a fresh scoped ctx.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler(result, ctx). result has the same fields as AgentTurn:result and AgentTurn:wait. Each invocation has a fresh trusted scoped context.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2007,8 +2124,8 @@ Subscribe to transitions to no pending turn work.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Trusted invocation context.
-- `{handler}` (`function`) Receives agent identity and a fresh scoped ctx.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler({agent_id}, ctx) with a fresh trusted scoped context. Idle is an observation, not a reservation against new work.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2024,8 +2141,8 @@ Subscribe to committed model or mode changes.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Trusted invocation context.
-- `{handler}` (`function`) Receives selection/generation and a fresh scoped ctx.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler(payload, ctx). Payload fields: agent_id, generation (committed integer), selection (normalized {spec, thinking, fast}), mode (registered name). The context is fresh and trusted.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2041,8 +2158,8 @@ Subscribe to permanent lifecycle closure.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Trusted invocation context.
-- `{handler}` (`function`) Receives lifecycle and a fresh scoped ctx.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{handler}` (`function`) Called as handler({agent_id, lifecycle}, ctx). lifecycle is "closed" or "shutdown". The context is fresh and trusted.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2066,7 +2183,8 @@ Read a reference's stable identity.
 
 ## maki.agent.AgentSubscription {#maki-agent-AgentSubscription}
 
-A revocable subscription. Close explicitly to cancel active callbacks.
+A revocable subscription. Garbage collection does not unsubscribe.
+Close explicitly to cancel callbacks; plugin unload also revokes registration.
 
 ---
 
@@ -2083,7 +2201,18 @@ Revoke future deliveries and cancel active handlers.
 
 ## maki.agent.AgentTurn {#maki-agent-AgentTurn}
 
-A nonowning exact-turn ticket with repeatable result reads.
+An exact-turn ticket with repeatable retained result reads. Dropping it does not cancel work.
+Settled results remain readable with current valid authority after lookup eviction
+or agent close. Result fields: agent_id, turn_id, status ("completed", "failed",
+or "cancelled"), text (last assistant message, including partial failure text),
+duration_ms (immutable elapsed milliseconds for this turn), usage,
+input_tokens, output_tokens (per-turn counters), output (captured array),
+origin. usage contains input_tokens, output_tokens, cache_creation_input_tokens
+and cache_read_input_tokens; top-level input_tokens includes cached tokens.
+captured is the last output when present. Failed results include error,
+user_message and retryable; cancelled results include cancellation_reason.
+origin contains kind ("user", "plugin", or "internal"), plugin?,
+plugin_generation?, source_agent?, source_turn?. It conveys provenance only.
 
 ---
 
@@ -2121,7 +2250,7 @@ Read a retained result without waiting or consuming it.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`table?`, `string?`) Nil without error while pending.
 
@@ -2137,8 +2266,8 @@ Wait for this exact turn. Timeout stops waiting, not the agent.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
-- `{opts?}` (`table?`) Optional timeout in seconds.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{opts?}` (`table?`) timeout is a nonnegative integer number of seconds. Zero returns nil, nil while pending; positive timeout returns nil and "agent turn wait timed out" without cancelling work.
 
 **Returns:** (`table?`, `string?`) Per-turn result or error.
 
@@ -2154,7 +2283,7 @@ Cancel only this admitted turn.
 
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Invocation context.
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
 
@@ -3650,7 +3779,19 @@ mapped, the old binding is replaced and a warning is logged.
 
 - `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
 - `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed.
+- `{rhs}` (`function`) Called as `rhs(nil, ctx)` when the key is pressed.
+
+  `ctx` is a trusted invocation-scoped LuaCtx, or nil if the host has no
+
+
+  agent target. Resolve the callback's agent with `maki.agent.current(ctx)`.
+
+
+  Later focus changes do not retarget an already resolved context. Retaining
+
+
+  the context does not extend its authority beyond the callback.
+
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
 
@@ -3988,7 +4129,8 @@ maki.api.mode.reset("plan")
 ## maki.model {#maki-model}
 
 Read a tool context's model without a UI, or the focused session's
-model for a keybind. `available` and `set` require an interactive UI.
+model for a keybind. Non-UI hosts supply root reads and discovery; SDK
+and ACP also support selection updates. Fixed print roots reject updates.
 
 ---
 
@@ -4005,8 +4147,7 @@ a UI is attached. `thinking` uses the spelling `set` accepts.
 
 - `{ctx?}` (`userdata|nil`) Optional tool handler context.
 
-**Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking, fast,
-  supports_thinking, supports_fast}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) `{spec, thinking, fast}`, or nil and an error.
 
 **Example:**
 
@@ -4046,9 +4187,10 @@ maki.model.set({opts})
 Switches the focused session's model, thinking level, or fast mode. Fields
 you leave out stay as they are, so this doubles as a thinking-only switch.
 Answers with the committed state, in the same shape `get` returns. Changes
-apply to subsequent admissions; saving runs asynchronously after commit.
-See [Configuration changes](/docs/modes/#configuration-changes) for save
-warnings, retry behavior, and crash limitations.
+apply to subsequent admissions. UI actors save asynchronously after commit;
+SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
+print roots reject all patches. Prefer `Agent:set_model(ctx, patch)` for an
+explicit target.
 
 **Parameters:**
 
@@ -4839,14 +4981,15 @@ standard 60s async deadline. Deadlines missed while the runtime was busy
 coalesce into a single fire.
 
 Registration is synchronous - nothing runs until the first deadline - so
-calling this from `init.lua` or a command is safe.
+calling this from `init.lua` or a command is safe. Delegated tool tasks,
+including their async children, cannot register timers.
 
 **Parameters:**
 
 - `{seconds}` (`number`) Interval between fires, in seconds. Must be a finite number > 0 and < 1e9.
 - `{callback}` (`function`) Called on each fire with the timer id. May be async.
 
-**Returns:** integer Id. Pass to `maki.timer.del` to stop the timer.
+**Returns:** string|nil Error on failure.
 
 **Example:**
 
