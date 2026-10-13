@@ -79,7 +79,10 @@ impl ChildDelivery {
                     agent_id: self.result.outcome.agent_id().to_string(),
                     turn_id: self.result.outcome.turn_id().to_string(),
                 }),
-                ..Message::observation(format!("{DELIVERY_HEADER}\n{}", self.to_json()))
+                ..Message::observation(format!(
+                    "{DELIVERY_HEADER}\n{}",
+                    without_nulls(self.to_json())
+                ))
             }],
             thinking: Default::default(),
             fast: false,
@@ -88,6 +91,19 @@ impl ChildDelivery {
             cancel: None,
             lease_committer: None,
         }
+    }
+}
+
+/// Absent and null read the same to the model, so the rendered envelope
+/// drops null fields rather than spending tokens on them.
+fn without_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(fields) => fields
+            .into_iter()
+            .filter(|(_, field)| !field.is_null())
+            .map(|(key, field)| (key, without_nulls(field)))
+            .collect(),
+        other => other,
     }
 }
 
@@ -850,6 +866,16 @@ mod tests {
             child_task.await;
             parent_task.await;
         });
+    }
+
+    #[test]
+    fn rendered_envelope_omits_null_fields() {
+        let envelope = delivery(AgentId::generate());
+        assert!(envelope.to_json().to_string().contains("null"));
+        let input = envelope.input();
+        let rendered = input.preamble[0].first_text_content().unwrap();
+        assert!(!rendered.contains("null"), "{rendered}");
+        assert!(super::delivery_summary(&input).is_some());
     }
 
     #[test]
