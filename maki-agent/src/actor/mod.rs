@@ -516,6 +516,20 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
             continue;
         }
         if let ActorOperation::Turn {
+            ticket,
+            correlation,
+            ..
+        } = head
+        {
+            delivery::record(
+                inner,
+                ticket.turn_id(),
+                state.policy_generation,
+                state.policy.clone(),
+                correlation.clone(),
+            );
+        }
+        if let ActorOperation::Turn {
             policy_constraint: Some(constraint),
             ..
         } = head
@@ -633,7 +647,7 @@ fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
 }
 
 fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, retryable: bool) {
-    tracing::error!(agent_id = %inner.agent_id, "admission preparation panicked");
+    tracing::error!(agent_id = %inner.agent_id, %diagnostic, retryable, "turn admission failed");
     if let ActorOperation::Root { root, .. } = &work
         && let Some(report) = &inner.root_preparation_error
     {
@@ -1318,6 +1332,14 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    pub(crate) fn lifecycle(&self) -> ActorLifecycle {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .lifecycle
     }
 
     /// Captures the nominal processing turn, including the pop/install gap.

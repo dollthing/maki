@@ -51,38 +51,23 @@ struct OutputState {
 pub struct TurnOutput(Arc<Mutex<OutputState>>);
 
 impl TurnOutput {
-    pub fn begin_message(&self) {
+    pub fn begin_text_attempt(&self) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
             state.text.clear();
         }
     }
 
-    pub fn reset_message(&self) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.result.is_none() {
-            state.text.clear();
-        }
+    pub fn reset_text_attempt(&self) {
+        self.begin_text_attempt();
     }
 
-    pub fn complete_message(&self, text: &str) {
+    pub fn reconcile_text_attempt(&self, text: &str) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
             state.text.clear();
             state.text.push_str(text);
         }
-    }
-
-    pub fn begin_text_attempt(&self) {
-        self.begin_message();
-    }
-
-    pub fn reset_text_attempt(&self) {
-        self.reset_message();
-    }
-
-    pub fn reconcile_text_attempt(&self, text: &str) {
-        self.complete_message(text);
     }
 
     pub fn append_text(&self, text: &str) {

@@ -257,7 +257,7 @@ impl AgentManagerHandle {
             || node
                 .actor
                 .as_ref()
-                .is_none_or(|actor| actor.snapshot().lifecycle != ActorLifecycle::Open)
+                .is_none_or(|actor| actor.lifecycle() != ActorLifecycle::Open)
         {
             return Err(ManagerError::NonLiveAgent(agent.agent_id));
         }
@@ -601,7 +601,7 @@ impl AgentManagerHandle {
                     || parent
                         .actor
                         .as_ref()
-                        .is_none_or(|actor| actor.snapshot().lifecycle != ActorLifecycle::Open)
+                        .is_none_or(|actor| actor.lifecycle() != ActorLifecycle::Open)
                 {
                     return Err(ManagerError::NonLiveAgent(parent_id));
                 }
@@ -1269,11 +1269,16 @@ impl AgentManagerHandle {
                 .nodes
                 .iter()
                 .filter_map(|(&id, node)| {
-                    (node.lifecycle.consumes_capacity() || node.reservation_pending).then_some(id)
+                    (node.lifecycle.consumes_capacity()
+                        || node.reservation_pending
+                        || node.task.as_ref().is_some_and(|task| !task.is_finished()))
+                    .then_some(id)
                 })
                 .collect();
             for id in &ids {
-                if let Some(node) = graph.nodes.get_mut(id) {
+                if let Some(node) = graph.nodes.get_mut(id)
+                    && node.lifecycle.consumes_capacity()
+                {
                     node.lifecycle = GraphLifecycle::Closing;
                 }
             }

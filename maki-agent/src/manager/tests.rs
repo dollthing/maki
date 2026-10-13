@@ -723,11 +723,19 @@ fn closed_node_waits_for_queued_event_callback_lease() {
         actor.close();
         let (event, lease) = events.recv_async().await.unwrap().into_parts();
         assert!(matches!(event, crate::ActorEvent::Close { .. }));
+        yield_until(|| root.snapshot().unwrap().graph_lifecycle == GraphLifecycle::Closed).await;
         assert!(manager.node(root.id()).is_ok());
+        let report = manager.shutdown(Duration::ZERO).await;
+        assert!(report.joined.is_empty());
+        assert_eq!(report.timed_out, vec![root.id()]);
+        assert_eq!(
+            root.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+        assert!(!manager.runner_finished(root.id()).unwrap());
         drop(lease);
         drop(events);
-        let report = manager.shutdown(COMPLETION_TIMEOUT).await;
-        assert!(report.timed_out.is_empty());
+        manager.wait_until_reaped().await;
         assert!(matches!(
             manager.node(root.id()),
             Err(ManagerError::UnknownAgent(_))
@@ -3461,9 +3469,11 @@ fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
     });
 }
 
-#[test]
-fn descendant_admission_rejects_parent_actor_without_suspending() {
+#[test_case(false; "parent_actor")]
+#[test_case(true; "foreign_manager_actor")]
+fn descendant_admission_rejects_mismatched_actor_without_suspending(foreign: bool) {
     smol::block_on(async {
+        const CORRELATION: &str = "child";
         let (manager, root, current, root_gate) = active_root(AgentLimits::default());
         let child = manager
             .spawn_child(
@@ -3475,88 +3485,56 @@ fn descendant_admission_rejects_parent_actor_without_suspending() {
             )
             .unwrap();
         let child_actor = child.actor().unwrap();
-
+        let foreign_root = foreign.then(|| active_root(AgentLimits::default()));
+        let wrong_actor = foreign_root
+            .as_ref()
+            .map_or(&root, |(_, root, _, _)| root)
+            .actor()
+            .unwrap();
         let error = current
             .lease()
             .admit_and_wait_for_descendant(
                 &current,
                 child.id(),
-                &root.actor().unwrap(),
+                &wrong_actor,
                 super::PromptAdmission {
                     input: input(),
                     event_sender: None,
-                    correlation: "child".into(),
+                    correlation: CORRELATION.into(),
                 },
                 None,
             )
             .err()
             .unwrap();
-        assert!(matches!(error, ManagerError::ActorMismatch { .. }));
+        assert_eq!(
+            error,
+            ManagerError::ActorMismatch {
+                expected_id: child.id(),
+                actual_id: wrong_actor.agent_id(),
+            }
+        );
         assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
         assert_eq!(child_actor.snapshot().queued, 0);
-
         root_gate.release(1);
+        if let Some((_, _, _, gate)) = &foreign_root {
+            gate.release(1);
+        }
         assert!(
             manager
-                .shutdown(std::time::Duration::from_secs(1))
+                .shutdown(COMPLETION_TIMEOUT)
                 .await
                 .timed_out
                 .is_empty()
         );
-    });
-}
-
-#[test]
-fn descendant_admission_rejects_foreign_manager_actor_without_suspending() {
-    smol::block_on(async {
-        let (manager, _, current, root_gate) = active_root(AgentLimits::default());
-        let child = manager
-            .spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            )
-            .unwrap();
-        let child_actor = child.actor().unwrap();
-        let (foreign_manager, foreign_root, _, foreign_gate) = active_root(AgentLimits::default());
-
-        let error = current
-            .lease()
-            .admit_and_wait_for_descendant(
-                &current,
-                child.id(),
-                &foreign_root.actor().unwrap(),
-                super::PromptAdmission {
-                    input: input(),
-                    event_sender: None,
-                    correlation: "child".into(),
-                },
-                None,
-            )
-            .err()
-            .unwrap();
-        assert!(matches!(error, ManagerError::ActorMismatch { .. }));
-        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
-        assert_eq!(child_actor.snapshot().queued, 0);
-
-        root_gate.release(1);
-        foreign_gate.release(1);
-        assert!(
-            manager
-                .shutdown(std::time::Duration::from_secs(1))
-                .await
-                .timed_out
-                .is_empty()
-        );
-        assert!(
-            foreign_manager
-                .shutdown(std::time::Duration::from_secs(1))
-                .await
-                .timed_out
-                .is_empty()
-        );
+        if let Some((manager, _, _, _)) = foreign_root {
+            assert!(
+                manager
+                    .shutdown(COMPLETION_TIMEOUT)
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+        }
     });
 }
 
