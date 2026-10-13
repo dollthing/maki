@@ -1905,6 +1905,30 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
 }
 
 #[test]
+fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change() {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr5_admitted_model",
+            r#"
+            local agent = assert(maki.agent.current(ctx))
+            local admitted = assert(ctx:model())
+            assert(admitted.thinking == "off", tostring(admitted.thinking))
+            assert(agent:set_model(ctx, { thinking = "high" }))
+            assert(assert(agent:model(ctx)).thinking == "high")
+            assert(assert(ctx:model()).thinking == "off")
+        "#,
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "admitted model reads")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
 fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
     smol::block_on(async {
         const PLUGIN: &str = "pr5_no_focus";
