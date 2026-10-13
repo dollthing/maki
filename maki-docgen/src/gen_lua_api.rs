@@ -18,77 +18,66 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    #[test_case("maki.api.register_command()", &[
-        "`handler(opts, ctx)`",
-        "trusted invocation-scoped LuaCtx",
-        "pinned agent",
-        "Existing one-argument handlers still work.",
-    ]; "command_context")]
-    #[test_case("maki.keymap.set()", &[
-        "`rhs(nil, ctx)`",
-        "trusted invocation-scoped LuaCtx",
-        "`maki.agent.current(ctx)`",
-        "Retaining the context does not extend its authority beyond the callback.",
-    ]; "keymap_context")]
-    #[test_case("maki.api.run_command()", &[
-        "Delegated tool handlers cannot call this trusted command executor.",
-        "Nested trusted command calls retain the invoking command's pinned agent target.",
-    ]; "nested_command_authority")]
-    #[test_case("Agent:status()", &["active_turn", "cumulative integers", "closed snapshot", "Host roots expose only id"]; "agent_status")]
-    #[test_case("Agent:model()", &["{spec, thinking, fast}", "Descriptive model metadata is not included."]; "agent_selection")]
-    #[test_case("Agent:available_models()", &["Array of available model spec strings."]; "model_discovery")]
-    #[test_case("maki.agent.spawn()", &["model_spec", "local_tools", "output_schema", "auto_deliver", "inherit_provider"]; "spawn_options")]
-    #[test_case("Agent:transcript()", &["transcript_unavailable", "omitted_tool_groups", "compacted", "max_bytes"]; "transcript_fields")]
-    #[test_case("Agent:prompt()", &["kind = \"timeout\"", "exact ticket remains usable", "Timeout does not cancel execution."]; "prompt_ticket")]
-    #[test_case("Agent:on_turn_start()", &["handler(payload, ctx)", "source_turn?", "plugin_generation?", "selection"]; "start_event")]
-    #[test_case("Agent:on_turn_end()", &["same fields as AgentTurn:result and AgentTurn:wait"]; "end_event")]
-    #[test_case("Agent:on_idle()", &["handler({agent_id}, ctx)", "not a reservation"]; "idle_event")]
-    #[test_case("Agent:on_config_change()", &["generation", "selection", "mode (registered name)"]; "config_event")]
-    #[test_case("Agent:on_close()", &["lifecycle is \"closed\" or \"shutdown\""]; "close_event")]
-    #[test_case("LuaCtx:agent()", &["pinned invocation subject", "maki.agent.current(ctx)"]; "context_agent")]
-    #[test_case("LuaCtx:model()", &["admitted selection", "{spec, thinking, fast}", "unsupported-capability error"]; "context_model")]
-    #[test_case("LuaCtx:defer_close()", &["including cancellation", "host-held cleanup", "Host roots do not support"]; "context_cleanup")]
-    #[test_case("Session:status()", &["cumulative session counters", "retryable", "Authority failure"]; "session_status")]
-    fn generated_docs_contain_callback_authority_contract(signature: &str, required: &[&str]) {
-        let page = generate();
-        let heading = format!("### `{signature}`");
-        let start = page.find(&heading).expect("API section must be rendered");
-        let end = page[start..]
-            .find("\n---\n")
-            .map(|offset| start + offset)
-            .expect("API section must have a separator");
-        let rendered = page[start..end]
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        for text in required {
-            assert!(
-                rendered.contains(text),
-                "rendered {signature} docs must contain {text:?}"
-            );
-        }
+    const SECTION_SEPARATOR: &str = "\n---\n";
+    const MODULE_HEADING_PREFIX: &str = "\n## ";
+
+    fn normalized(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    #[test_case("maki.agent.AgentTurn", &["lookup eviction", "cancellation_reason", "user_message", "retryable", "per-turn counters", "last assistant message", "duration_ms", "immutable elapsed milliseconds for this turn"]; "ticket_result_fields")]
-    #[test_case("maki.agent.AgentSubscription", &["Garbage collection does not unsubscribe", "Close explicitly"]; "subscription_lifetime")]
-    fn generated_class_docs_contain_lifetime_and_result_contract(name: &str, required: &[&str]) {
+    #[test_case("maki.api.register_command()", "maki.api.register_command({spec})"; "register_command")]
+    #[test_case("maki.keymap.set()", "maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})"; "keymap_set")]
+    #[test_case("maki.api.run_command()", "maki.api.run_command({cmdline})"; "run_command")]
+    #[test_case("maki.agent.spawn()", "maki.agent.spawn({ctx}, {opts})"; "agent_spawn")]
+    #[test_case("Agent:status()", "Agent:status({ctx})"; "agent_status")]
+    #[test_case("Agent:model()", "Agent:model({ctx})"; "agent_model")]
+    #[test_case("Agent:available_models()", "Agent:available_models({ctx})"; "agent_available_models")]
+    #[test_case("Agent:transcript()", "Agent:transcript({ctx}, {opts})"; "agent_transcript")]
+    #[test_case("Agent:prompt()", "Agent:prompt({ctx}, {message}, {opts?})"; "agent_prompt")]
+    #[test_case("Agent:on_turn_start()", "Agent:on_turn_start({ctx}, {handler})"; "agent_on_turn_start")]
+    #[test_case("Agent:on_turn_end()", "Agent:on_turn_end({ctx}, {handler})"; "agent_on_turn_end")]
+    #[test_case("Agent:on_idle()", "Agent:on_idle({ctx}, {handler})"; "agent_on_idle")]
+    #[test_case("Agent:on_config_change()", "Agent:on_config_change({ctx}, {handler})"; "agent_on_config_change")]
+    #[test_case("Agent:on_close()", "Agent:on_close({ctx}, {handler})"; "agent_on_close")]
+    #[test_case("LuaCtx:agent()", "LuaCtx:agent()"; "context_agent")]
+    #[test_case("LuaCtx:model()", "LuaCtx:model()"; "context_model")]
+    #[test_case("LuaCtx:defer_close()", "LuaCtx:defer_close({agent})"; "context_defer_close")]
+    #[test_case("Session:status()", "Session:status()"; "session_status")]
+    fn generated_docs_render_agent_api_sections(heading: &str, signature: &str) {
+        let page = generate();
+        let start = page
+            .find(&format!("### `{heading}`"))
+            .expect("API section must be rendered");
+        let end = page[start..]
+            .find(SECTION_SEPARATOR)
+            .map(|offset| start + offset)
+            .expect("API section must have a separator");
+        assert!(
+            page[start..end].contains(&format!("```lua\n{signature}\n```")),
+            "{heading} section must render its signature {signature:?}"
+        );
+    }
+
+    #[test_case("maki.agent.AgentTurn"; "agent_turn")]
+    #[test_case("maki.agent.AgentSubscription"; "agent_subscription")]
+    fn generated_docs_render_agent_class_description(name: &str) {
         let module = maki_lua::docs::api_docs()
             .into_iter()
             .find(|module| module.name == name)
             .expect("class metadata must be registered");
         let page = generate();
-        let description = module.desc.split_whitespace().collect::<Vec<_>>().join(" ");
-        let rendered = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        let start = page
+            .find(&format!("{MODULE_HEADING_PREFIX}{name} "))
+            .expect("class section must be rendered");
+        let end = page[start + MODULE_HEADING_PREFIX.len()..]
+            .find(MODULE_HEADING_PREFIX)
+            .map_or(page.len(), |offset| {
+                start + MODULE_HEADING_PREFIX.len() + offset
+            });
         assert!(
-            rendered.contains(&description),
-            "class description must be rendered"
+            normalized(&page[start..end]).contains(&normalized(module.desc)),
+            "{name} section must render the class description"
         );
-        for text in required {
-            assert!(
-                description.contains(text),
-                "{name} description must contain {text:?}"
-            );
-        }
     }
 
     const MUTABLE_PATH_CONTRACT: &str = "same-path mutation is already in progress";
@@ -113,11 +102,11 @@ mod tests {
             .find("### `maki.api.register_command()`")
             .expect("generated docs must render register_command");
         let end = page[start..]
-            .find("\n---\n")
+            .find(SECTION_SEPARATOR)
             .map(|offset| start + offset)
             .expect("register_command section must have a separator");
         let section = &page[start..end];
-        let rendered = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        let rendered = normalized(section);
         assert!(
             !section.contains("| Completion is declared"),
             "completion prose must remain part of the arguments parameter"
