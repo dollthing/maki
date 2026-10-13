@@ -1677,7 +1677,9 @@ Unmanaged children use the current host task's authority, not a managed graph.
     report each turn through the Rust structured-output reporting tool.
   - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
   - `auto_deliver` (`boolean`) defaults to true; managed children notify their
-    recorded parent once per settled turn, independently of ticket waits.
+    recorded parent once per settled turn. A wait or result read in the
+    parent's own turn returns the result directly and withdraws the
+    queued notification.
   - `semaphore` (`maki.async.Semaphore`) unmanaged concurrency limit; managed
     children use their manager's capacity instead.
   - `inherit_provider` (`boolean`) defaults to false; reuse the caller's provider

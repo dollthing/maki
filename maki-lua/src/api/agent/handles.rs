@@ -7,7 +7,7 @@ use crate::api::util::{
 use crate::host_root::{HostRootRef, HostRootServices, UNSUPPORTED_OPERATION_ERROR};
 use maki_agent::{
     AgentActorHandle, AgentId, AgentInput, AgentManagerHandle, AgentRef, CurrentManagedTurn,
-    TurnTicket,
+    TurnId, TurnTicket,
     actor::{ActorLifecycle, ActorStatus},
     cancel::CancelMap,
 };
@@ -733,7 +733,9 @@ pub(super) fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Tab
 ///     report each turn through the Rust structured-output reporting tool.
 ///   silent (boolean): defaults to false; suppresses parent relay and delivery.
 ///   auto_deliver (boolean): defaults to true; managed children notify their
-///     recorded parent once per settled turn, independently of ticket waits.
+///     recorded parent once per settled turn. A wait or result read in the
+///     parent's own turn returns the result directly and withdraws the
+///     queued notification.
 ///   semaphore (maki.async.Semaphore): unmanaged concurrency limit; managed
 ///     children use their manager's capacity instead.
 ///   inherit_provider (boolean): defaults to false; reuse the caller's provider
@@ -1038,11 +1040,7 @@ fn agent_transcript(
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(lua, &ctx, this));
     let through_turn = opts.get::<Option<String>>("through_turn")?;
-    let through_turn = try_pair!(
-        through_turn
-            .map(|id| id.parse::<maki_agent::TurnId>())
-            .transpose()
-    );
+    let through_turn = try_pair!(through_turn.map(|id| id.parse::<TurnId>()).transpose());
     let actor = try_pair!(this.manager.actor(this.id));
     let snapshot = try_pair!(actor.transcript(maki_agent::TranscriptRequest {
         through_turn,
@@ -1087,7 +1085,7 @@ fn admit(
     ctx: &LuaCtx,
     message: String,
     idle: bool,
-    after_turn: Option<maki_agent::TurnId>,
+    after_turn: Option<TurnId>,
 ) -> Result<LuaAgentTurn, String> {
     authorize(lua, ctx, agent)?;
     let actor = agent
@@ -1162,11 +1160,7 @@ fn agent_send(
         .map(|opts| opts.get::<Option<String>>("after_turn"))
         .transpose()?
         .flatten();
-    let after_turn = try_pair!(
-        after_turn
-            .map(|id| id.parse::<maki_agent::TurnId>())
-            .transpose()
-    );
+    let after_turn = try_pair!(after_turn.map(|id| id.parse::<TurnId>()).transpose());
     Ok((
         Some(try_pair!(admit(lua, this, &ctx, message, true, after_turn))),
         None,
@@ -1208,10 +1202,7 @@ async fn agent_prompt(
         .map(|opts| opts.get::<Option<String>>("after_turn"))
         .transpose()?
         .flatten();
-    let after_turn = match after_turn
-        .map(|id| id.parse::<maki_agent::TurnId>())
-        .transpose()
-    {
+    let after_turn = match after_turn.map(|id| id.parse::<TurnId>()).transpose() {
         Ok(value) => value,
         Err(error) => {
             return Ok((
@@ -1537,10 +1528,21 @@ fn ticket_result(
     this: &LuaAgentTurn,
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
-    try_pair!(observe(lua, &ctx, &this.agent));
+    let active = try_pair!(observe(lua, &ctx, &this.agent));
     match this.ticket.peek() {
-        Some(outcome) => turn_result(lua, &this.agent, &this.ticket, &outcome),
+        Some(outcome) => {
+            withdraw_delivery(active.as_ref(), this.ticket.turn_id());
+            turn_result(lua, &this.agent, &this.ticket, &outcome)
+        }
         None => Ok((None, None)),
+    }
+}
+
+/// A result returned to the parent's own turn makes its queued delivery
+/// redundant.
+fn withdraw_delivery(active: Option<&CurrentManagedTurn>, turn_id: TurnId) {
+    if let Some(parent) = active.and_then(|active| active.manager().actor(active.agent_id()).ok()) {
+        parent.withdraw_child_delivery(turn_id);
     }
 }
 
@@ -1564,19 +1566,20 @@ async fn ticket_wait(
         .transpose()?
         .flatten();
     if let Some(outcome) = ticket.peek() {
+        withdraw_delivery(active.as_ref(), ticket.turn_id());
         return turn_result(&lua, &agent, &ticket, &outcome);
     }
     if timeout == Some(0) {
         return Ok((None, None));
     }
     drop(this);
-    let outcome = if let Some(active) = active {
+    let outcome = if let Some(active) = &active {
         if Some(active.agent_id()) == agent.id {
             return Ok(err_pair("cannot wait for a turn on the calling agent"));
         }
         let actor = try_pair!(agent.manager.actor(agent.id));
         let wait = try_pair!(active.lease().observe_descendant(
-            &active,
+            active,
             try_pair!(agent.id.ok_or(UNSUPPORTED_OPERATION_ERROR)),
             &actor,
             ticket,
@@ -1599,6 +1602,7 @@ async fn ticket_wait(
         }
     };
     try_pair!(ctx.validate_origin(&lua));
+    withdraw_delivery(active.as_ref(), retained_ticket.turn_id());
     turn_result(&lua, &agent, &retained_ticket, &outcome)
 }
 

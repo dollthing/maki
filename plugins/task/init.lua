@@ -1,5 +1,5 @@
 -- Async tasks retain exact turn tickets, not invocation authority.
--- Completion delivery belongs to the runtime; waiting only observes a ticket.
+-- Completion delivery belongs to the runtime; a wait in the parent's own turn withdraws it.
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local plan_spec = require("maki.plan_spec")
@@ -18,6 +18,9 @@ local NUDGE_SUMMARY =
 local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
 local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
+local RECURSIVE_UNMANAGED_WAIT_ERR =
+  "blocking task_wait is unavailable from an unmanaged subagent; pass timeout = 0 to check without waiting"
+local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
@@ -592,11 +595,17 @@ local wait_schema = {
 }
 
 local function wait_handler(input, ctx)
+  if input.timeout ~= 0 and ctx:audience() == "general_sub" and not ctx:_maki_managed() then
+    return { llm_output = RECURSIVE_UNMANAGED_WAIT_ERR, is_error = true }
+  end
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
   local result, wait_err = task.sess:wait(ctx, input.turn_id, input.timeout)
+  if wait_err == TURN_WAIT_TIMEOUT then
+    return { llm_output = maki.json.encode({ status = "running" }) }
+  end
   if wait_err then
     return { llm_output = tostring(wait_err), is_error = true }
   end

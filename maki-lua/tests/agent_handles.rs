@@ -3617,7 +3617,7 @@ fn abandoned_managed_blocking_task_releases_child_provider() {
 #[test_case::test_case(false, true; "agent_with_wait")]
 #[test_case::test_case(true, false; "bundled_task_without_wait")]
 #[test_case::test_case(true, true; "bundled_task_with_wait")]
-fn managed_capacity_one_delivers_child_once_independently_of_wait(bundled_tasks: bool, wait: bool) {
+fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, wait: bool) {
     smol::block_on(async {
         const TOOL: &str = "managed_capacity_one_delivery";
         let spawn = if bundled_tasks {
@@ -3715,6 +3715,29 @@ fn managed_capacity_one_delivers_child_once_independently_of_wait(bundled_tasks:
             .reply
             .send(common::canned_reply(FIRST_REPLY))
             .unwrap();
+        if wait {
+            bounded(fixture.root_ticket.wait(), "waiting root settlement").await;
+            let statuses = bounded(
+                async {
+                    let mut statuses = Vec::new();
+                    while !statuses.contains(&DeliveryStatus::Withdrawn) {
+                        if let ActorEvent::Delivery(event) = events.recv_async().await.unwrap() {
+                            statuses.push(event.status);
+                        }
+                    }
+                    statuses
+                },
+                "waited delivery withdrawal",
+            )
+            .await;
+            assert!(matches!(
+                statuses[..],
+                [DeliveryStatus::Accepted { .. }, DeliveryStatus::Withdrawn]
+            ));
+            assert!(fixture.observations.is_empty());
+            fixture.finish().await;
+            return;
+        }
         let (parent_turn_id, provenance, messages) = bounded(
             fixture.observations.recv_async(),
             "parent lifecycle observation execution",
@@ -3803,20 +3826,6 @@ fn managed_capacity_one_delivers_child_once_independently_of_wait(bundled_tasks:
             })
             .collect();
         assert_eq!(starts, vec![parent_turn_id]);
-        if wait {
-            let root_end = lifecycle.iter().position(|event| matches!(event,
-                ActorEvent::End(result) if result.outcome.turn_id() == fixture.root_ticket.turn_id()
-            )).unwrap();
-            let delivery_start = lifecycle
-                .iter()
-                .position(|event| {
-                    matches!(event,
-                        ActorEvent::Start { turn_id, .. } if *turn_id == parent_turn_id
-                    )
-                })
-                .unwrap();
-            assert!(root_end < delivery_start);
-        }
         assert!(fixture.observations.is_empty());
         fixture.finish().await;
     });

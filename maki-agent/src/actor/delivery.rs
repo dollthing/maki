@@ -4,8 +4,8 @@ use maki_providers::{CompleteModelSelection, Message, ObservationSource, Request
 use serde_json::{Value, json};
 
 use super::{
-    ActorEvent, ActorInner, ActorLifecycle, ActorOperation, ConfigCommit, TurnOrigin,
-    TurnProvenance, TurnResult, TurnTicket, drive_operations,
+    ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, ConfigCommit,
+    TurnOrigin, TurnProvenance, TurnResult, TurnTicket, drive_operations,
 };
 use crate::{AgentId, AgentInput, AgentMode, TurnCancellationReason, TurnId};
 
@@ -102,10 +102,16 @@ pub enum DeliveryRejection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryStatus {
-    Accepted { parent_turn_id: TurnId },
+    Accepted {
+        parent_turn_id: TurnId,
+    },
     Rejected(DeliveryRejection),
     Discarded(TurnCancellationReason),
-    Executed { parent_turn_id: TurnId },
+    /// The parent's own turn received the result through an exact wait.
+    Withdrawn,
+    Executed {
+        parent_turn_id: TurnId,
+    },
 }
 
 #[derive(Clone)]
@@ -271,6 +277,38 @@ pub(super) fn publish(
     }
 }
 
+impl AgentActorHandle {
+    /// Withdraws the queued delivery of `child_turn` once an exact wait in
+    /// this agent's own turn has returned that result to the model.
+    pub fn withdraw_child_delivery(&self, child_turn: TurnId) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(delivery_turn) = state.deliveries.iter().find_map(|(turn_id, pending)| {
+            (!pending.started && pending.delivery.result.outcome.turn_id() == child_turn)
+                .then_some(*turn_id)
+        }) else {
+            return false;
+        };
+        let Ok(cut) =
+            self.capture_turn_cancel(&mut state, delivery_turn, TurnCancellationReason::User)
+        else {
+            return false;
+        };
+        if let Some(pending) = state.deliveries.remove(&delivery_turn) {
+            state.emit(ActorEvent::Delivery(DeliveryEvent {
+                delivery: pending.delivery,
+                status: DeliveryStatus::Withdrawn,
+            }));
+        }
+        drop(state);
+        self.settle_turn_cancel(cut, TurnCancellationReason::User);
+        true
+    }
+}
+
 pub(super) fn settle(inner: &ActorInner, turn_id: TurnId, reason: Option<TurnCancellationReason>) {
     let mut state = inner
         .state
@@ -388,6 +426,49 @@ mod tests {
         assert_eq!(configuration["selection"]["fast"], false);
         assert!(configuration.get("provider").is_none());
         assert!(configuration.get("thinking").is_none());
+    }
+
+    #[test]
+    fn withdrawn_delivery_settles_once_without_running() {
+        smol::block_on(async {
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            let events = actor.subscribe_events();
+            let envelope = delivery(actor.agent_id());
+            let ticket = admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
+            let child_turn = envelope.result.outcome.turn_id();
+            assert!(!actor.withdraw_child_delivery(TurnId::generate()));
+            assert!(actor.withdraw_child_delivery(child_turn));
+            assert!(!actor.withdraw_child_delivery(child_turn));
+            assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
+            let statuses: Vec<_> = events
+                .try_iter()
+                .filter_map(|event| match event {
+                    ActorEvent::Delivery(event) => Some(event.status),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    DeliveryStatus::Accepted {
+                        parent_turn_id: ticket.turn_id()
+                    },
+                    DeliveryStatus::Withdrawn,
+                ]
+            );
+            assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
+            actor.close();
+            task.await;
+        });
     }
 
     #[test_case(false; "clear")]

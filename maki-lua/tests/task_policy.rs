@@ -44,6 +44,9 @@ const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
 const RECURSIVE_UNMANAGED_TASK_ERR: &str =
     "blocking task is unavailable from an unmanaged subagent; use task_spawn";
 /// Mirrors the task plugin's `max_concurrent` default.
+const RECURSIVE_UNMANAGED_WAIT_ERR: &str = "blocking task_wait is unavailable from an unmanaged subagent; pass timeout = 0 to check without waiting";
+const UNKNOWN_TASK_ERR: &str = "unknown task_id";
+const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
 const SCENARIO_PLAIN: &str = "plain";
@@ -478,6 +481,24 @@ fn recursive_unmanaged_blocking_task_rejects_before_capacity_wait() {
     assert_eq!(snapshot["prompt_count"], json!(0));
     assert_eq!(snapshot["closed"], json!(0));
     assert_eq!(snapshot["sem_size"], json!(1));
+}
+
+#[test_case::test_case(None, RECURSIVE_UNMANAGED_WAIT_ERR ; "default_blocks")]
+#[test_case::test_case(Some(5), RECURSIVE_UNMANAGED_WAIT_ERR ; "positive_timeout_blocks")]
+#[test_case::test_case(Some(0), UNKNOWN_TASK_ERR ; "zero_timeout_checks")]
+fn recursive_unmanaged_task_wait_allows_only_nonblocking_checks(
+    timeout: Option<u64>,
+    expected: &str,
+) {
+    let (reg, _host) = load_task_host();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.audience = ToolAudience::GENERAL_SUB;
+    let mut input = json!({"task_id": "missing"});
+    if let Some(timeout) = timeout {
+        input["timeout"] = json!(timeout);
+    }
+    let error = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, input).unwrap_err();
+    assert_eq!(error, expected);
 }
 
 #[test]
@@ -1019,8 +1040,9 @@ fn pending_ticket_backpressure_preserves_accepted_turns() {
     });
 }
 
-#[test]
-fn zero_timeout_task_wait_preserves_child_and_exact_ticket() {
+#[test_case::test_case(0 ; "zero")]
+#[test_case::test_case(1 ; "positive")]
+fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
@@ -1040,7 +1062,7 @@ fn zero_timeout_task_wait_preserves_child_and_exact_ticket() {
             &reg,
             &ctx,
             "task_wait",
-            json!({"task_id": task_id, "turn_id": spawned["turn_id"], "timeout": 0}),
+            json!({"task_id": task_id, "turn_id": spawned["turn_id"], "timeout": timeout}),
         );
         assert_eq!(pending["status"], "running");
         release_tx.send(()).unwrap();
