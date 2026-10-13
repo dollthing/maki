@@ -1904,6 +1904,93 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
 }
 
 #[test]
+fn trusted_ctx_keeps_authority_after_its_pinned_target_closes() {
+    smol::block_on(async {
+        const PLUGIN: &str = "pr5_closed_pin";
+        const KEY: &str = "<C-k>";
+        let fixture = Fixture::start("pr5_closed_pin_root", "");
+        assert_eq!(
+            bounded(
+                fixture.completed.recv_async(),
+                "integration channel receive"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
+        let root = fixture.manager.root().unwrap();
+        let services = Arc::new(RegisteredOrchestrationTargets::new(vec![TrustedTarget {
+            target: root.clone(),
+            template,
+        }]));
+        let handle = fixture._host.event_handle();
+        handle.install_orchestration_services(services.clone());
+        fixture
+            ._host
+            .load_source(
+                PLUGIN,
+                &format!(
+                    r#"
+            local outcome = "keymap did not run"
+            maki.api.register_command({{
+                name = "/pr5_closed_pin_spawn", tui_only = false,
+                handler = function(_, ctx)
+                    assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                end,
+            }})
+            maki.api.register_command({{
+                name = "/pr5_closed_pin_check", tui_only = false,
+                handler = function() assert(outcome == "ok", outcome) end,
+            }})
+            maki.keymap.set("n", "{KEY}", function(_, ctx)
+                local ok, err = pcall(function()
+                    local pinned = assert(maki.agent.current(ctx))
+                    assert(pinned:close(ctx))
+                    local current, current_err = maki.agent.current(ctx)
+                    assert(current == nil and current_err ~= nil, "closed target stayed current")
+                    local spawned, spawn_err = maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }})
+                    assert(spawned == nil and spawn_err ~= nil, "spawned under a closed target")
+                    local root = assert(maki.agent.root(ctx))
+                    local listed = false
+                    for _, reference in ipairs(assert(maki.agent.list(ctx))) do
+                        listed = listed or reference:id() == root:id()
+                    end
+                    assert(listed, "root missing from list")
+                end)
+                outcome = ok and "ok" or tostring(err)
+            end)
+        "#
+                ),
+            )
+            .unwrap();
+        let run = |command: &str| {
+            handle
+                .run_command_for_test(Arc::from(PLUGIN), Arc::from(command), String::new(), 0)
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap()
+        };
+        assert_eq!(run("/pr5_closed_pin_spawn"), Ok(()));
+        let child = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id.is_some())
+            .expect("spawned child");
+        let child = fixture.manager.lookup(child.agent_id).unwrap();
+        let pinned = TrustedTarget {
+            template: services.template(&child).unwrap(),
+            target: child,
+        };
+        let keymap = fixture._host.keymap_reader().load().entries[0].id;
+        assert!(handle.run_keybind_callback(keymap, Some(pinned)));
+        fixture._host.wait_for_worker_barrier_for_test();
+        assert_eq!(run("/pr5_closed_pin_check"), Ok(()));
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
 fn bundled_thinking_command_updates_only_its_target_agent() {
     smol::block_on(async {
         const PLUGIN: &str = "thinking";

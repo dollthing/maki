@@ -214,10 +214,13 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
         return Ok((Some(table), None));
     }
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
-    try_pair!(scope(lua, &ctx, id));
+    let trusted = ctx.trusted(lua).ok();
+    if trusted.is_none() {
+        try_pair!(scope(lua, &ctx, id));
+    }
     let table = lua.create_table()?;
     for node in manager.snapshot() {
-        if let Ok(trusted) = ctx.trusted(lua) {
+        if let Some(trusted) = trusted {
             let Ok(target) = manager.lookup(node.agent_id) else {
                 continue;
             };

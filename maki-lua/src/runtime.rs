@@ -5113,7 +5113,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         target.template = template;
                                     }
                                     lock_cell(scope.handle()).pinned_target = Some(target.clone());
-                                    let ctx = LuaCtx::trusted_event_context(&lua, target, plugin.clone());
+                                    let ctx = LuaCtx::trusted_context(&lua, target, plugin.clone());
                                     let run = async {
                                         let payload = json_to_lua(&lua, &request.payload)?;
                                         let thread = lua.create_thread(function)?;

@@ -183,7 +183,7 @@ pub(super) fn observe(
     if let Some(result) = validate_outside_graph(lua, ctx, agent) {
         return result.map(|()| None);
     }
-    if let Ok(trusted) = ctx.trusted_observer(lua) {
+    if let Ok(trusted) = ctx.trusted(lua) {
         let root = agent
             .root
             .as_ref()

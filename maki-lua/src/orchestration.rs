@@ -281,7 +281,6 @@ pub(crate) struct TrustedContext {
     pub(crate) plugin: Arc<str>,
     pub(crate) generation: u64,
     services: Option<Arc<dyn OrchestrationServices>>,
-    event_scope: bool,
     authority: ScopeAuthority,
 }
 
@@ -304,7 +303,6 @@ impl TrustedContext {
             template: target.template,
             plugin,
             generation: owner.generation,
-            event_scope: false,
             services: services(lua),
             authority: ScopeAuthority {
                 task: Arc::downgrade(task),
@@ -313,23 +311,9 @@ impl TrustedContext {
         }
     }
 
-    pub(crate) fn for_event(mut self) -> Self {
-        self.event_scope = true;
-        self
-    }
-
+    /// Checks plugin and host authority only. The pinned target may have
+    /// closed since; operations that address it check it themselves.
     pub(crate) fn validate(&self, lua: &Lua) -> Result<(), String> {
-        self.validate_host(lua)?;
-        if self.event_scope {
-            return Ok(());
-        }
-        self.services
-            .as_ref()
-            .ok_or(NO_ORCHESTRATION_SERVICES)?
-            .validate_target(&self.target)
-    }
-
-    pub(crate) fn validate_host(&self, lua: &Lua) -> Result<(), String> {
         self.authority.validate(lua)?;
         let captured = self.services.as_ref().ok_or(NO_ORCHESTRATION_SERVICES)?;
         let current = services(lua).ok_or(ORCHESTRATION_SERVICES_EXPIRED)?;
@@ -340,7 +324,7 @@ impl TrustedContext {
     }
 
     pub(crate) fn validate_target(&self, lua: &Lua, target: &AgentRef) -> Result<(), String> {
-        self.validate_host(lua)?;
+        self.validate(lua)?;
         self.services
             .as_ref()
             .ok_or(NO_ORCHESTRATION_SERVICES)?

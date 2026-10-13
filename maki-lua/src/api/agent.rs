@@ -1203,7 +1203,7 @@ async fn build_session(
         try_pair!(current.validate_active());
     }
     if let Some(trusted) = &trusted {
-        try_pair!(trusted.validate(&lua));
+        try_pair!(trusted.validate_target(&lua, &trusted.target));
     }
     try_pair!(authority.validate(&lua, None));
     let model_annotation = model.spec();
@@ -1536,7 +1536,7 @@ async fn build_session(
             ))
         } else {
             let trusted = trusted.as_ref().expect("trusted spawn checked");
-            try_pair!(trusted.validate(&lua));
+            try_pair!(trusted.validate_target(&lua, &trusted.target));
             try_pair!(trusted.target.manager().spawn_child_trusted_with_config(
                 &trusted.target,
                 initial_config,

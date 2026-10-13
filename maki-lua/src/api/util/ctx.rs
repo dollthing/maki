@@ -239,18 +239,6 @@ impl LuaCtx {
         }
     }
 
-    pub(crate) fn trusted_event_context(
-        lua: &mlua::Lua,
-        target: crate::orchestration::TrustedTarget,
-        plugin: Arc<str>,
-    ) -> Self {
-        let mut ctx = Self::trusted_context(lua, target, plugin);
-        if let Caps::Trusted { authority, .. } = &mut ctx.caps {
-            **authority = (**authority).clone().for_event();
-        }
-        ctx
-    }
-
     pub(crate) fn trusted(
         &self,
         lua: &mlua::Lua,
@@ -259,17 +247,6 @@ impl LuaCtx {
             return Err(self.cap_err("orchestration"));
         };
         authority.validate(lua)?;
-        Ok(authority)
-    }
-
-    pub(crate) fn trusted_observer(
-        &self,
-        lua: &mlua::Lua,
-    ) -> Result<&crate::orchestration::TrustedContext, String> {
-        let Caps::Trusted { authority, .. } = &self.caps else {
-            return Err(self.cap_err("orchestration"));
-        };
-        authority.validate_host(lua)?;
         Ok(authority)
     }
 
