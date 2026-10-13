@@ -3,7 +3,7 @@
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{
-    CompleteModelSelection, Model, ModelSelection, RequestOptions, ThinkingConfig,
+    CompleteModelSelection, MODEL_THINKING_KEY, Model, RequestOptions, ThinkingConfig,
 };
 use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
@@ -11,7 +11,7 @@ use crate::agent_errors::{EXPLICIT_MODEL_TARGET_REQUIRED, TRUSTED_MODEL_MUTATION
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
-use std::sync::Arc;
+use crate::api::util::selection::selection_from_lua;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -104,31 +104,35 @@ async fn set(
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_MODEL_MUTATION_REQUIRED));
     }
-    let (selection, toggle_thinking) = match opts {
-        Value::String(spec) => (
-            ModelSelection {
-                spec: Some(Arc::from(spec.to_str()?.as_ref())),
-                ..ModelSelection::default()
-            },
-            false,
-        ),
-        Value::Table(opts) => {
-            let toggle = matches!(opts.get::<Value>("thinking")?, Value::String(value) if value.to_str()?.is_empty());
-            let mut value = crate::api::util::convert::lua_to_json(&lua, &Value::Table(opts))?;
-            if toggle && let Some(value) = value.as_object_mut() {
-                value.remove("thinking");
-            }
-            match serde_json::from_value(value) {
-                Ok(selection) => (selection, toggle),
-                Err(error) => return Ok(err_pair(error.to_string())),
+    let (opts, toggle_thinking) = match opts {
+        Value::Table(table) => {
+            // `thinking = ""` is the documented toggle, not a selection value.
+            let toggle = matches!(table.get::<Value>(MODEL_THINKING_KEY)?, Value::String(value) if value.to_str()?.is_empty());
+            if toggle {
+                let rest = lua.create_table()?;
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair?;
+                    if !matches!(&key, Value::String(name) if name.to_str()?.as_ref() == MODEL_THINKING_KEY)
+                    {
+                        rest.set(key, value)?;
+                    }
+                }
+                (Value::Table(rest), true)
+            } else {
+                (Value::Table(table), false)
             }
         }
+        Value::String(spec) => (Value::String(spec), false),
         other => {
             return Err(LuaError::runtime(format!(
                 "{SET_ARG_ERR}, got {}",
                 other.type_name()
             )));
         }
+    };
+    let selection = match selection_from_lua(&lua, opts) {
+        Ok(selection) => selection,
+        Err(error) => return Ok(err_pair(error)),
     };
     if tx.is_none() {
         return Ok(err_pair(EXPLICIT_MODEL_TARGET_REQUIRED));

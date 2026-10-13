@@ -7,10 +7,9 @@ use maki_agent::{
     TurnId, TurnOrigin, TurnProvenance,
 };
 use maki_lua_macro::{lua_class, lua_fn};
-use maki_providers::ModelSelection;
 use maki_storage::StateDir;
 use maki_storage::plans::new_plan_path;
-use mlua::{Lua, LuaSerdeExt, Table, UserDataMethods, UserDataRef, Value as LuaValue};
+use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, observe, retire_closed};
 use super::projection::{host_selection_table, selection_table};
@@ -31,6 +30,7 @@ use crate::api::env::StateDirOverride;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::selection::selection_from_lua;
 use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
 use crate::orchestration::{self, plugin_authority};
 use crate::runtime::{current_managed_turn, current_plugin, register_defer_close};
@@ -327,16 +327,7 @@ async fn agent_set_model(
     patch: LuaValue,
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(&lua, &ctx, &this));
-    let patch = match patch {
-        LuaValue::String(spec) => {
-            let table = lua.create_table()?;
-            table.set("spec", spec)?;
-            table
-        }
-        LuaValue::Table(table) => table,
-        _ => return Ok(err_pair("model patch must be a spec string or table")),
-    };
-    let selection = try_pair!(lua.from_value::<ModelSelection>(LuaValue::Table(patch)));
+    let selection = try_pair!(selection_from_lua(&lua, patch));
     if let AgentRuntime::HostRoot {
         services,
         reference,

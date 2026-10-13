@@ -46,11 +46,9 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, Message, Model, ModelError, RequestOptions, Role, ThinkingConfig, TokenUsage,
-    add_cost,
+    ContentBlock, Message, Model, ModelError, RequestOptions, Role, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -71,15 +69,29 @@ const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admi
 const SESSION_CLOSED_ERR: &str = "session closed";
 const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const SPAWN_OPTIONS: &[&str] = &[
+    "audience",
+    "auto_deliver",
+    "inherit_provider",
+    "local_tools",
+    "mcp",
+    "model",
+    "name",
+    "output_schema",
+    "semaphore",
+    "silent",
+    "system",
+    "tools",
+];
 
 pub type SessionProviderPreparer =
     Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
 
 /// Build the `(model, provider)` pair that backs a `maki.agent.session` spawn.
-/// `inherit_provider` (or an absent `model_spec`) reuses the parent model and
+/// `inherit_provider` (or an absent `model.spec`) reuses the parent model and
 /// provider so a test-side wrapper can drive a real spawned session through a
 /// caller-provided provider without network. Otherwise build a provider for the
-/// given `model_spec`.
+/// given `model.spec`.
 async fn build_session_provider(
     model_spec: &Option<String>,
     inherit_provider: bool,
@@ -1009,7 +1021,10 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table Optional fields:
-///   `model_spec` (string?) - model spec string to use instead of the parent model.
+///   `model` (string|table?) - a spec string or a `{spec, thinking, fast}`
+///     selection, validated like `Agent:set_model`. Omitted fields inherit the
+///     parent's; thinking is capped at the parent's level. A query result from
+///     `Agent:model` can be passed as is.
 ///   `system` (string?) - system prompt. Defaults to empty.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
@@ -1023,15 +1038,10 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///     definitions are injected automatically each turn (deferred behind
 ///     `tool_search`), so don't put MCP definitions in `tools`. The session
 ///     starts with no loaded tools of its own. Default: `true`.
-///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
-///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
-///     `"max"`), or a budget integer (token count). Inherits parent setting
-///     if omitted.
-///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 ///   `inherit_provider` (boolean?) - reuse the parent model and provider instead
-///     of building one from `model_spec`. Used by tests (and tools that want to
+///     of building one from `model.spec`. Used by tests (and tools that want to
 ///     thread a caller-provided provider) to drive a real spawned session without
-///     hitting the network. `model_spec` is ignored when this is `true`. Default: `false`.
+///     hitting the network. `model.spec` is ignored when this is `true`. Default: `false`.
 ///   `silent` (boolean?) - do not relay the session's turns, annotations, or
 ///     usage into the parent session's UI or event stream. The session still
 ///     completes and `:prompt()` still returns its result (including a commit
@@ -1044,6 +1054,7 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///   `semaphore` (maki.async.Semaphore?) - concurrency limit acquired by the
 ///     driver immediately before each unmanaged turn and released when that turn
 ///     ends. Managed sessions ignore it and use the parent manager's limit.
+/// Any other option key is an error.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -1127,12 +1138,27 @@ async fn build_session(
             return Ok(err_pair(MANAGED_AUTHORITY_INACTIVE));
         }
     };
-    let model_spec: Option<String> = opts.get("model_spec")?;
+    for pair in opts.pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let known =
+            matches!(&key, LuaValue::String(name) if SPAWN_OPTIONS.contains(&&*name.to_str()?));
+        if !known {
+            return Ok(err_pair(format!(
+                "{}: {}",
+                crate::agent_errors::UNKNOWN_SPAWN_OPTION,
+                key.to_string()?
+            )));
+        }
+    }
+    let selection = match opts.get::<Option<LuaValue>>("model")? {
+        Some(value) => try_pair!(crate::api::util::selection::selection_from_lua(&lua, value)),
+        None => Default::default(),
+    };
+    let model_spec = selection.spec.as_deref().map(str::to_owned);
     let system: Option<String> = opts.get("system")?;
     let tools_val: Option<LuaValue> = opts.get("tools")?;
     let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     let name: Option<String> = opts.get("name")?;
-    let thinking_val: Option<LuaValue> = opts.get("thinking")?;
     let audience = match opts.get::<Option<String>>("audience")? {
         Some(s) => {
             try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
@@ -1143,9 +1169,7 @@ async fn build_session(
     let inherit_provider: bool = opts
         .get::<Option<bool>>("inherit_provider")?
         .unwrap_or(false);
-    let fast: bool = opts
-        .get::<Option<bool>>("fast")?
-        .unwrap_or(agent_ctx.opts.fast);
+    let fast = selection.fast.unwrap_or(agent_ctx.opts.fast);
     let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !restrictive_parent;
     let silent: bool = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
     let auto_deliver: bool = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
@@ -1315,26 +1339,7 @@ async fn build_session(
             .push(structured.definition());
         local_map.insert(structured_output::TOOL_NAME.into(), structured.local_tool());
     }
-    let requested_thinking = match thinking_val {
-        None => None,
-        Some(value) => {
-            let setting = match &value {
-                LuaValue::String(s) => s.to_str()?.to_owned(),
-                LuaValue::Integer(n) => n.to_string(),
-                LuaValue::Number(n) => n.to_string(),
-                other => {
-                    return Ok(err_pair(format!(
-                        "thinking must be string or number, got {}",
-                        other.type_name()
-                    )));
-                }
-            };
-            match StoredThinking::parse_setting(&setting) {
-                Ok(stored) => Some(ThinkingConfig::from(stored)),
-                Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
-            }
-        }
-    };
+    let requested_thinking = selection.thinking;
     let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
         t.clamp_to(agent_ctx.opts.thinking)
     });

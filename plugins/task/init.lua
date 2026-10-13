@@ -205,7 +205,7 @@ end
 
 local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
   return {
-    model_spec = spec.model.spec,
+    model = { spec = spec.model.spec, thinking = input.thinking },
     system = spec.system,
     tools = spec.tools,
     output_schema = spec.output_schema,
@@ -213,7 +213,6 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
     name = input.description,
     semaphore = turn_semaphore,
     auto_deliver = auto_deliver,
-    thinking = input.thinking,
   }
 end
 

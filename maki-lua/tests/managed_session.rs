@@ -104,7 +104,7 @@ maki.api.register_tool({
   handler = function()
     local session, err = maki.agent.session(retained_unmanaged_ctx, {
       audience = {},
-      model_spec = "not/a/model",
+      model = { spec = "not/a/model" },
     })
     if session ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected foreign context result: " .. tostring(err), is_error = true }
@@ -750,12 +750,12 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 description = "create and retain a configured child",
                 schema = { type = "object", properties = {} },
                 handler = function(_, ctx)
-                    local rejected, policy_err = maki.agent.session(ctx, { model_spec = "openai/gpt-4.1" })
+                    local rejected, policy_err = maki.agent.session(ctx, { model = { spec = "openai/gpt-4.1" } })
                     assert(rejected == nil and policy_err ~= nil)
-                    local failed, preparation_err = maki.agent.session(ctx, { model_spec = "anthropic/claude-opus-5" })
+                    local failed, preparation_err = maki.agent.session(ctx, { model = { spec = "anthropic/claude-opus-5" } })
                     assert(failed == nil and preparation_err == "$PREPARATION_ERROR")
                     child = assert(maki.agent.session(ctx, {
-                        model_spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off", auto_deliver = false,
+                        model = { spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off" }, auto_deliver = false,
                         tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},
                     }))
                     assert(child:prompt("first"))

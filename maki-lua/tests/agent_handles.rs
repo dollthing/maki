@@ -13,7 +13,7 @@ use maki_lua::{
         INVOCATION_EXPIRED, NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
         OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, STRUCTURED_OUTPUT_CONFLICT,
         TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
-        TURN_WAIT_TIMEOUT,
+        TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
     orchestration::{OrchestrationServices, TrustedTarget},
     test_support::InMemoryFs,
@@ -992,7 +992,7 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
             &format!(
                 r#"
             local child = assert(maki.agent.spawn(ctx, {{
-                inherit_provider = true, system = "{SYSTEM}", thinking = "off", silent = true, tools = {{}},
+                inherit_provider = true, system = "{SYSTEM}", model = {{ thinking = "off" }}, silent = true, tools = {{}},
             }}))
             local id = assert(child:id())
             assert(assert(maki.agent.get(ctx, assert(child:ref()))):id() == id)
@@ -3863,6 +3863,45 @@ fn bundled_task_refuses_new_work_for_general_tasks_after_entering_plan_mode() {
         );
         assert_eq!(
             bounded(fixture.completed.recv_async(), "plan mode send refusal")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
+fn spawn_takes_the_shared_selection_and_rejects_other_options() {
+    smol::block_on(async {
+        let fixture = Fixture::start(
+            "pr5_spawn_selection",
+            &format!(
+                r#"
+            local parent = assert(maki.agent.current(ctx))
+            local selection = assert(parent:model(ctx))
+            local child = assert(maki.agent.spawn(ctx, {{
+                inherit_provider = true, silent = true, tools = {{}}, model = selection,
+            }}))
+            local copied = assert(child:model(ctx))
+            assert(copied.spec == selection.spec and copied.thinking == selection.thinking and copied.fast == selection.fast)
+            assert(child:close(ctx))
+            for key, opts in pairs({{
+                model_spec = {{ model_spec = selection.spec }},
+                thinking = {{ thinking = "high" }},
+                fast = {{ fast = true }},
+            }}) do
+                local spawned, err = maki.agent.spawn(ctx, opts)
+                assert(spawned == nil and err == "{UNKNOWN_SPAWN_OPTION}: " .. key, tostring(err))
+            end
+            local spawned, err = maki.agent.spawn(ctx, {{ model = {{ spec = selection.spec, fast = "maybe" }} }})
+            assert(spawned == nil and err == "{FAST_INVALID}", tostring(err))
+        "#,
+                FAST_INVALID = maki_providers::ModelSelectionError::InvalidFast,
+            ),
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "spawn selection")
                 .await
                 .unwrap(),
             Ok(())

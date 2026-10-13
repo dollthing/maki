@@ -31,7 +31,7 @@ maki.api.register_tool({
     local sess, err = maki.agent.session(ctx, {
       name = "probe",
       inherit_provider = true,
-      thinking = input.thinking,
+      model = { thinking = input.thinking },
     })
     if not sess then
       return { llm_output = "spawn failed: " .. tostring(err), is_error = true }

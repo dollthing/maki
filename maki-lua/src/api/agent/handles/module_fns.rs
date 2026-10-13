@@ -248,8 +248,9 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 ///
 /// @param ctx LuaCtx Active agent context or trusted pinned parent.
 /// @param opts table Optional creation fields:
-///   model_spec (string): override the inherited model; no command brace grammar.
-///   thinking (string|integer) and fast (boolean): override inherited options.
+///   model (string|table): a spec or `{spec, thinking, fast}` selection, validated
+///     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
+///     parent's level, and `Agent:model` results can be passed as is.
 ///   system (string): custom system prompt contribution; defaults to empty.
 ///   tools (array): request definitions; omitted inherits permitted parent tools.
 ///   local_tools (table): name-keyed Lua tool specs with description, input_schema,
@@ -267,7 +268,8 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 ///   semaphore (maki.async.Semaphore): unmanaged concurrency limit; managed
 ///     children use their manager's capacity instead.
 ///   inherit_provider (boolean): defaults to false; reuse the caller's provider
-///     and model, ignoring model_spec, when true.
+///     and model, ignoring model.spec, when true.
+///   Any other option key is an error.
 /// @return (Agent?, string?) Nonowning child handle. Garbage collection does not close it.
 #[lua_fn]
 async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<Pair<LuaAgent>> {

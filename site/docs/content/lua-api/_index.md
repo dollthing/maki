@@ -1512,7 +1512,10 @@ and tool set.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts}` (`table`) Optional fields:
-  - `model_spec` (`string?`) model spec string to use instead of the parent model.
+  - `model` (`string|table?`) a spec string or a `{spec, thinking, fast}`
+    selection, validated like `Agent:set_model`. Omitted fields inherit the
+    parent's; thinking is capped at the parent's level. A query result from
+    `Agent:model` can be passed as is.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
@@ -1526,15 +1529,10 @@ and tool set.
     definitions are injected automatically each turn (deferred behind
     `tool_search`), so don't put MCP definitions in `tools`. The session
     starts with no loaded tools of its own. Default: `true`.
-  - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
-    effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
-    `"max"`), or a budget integer (token count). Inherits parent setting
-    if omitted.
-  - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
   - `inherit_provider` (`boolean?`) reuse the parent model and provider instead
-    of building one from `model_spec`. Used by tests (and tools that want to
+    of building one from `model.spec`. Used by tests (and tools that want to
     thread a caller-provided provider) to drive a real spawned session without
-    hitting the network. `model_spec` is ignored when this is `true`. Default: `false`.
+    hitting the network. `model.spec` is ignored when this is `true`. Default: `false`.
   - `silent` (`boolean?`) do not relay the session's turns, annotations, or
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
@@ -1547,6 +1545,9 @@ and tool set.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
     driver immediately before each unmanaged turn and released when that turn
     ends. Managed sessions ignore it and use the parent manager's limit.
+
+  Any other option key is an error.
+
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1665,8 +1666,9 @@ Unmanaged children use the current host task's authority, not a managed graph.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Active agent context or trusted pinned parent.
 - `{opts}` (`table`) Optional creation fields:
-  - `model_spec` (`string`) override the inherited model; no command brace grammar.
-  - `thinking` (`string|integer`) and fast (boolean): override inherited options.
+  - `model` (`string|table`) a spec or `{spec, thinking, fast}` selection, validated
+    like `Agent:set_model`; omitted fields inherit, thinking is capped at the
+    parent's level, and `Agent:model` results can be passed as is.
   - `system` (`string`) custom system prompt contribution; defaults to empty.
   - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
   - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
@@ -1684,7 +1686,10 @@ Unmanaged children use the current host task's authority, not a managed graph.
   - `semaphore` (`maki.async.Semaphore`) unmanaged concurrency limit; managed
     children use their manager's capacity instead.
   - `inherit_provider` (`boolean`) defaults to false; reuse the caller's provider
-    and model, ignoring model_spec, when true.
+    and model, ignoring model.spec, when true.
+
+  Any other option key is an error.
+
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
 

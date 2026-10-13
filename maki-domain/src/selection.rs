@@ -9,19 +9,69 @@ pub const MODEL_FAST_KEY: &str = "fast";
 pub const MODEL_OPTION_KEYS: [&str; 2] = [MODEL_THINKING_KEY, MODEL_FAST_KEY];
 pub const FAST_VALUES: [&str; 2] = ["true", "false"];
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ModelSelection {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<Arc<str>>,
     #[serde(
-        default,
         skip_serializing_if = "Option::is_none",
-        with = "optional_thinking"
+        serialize_with = "optional_thinking::serialize"
     )]
     pub thinking: Option<ThinkingConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
+}
+
+/// Structured input goes through the same `set_spec` and `set_option`
+/// validation as `/model` arguments.
+impl<'de> Deserialize<'de> for ModelSelection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Setting {
+            Text(String),
+            Budget(u32),
+            Flag(bool),
+        }
+
+        impl Setting {
+            fn text(self) -> String {
+                match self {
+                    Self::Text(text) => text,
+                    Self::Budget(tokens) => tokens.to_string(),
+                    Self::Flag(flag) => flag.to_string(),
+                }
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            spec: Option<String>,
+            #[serde(default)]
+            thinking: Option<Setting>,
+            #[serde(default)]
+            fast: Option<Setting>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut selection = Self::default();
+        if let Some(spec) = raw.spec {
+            selection.set_spec(spec).map_err(de::Error::custom)?;
+        }
+        if let Some(thinking) = raw.thinking {
+            selection
+                .set_option(MODEL_THINKING_KEY, &thinking.text())
+                .map_err(de::Error::custom)?;
+        }
+        if let Some(fast) = raw.fast {
+            selection
+                .set_option(MODEL_FAST_KEY, &fast.text())
+                .map_err(de::Error::custom)?;
+        }
+        Ok(selection)
+    }
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -116,7 +166,7 @@ pub mod thinking {
 }
 
 mod optional_thinking {
-    use super::{Deserializer, Serializer, ThinkingConfig, thinking};
+    use super::{Serializer, ThinkingConfig, thinking};
 
     pub fn serialize<S: Serializer>(
         value: &Option<ThinkingConfig>,
@@ -127,10 +177,50 @@ mod optional_thinking {
             None => serializer.serialize_none(),
         }
     }
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<ThinkingConfig>, D::Error> {
-        thinking::deserialize(deserializer).map(Some)
+#[cfg(test)]
+mod tests {
+    use super::{MODEL_FAST_KEY, MODEL_THINKING_KEY, ModelSelection, ModelSelectionError};
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    fn built(
+        spec: Option<&str>,
+        options: &[(&str, &str)],
+    ) -> Result<ModelSelection, ModelSelectionError> {
+        let mut selection = ModelSelection::default();
+        if let Some(spec) = spec {
+            selection.set_spec(spec)?;
+        }
+        for (key, value) in options {
+            selection.set_option(key, value)?;
+        }
+        Ok(selection)
+    }
+
+    /// Structured input and `/model` arguments agree on every value.
+    #[test_case(json!({"spec": "openai/gpt-5"}), Some("openai/gpt-5"), &[]; "spec_only")]
+    #[test_case(json!({"spec": ""}), Some(""), &[]; "empty_spec")]
+    #[test_case(json!({"thinking": "high"}), None, &[(MODEL_THINKING_KEY, "high")]; "thinking_text")]
+    #[test_case(json!({"thinking": 2048}), None, &[(MODEL_THINKING_KEY, "2048")]; "thinking_budget")]
+    #[test_case(json!({"thinking": true}), None, &[(MODEL_THINKING_KEY, "true")]; "thinking_flag")]
+    #[test_case(json!({"thinking": "nope"}), None, &[(MODEL_THINKING_KEY, "nope")]; "thinking_invalid")]
+    #[test_case(json!({"fast": true}), None, &[(MODEL_FAST_KEY, "true")]; "fast_flag")]
+    #[test_case(json!({"fast": "false"}), None, &[(MODEL_FAST_KEY, "false")]; "fast_text")]
+    #[test_case(json!({"fast": "yes"}), None, &[(MODEL_FAST_KEY, "yes")]; "fast_invalid")]
+    fn structured_input_matches_command_options(
+        input: Value,
+        spec: Option<&str>,
+        options: &[(&str, &str)],
+    ) {
+        let structured = serde_json::from_value::<ModelSelection>(input).map_err(|e| e.to_string());
+        let command = built(spec, options).map_err(|e| e.to_string());
+        assert_eq!(structured, command);
+    }
+
+    #[test]
+    fn structured_input_rejects_unknown_keys() {
+        assert!(serde_json::from_value::<ModelSelection>(json!({"model_spec": "a/b"})).is_err());
     }
 }

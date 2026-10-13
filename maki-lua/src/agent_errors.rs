@@ -24,6 +24,7 @@ pub const EXPLICIT_MODEL_TARGET_REQUIRED: &str =
     "no interactive UI attached; pass ctx or use the Agent API";
 pub const TRUSTED_MODEL_MUTATION_REQUIRED: &str =
     "host model mutation requires trusted handler authority";
+pub const UNKNOWN_SPAWN_OPTION: &str = "unknown spawn option";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
 pub const NOT_DESCENDANT_OF_CALLER: &str = "agent is not a descendant of the caller";
 pub const FOREIGN_AGENT_REFERENCE: &str = "agent reference belongs to another runtime";
