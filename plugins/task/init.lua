@@ -96,7 +96,10 @@ local spawn_schema = {
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
     output_schema = {
-      description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
+      type = "object",
+      properties = {},
+      additionalProperties = true,
+      description = "JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text.",
     },
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
