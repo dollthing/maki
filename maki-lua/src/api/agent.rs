@@ -2,7 +2,7 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -34,19 +34,21 @@ use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
     CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools,
     PermissionScopes, RequestTools, ToolAudience, ToolContext, ToolFilter, ToolLive,
+    TurnToolBindings,
 };
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
-    AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger,
-    RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId,
-    TurnOutcome,
+    AgentRunParams, CancelTrigger, CurrentManagedTurn, EMPTY_RESPONSE_MARKER, Envelope,
+    EventSender, History, McpSession, RunLedger, RunSettings, SubagentCancel, SubagentInfo,
+    ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::{ModelPolicy, ToolKey};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, Message, Model, ModelError, RequestOptions, Role, TokenUsage, add_cost,
+    ContentBlock, Message, Model, ModelError, ModelSelection, RequestOptions, Role, TokenUsage,
+    add_cost,
 };
 use maki_storage::id::MakiId;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -62,7 +64,8 @@ use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::orchestration::TrustedContext;
 use crate::runtime::CANCELLED_MSG;
 
 const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
@@ -338,7 +341,7 @@ impl ActorBackend for LuaActorBackend {
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
                 prompt_inputs: None,
-                bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                bindings: Arc::new(TurnToolBindings::capture(
                     &params.registry,
                     &state.local_tools,
                     state.mcp.as_ref(),
@@ -1092,386 +1095,774 @@ fn request_tools_json(lua: &Lua, value: &LuaValue) -> LuaResult<JsonValue> {
     Ok(definitions)
 }
 
+/// Who a new session answers to: the parent agent context it inherits from and
+/// the authority that must still hold after every suspension point.
+struct SessionParent {
+    context: AgentContext,
+    trusted: Option<TrustedContext>,
+    managed_turn: Option<CurrentManagedTurn>,
+    authority: SessionAuthority,
+    agent_id: Option<AgentId>,
+    is_root: bool,
+}
+
+impl SessionParent {
+    fn resolve(lua: &Lua, ctx: &LuaCtx) -> Result<Self, String> {
+        ctx.validate_origin(lua)?;
+        let trusted = ctx.trusted(lua).ok().cloned();
+        let context = Self::agent_context(lua, ctx, trusted.as_ref())?;
+        let authority = SessionAuthority::capture(lua, trusted.as_ref(), &context)?;
+        let managed_turn = match (
+            &context.managed_turn,
+            crate::runtime::current_managed_turn(lua),
+        ) {
+            (Some(expected), Some(active)) if expected.same_authority(&active) => Some(active),
+            (None, None) => None,
+            _ => return Err(MANAGED_AUTHORITY_INACTIVE.into()),
+        };
+        let agent_id = managed_turn
+            .as_ref()
+            .map(|current| current.agent_id())
+            .or_else(|| trusted.as_ref().map(|trusted| trusted.target.id()));
+        let is_root = managed_turn
+            .as_ref()
+            .and_then(|current| current.node_snapshot().ok())
+            .is_some_and(|node| node.parent_id.is_none());
+        Ok(Self {
+            context,
+            trusted,
+            managed_turn,
+            authority,
+            agent_id,
+            is_root,
+        })
+    }
+
+    fn agent_context(
+        lua: &Lua,
+        ctx: &LuaCtx,
+        trusted: Option<&TrustedContext>,
+    ) -> Result<AgentContext, String> {
+        if let Some(trusted) = trusted {
+            let mut template = trusted.template.clone();
+            if let Some(config) = trusted
+                .target
+                .effective_config()
+                .map_err(|error| error.to_string())?
+            {
+                template.apply_effective_config(&config);
+            }
+            return Ok(AgentContext::from(&template));
+        }
+        if let Ok(host) = ctx.trusted_host_root(lua) {
+            let template = host
+                .template
+                .as_ref()
+                .ok_or("host root spawn template is unavailable")?;
+            return Ok(AgentContext::from(template));
+        }
+        dispatch_ctx(lua, ctx, "session").cloned()
+    }
+
+    fn restricts_writes(&self) -> bool {
+        self.context.restrict_write_to().is_some()
+    }
+
+    fn revalidate(&self, lua: &Lua, ctx: &LuaCtx) -> Result<(), String> {
+        ctx.validate_origin(lua)?;
+        if let Some(current) = &self.managed_turn {
+            current
+                .validate_active()
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(trusted) = &self.trusted {
+            trusted.validate_target(lua, &trusted.target)?;
+        }
+        self.authority.validate(lua, None)
+    }
+
+    /// The parent's callable tool context, with turn bindings captured fresh
+    /// for trusted parents, and the names it may call.
+    fn callable_tools(&self) -> (ToolContext, HashSet<String>) {
+        let mut context = self.context.to_tool_context();
+        if self.trusted.is_some() {
+            context.turn_bindings = Arc::new(TurnToolBindings::capture(
+                &context.registry,
+                &context.local_tools,
+                context.mcp.as_ref(),
+            ));
+        }
+        let allowed = tool_dispatch::callable(&context)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        (context, allowed)
+    }
+}
+
+struct SessionOptions {
+    inherit_defaults: bool,
+    selection: ModelSelection,
+    system: Option<String>,
+    tools: Option<LuaValue>,
+    local_tools: Option<Table>,
+    name: String,
+    audience: ToolAudience,
+    inherit_provider: bool,
+    fast: bool,
+    mcp: bool,
+    silent: bool,
+    auto_deliver: bool,
+    semaphore: Option<Arc<async_lock::Semaphore>>,
+}
+
+impl SessionOptions {
+    fn parse(
+        lua: &Lua,
+        opts: &Table,
+        parent: &SessionParent,
+        inherit_defaults: bool,
+    ) -> LuaResult<Result<Self, String>> {
+        for pair in opts.pairs::<LuaValue, LuaValue>() {
+            let (key, _) = pair?;
+            let known =
+                matches!(&key, LuaValue::String(name) if SPAWN_OPTIONS.contains(&&*name.to_str()?));
+            if !known {
+                return Ok(Err(format!(
+                    "{}: {}",
+                    crate::agent_errors::UNKNOWN_SPAWN_OPTION,
+                    key.to_string()?
+                )));
+            }
+        }
+        let selection = match opts.get::<Option<LuaValue>>("model")? {
+            Some(value) => match crate::api::util::selection::selection_from_lua(lua, value) {
+                Ok(selection) => selection,
+                Err(error) => return Ok(Err(error)),
+            },
+            None => Default::default(),
+        };
+        let system = opts.get("system")?;
+        let tools = opts.get("tools")?;
+        let local_tools = opts.get("local_tools")?;
+        let name: Option<String> = opts.get("name")?;
+        let audience = match opts.get::<Option<String>>("audience")? {
+            Some(s) => match ToolAudience::parse_name(&s) {
+                Some(audience) => audience,
+                None => return Ok(Err(format!("unknown audience: {s}"))),
+            },
+            None if inherit_defaults => parent.context.audience,
+            None => DEFAULT_SESSION_AUDIENCE,
+        };
+        let inherit_provider = opts
+            .get::<Option<bool>>("inherit_provider")?
+            .unwrap_or(false);
+        let fast = selection.fast.unwrap_or(parent.context.opts.fast);
+        let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !parent.restricts_writes();
+        let silent = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
+        let auto_deliver = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
+        let semaphore = if parent.managed_turn.is_some() {
+            None
+        } else {
+            opts.get::<Option<mlua::AnyUserData>>("semaphore")?
+                .map(|value| {
+                    value
+                        .borrow::<LuaSemaphore>()
+                        .map(|semaphore| Arc::clone(&semaphore.sem))
+                })
+                .transpose()?
+        };
+        Ok(Ok(Self {
+            inherit_defaults,
+            selection,
+            system,
+            tools,
+            local_tools,
+            name: name.unwrap_or_default(),
+            audience,
+            inherit_provider,
+            fast,
+            mcp,
+            silent,
+            auto_deliver,
+            semaphore,
+        }))
+    }
+
+    fn workflow(&self, parent: &SessionParent) -> bool {
+        self.inherit_defaults && parent.context.workflow
+    }
+
+    fn inherits_parent_mode(&self, parent: &SessionParent) -> bool {
+        self.inherit_defaults
+            || parent.restricts_writes()
+            || matches!(&parent.context.mode, AgentMode::Custom(_))
+    }
+}
+
+struct SessionTools {
+    request: RequestTools,
+    local: HashMap<String, LocalTool>,
+    structured: Option<Arc<StructuredOutput>>,
+}
+
+impl SessionTools {
+    fn assemble(
+        lua: &Lua,
+        opts: &Table,
+        parent: &SessionParent,
+        options: &SessionOptions,
+        model: &Model,
+    ) -> LuaResult<Result<Self, String>> {
+        let (parent_tools, parent_allowed) = parent.callable_tools();
+        let mut definitions = match &options.tools {
+            Some(value) => request_tools_json(lua, value)?,
+            None if options.inherit_defaults => {
+                match inherited_tool_definitions(&parent.context, model, &parent_allowed) {
+                    Ok(definitions) => definitions,
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            None => JsonValue::Array(vec![]),
+        };
+        let structured = match opts.get::<Option<LuaValue>>("output_schema")? {
+            Some(value) => match StructuredOutput::compile(lua_to_json(lua, &value)?) {
+                Ok(structured) => Some(structured),
+                Err(error) => return Ok(Err(error)),
+            },
+            None => None,
+        };
+        let mut local = if options.inherit_defaults && options.tools.is_none() {
+            inherited_local_tools(&parent.context, &definitions)
+        } else {
+            HashMap::new()
+        };
+        if let Some(table) = &options.local_tools
+            && let Err(error) = add_lua_local_tools(lua, table, &mut definitions, &mut local)?
+        {
+            return Ok(Err(error));
+        }
+        if let Some(structured) = &structured {
+            if local.contains_key(structured_output::TOOL_NAME)
+                || definition_names(&definitions).any(|name| name == structured_output::TOOL_NAME)
+            {
+                return Ok(Err(STRUCTURED_OUTPUT_CONFLICT.into()));
+            }
+            definitions
+                .as_array_mut()
+                .expect("tools checked")
+                .push(structured.definition());
+            local.insert(structured_output::TOOL_NAME.into(), structured.local_tool());
+        }
+        // The array is the caller's, and the filter comes out of it, so whatever
+        // the caller left out is also a name this session cannot dispatch or bind
+        // inside its sandbox.
+        if options.inherits_parent_mode(parent) {
+            let initial =
+                RequestTools::assembled(definitions.clone(), &parent.context.config, model);
+            let mut child_tools = parent_tools;
+            child_tools.audience = options.audience;
+            child_tools.tool_filter = Arc::clone(initial.filter());
+            let within_parent = options.inherit_defaults || parent.restricts_writes();
+            let mut allowed: HashSet<_> = tool_dispatch::callable(&child_tools)
+                .into_iter()
+                .map(|tool| tool.name)
+                .filter(|name| !within_parent || parent_allowed.contains(name))
+                .collect();
+            allowed.extend(local.keys().cloned());
+            definitions
+                .as_array_mut()
+                .expect("request tools are an array")
+                .retain(|definition| {
+                    definition_name(definition).is_some_and(|name| allowed.contains(name))
+                });
+        }
+        Ok(Ok(Self {
+            request: RequestTools::assembled(definitions, &parent.context.config, model),
+            local,
+            structured,
+        }))
+    }
+}
+
+fn definition_name(definition: &JsonValue) -> Option<&str> {
+    definition.get("name").and_then(JsonValue::as_str)
+}
+
+fn definition_names(definitions: &JsonValue) -> impl Iterator<Item = &str> {
+    definitions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(definition_name)
+}
+
+fn inherited_tool_definitions(
+    context: &AgentContext,
+    model: &Model,
+    parent_allowed: &HashSet<String>,
+) -> Result<JsonValue, String> {
+    let filter = context
+        .tool_filter
+        .as_ref()
+        .clone()
+        .excluding(maki_agent::tools::capability_exclusions(model));
+    let mut definitions = context
+        .request_tools
+        .as_ref()
+        .ok_or("parent request tools snapshot is unavailable")?
+        .definitions()
+        .clone();
+    if let Some(definitions) = definitions.as_array_mut() {
+        definitions.retain(|definition| {
+            definition_name(definition).is_some_and(|name| {
+                name != structured_output::TOOL_NAME
+                    && parent_allowed.contains(name)
+                    && filter.matches(name)
+            })
+        });
+    }
+    Ok(definitions)
+}
+
+fn inherited_local_tools(
+    context: &AgentContext,
+    definitions: &JsonValue,
+) -> HashMap<String, LocalTool> {
+    let published: HashSet<_> = definition_names(definitions).collect();
+    context
+        .local_tools
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() != structured_output::TOOL_NAME && published.contains(name.as_str())
+        })
+        .map(|(name, tool)| (name.clone(), tool.clone()))
+        .collect()
+}
+
+fn add_lua_local_tools(
+    lua: &Lua,
+    table: &Table,
+    definitions: &mut JsonValue,
+    local: &mut HashMap<String, LocalTool>,
+) -> LuaResult<Result<(), String>> {
+    let definitions = definitions.as_array_mut().expect("checked above");
+    for pair in table.pairs::<String, Table>() {
+        let (name, spec) = pair?;
+        let Ok(description) = spec.get::<String>("description") else {
+            return Ok(Err(format!(
+                "local_tools.{name}: 'description' is required"
+            )));
+        };
+        let input_schema = lua_to_json(lua, &spec.get::<LuaValue>("input_schema")?)?;
+        let sanitized_schema = sanitize_tool_input_schema(input_schema);
+        let Ok(handler) = spec.get::<Function>("handler") else {
+            return Ok(Err(format!("local_tools.{name}: 'handler' is required")));
+        };
+        let capture_input = spec.get::<Option<bool>>("capture_input")?.unwrap_or(false);
+        definitions.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "input_schema": sanitized_schema,
+        }));
+        let audience =
+            parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
+        let weak = lua.weak();
+        local.insert(
+            name,
+            maki_agent::tools::local_tool(audience, move |input, ctx| {
+                let result = call_local_tool(
+                    &weak,
+                    &handler,
+                    &input,
+                    ctx.local_tool_capture.as_ref(),
+                    capture_input,
+                );
+                Box::pin(async move { result })
+            }),
+        );
+    }
+    Ok(Ok(()))
+}
+
+/// Model, provider, and mode the child runs with, resolved once the provider
+/// is built.
+struct ChildSettings {
+    model: Model,
+    provider: Arc<dyn provider::Provider>,
+    opts: RequestOptions,
+    mode: AgentMode,
+    inherits_parent_mode: bool,
+}
+
+impl ChildSettings {
+    fn new(
+        parent: &SessionParent,
+        options: &SessionOptions,
+        model: Model,
+        provider: Arc<dyn provider::Provider>,
+    ) -> Self {
+        let parent_thinking = parent.context.opts.thinking;
+        let thinking = options
+            .selection
+            .thinking
+            .map_or(parent_thinking, |t| t.clamp_to(parent_thinking));
+        let opts = RequestOptions {
+            thinking,
+            fast: options.fast,
+        }
+        .clamped(&model);
+        let inherits_parent_mode = options.inherits_parent_mode(parent);
+        let mode = if inherits_parent_mode {
+            parent.context.mode.clone()
+        } else {
+            AgentMode::Build
+        };
+        Self {
+            model,
+            provider,
+            opts,
+            mode,
+            inherits_parent_mode,
+        }
+    }
+
+    fn tool_template(
+        &self,
+        parent: &SessionParent,
+        options: &SessionOptions,
+        tools: &SessionTools,
+        commit: &Arc<Mutex<Option<JsonValue>>>,
+    ) -> ToolContext {
+        let context = &parent.context;
+        let mut template = context.to_tool_context();
+        template.model = Arc::new(self.model.clone());
+        template.provider = Arc::clone(&self.provider);
+        template.opts = self.opts;
+        template.audience = options.audience;
+        template.workflow = options.workflow(parent);
+        template.mode = self.mode.clone();
+        template.mode_def = if self.inherits_parent_mode {
+            context.mode_def.clone()
+        } else {
+            Some(Arc::new(context.modes.current(&self.mode)))
+        };
+        template.tool_filter = Arc::clone(tools.request.filter());
+        template.request_tools = Some(tools.request.clone());
+        template.managed_turn = None;
+        template.local_tools = Arc::new(tools.local.clone());
+        template.local_tool_capture = Some(Arc::clone(commit));
+        template.mcp = context
+            .mcp
+            .as_ref()
+            .filter(|_| options.mcp)
+            .map(McpSession::fresh);
+        template
+    }
+
+    fn initial_config(
+        &self,
+        parent: &SessionParent,
+        options: &SessionOptions,
+    ) -> EffectiveAgentConfig {
+        let context = &parent.context;
+        EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&self.provider),
+                model: self.model.clone(),
+                thinking: self.opts.thinking,
+                fast: self.opts.fast,
+                workflow: options.workflow(parent),
+            },
+            self.mode.clone(),
+        )
+        .with_mode_def(if self.inherits_parent_mode {
+            context.mode_def.as_deref().cloned()
+        } else {
+            Some(context.modes.current(&self.mode))
+        })
+    }
+}
+
+fn agent_params(
+    context: &AgentContext,
+    agent_id: AgentId,
+    model: Model,
+    provider: Arc<dyn provider::Provider>,
+    options: &SessionOptions,
+) -> AgentParams {
+    AgentParams {
+        agent_id,
+        provider,
+        model,
+        config: context.config.clone(),
+        tool_output_lines: maki_config::ToolOutputLines::default(),
+        permissions: Arc::clone(&context.permissions),
+        session_id: context.session_id.clone(),
+        mailbox: None,
+        timeouts: context.timeouts,
+        file_tracker: FileReadTracker::fresh(),
+        prompt_slots: Arc::clone(&context.prompt_slots),
+        modes: Arc::clone(&context.modes),
+        subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: RunLedger::child(&context.ledger),
+        registry: if options.inherit_defaults {
+            Arc::clone(&context.registry)
+        } else {
+            Arc::clone(ToolRegistry::global_arc())
+        },
+        audience: options.audience,
+        question_mode: context.question_mode,
+        model_policy: Arc::clone(&context.model_policy),
+        file_write_locks: Arc::clone(&context.file_write_locks),
+        offload: context.offload.clone(),
+        managed_turn: None,
+    }
+}
+
+/// Spawns the child under the managed turn or trusted target when there is
+/// one, otherwise as a free actor keyed into the parent's `subagent_cancels`.
+fn spawn_session_actor(
+    lua: &Lua,
+    parent: &SessionParent,
+    state: &Arc<LuaActorState>,
+    initial_config: EffectiveAgentConfig,
+    params: impl FnOnce(AgentId) -> AgentParams,
+    child_trigger: CancelTrigger,
+) -> Result<(AgentActorHandle, SessionControl), String> {
+    let backend = || -> Box<dyn ActorBackend> { Box::new(LuaActorBackend::new(Arc::clone(state))) };
+    let init_params = |agent_id| {
+        assert!(
+            state.params.set(params(agent_id)).is_ok(),
+            "session parameters must only be initialized once"
+        );
+    };
+    if parent.managed_turn.is_none() && parent.trusted.is_none() {
+        let agent_id = AgentId::generate();
+        init_params(agent_id);
+        let cancel_slot = parent
+            .context
+            .subagent_cancels
+            .insert(state.ui_id.clone(), child_trigger);
+        let (actor, task) = AgentActorHandle::spawn(agent_id, Vec::new(), None, backend());
+        actor
+            .initialize_config(initial_config)
+            .map_err(|error| error.to_string())?;
+        task.detach();
+        return Ok((
+            actor,
+            SessionControl::Unmanaged {
+                parent_cancels: Arc::clone(&parent.context.subagent_cancels),
+                cancel_slot,
+            },
+        ));
+    }
+    let metadata = maki_agent::AgentMetadata {
+        label: (!state.name.is_empty()).then_some(state.name.clone()),
+        spawned_by_tool_use_id: parent.context.tool_use_id.clone(),
+    };
+    let child = if let Some(current) = &parent.managed_turn {
+        current.spawn_child_with_config(initial_config, metadata, Vec::new(), None, backend())
+    } else {
+        let trusted = parent.trusted.as_ref().expect("trusted spawn checked");
+        trusted.validate_target(lua, &trusted.target)?;
+        trusted.target.manager().spawn_child_trusted_with_config(
+            &trusted.target,
+            initial_config,
+            metadata,
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(backend()),
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    init_params(child.id());
+    let actor = child.actor().map_err(|error| error.to_string())?;
+    if let Err(error) = actor.configure_parent_delivery(
+        state.auto_deliver && !state.silent,
+        Some(state.ui_id.clone()),
+    ) {
+        let _ = child.close_subtree();
+        return Err(error.to_string());
+    }
+    Ok((
+        actor,
+        SessionControl::Managed {
+            agent: child,
+            _child_trigger: child_trigger,
+        },
+    ))
+}
+
+/// `task_despawn` and global cancellation fire the shared child token.
+/// Permanent closure aborts running turns and terminalizes queued turns;
+/// managed sessions close their subtree. A normal close stops the relay first,
+/// through the returned sender.
+fn spawn_close_relay(
+    actor: &AgentActorHandle,
+    control: &SessionControl,
+    state: &Arc<LuaActorState>,
+) -> flume::Sender<()> {
+    let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
+    let actor = actor.clone();
+    let managed_agent = match control {
+        SessionControl::Managed { agent, .. } => Some(agent.clone()),
+        SessionControl::Unmanaged { .. } => None,
+    };
+    let child_cancel = state.child_cancel.clone();
+    let close_state = Arc::clone(state);
+    smol::spawn(async move {
+        select(
+            Box::pin(async move { child_cancel.cancelled().await }),
+            Box::pin(async move {
+                let _ = relay_stop_rx.recv_async().await;
+            }),
+        )
+        .await;
+        close_state.notify_closed_direct();
+        if let Some(agent) = managed_agent {
+            let _ = agent.close_subtree();
+        } else {
+            actor.close();
+        }
+    })
+    .detach();
+    relay_stop_tx
+}
+
+/// UI input relay: tab submits from the parent dispatch into this session.
+/// Each message is admitted to the actor as its own turn, exactly like `send`
+/// (no second FIFO; the actor's queue is the FIFO).
+fn spawn_ui_input_relay(
+    actor: &AgentActorHandle,
+    state: &LuaActorState,
+    ui_input_rx: flume::Receiver<String>,
+) {
+    let actor = actor.clone();
+    let mode = state.mode.clone();
+    let opts = state.opts;
+    smol::spawn(async move {
+        while let Ok(message) = ui_input_rx.recv_async().await {
+            let _ = actor.admit_turn(
+                AgentInput {
+                    message,
+                    mode: mode.clone(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: opts.thinking,
+                    fast: opts.fast,
+                    workflow: false,
+                    prompt: None,
+                    cancel: None,
+                    lease_committer: None,
+                },
+                None,
+                String::new(),
+            );
+        }
+    })
+    .detach();
+}
+
+/// Publishes a managed child as a trusted target, ties a delegated unmanaged
+/// session to its invocation's lifetime, and records its owner. A failed step
+/// closes the session.
+fn register_session(
+    lua: &Lua,
+    sess: LuaSession,
+    child_template: ToolContext,
+    inherit_defaults: bool,
+) -> Result<LuaSession, String> {
+    let _ = sess.state.template.set(child_template.clone());
+    if let SessionControl::Managed { agent, .. } = &sess.control
+        && let Some(service) = crate::orchestration::services(lua)
+        && let Err(error) = service.register_target(crate::orchestration::TrustedTarget {
+            target: agent.clone(),
+            template: child_template,
+        })
+    {
+        sess.close_controlled();
+        return Err(error.to_string());
+    }
+    if !inherit_defaults
+        && matches!(sess.authority, SessionAuthority::Delegated { .. })
+        && matches!(sess.control, SessionControl::Unmanaged { .. })
+    {
+        let actor = Arc::clone(&sess.actor);
+        let state = Arc::clone(&sess.state);
+        if let Err(error) = crate::runtime::register_defer_close(
+            lua,
+            Box::new(move || {
+                state.close_with(&actor);
+            }),
+        ) {
+            sess.close_controlled();
+            return Err(error.to_string());
+        }
+    }
+    register_session_owner(lua, &sess);
+    Ok(sess)
+}
+
 async fn build_session(
     lua: Lua,
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
     inherit_defaults: bool,
 ) -> LuaResult<Pair<LuaSession>> {
-    try_pair!(ctx.validate_origin(&lua));
-    let trusted = ctx.trusted(&lua).ok().cloned();
-    let agent_ctx = match &trusted {
-        Some(trusted) => {
-            let mut template = trusted.template.clone();
-            if let Some(config) = try_pair!(trusted.target.effective_config()) {
-                template.apply_effective_config(&config);
-            }
-            AgentContext::from(&template)
-        }
-        None => {
-            if let Ok(host) = ctx.trusted_host_root(&lua) {
-                let template = try_pair!(
-                    host.template
-                        .as_ref()
-                        .ok_or("host root spawn template is unavailable")
-                );
-                AgentContext::from(template)
-            } else {
-                try_pair!(dispatch_ctx(&lua, &ctx, "session")).clone()
-            }
-        }
-    };
-    let authority = try_pair!(SessionAuthority::capture(
+    let parent = try_pair!(SessionParent::resolve(&lua, &ctx));
+    let mut options = try_pair!(SessionOptions::parse(
         &lua,
-        trusted.as_ref(),
-        &agent_ctx
-    ));
-    let parent_mode = agent_ctx.mode.clone();
-    let restrictive_parent = agent_ctx.restrict_write_to().is_some();
-    let managed_turn = match (
-        &agent_ctx.managed_turn,
-        crate::runtime::current_managed_turn(&lua),
-    ) {
-        (Some(expected), Some(active)) if expected.same_authority(&active) => Some(active),
-        (None, None) => None,
-        _ => {
-            return Ok(err_pair(MANAGED_AUTHORITY_INACTIVE));
-        }
-    };
-    for pair in opts.pairs::<LuaValue, LuaValue>() {
-        let (key, _) = pair?;
-        let known =
-            matches!(&key, LuaValue::String(name) if SPAWN_OPTIONS.contains(&&*name.to_str()?));
-        if !known {
-            return Ok(err_pair(format!(
-                "{}: {}",
-                crate::agent_errors::UNKNOWN_SPAWN_OPTION,
-                key.to_string()?
-            )));
-        }
-    }
-    let selection = match opts.get::<Option<LuaValue>>("model")? {
-        Some(value) => try_pair!(crate::api::util::selection::selection_from_lua(&lua, value)),
-        None => Default::default(),
-    };
-    let model_spec = selection.spec.as_deref().map(str::to_owned);
-    let system: Option<String> = opts.get("system")?;
-    let tools_val: Option<LuaValue> = opts.get("tools")?;
-    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
-    let name: Option<String> = opts.get("name")?;
-    let audience = match opts.get::<Option<String>>("audience")? {
-        Some(s) => {
-            try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
-        }
-        None if inherit_defaults => agent_ctx.audience,
-        None => DEFAULT_SESSION_AUDIENCE,
-    };
-    let inherit_provider: bool = opts
-        .get::<Option<bool>>("inherit_provider")?
-        .unwrap_or(false);
-    let fast = selection.fast.unwrap_or(agent_ctx.opts.fast);
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !restrictive_parent;
-    let silent: bool = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
-    let auto_deliver: bool = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
-    let parent_agent_id = managed_turn
-        .as_ref()
-        .map(|current| current.agent_id())
-        .or_else(|| trusted.as_ref().map(|trusted| trusted.target.id()));
-    let parent_is_root = managed_turn
-        .as_ref()
-        .and_then(|current| current.node_snapshot().ok())
-        .is_some_and(|node| node.parent_id.is_none());
-    let semaphore = if managed_turn.is_some() {
-        None
-    } else {
-        opts.get::<Option<mlua::AnyUserData>>("semaphore")?
-            .map(|value| {
-                value
-                    .borrow::<LuaSemaphore>()
-                    .map(|semaphore| Arc::clone(&semaphore.sem))
-            })
-            .transpose()?
-    };
+        &opts,
+        &parent,
+        inherit_defaults
+    )?);
 
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
         .map(|p| Arc::clone(&p));
-    let (model, provider): (Model, Arc<dyn provider::Provider>) =
-        try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx, prepare).await);
-    try_pair!(ctx.validate_origin(&lua));
-    if let Some(current) = &managed_turn {
-        try_pair!(current.validate_active());
-    }
-    if let Some(trusted) = &trusted {
-        try_pair!(trusted.validate_target(&lua, &trusted.target));
-    }
-    try_pair!(authority.validate(&lua, None));
+    let model_spec = options.selection.spec.as_deref().map(str::to_owned);
+    let (model, provider) = try_pair!(
+        build_session_provider(
+            &model_spec,
+            options.inherit_provider,
+            &parent.context,
+            prepare
+        )
+        .await
+    );
+    try_pair!(parent.revalidate(&lua, &ctx));
     let model_annotation = model.spec();
     let model_id = model.id.clone();
 
-    let inherit_tools = inherit_defaults && tools_val.is_none();
-    let mut parent_tools_context = agent_ctx.to_tool_context();
-    if trusted.is_some() {
-        parent_tools_context.turn_bindings =
-            Arc::new(maki_agent::tools::TurnToolBindings::capture(
-                &parent_tools_context.registry,
-                &parent_tools_context.local_tools,
-                parent_tools_context.mcp.as_ref(),
-            ));
-    }
-    let parent_allowed: std::collections::HashSet<_> =
-        tool_dispatch::callable(&parent_tools_context)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
-    let mut tools_json: JsonValue = match tools_val {
-        Some(LuaValue::Table(table)) if table.is_empty() => JsonValue::Array(Vec::new()),
-        Some(value) => request_tools_json(&lua, &value)?,
-        None if inherit_defaults => {
-            let filter = agent_ctx
-                .tool_filter
-                .as_ref()
-                .clone()
-                .excluding(maki_agent::tools::capability_exclusions(&model));
-            let mut definitions = try_pair!(
-                agent_ctx
-                    .request_tools
-                    .as_ref()
-                    .ok_or("parent request tools snapshot is unavailable")
-            )
-            .definitions()
-            .clone();
-            if let Some(definitions) = definitions.as_array_mut() {
-                definitions.retain(|definition| {
-                    definition
-                        .get("name")
-                        .and_then(JsonValue::as_str)
-                        .is_some_and(|name| {
-                            name != structured_output::TOOL_NAME
-                                && parent_allowed.contains(name)
-                                && filter.matches(name)
-                        })
-                });
-            }
-            definitions
-        }
-        None => JsonValue::Array(vec![]),
-    };
-
-    let structured = match opts.get::<Option<LuaValue>>("output_schema")? {
-        Some(value) => Some(try_pair!(StructuredOutput::compile(lua_to_json(
-            &lua, &value
-        )?))),
-        None => None,
-    };
+    let tools = try_pair!(SessionTools::assemble(
+        &lua, &opts, &parent, &options, &model
+    )?);
+    let child = ChildSettings::new(&parent, &options, model, provider);
     let commit = Arc::new(Mutex::new(None));
-    let mut local_map: HashMap<String, LocalTool> = if inherit_tools {
-        let published: std::collections::HashSet<_> = tools_json
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|definition| definition.get("name").and_then(JsonValue::as_str))
-            .collect();
-        agent_ctx
-            .local_tools
-            .iter()
-            .filter(|(name, _)| {
-                name.as_str() != structured_output::TOOL_NAME && published.contains(name.as_str())
-            })
-            .map(|(name, tool)| (name.clone(), tool.clone()))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    if let Some(tbl) = local_tools_tbl {
-        let defs = tools_json.as_array_mut().expect("checked above");
-        for pair in tbl.pairs::<String, Table>() {
-            let (name, spec) = pair?;
-            let description = try_pair!(
-                spec.get::<String>("description")
-                    .map_err(|_| format!("local_tools.{name}: 'description' is required"))
-            );
-            let input_schema = lua_to_json(&lua, &spec.get::<LuaValue>("input_schema")?)?;
-            let sanitized_schema = sanitize_tool_input_schema(input_schema);
-            let handler = try_pair!(
-                spec.get::<Function>("handler")
-                    .map_err(|_| format!("local_tools.{name}: 'handler' is required"))
-            );
-            let capture_input = spec.get::<Option<bool>>("capture_input")?.unwrap_or(false);
-            defs.push(serde_json::json!({
-                "name": name,
-                "description": description,
-                "input_schema": sanitized_schema,
-            }));
-            let audience =
-                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
-            let weak = lua.weak();
-            local_map.insert(
-                name,
-                maki_agent::tools::local_tool(audience, move |input, ctx| {
-                    let result = call_local_tool(
-                        &weak,
-                        &handler,
-                        &input,
-                        ctx.local_tool_capture.as_ref(),
-                        capture_input,
-                    );
-                    Box::pin(async move { result })
-                }),
-            );
-        }
-    }
-
-    if let Some(structured) = &structured {
-        if local_map.contains_key(structured_output::TOOL_NAME)
-            || tools_json.as_array().is_some_and(|definitions| {
-                definitions.iter().any(|definition| {
-                    definition.get("name").and_then(JsonValue::as_str)
-                        == Some(structured_output::TOOL_NAME)
-                })
-            })
-        {
-            return Ok(err_pair(STRUCTURED_OUTPUT_CONFLICT));
-        }
-        tools_json
-            .as_array_mut()
-            .expect("tools checked")
-            .push(structured.definition());
-        local_map.insert(structured_output::TOOL_NAME.into(), structured.local_tool());
-    }
-    let requested_thinking = selection.thinking;
-    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
-        t.clamp_to(agent_ctx.opts.thinking)
-    });
-    let opts = RequestOptions { thinking, fast }.clamped(&model);
+    let child_template = child.tool_template(&parent, &options, &tools, &commit);
+    let initial_config = child.initial_config(&parent, &options);
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let chip_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
-    let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-
+    let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-
     // Register a cancel trigger so the child token does not fire on drop
     // and kill the subagent at birth. The fallback key gets its own id:
     // it keys `subagent_cancels`, so sharing the session id would make two
     // subagents running at once collide.
-    let ui_id = agent_ctx
+    let ui_id = parent
+        .context
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     // The subagent's permanent close is independent of the parent run's cancel:
     // it is triggered only through the shared `subagent_cancels` map
-    // (`task_despawn` and global cancellation). Deriving it from `agent_ctx.cancel`
+    // (`task_despawn` and global cancellation). Deriving it from `parent.context.cancel`
     // (the run's token, which the UI fires at normal run end by dropping the
     // run's CancelTrigger) would close every in-flight subagent as soon as the
     // spawning run finishes.
     let (child_trigger, child_cancel) = CancelToken::new();
-
-    let name = name.unwrap_or_default();
-
-    // UI input relay: tab submits from the parent dispatch into this session.
-    // Each message is admitted to the actor as its own turn (no second FIFO;
-    // the actor's queue is the FIFO).
-    // The array is the caller's, and the filter comes out of it, so whatever
-    // the caller left out is also a name this session cannot dispatch or bind
-    // inside its sandbox.
-    let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
-    let inherit_parent_mode =
-        inherit_defaults || restrictive_parent || matches!(&parent_mode, AgentMode::Custom(_));
-    if inherit_parent_mode {
-        let mut child_ctx = parent_tools_context.clone();
-        child_ctx.audience = audience;
-        child_ctx.tool_filter = Arc::clone(initial_tools.filter());
-        let mut allowed: std::collections::HashSet<_> = tool_dispatch::callable(&child_ctx)
-            .into_iter()
-            .map(|tool| tool.name)
-            .filter(|name| {
-                !(inherit_defaults || restrictive_parent) || parent_allowed.contains(name)
-            })
-            .collect();
-        allowed.extend(local_map.keys().cloned());
-        tools_json
-            .as_array_mut()
-            .expect("request tools are an array")
-            .retain(|definition| {
-                definition
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|name| allowed.contains(name))
-            });
-    }
-    let child_mode = if inherit_parent_mode {
-        parent_mode
-    } else {
-        AgentMode::Build
-    };
-    let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
-    let mut child_template = agent_ctx.to_tool_context();
-    child_template.model = Arc::new(model.clone());
-    child_template.provider = Arc::clone(&provider);
-    child_template.opts = opts;
-    child_template.audience = audience;
-    child_template.workflow = inherit_defaults && agent_ctx.workflow;
-    child_template.mode = child_mode.clone();
-    child_template.mode_def = if inherit_parent_mode {
-        agent_ctx.mode_def.clone()
-    } else {
-        Some(Arc::new(agent_ctx.modes.current(&child_mode)))
-    };
-    child_template.tool_filter = Arc::clone(tools.filter());
-    child_template.request_tools = Some(tools.clone());
-    child_template.managed_turn = None;
-    child_template.local_tools = Arc::new(local_map.clone());
-    child_template.local_tool_capture = Some(Arc::clone(&commit));
-    child_template.mcp = agent_ctx
-        .mcp
-        .as_ref()
-        .filter(|_| mcp_enabled)
-        .map(McpSession::fresh);
-    let initial_config = EffectiveAgentConfig::new(
-        RunSettings {
-            provider: Arc::clone(&provider),
-            model: model.clone(),
-            thinking: opts.thinking,
-            fast: opts.fast,
-            workflow: inherit_defaults && agent_ctx.workflow,
-        },
-        child_mode.clone(),
-    )
-    .with_mode_def(if inherit_parent_mode {
-        agent_ctx.mode_def.as_deref().cloned()
-    } else {
-        Some(agent_ctx.modes.current(&child_mode))
-    });
-    let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
-    let build_params = |agent_id| AgentParams {
-        agent_id,
-        provider,
-        model,
-        config: agent_ctx.config.clone(),
-        tool_output_lines: maki_config::ToolOutputLines::default(),
-        permissions: Arc::clone(&agent_ctx.permissions),
-        session_id: agent_ctx.session_id.clone(),
-        mailbox: None,
-        timeouts: agent_ctx.timeouts,
-        file_tracker: FileReadTracker::fresh(),
-        prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
-        modes: Arc::clone(&agent_ctx.modes),
-        subagent_cancels: Arc::new(CancelMap::new()),
-        ledger: RunLedger::child(&agent_ctx.ledger),
-        registry: if inherit_defaults {
-            Arc::clone(&agent_ctx.registry)
-        } else {
-            Arc::clone(ToolRegistry::global_arc())
-        },
-        audience,
-        question_mode: agent_ctx.question_mode,
-        model_policy: Arc::clone(&agent_ctx.model_policy),
-        file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
-        offload: agent_ctx.offload.clone(),
-        managed_turn: None,
-    };
     let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
     let cancel = SubagentCancel::new({
         let cancel_actor = Arc::clone(&cancel_actor);
@@ -1484,36 +1875,38 @@ async fn build_session(
     let state = Arc::new(LuaActorState {
         template: OnceLock::new(),
         params: OnceLock::new(),
-        system: system.unwrap_or_default(),
-        tools,
-        opts,
-        mode: child_mode,
-        mode_def: inherit_parent_mode
-            .then(|| agent_ctx.mode_def.clone())
+        system: options.system.take().unwrap_or_default(),
+        tools: tools.request,
+        opts: child.opts,
+        mode: child.mode,
+        mode_def: child
+            .inherits_parent_mode
+            .then(|| parent.context.mode_def.clone())
             .flatten(),
-        mcp: agent_ctx
+        mcp: parent
+            .context
             .mcp
             .as_ref()
-            .filter(|_| mcp_enabled)
+            .filter(|_| options.mcp)
             .map(McpSession::fresh),
-        chip_event_tx,
+        chip_event_tx: EventSender::new(sub_tx, parent.context.event_tx.run_id()),
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
         ui_id: ui_id.clone(),
-        parent_event_tx: parent_tx.clone(),
-        input_tx: ui_input_tx.clone(),
+        parent_event_tx: parent.context.event_tx.clone(),
+        input_tx: ui_input_tx,
         cancel,
-        parent_agent_id,
-        parent_is_root,
-        auto_deliver,
-        silent,
+        parent_agent_id: parent.agent_id,
+        parent_is_root: parent.is_root,
+        auto_deliver: options.auto_deliver,
+        silent: options.silent,
         subagent_info: Arc::clone(&subagent_info),
-        local_tools: Arc::new(local_map),
-        structured,
-        name: name.clone(),
+        local_tools: Arc::new(tools.local),
+        structured: tools.structured,
+        name: options.name.clone(),
         commit,
-        semaphore,
+        semaphore: options.semaphore.take(),
         start: Instant::now(),
         execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
@@ -1521,154 +1914,45 @@ async fn build_session(
         relay_snapshot: Mutex::new(Vec::new()),
         presentation: Mutex::new(HashMap::new()),
     });
-    let (actor, control) = if managed_turn.is_some() || trusted.is_some() {
-        let metadata = maki_agent::AgentMetadata {
-            label: (!name.is_empty()).then_some(name.clone()),
-            spawned_by_tool_use_id: agent_ctx.tool_use_id.clone(),
-        };
-        let child = if let Some(current) = &managed_turn {
-            try_pair!(current.spawn_child_with_config(
-                initial_config,
-                metadata,
-                Vec::new(),
-                None,
-                Box::new(LuaActorBackend::new(Arc::clone(&state)))
-            ))
-        } else {
-            let trusted = trusted.as_ref().expect("trusted spawn checked");
-            try_pair!(trusted.validate_target(&lua, &trusted.target));
-            try_pair!(trusted.target.manager().spawn_child_trusted_with_config(
-                &trusted.target,
-                initial_config,
-                metadata,
-                Vec::new(),
-                None,
-                |_| Ok::<_, String>(Box::new(LuaActorBackend::new(Arc::clone(&state))))
-            ))
-        };
-        let agent_id = child.id();
-        assert!(
-            state.params.set(build_params(agent_id)).is_ok(),
-            "session parameters must only be initialized once"
-        );
-        let actor = try_pair!(child.actor());
-        if let Err(error) =
-            actor.configure_parent_delivery(auto_deliver && !silent, Some(ui_id.clone()))
-        {
-            let _ = child.close_subtree();
-            return Ok(err_pair(error));
-        }
-        (
-            actor,
-            SessionControl::Managed {
-                agent: child,
-                _child_trigger: child_trigger,
-            },
-        )
-    } else {
-        let agent_id = AgentId::generate();
-        assert!(
-            state.params.set(build_params(agent_id)).is_ok(),
-            "session parameters must only be initialized once"
-        );
-        let cancel_slot = agent_ctx
-            .subagent_cancels
-            .insert(ui_id.clone(), child_trigger);
-        let (actor, task) = AgentActorHandle::spawn(
+    let (actor, control) = try_pair!(spawn_session_actor(
+        &lua,
+        &parent,
+        &state,
+        initial_config,
+        |agent_id| agent_params(
+            &parent.context,
             agent_id,
-            Vec::new(),
-            None,
-            Box::new(LuaActorBackend::new(Arc::clone(&state))),
-        );
-        try_pair!(actor.initialize_config(initial_config));
-        task.detach();
-        (
-            actor,
-            SessionControl::Unmanaged {
-                parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
-                cancel_slot,
-            },
-        )
-    };
+            child.model,
+            child.provider,
+            &options
+        ),
+        child_trigger,
+    ));
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
-    if !silent && let Some(sink) = &agent_ctx.live_sink {
+    if !options.silent
+        && let Some(sink) = &parent.context.live_sink
+    {
         let _ = sink.send(ToolLive::Annotation(model_annotation));
     }
-    info!(name = %name, model = %model_id, "subagent session opened");
+    info!(name = %options.name, model = %model_id, "subagent session opened");
     smol::spawn(relay_session_events(
         sub_rx,
-        parent_tx.clone(),
-        Arc::clone(&subagent_info),
-        agent_ctx.live_sink.clone(),
-        silent,
+        parent.context.event_tx.clone(),
+        subagent_info,
+        parent.context.live_sink.clone(),
+        options.silent,
         None,
     ))
     .detach();
 
-    let agent_id = actor.agent_id();
     *cancel_actor.lock().unwrap() = Some(actor.clone());
-
-    // `task_despawn` and global cancellation fire the shared child token.
-    // Permanent closure aborts running turns and terminalizes queued turns;
-    // managed sessions close their subtree. A normal close stops the relay first.
-    let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
-    {
-        let actor = actor.clone();
-        let managed_agent = match &control {
-            SessionControl::Managed { agent, .. } => Some(agent.clone()),
-            SessionControl::Unmanaged { .. } => None,
-        };
-        let child_cancel = state.child_cancel.clone();
-        let close_state = Arc::clone(&state);
-        smol::spawn(async move {
-            select(
-                Box::pin(async move { child_cancel.cancelled().await }),
-                Box::pin(async move {
-                    let _ = relay_stop_rx.recv_async().await;
-                }),
-            )
-            .await;
-            close_state.notify_closed_direct();
-            if let Some(agent) = managed_agent {
-                let _ = agent.close_subtree();
-            } else {
-                actor.close();
-            }
-        })
-        .detach();
-    }
-
-    // Tab submits go through the actor's admission, exactly like `send`.
-    {
-        let actor = actor.clone();
-        let mode = state.mode.clone();
-        smol::spawn(async move {
-            while let Ok(message) = ui_input_rx.recv_async().await {
-                let _ = actor.admit_turn(
-                    AgentInput {
-                        message,
-                        mode: mode.clone(),
-                        images: Vec::new(),
-                        preamble: Vec::new(),
-                        thinking: opts.thinking,
-                        fast: opts.fast,
-                        workflow: false,
-                        prompt: None,
-                        cancel: None,
-                        lease_committer: None,
-                    },
-                    None,
-                    String::new(),
-                );
-            }
-        })
-        .detach();
-    }
+    let relay_stop_tx = spawn_close_relay(&actor, &control, &state);
+    spawn_ui_input_relay(&actor, &state, ui_input_rx);
 
     let sess = LuaSession {
         id: ui_id,
-        agent_id,
+        agent_id: actor.agent_id(),
         policy_constraint: actor.effective_config().map(|ceiling| {
             session_policy_constraint(Arc::clone(&child_template.model_policy), ceiling)
         }),
@@ -1676,37 +1960,14 @@ async fn build_session(
         state,
         control,
         relay_stop_tx,
-        authority,
+        authority: parent.authority,
     };
-    let _ = sess.state.template.set(child_template.clone());
-    if let SessionControl::Managed { agent, .. } = &sess.control
-        && let Some(service) = crate::orchestration::services(&lua)
-        && let Err(error) = service.register_target(crate::orchestration::TrustedTarget {
-            target: agent.clone(),
-            template: child_template,
-        })
-    {
-        sess.close_controlled();
-        return Ok(err_pair(error));
-    }
-    if !inherit_defaults
-        && matches!(sess.authority, SessionAuthority::Delegated { .. })
-        && matches!(sess.control, SessionControl::Unmanaged { .. })
-    {
-        let actor = Arc::clone(&sess.actor);
-        let state = Arc::clone(&sess.state);
-        if let Err(error) = crate::runtime::register_defer_close(
-            &lua,
-            Box::new(move || {
-                state.close_with(&actor);
-            }),
-        ) {
-            sess.close_controlled();
-            return Ok(err_pair(error));
-        }
-    }
-    register_session_owner(&lua, &sess);
-    Ok((Some(sess), None))
+    Ok(pair(register_session(
+        &lua,
+        sess,
+        child_template,
+        inherit_defaults,
+    )))
 }
 
 lua_table! {
@@ -1860,7 +2121,7 @@ enum SessionAuthority {
     },
     Delegated {
         invocation: InvocationGuard,
-        turn: Option<Box<maki_agent::CurrentManagedTurn>>,
+        turn: Option<Box<CurrentManagedTurn>>,
         parent: Option<Weak<CancelMap<String>>>,
         generation: Option<u64>,
     },
@@ -1869,7 +2130,7 @@ enum SessionAuthority {
 impl SessionAuthority {
     fn capture(
         lua: &Lua,
-        trusted: Option<&crate::orchestration::TrustedContext>,
+        trusted: Option<&TrustedContext>,
         context: &AgentContext,
     ) -> Result<Self, String> {
         if let Some(trusted) = trusted {
@@ -2036,7 +2297,7 @@ pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
 enum SessionControl {
     Managed {
         agent: maki_agent::AgentRef,
-        _child_trigger: maki_agent::CancelTrigger,
+        _child_trigger: CancelTrigger,
     },
     Unmanaged {
         parent_cancels: Arc<CancelMap<String>>,
@@ -2381,8 +2642,8 @@ fn session_provenance(lua: &Lua) -> maki_agent::TurnProvenance {
         origin: maki_agent::TurnOrigin::Plugin,
         plugin: plugin.as_ref().map(|(name, _)| name.to_string()),
         plugin_generation: plugin.map(|(_, generation)| generation),
-        source_agent: turn.as_ref().map(maki_agent::CurrentManagedTurn::agent_id),
-        source_turn: turn.as_ref().map(maki_agent::CurrentManagedTurn::turn_id),
+        source_agent: turn.as_ref().map(CurrentManagedTurn::agent_id),
+        source_turn: turn.as_ref().map(CurrentManagedTurn::turn_id),
     }
 }
 
