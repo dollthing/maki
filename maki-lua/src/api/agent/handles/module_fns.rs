@@ -254,7 +254,7 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 ///   model (string|table): a spec or `{spec, thinking, fast}` selection, validated
 ///     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
 ///     parent's level, and `Agent:model` results can be passed as is.
-///   system (string): custom system prompt contribution; defaults to empty.
+///   system (string): custom text appended after the admitted mode's prompt contribution; defaults to empty and does not inherit the parent's full system prompt.
 ///   tools (array): request definitions; omitted inherits permitted parent tools.
 ///   local_tools (table): name-keyed Lua tool specs with description, input_schema,
 ///     handler(input), and optional capture_input for successful input capture.

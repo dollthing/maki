@@ -331,6 +331,7 @@ impl ActorBackend for LuaInvocationBackend {
 #[derive(Default)]
 struct FixtureOptions {
     mode: Option<AgentMode>,
+    modes: Vec<maki_agent::ModeDefSpec>,
     limits: AgentLimits,
     bundled_tasks: bool,
     authority_probes: bool,
@@ -358,14 +359,6 @@ async fn settle_legacy_reply(manager: &AgentManagerHandle, request: &CapturedReq
 async fn wait_for_child_reclamation(manager: &AgentManagerHandle, operation: &str) {
     let wait = async {
         loop {
-            let children: Vec<_> = manager
-                .snapshot()
-                .into_iter()
-                .filter(|node| node.parent_id.is_some())
-                .collect();
-            for child in &children {
-                manager.runner_finished(child.agent_id).unwrap();
-            }
             if manager
                 .snapshot()
                 .iter()
@@ -434,6 +427,7 @@ impl Fixture {
     fn start_with_options(tool: &'static str, options: FixtureOptions, handler: &str) -> Self {
         let FixtureOptions {
             mode,
+            modes,
             limits,
             bundled_tasks,
             authority_probes,
@@ -550,6 +544,9 @@ impl Fixture {
             &context.local_tools,
             context.mcp.as_ref(),
         ));
+        for definition in modes {
+            context.modes.define(definition).unwrap();
+        }
         let mut definition = context.modes.current(&mode);
         if authority_probes {
             definition.tools = Some(vec![
@@ -1091,6 +1088,215 @@ fn public_agent_model_change_controls_next_request_without_losing_history() {
             .send(common::canned_reply(SECOND_REPLY))
             .unwrap();
         fixture.finish().await;
+    });
+}
+
+#[test_case::test_case(Some(SYSTEM); "custom_system")]
+#[test_case::test_case(None; "empty_custom_system")]
+fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&str>) {
+    const OWNER: &str = "pr160_mode_system";
+    const COMMAND: &str = "/pr160_mode_system";
+    const OLD_MODE: &str = "pr160_old_mode";
+    const NEW_MODE: &str = "pr160_new_mode";
+    const OLD_PROMPT: &str = "old mode directive";
+    const NEW_PROMPT: &str = "new mode directive";
+    smol::block_on(async {
+        let fixture = Fixture::start_with_options(
+            OWNER,
+            FixtureOptions {
+                mode: Some(AgentMode::Custom(ModeId::parse(OLD_MODE))),
+                modes: vec![
+                    maki_agent::ModeDefSpec {
+                        name: OLD_MODE.into(),
+                        system_prompt: Some(OLD_PROMPT.into()),
+                        ..Default::default()
+                    },
+                    maki_agent::ModeDefSpec {
+                        name: NEW_MODE.into(),
+                        system_prompt: Some(NEW_PROMPT.into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "mode setup")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "mode root settlement").await;
+        let system_option = custom
+            .map(|system| format!("system = {system:?},"))
+            .unwrap_or_default();
+        fixture._host.load_source(OWNER, &format!(r#"
+            maki.api.register_command({{
+                name = "{COMMAND}", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, {system_option} }}))
+                    local first = assert(child:send(ctx, "old mode first"))
+                    local queued = assert(child:enqueue(ctx, "old mode queued"))
+                    assert(child:set_mode(ctx, "{NEW_MODE}") == "{NEW_MODE}")
+                    assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
+                    assert(assert(queued:wait(ctx)).text == "{SECOND_REPLY}")
+                    local latest = assert(child:send(ctx, "new mode turn"))
+                    assert(assert(latest:wait(ctx)).text == "{FIRST_REPLY}")
+                    assert(assert(first:result(ctx)).text == "{FIRST_REPLY}")
+                    assert(child:close(ctx))
+                end,
+            }})
+        "#)).unwrap();
+        let command = fixture._host.event_handle().run_command_for_test(
+            Arc::from(OWNER),
+            Arc::from(COMMAND),
+            String::new(),
+            0,
+        );
+        for (prompt, reply) in [
+            (OLD_PROMPT, FIRST_REPLY),
+            (OLD_PROMPT, SECOND_REPLY),
+            (NEW_PROMPT, FIRST_REPLY),
+        ] {
+            let request =
+                request_with_command_diagnostics(&fixture.requests, &command, "child mode request")
+                    .await;
+            let expected = custom.map_or_else(
+                || prompt.to_owned(),
+                |system| format!("{prompt}\n\n{system}"),
+            );
+            assert_eq!(request.system, expected);
+            request.reply.send(common::canned_reply(reply)).unwrap();
+        }
+        assert_eq!(
+            bounded(command.recv_async(), "mode command completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert!(fixture.requests.is_empty());
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
+fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves_mode() {
+    const OWNER: &str = "pr160_schema_policy";
+    const COMMAND: &str = "/pr160_schema_policy";
+    const DENIED_MODE: &str = "pr160_schema_denied";
+    const ALLOWED_MODE: &str = "pr160_schema_allowed";
+    const POLICY_ERROR: &str =
+        "output_schema requires tool 'structured_output' but the selected mode excludes it";
+    smol::block_on(async {
+        let fixture = Fixture::start_with_options(
+            OWNER,
+            FixtureOptions {
+                mode: Some(AgentMode::Custom(ModeId::parse(DENIED_MODE))),
+                modes: vec![
+                    maki_agent::ModeDefSpec {
+                        name: DENIED_MODE.into(),
+                        tools: Some(vec![OWNER.into()]),
+                        ..Default::default()
+                    },
+                    maki_agent::ModeDefSpec {
+                        name: ALLOWED_MODE.into(),
+                        tools: Some(vec!["structured_output".into()]),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "schema setup")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "schema root settlement").await;
+        fixture._host.load_source(OWNER, &format!(r#"
+            maki.api.register_command({{
+                name = "{COMMAND}", tui_only = false,
+                handler = function(_, ctx)
+                    local opts = {{ inherit_provider = true, silent = true, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}
+                    local before = #assert(maki.agent.list(ctx))
+                    for _, constructor in ipairs({{ maki.agent.spawn, maki.agent.session }}) do
+                        local child, err = constructor(ctx, opts)
+                        assert(child == nil and err == {POLICY_ERROR:?}, err)
+                        assert(#assert(maki.agent.list(ctx)) == before)
+                    end
+                    local root = assert(maki.agent.current(ctx))
+                    assert(root:set_mode(ctx, "{ALLOWED_MODE}") == "{ALLOWED_MODE}")
+                    local child = assert(maki.agent.spawn(ctx, opts))
+                    local mode, err = child:set_mode(ctx, "{DENIED_MODE}")
+                    assert(mode == nil and err == {POLICY_ERROR:?}, err)
+                    assert(child:mode(ctx) == "{ALLOWED_MODE}")
+                    local turn = assert(child:send(ctx, "required schema under allowed mode"))
+                    local result = assert(turn:wait(ctx))
+                    assert(result.status == "completed" and result.captured.answer == 42)
+                    assert(child:close(ctx))
+                    assert(assert(turn:result(ctx)).captured.answer == 42)
+                    local session = assert(maki.agent.session(ctx, opts))
+                    local found = false
+                    for _, reference in ipairs(assert(maki.agent.list(ctx))) do
+                        if reference:id() ~= root:id() then
+                            local controlled = assert(maki.agent.get(ctx, reference))
+                            local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
+                            assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
+                            assert(controlled:mode(ctx) == "{ALLOWED_MODE}")
+                            found = true
+                        end
+                    end
+                    assert(found)
+                    assert(session:close())
+                end,
+            }})
+        "#)).unwrap();
+        let command = fixture._host.event_handle().run_command_for_test(
+            Arc::from(OWNER),
+            Arc::from(COMMAND),
+            String::new(),
+            0,
+        );
+        let request =
+            request_with_command_diagnostics(&fixture.requests, &command, "allowed schema request")
+                .await;
+        assert_eq!(
+            common::tool_names(&request.tools),
+            vec!["structured_output"]
+        );
+        assert!(
+            serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains("required schema under allowed mode")
+        );
+        request
+            .reply
+            .send(common::canned_tool_use(
+                "structured_output",
+                json!({ "answer": 42 }),
+            ))
+            .unwrap();
+        let completion = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "allowed schema completion",
+        )
+        .await;
+        completion
+            .reply
+            .send(common::canned_reply(CAPTURE_REPLY))
+            .unwrap();
+        assert_eq!(
+            bounded(command.recv_async(), "schema command completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert!(fixture.requests.is_empty());
+        shutdown_manager(&fixture.manager).await;
     });
 }
 
@@ -3967,32 +4173,31 @@ fn bundled_task_gates_subagent_types_on_the_executing_agent_mode() {
 }
 
 #[test]
-fn bundled_task_refuses_new_work_for_general_tasks_after_entering_plan_mode() {
+fn bundled_task_gates_new_work_on_admitted_mode_across_configuration_changes() {
     smol::block_on(async {
-        const SEND_REFUSED: &str = "general subagents cannot take new work in plan mode; despawn the task or switch to build mode";
         let fixture = Fixture::start_with_options(
             "pr5_plan_mode_send",
             FixtureOptions {
                 bundled_tasks: true,
                 ..Default::default()
             },
-            &format!(
-                r#"
-            local text = assert(maki.agent.call_tool(ctx, "task_spawn", {{
+            r#"
+            local text = assert(maki.agent.call_tool(ctx, "task_spawn", {
                 description = "writer", prompt = "edit things", subagent_type = "general",
-            }}))
+            }))
             local task = maki.json.decode(text)
-            assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan") == "plan")
-            local sent, err = maki.agent.call_tool(ctx, "task_send", {{
+            local parent = assert(maki.agent.current(ctx))
+            assert(parent:set_mode(ctx, "plan") == "plan")
+            assert(ctx:mode() == "build" and parent:mode(ctx) == "plan")
+            local sent, err = maki.agent.call_tool(ctx, "task_send", {
                 task_id = task.task_id, message = "keep editing",
-            }})
-            assert(sent == nil and err == "{SEND_REFUSED}", tostring(err))
-            assert(maki.agent.call_tool(ctx, "task_despawn", {{ task_id = task.task_id }}))
-        "#
-            ),
+            })
+            assert(sent ~= nil and err == nil, tostring(err))
+            assert(maki.agent.call_tool(ctx, "task_despawn", { task_id = task.task_id }))
+        "#,
         );
         assert_eq!(
-            bounded(fixture.completed.recv_async(), "plan mode send refusal")
+            bounded(fixture.completed.recv_async(), "admitted mode send gate")
                 .await
                 .unwrap(),
             Ok(())

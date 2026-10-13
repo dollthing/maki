@@ -28,6 +28,7 @@ use crate::agent_errors::{
 };
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, TaskOwnerAuthority, build_session_provider,
+    validate_required_output_mode,
 };
 use crate::api::env::StateDirOverride;
 use crate::api::util::convert::json_to_lua;
@@ -245,10 +246,10 @@ fn after_turn(opts: Option<&Table>) -> mlua::Result<Result<Option<TurnId>, Strin
         .map_err(|error| error.to_string()))
 }
 
-/// Admit a turn only when this agent and its descendants are idle.
+/// Admit a turn only when this agent has no active, preparing, or queued work.
 /// @param ctx LuaCtx Invocation context.
 /// @param message string User message.
-/// @param opts table? Optional after_turn ID required to match the latest completed turn.
+/// @param opts table? Optional after_turn ID required to match the latest terminal turn, including failure or cancellation.
 /// @return (AgentTurn?, string?) Exact-turn ticket.
 #[lua_fn(name = "send")]
 fn agent_send(
@@ -456,6 +457,12 @@ async fn agent_set_mode(
             .get_by_key(&name)
             .ok_or_else(|| format!("unknown mode: {name}"))
     );
+    try_pair!(validate_required_output_mode(
+        this.state
+            .as_ref()
+            .is_some_and(|state| state.structured.is_some()),
+        Some(&definition),
+    ));
     let actor = try_pair!(this.manager.actor(this.id));
     let reservation = try_pair!(actor.reserve_config_update());
     let mode = match name.as_str() {

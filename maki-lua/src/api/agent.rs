@@ -26,8 +26,11 @@ use maki_agent::actor::{
     ActorBackend, ActorLifecycle, ActorStatus, AdmissionPolicyConstraint, BackendResult,
     EffectiveAgentConfig, TurnContext, WorkKind,
 };
-use maki_agent::agent::tool_dispatch;
+use maki_agent::agent::{
+    Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
+};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
+use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -38,17 +41,16 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
-    AgentRunParams, CancelTrigger, CurrentManagedTurn, EMPTY_RESPONSE_MARKER, Envelope,
-    EventSender, History, McpSession, RunLedger, RunSettings, SubagentCancel, SubagentInfo,
-    ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
+    AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History, McpSession,
+    ModeDef, RunLedger, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
+    TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome, TurnResult,
 };
 use maki_config::{ModelPolicy, ToolKey};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, Message, Model, ModelError, ModelSelection, RequestOptions, Role, TokenUsage,
-    add_cost,
+    Message, Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -120,16 +122,6 @@ async fn build_session_provider(
     }
 }
 
-/// The actor lifecycle is the session lifecycle, and the actor's retained
-/// outcomes are the outcome truth. `AdapterResult` is presentation storage
-/// only, keyed by [`TurnId`]; it never arbitrates lifecycle or outcomes.
-#[derive(Clone)]
-struct AdapterResult {
-    text: String,
-    captured: Option<JsonValue>,
-    error: Option<String>,
-}
-
 /// Shared backend state, owned by the adapter and cloned into the actor's
 /// backend. Runs are transient: the [`actor::Runner`](maki_agent::actor) owns
 /// the [`History`], while every per-session capability that must outlive a
@@ -142,7 +134,7 @@ struct AdapterResult {
 struct LuaActorState {
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
-    system: String,
+    custom_system: String,
     tools: RequestTools,
     opts: RequestOptions,
     mode: AgentMode,
@@ -178,7 +170,6 @@ struct LuaActorState {
     history_relayed: std::sync::atomic::AtomicBool,
     close_notified: std::sync::atomic::AtomicBool,
     relay_snapshot: Mutex<Vec<Message>>,
-    presentation: Mutex<HashMap<TurnId, AdapterResult>>,
 }
 
 impl LuaActorState {
@@ -312,12 +303,6 @@ impl LuaActorState {
             self.relay_snapshot_if_pending();
         }
     }
-
-    /// Commits the per-turn presentation result. Actor outcomes and the
-    /// snapshot remain authoritative; this is history-relay/status decoration.
-    fn present_result(&self, turn_id: TurnId, result: AdapterResult) {
-        self.presentation.lock().unwrap().insert(turn_id, result);
-    }
 }
 
 /// The actor backend for one Lua session. Thin `&mut self` shell over the
@@ -358,7 +343,21 @@ impl ActorBackend for LuaActorBackend {
             };
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
-                prompt_inputs: None,
+                prompt_inputs: Some(Arc::new(TurnPromptInputs {
+                    cwd: state
+                        .template
+                        .get()
+                        .map(|template| template.cwd.clone())
+                        .unwrap_or_else(|| ".".into()),
+                    instructions: Instructions::default(),
+                    mcp_prompt: None,
+                    resolved: None,
+                    ready: Some(ResolvedPromptInputs {
+                        slots: Arc::clone(&params.prompt_slots),
+                        slots_error: None,
+                        mcp_messages: None,
+                    }),
+                })),
                 bindings: Arc::new(TurnToolBindings::capture(
                     &params.registry,
                     &state.local_tools,
@@ -389,18 +388,18 @@ impl ActorBackend for LuaActorBackend {
                 .with_output(context.output.clone());
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
             if context.managed_turn.is_some() && context.policy.is_none() {
-                state.present_result(
+                return BackendResult::EnteredRun(TurnOutcome::failed(
+                    context.agent_id,
                     turn_id,
-                    AdapterResult {
-                        text: String::new(),
-                        captured: None,
-                        error: Some(MANAGED_POLICY_MISSING_ERR.to_owned()),
+                    TokenUsage::default(),
+                    0,
+                    TurnFailure {
+                        kind: TurnFailureKind::Internal,
+                        diagnostic: MANAGED_POLICY_MISSING_ERR.into(),
+                        user_message: MANAGED_POLICY_MISSING_ERR.into(),
+                        retryable: false,
                     },
-                );
-                return BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id,
-                };
+                ));
             }
             state.commit.lock().unwrap().take();
             if let Some(structured) = &state.structured {
@@ -433,16 +432,7 @@ impl ActorBackend for LuaActorBackend {
                                     .reason()
                                     .unwrap_or(TurnCancellationReason::User),
                             );
-                            let text = latest_assistant_text(history);
                             state.relay_history(history);
-                            state.present_result(
-                                turn_id,
-                                AdapterResult {
-                                    text,
-                                    captured: state.commit.lock().unwrap().take(),
-                                    error: Some(CANCELLED_MSG.to_owned()),
-                                },
-                            );
                             return BackendResult::EnteredRun(cancelled);
                         }
                     }
@@ -466,11 +456,30 @@ impl ActorBackend for LuaActorBackend {
             }
             params.agent_id = context.agent_id;
             params.managed_turn = context.managed_turn.clone();
+            let mut system = context
+                .admission
+                .as_ref()
+                .and_then(|admission| {
+                    let definition = admission.mode_def.as_deref()?;
+                    let inputs = admission.prompt_inputs.as_ref()?;
+                    Some(build_mode_system_prompt(
+                        &env_vars_for(&inputs.cwd),
+                        definition,
+                        &input.mode,
+                    ))
+                })
+                .unwrap_or_default();
+            if !state.custom_system.is_empty() {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&state.custom_system);
+            }
             let mut agent = Agent::new(
                 params,
                 AgentRunParams {
                     history,
-                    system: state.system.clone(),
+                    system,
                     event_tx,
                     tools: state.tools.clone(),
                 },
@@ -493,33 +502,13 @@ impl ActorBackend for LuaActorBackend {
             drop(agent);
             state.turn_permit.lock().unwrap().take();
 
-            let text = latest_assistant_text(history);
-            let captured = state.commit.lock().unwrap().take().or_else(|| {
-                state
-                    .structured
-                    .as_ref()
-                    .and_then(|structured| structured.reports().last().cloned())
-            });
+            let captured = state.commit.lock().unwrap().take();
             if state.structured.is_none()
                 && let Some(value) = &captured
             {
                 context.output.append_output(value.clone());
             }
-            let error = match &outcome {
-                TurnOutcome::Completed { .. } => None,
-                TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
-                TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
-            };
-            // Actor cumulative usage is the total source for status/prompt totals.
             state.relay_history(history);
-            state.present_result(
-                turn_id,
-                AdapterResult {
-                    text,
-                    captured,
-                    error,
-                },
-            );
             BackendResult::EnteredRun(outcome)
         })
     }
@@ -549,20 +538,6 @@ impl ActorBackend for LuaActorBackend {
             BackendResult::CompactDone
         })
     }
-}
-
-fn latest_assistant_text(history: &History) -> String {
-    history
-        .as_slice()
-        .iter()
-        .rfind(|m| matches!(m.role, Role::Assistant))
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
-                _ => None,
-            })
-        })
-        .map_or_else(String::new, str::to_owned)
 }
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -1047,7 +1022,7 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///     selection, validated like `Agent:set_model`. Omitted fields inherit the
 ///     parent's; thinking is capped at the parent's level. A query result from
 ///     `Agent:model` can be passed as is.
-///   `system` (string?) - system prompt. Defaults to empty.
+///   `system` (string?) - custom text appended after the admitted mode's prompt contribution. Defaults to empty; does not inherit the parent's full system prompt.
 ///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
 ///     requires `description` (string), `input_schema` (table), and
@@ -1319,6 +1294,27 @@ impl SessionOptions {
     }
 }
 
+fn validate_required_output_mode(
+    required: bool,
+    definition: Option<&ModeDef>,
+) -> Result<(), String> {
+    if required
+        && definition
+            .and_then(|definition| definition.tools.as_ref())
+            .is_some_and(|tools| {
+                !tools
+                    .iter()
+                    .any(|name| name == structured_output::TOOL_NAME)
+            })
+    {
+        return Err(format!(
+            "output_schema requires tool '{}' but the selected mode excludes it",
+            structured_output::TOOL_NAME,
+        ));
+    }
+    Ok(())
+}
+
 struct SessionTools {
     request: RequestTools,
     local: HashMap<String, LocalTool>,
@@ -1546,6 +1542,19 @@ impl ChildSettings {
         }
     }
 
+    fn mode_definition(&self, parent: &SessionParent) -> ModeDef {
+        if self.inherits_parent_mode {
+            parent
+                .context
+                .mode_def
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| parent.context.modes.current(&self.mode))
+        } else {
+            parent.context.modes.current(&self.mode)
+        }
+    }
+
     fn tool_template(
         &self,
         parent: &SessionParent,
@@ -1561,11 +1570,7 @@ impl ChildSettings {
         template.audience = options.audience;
         template.workflow = options.workflow(parent);
         template.mode = self.mode.clone();
-        template.mode_def = if self.inherits_parent_mode {
-            context.mode_def.clone()
-        } else {
-            Some(Arc::new(context.modes.current(&self.mode)))
-        };
+        template.mode_def = Some(Arc::new(self.mode_definition(parent)));
         template.tool_filter = Arc::clone(tools.request.filter());
         template.request_tools = Some(tools.request.clone());
         template.managed_turn = None;
@@ -1584,7 +1589,6 @@ impl ChildSettings {
         parent: &SessionParent,
         options: &SessionOptions,
     ) -> EffectiveAgentConfig {
-        let context = &parent.context;
         EffectiveAgentConfig::new(
             RunSettings {
                 provider: Arc::clone(&self.provider),
@@ -1595,11 +1599,7 @@ impl ChildSettings {
             },
             self.mode.clone(),
         )
-        .with_mode_def(if self.inherits_parent_mode {
-            context.mode_def.as_deref().cloned()
-        } else {
-            Some(context.modes.current(&self.mode))
-        })
+        .with_mode_def(Some(self.mode_definition(parent)))
     }
 }
 
@@ -1837,6 +1837,21 @@ async fn build_session(
         inherit_defaults
     )?);
 
+    let required_output = opts.get::<Option<LuaValue>>("output_schema")?.is_some();
+    let initial_mode_def = if options.inherits_parent_mode(&parent) {
+        parent
+            .context
+            .mode_def
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| parent.context.modes.current(&parent.context.mode))
+    } else {
+        parent.context.modes.current(&AgentMode::Build)
+    };
+    try_pair!(validate_required_output_mode(
+        required_output,
+        Some(&initial_mode_def)
+    ));
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
         .map(|p| Arc::clone(&p));
@@ -1861,6 +1876,10 @@ async fn build_session(
     let commit = Arc::new(Mutex::new(None));
     let child_template = child.tool_template(&parent, &options, &tools, &commit);
     let initial_config = child.initial_config(&parent, &options);
+    try_pair!(validate_required_output_mode(
+        tools.structured.is_some(),
+        initial_config.mode_def.as_ref(),
+    ));
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -1894,7 +1913,7 @@ async fn build_session(
     let state = Arc::new(LuaActorState {
         template: OnceLock::new(),
         params: OnceLock::new(),
-        system: options.system.take().unwrap_or_default(),
+        custom_system: options.system.take().unwrap_or_default(),
         tools: tools.request,
         opts: child.opts,
         mode: child.mode,
@@ -1932,7 +1951,6 @@ async fn build_session(
         history_relayed: std::sync::atomic::AtomicBool::new(false),
         close_notified: std::sync::atomic::AtomicBool::new(false),
         relay_snapshot: Mutex::new(Vec::new()),
-        presentation: Mutex::new(HashMap::new()),
     });
     let (actor, control) = try_pair!(spawn_session_actor(
         &lua,
@@ -2524,7 +2542,7 @@ async fn prompt(
         cancel: None,
         lease_committer: None,
     };
-    let (turn_id, outcome) = if let Some((current, child_id)) = managed_wait {
+    let result = if let Some((current, child_id)) = managed_wait {
         let admission = maki_agent::manager::PromptAdmission {
             input,
             event_sender: None,
@@ -2546,8 +2564,8 @@ async fn prompt(
             Ok(None) => return Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
             Err(error) => return Ok(err_pair(error.to_string())),
         };
-        let (turn_id, wait) = admitted;
-        let outcome = match wait.wait().await {
+        let (_, wait) = admitted;
+        match wait.wait_result().await {
             Ok(outcome) => outcome,
             Err(maki_agent::PromptWaitError::Timeout) => {
                 let seconds = timeout.expect("managed timeout requires a configured duration");
@@ -2558,8 +2576,7 @@ async fn prompt(
             Err(maki_agent::PromptWaitError::Cancelled) => {
                 return Ok(err_pair(CANCELLED_MSG));
             }
-        };
-        (turn_id, outcome)
+        }
     } else {
         let Ok(ticket) = actor.admit_turn_with_options(
             input,
@@ -2573,11 +2590,10 @@ async fn prompt(
         ) else {
             return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
         };
-        let turn_id = ticket.turn_id();
-        let outcome = match timeout {
+        match timeout {
             Some(seconds) => {
                 let outcome =
-                    futures_lite::future::race(async { Some(ticket.wait().await) }, async {
+                    futures_lite::future::race(async { Some(ticket.wait_result().await) }, async {
                         smol::Timer::after(Duration::from_secs(seconds)).await;
                         None
                     })
@@ -2597,62 +2613,41 @@ async fn prompt(
                 };
                 outcome
             }
-            None => ticket.wait().await,
-        };
-        (turn_id, outcome)
+            None => ticket.wait_result().await,
+        }
     };
     try_pair!(authority.validate(&lua, Some(child_id)));
-    // The actor retains every outcome and accumulates usage before the ticket
-    // resolves, so the snapshot's cumulative usage is the per-session total the
-    // old driver surfaced (`input_tokens`/`output_tokens` across all turns).
-    // The presentation result stays keyed by the admitted turn.
-    let result = state
-        .presentation
-        .lock()
-        .unwrap()
-        .remove(&turn_id)
-        .unwrap_or_else(|| derive_result(&outcome));
     let cumulative = actor.snapshot().cumulative_usage;
     build_prompt_result(&lua, result, cumulative)
 }
 
-fn build_prompt_result(
-    lua: &Lua,
-    result: AdapterResult,
-    usage: TokenUsage,
-) -> LuaResult<Pair<Table>> {
-    if let Some(e) = &result.error {
-        let tbl = if result.text.is_empty() {
-            None
-        } else {
-            let t = lua.create_table()?;
-            t.set("text", result.text)?;
-            Some(t)
-        };
-        return Ok((tbl, Some(e.clone())));
-    }
+fn session_result_table(lua: &Lua, result: &TurnResult, usage: TokenUsage) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
-    tbl.set("text", result.text)?;
+    tbl.set("text", result.text.clone())?;
     tbl.set("input_tokens", usage.total_input())?;
     tbl.set("output_tokens", usage.output)?;
-    if let Some(captured) = &result.captured {
+    if let Some(captured) = result.output.last() {
         tbl.set("captured", json_to_lua(lua, captured)?)?;
     }
-    Ok((Some(tbl), None))
+    Ok(tbl)
 }
 
-/// Safe fallback for an admitted turn whose backend presentation result was
-/// lost to a racing actor close: derive the adapter view from the outcome.
-fn derive_result(outcome: &TurnOutcome) -> AdapterResult {
-    AdapterResult {
-        text: String::new(),
-        captured: None,
-        error: match outcome {
-            TurnOutcome::Completed { .. } => None,
-            TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
-            TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
-        },
+fn session_result_error(outcome: &TurnOutcome) -> Option<String> {
+    match outcome {
+        TurnOutcome::Completed { .. } => None,
+        TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
+        TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
     }
+}
+
+fn build_prompt_result(lua: &Lua, result: TurnResult, usage: TokenUsage) -> LuaResult<Pair<Table>> {
+    let error = session_result_error(&result.outcome);
+    let table = if error.is_some() && result.text.is_empty() && result.output.is_empty() {
+        None
+    } else {
+        Some(session_result_table(lua, &result, usage)?)
+    };
+    Ok((table, error))
 }
 
 fn session_provenance(lua: &Lua) -> maki_agent::TurnProvenance {
@@ -2724,7 +2719,6 @@ async fn send(
 async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<Table>> {
     try_pair!(this.authority.validate(&lua, Some(this.agent_id)));
     let actor = Arc::clone(&this.actor);
-    let state = Arc::clone(&this.state);
     drop(this);
     let snapshot = actor.snapshot();
     let tbl = lua.create_table()?;
@@ -2737,36 +2731,18 @@ async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair
             if busy {
                 tbl.set("status", "running")?;
             } else if let Some(outcome) = snapshot.latest {
-                let result = state
-                    .presentation
-                    .lock()
-                    .unwrap()
-                    .get(&outcome.turn_id())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let mut result = derive_result(&outcome);
-                        if let Some(retained) = actor
-                            .turn_ticket(outcome.turn_id())
-                            .and_then(|ticket| ticket.peek_result())
-                        {
-                            result.text = retained.text;
-                            result.captured = retained.output.last().cloned();
-                        }
-                        result
-                    });
                 tbl.set("status", "done")?;
-                let r = lua.create_table()?;
-                r.set("text", result.text.clone())?;
-                // Done totals are the per-session cumulative usage, matching the
-                // old driver's session-wide counters.
-                r.set("input_tokens", snapshot.cumulative_usage.total_input())?;
-                r.set("output_tokens", snapshot.cumulative_usage.output)?;
-                if let Some(captured) = &result.captured {
-                    r.set("captured", json_to_lua(&lua, captured)?)?;
+                if let Some(result) = actor
+                    .turn_ticket(outcome.turn_id())
+                    .and_then(|ticket| ticket.peek_result())
+                {
+                    tbl.set(
+                        "result",
+                        session_result_table(&lua, &result, snapshot.cumulative_usage)?,
+                    )?;
                 }
-                tbl.set("result", r)?;
-                if let Some(e) = &result.error {
-                    tbl.set("error", e.clone())?;
+                if let Some(error) = session_result_error(&outcome) {
+                    tbl.set("error", error)?;
                 }
                 if let TurnOutcome::Failed { failure, .. } = &outcome {
                     tbl.set("retryable", failure.retryable)?;
@@ -2998,8 +2974,8 @@ mod tests {
     };
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StopReason,
-        StreamResponse, ThinkingConfig, TokenUsage,
+        AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+        StopReason, StreamResponse, ThinkingConfig, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::{Value, json};
@@ -3316,7 +3292,7 @@ mod tests {
         let state = Arc::new(LuaActorState {
             template: OnceLock::new(),
             params: OnceLock::from(params),
-            system: String::new(),
+            custom_system: String::new(),
             tools: RequestTools::default(),
             opts: maki_providers::RequestOptions {
                 thinking: ThinkingConfig::Off,
@@ -3349,7 +3325,6 @@ mod tests {
             history_relayed: std::sync::atomic::AtomicBool::new(false),
             close_notified: std::sync::atomic::AtomicBool::new(false),
             relay_snapshot: Mutex::new(Vec::new()),
-            presentation: Mutex::new(HashMap::new()),
         });
         if let Some((sub_rx, gate)) = relay {
             smol::spawn(relay_session_events(
@@ -3482,13 +3457,11 @@ mod tests {
             let ticket = admit(&state, &root.actor().unwrap(), "missing policy");
             let outcome = ticket.wait().await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
-            let result = state
-                .presentation
-                .lock()
-                .unwrap()
-                .remove(&ticket.turn_id())
-                .unwrap();
-            assert_eq!(result.error.as_deref(), Some(MANAGED_POLICY_MISSING_ERR));
+            let result = ticket.peek_result().unwrap();
+            assert_eq!(
+                session_result_error(&result.outcome).as_deref(),
+                Some(MANAGED_POLICY_MISSING_ERR)
+            );
             manager.shutdown(Duration::from_secs(1)).await;
         });
     }
@@ -4058,15 +4031,9 @@ mod tests {
             first_outcome,
             TurnOutcome::Completed { turn_id, .. } if turn_id == first_id
         ));
-        let first_result = state
-            .presentation
-            .lock()
-            .unwrap()
-            .get(&first_id)
-            .cloned()
-            .unwrap();
+        let first_result = first.peek_result().unwrap();
         assert_eq!(first_result.text, "the answer");
-        assert_eq!(first_result.error, None);
+        assert_eq!(session_result_error(&first_result.outcome), None);
 
         let second = admit(&state, &actor, "follow up");
         let second_id = second.turn_id();
@@ -4169,12 +4136,7 @@ mod tests {
             TurnOutcome::Failed { turn_id: id, .. } if id == turn_id
         ));
         assert!(
-            state
-                .presentation
-                .lock()
-                .unwrap()
-                .get(&turn_id)
-                .is_some_and(|r| r.error.is_some()),
+            session_result_error(&ticket.peek_result().unwrap().outcome).is_some(),
             "failed turn must present an error"
         );
 
@@ -4209,10 +4171,18 @@ mod tests {
         let cumulative = tokens(150, 30);
         let (result, error) = build_prompt_result(
             &lua,
-            AdapterResult {
+            TurnResult {
+                outcome: TurnOutcome::completed(
+                    AgentId::generate(),
+                    TurnId::generate(),
+                    tokens(10, 2),
+                    1,
+                    maki_agent::DoneReason::EndTurn,
+                ),
                 text: "done".into(),
-                captured: None,
-                error: None,
+                output: Vec::new(),
+                provenance: Default::default(),
+                duration_ms: 0,
             },
             cumulative,
         )
@@ -4225,28 +4195,49 @@ mod tests {
     }
 
     #[test]
-    fn prompt_result_preserves_partial_text_with_error() {
+    fn prompt_result_preserves_partial_text_and_captured_output_with_error() {
+        const FAILURE: &str = "provider failed";
+        const PARTIAL: &str = "partial output";
         let lua = Lua::new();
         let (result, error) = build_prompt_result(
             &lua,
-            AdapterResult {
-                text: "partial output".into(),
-                captured: None,
-                error: Some("provider failed".into()),
+            TurnResult {
+                outcome: TurnOutcome::failed(
+                    AgentId::generate(),
+                    TurnId::generate(),
+                    TokenUsage::default(),
+                    1,
+                    maki_agent::TurnFailure {
+                        kind: maki_agent::TurnFailureKind::Provider,
+                        diagnostic: FAILURE.into(),
+                        user_message: FAILURE.into(),
+                        retryable: false,
+                    },
+                ),
+                text: PARTIAL.into(),
+                output: vec![json!({ "answer": 42 })],
+                provenance: Default::default(),
+                duration_ms: 0,
             },
             TokenUsage::default(),
         )
         .unwrap();
 
+        let result = result.unwrap();
+        assert_eq!(result.get::<String>("text").unwrap(), PARTIAL);
         assert_eq!(
-            result.unwrap().get::<String>("text").unwrap(),
-            "partial output"
+            result
+                .get::<Table>("captured")
+                .unwrap()
+                .get::<u32>("answer")
+                .unwrap(),
+            42
         );
-        assert_eq!(error.as_deref(), Some("provider failed"));
+        assert_eq!(error.as_deref(), Some(FAILURE));
     }
 
     #[test]
-    fn prompt_derives_closed_result_from_outcome_when_presentation_missing() {
+    fn prompt_empty_closed_result_returns_only_error() {
         let lua = Lua::new();
         let agent_id = AgentId::generate();
         let turn_id = TurnId::generate();
@@ -4257,8 +4248,19 @@ mod tests {
             0,
             TurnCancellationReason::Closed,
         );
-        let (result, error) =
-            build_prompt_result(&lua, derive_result(&outcome), outcome.usage()).unwrap();
+        let usage = outcome.usage();
+        let (result, error) = build_prompt_result(
+            &lua,
+            TurnResult {
+                outcome,
+                text: String::new(),
+                output: Vec::new(),
+                provenance: Default::default(),
+                duration_ms: 0,
+            },
+            usage,
+        )
+        .unwrap();
         assert!(result.is_none());
         assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
     }

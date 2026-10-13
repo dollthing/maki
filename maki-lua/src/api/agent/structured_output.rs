@@ -90,6 +90,7 @@ impl StructuredOutput {
         Ok(ACK.into())
     }
 
+    #[cfg(test)]
     pub(super) fn reports(&self) -> Vec<Value> {
         self.state
             .lock()

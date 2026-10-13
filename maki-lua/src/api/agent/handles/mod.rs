@@ -15,7 +15,7 @@ use maki_lua_macro::{lua_class, lua_fn};
 use mlua::Lua;
 
 use crate::agent_errors::OTHER_RUNTIME;
-use crate::api::agent::{LuaActorState, LuaSession};
+use crate::api::agent::{LuaActorState, LuaSession, SessionOwners};
 use crate::api::util::pair::Pair;
 use crate::host_root::{HostRootRef, HostRootServices, UNSUPPORTED_OPERATION_ERROR};
 use crate::orchestration::{PluginAuthority, plugin_authority};
@@ -243,12 +243,22 @@ fn session_settled_closed(session: &LuaSession) -> bool {
 }
 
 fn session_state(lua: &Lua, id: AgentId) -> Option<Arc<LuaActorState>> {
-    lua.app_data_ref::<AgentSessions>().and_then(|sessions| {
-        sessions
-            .lock()
-            .get(&id)
-            .map(|session| Arc::clone(&session.state))
-    })
+    lua.app_data_ref::<AgentSessions>()
+        .and_then(|sessions| {
+            sessions
+                .lock()
+                .get(&id)
+                .map(|session| Arc::clone(&session.state))
+        })
+        .or_else(|| {
+            lua.app_data_ref::<SessionOwners>().and_then(|owners| {
+                owners
+                    .0
+                    .iter()
+                    .find(|owner| owner.agent.as_ref().is_some_and(|agent| agent.id() == id))
+                    .and_then(|owner| owner.state.upgrade())
+            })
+        })
 }
 
 /// Read a reference's stable identity.
