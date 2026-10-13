@@ -109,6 +109,7 @@ async fn fetch(
 /// @return function Idempotent unsubscribe callback.
 #[lua_fn]
 fn on_change(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function) -> LuaResult<Function> {
+    crate::runtime::deny_delegated_registration(lua)?;
     let mut mirror = lua
         .app_data_mut::<UsageMirror>()
         .ok_or_else(|| mlua::Error::runtime("usage mirror not initialized"))?;

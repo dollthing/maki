@@ -189,6 +189,7 @@ fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> Lua
 /// `set_notify_handler` and by the `maki.notify = fn` sugar that the `maki`
 /// global's `__newindex` routes here.
 pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     // Validate the argument before touching the slot: a wrong-typed
     // handler must not silently clear a previously installed one.
     let new_key = match handler {

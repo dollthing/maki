@@ -448,6 +448,7 @@ fn declare_slot(
 /// end)
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     with_slot_store(lua, &plugin, |store| {
         store.slots.entry(name).or_default().layers.push(SlotLayer {
             plugin: Arc::clone(&plugin),

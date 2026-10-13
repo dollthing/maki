@@ -190,9 +190,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
 }
 
 pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), &'static str> {
-    if crate::runtime::active_task_id(lua).is_some()
-        && crate::runtime::lock_cell(&crate::runtime::active_task(lua)).delegated_tool
-    {
+    if crate::runtime::in_delegated_tool(lua) {
         return Err(ERR_TRUSTED_AUTHORITY);
     }
     Ok(())

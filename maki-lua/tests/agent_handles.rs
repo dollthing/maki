@@ -2057,7 +2057,7 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
 }
 
 #[test]
-fn delegated_tools_cannot_subscribe_or_run_commands() {
+fn delegated_tools_cannot_reach_trusted_entry_points() {
     smol::block_on(async {
         let fixture = Fixture::start_with_options(
             "pr5_tool_events",
@@ -2105,6 +2105,22 @@ fn delegated_tools_cannot_subscribe_or_run_commands() {
                 assert(handle == nil and defer_err == timer_error, tostring(defer_err))
             end
             deny_timers()
+            local registration_error = "delegated tool handlers cannot register host callbacks"
+            local registrations = {
+                register_command = function()
+                    maki.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
+                end,
+                keymap_set = function() maki.keymap.set("n", "<C-y>", pr5_timer_escape) end,
+                keymap_del = function() maki.keymap.del("n", "<C-y>") end,
+                usage_on_change = function() maki.usage.on_change(pr5_timer_escape) end,
+                set_notify_handler = function() maki.set_notify_handler(pr5_timer_escape) end,
+                notify_assignment = function() maki.notify = pr5_timer_escape end,
+                set_slot = function() maki.api.set_slot("pr5.escape", pr5_timer_escape) end,
+            }
+            for name, register in pairs(registrations) do
+                local ok, register_err = pcall(register)
+                assert(not ok and tostring(register_err):find(registration_error, 1, true), name .. ": " .. tostring(register_err))
+            end
             local async_err = maki.async.await(1, function(done)
                 maki.async.run(deny_timers, function(err) done(err or false) end)
             end)

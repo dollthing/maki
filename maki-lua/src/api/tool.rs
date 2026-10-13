@@ -1095,6 +1095,7 @@ fn register_command(
     #[ctx] plugin: Arc<str>,
     spec: Table,
 ) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     register_command_from_lua(lua, &spec, plugin, pending)
 }
 
@@ -1148,9 +1149,7 @@ async fn run_command(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
-    if crate::runtime::active_task_id(&lua).is_some()
-        && crate::runtime::lock_cell(&crate::runtime::active_task(&lua)).delegated_tool
-    {
+    if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair("run_command requires trusted authority"));
     }
     let depth = command_depth(&lua).saturating_add(1);

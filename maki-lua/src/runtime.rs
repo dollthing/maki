@@ -83,6 +83,8 @@ const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
+pub(crate) const ERR_DELEGATED_REGISTRATION: &str =
+    "delegated tool handlers cannot register host callbacks";
 static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
@@ -1418,6 +1420,21 @@ pub(crate) fn command_depth(lua: &Lua) -> u8 {
 pub(crate) fn command_invocation(lua: &Lua) -> Option<CommandTaskInvocation> {
     lua.app_data_ref::<TaskHandle>()
         .and_then(|handle| lock_cell(&handle).command_invocation.clone())
+}
+
+/// Whether the running code is a tool handler acting for a delegated turn.
+pub(crate) fn in_delegated_tool(lua: &Lua) -> bool {
+    lua.app_data_ref::<TaskHandle>()
+        .is_some_and(|handle| lock_cell(&handle).delegated_tool)
+}
+
+/// Host entry points registered from a delegated tool would later run with
+/// trusted contexts, so registration requires a non-delegated caller.
+pub(crate) fn deny_delegated_registration(lua: &Lua) -> mlua::Result<()> {
+    if in_delegated_tool(lua) {
+        return Err(mlua::Error::runtime(ERR_DELEGATED_REGISTRATION));
+    }
+    Ok(())
 }
 
 /// Task id for job ownership; `None` under a delivery scope.

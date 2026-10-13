@@ -6,6 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::runtime::deny_delegated_registration;
+
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -369,6 +371,7 @@ fn set(
     rhs: mlua::Function,
     opts: Option<Table>,
 ) -> LuaResult<()> {
+    deny_delegated_registration(lua)?;
     if mode != "n" {
         return Err(mlua::Error::runtime(format!(
             "unsupported keymap mode: {mode}"
@@ -415,6 +418,7 @@ fn del(
     mode: String,
     lhs: String,
 ) -> LuaResult<()> {
+    deny_delegated_registration(lua)?;
     let _ = mode;
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     let old = if loading(lua, &plugin) {
