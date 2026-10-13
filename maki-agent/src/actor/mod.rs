@@ -41,6 +41,8 @@ pub use queue::{ActorQueue, InterruptQueue, QueueProjection};
 pub use tickets::{TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket};
 
 pub const MAX_RETAINED_TURN_RESULTS: usize = 128;
+const ADMISSION_PREPARATION_FAILED: &str =
+    "The agent could not start this turn: admission preparation failed.";
 
 pub type AdmissionPolicyConstraint =
     Arc<dyn Fn(&EffectiveAgentConfig) -> Result<(), String> + Send + Sync>;
@@ -635,10 +637,7 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
     if let ActorOperation::Root { root, .. } = &work
         && let Some(report) = &inner.root_preparation_error
     {
-        report(
-            root.run_id,
-            "The agent could not start this turn: admission preparation failed.".into(),
-        );
+        report(root.run_id, ADMISSION_PREPARATION_FAILED.into());
     }
     if let ActorOperation::Turn {
         input,

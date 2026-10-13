@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
-    ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
-    QueueProjection,
+    ADMISSION_PREPARATION_FAILED, ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork,
+    EffectiveAgentConfig, QueueProjection,
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
+
+const ROOT_RUN_ID: u64 = 17;
 
 #[test]
 fn admitted_prompt_dependencies_remain_pinned() {
@@ -1081,8 +1083,6 @@ fn acceptance_does_not_run_blocking_preparation_inline(root: bool) {
 
 #[test]
 fn root_preparation_failure_is_visible_once_and_successors_progress() {
-    const RUN_ID: u64 = 17;
-    const FAILURE: &str = "The agent could not start this turn: admission preparation failed.";
     smol::block_on(async {
         let (sender, events) = flume::unbounded();
         let mut backend = ScriptedBackend::new();
@@ -1099,7 +1099,7 @@ fn root_preparation_failure_is_visible_once_and_successors_progress() {
         actor
             .rush(crate::RootWork::new(
                 input("panic"),
-                RUN_ID,
+                ROOT_RUN_ID,
                 false,
                 "panic".into(),
                 Vec::new(),
@@ -1110,9 +1110,9 @@ fn root_preparation_failure_is_visible_once_and_successors_progress() {
             .admit_turn(input("next"), None, "next".into())
             .unwrap();
         let error = events.recv_async().await.unwrap();
-        assert_eq!(error.run_id, RUN_ID);
+        assert_eq!(error.run_id, ROOT_RUN_ID);
         assert!(
-            matches!(error.event, crate::AgentEvent::ControlError { message } if message == FAILURE)
+            matches!(error.event, crate::AgentEvent::ControlError { message } if message == ADMISSION_PREPARATION_FAILED)
         );
         assert!(matches!(next.wait().await, TurnOutcome::Completed { .. }));
         assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 1);
@@ -1124,8 +1124,6 @@ fn root_preparation_failure_is_visible_once_and_successors_progress() {
 
 #[test]
 fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
-    const RUN_ID: u64 = 17;
-    const FAILURE: &str = "The agent could not start this turn: admission preparation failed.";
     smol::block_on(async {
         let (sender, errors) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
@@ -1145,7 +1143,7 @@ fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
         actor
             .rush(crate::RootWork::new(
                 input("panic"),
-                RUN_ID,
+                ROOT_RUN_ID,
                 false,
                 "panic".into(),
                 Vec::new(),
@@ -1163,9 +1161,9 @@ fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
             ActorEvent::Idle { agent_id } if agent_id == actor.agent_id()
         ));
         let error = errors.try_recv().unwrap();
-        assert_eq!(error.run_id, RUN_ID);
+        assert_eq!(error.run_id, ROOT_RUN_ID);
         assert!(
-            matches!(error.event, crate::AgentEvent::ControlError { message } if message == FAILURE)
+            matches!(error.event, crate::AgentEvent::ControlError { message } if message == ADMISSION_PREPARATION_FAILED)
         );
         assert!(observed.runs.lock().unwrap().is_empty());
         assert!(actor.inner.outcomes.lock().unwrap().is_empty());
