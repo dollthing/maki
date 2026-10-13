@@ -5727,7 +5727,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, AcpError::invalid_params().code);
-        assert_eq!(error.message, "command failed: Usage: /model <model>");
+        assert_eq!(
+            error.message,
+            format!(
+                "command failed: {}",
+                maki_agent::command::NONINTERACTIVE_MODEL_USAGE
+            )
+        );
         assert!(input_rx.is_empty());
     }
 

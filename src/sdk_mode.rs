@@ -2741,7 +2741,7 @@ mod tests {
         assert!(matches!(
             commands.dispatch_input("/model", &[]),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
-                if message.as_ref() == "Usage: /model <model>"
+                if message.as_ref() == maki_agent::command::NONINTERACTIVE_MODEL_USAGE
         ));
         assert!(commands.route_rx.is_empty());
     }
