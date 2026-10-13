@@ -52,7 +52,6 @@ use maki_lua::{
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
     ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
 };
-use maki_providers::ThinkingConfigExt;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model, TokenUsage};
@@ -695,7 +694,7 @@ fn dispatch_thinking_change(
     let change = match thinking_change(thinking) {
         Ok(change) => change,
         Err(error) => {
-            let _ = reply_tx.send(Err(error.into()));
+            let _ = reply_tx.send(Err(error));
             return;
         }
     };
@@ -743,20 +742,17 @@ fn thinking_reply(commit: &maki_agent::actor::ConfigCommit) -> serde_json::Value
     json!({ "mode": commit.config.thinking.to_string() })
 }
 
-fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, &'static str> {
+fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, String> {
     if input.trim().is_empty() {
-        Ok(maki_agent::actor::ConfigChange::ToggleThinking)
-    } else {
-        Ok(maki_agent::actor::ConfigChange::Patch(
-            maki_agent::actor::ConfigPatch {
-                thinking: Some(DomainThinkingConfig::parse(
-                    input.trim(),
-                    DomainThinkingConfig::default(),
-                )?),
-                ..Default::default()
-            },
-        ))
+        return Ok(maki_agent::actor::ConfigChange::ToggleThinking);
     }
+    let thinking = maki_domain::parse_thinking(input.trim()).map_err(|error| error.to_string())?;
+    Ok(maki_agent::actor::ConfigChange::Patch(
+        maki_agent::actor::ConfigPatch {
+            thinking: Some(thinking),
+            ..Default::default()
+        },
+    ))
 }
 
 /// The agent a session's commands and keymaps address: the selected chat's
@@ -3554,19 +3550,18 @@ impl<'t> EventLoop<'t> {
                 thinking,
             } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
             SessionRequest::SetDefaultThinking { thinking } => {
-                let reply =
-                    DomainThinkingConfig::parse(thinking.trim(), DomainThinkingConfig::default())
-                        .map_err(str::to_owned)
-                        .and_then(|thinking| {
-                            write_prefs(
-                                &self.ctx.storage,
-                                &Prefs {
-                                    default_thinking: Some(thinking.into()),
-                                },
-                            )
-                            .map_err(|error| error.to_string())?;
-                            Ok(json!({ "mode": thinking.to_string() }))
-                        });
+                let reply = maki_domain::parse_thinking(thinking.trim())
+                    .map_err(|error| error.to_string())
+                    .and_then(|thinking| {
+                        write_prefs(
+                            &self.ctx.storage,
+                            &Prefs {
+                                default_thinking: Some(thinking.into()),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(json!({ "mode": thinking.to_string() }))
+                    });
                 let _ = reply_tx.send(reply);
             }
         }
@@ -5659,7 +5654,7 @@ mod tests {
             predecessor.wait().await.unwrap();
             let commit = combined.wait().await.unwrap();
             assert!(commit.config.workflow);
-            assert!(commit.config.thinking.enabled());
+            assert!(commit.config.thinking.is_enabled());
             assert_eq!(commit.config.model.id, "replacement");
             release_runtime(runtime);
         });
@@ -5709,10 +5704,7 @@ mod tests {
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
             let later = actor.reserve_config_update().unwrap();
             later
-                .resolve(
-                    thinking_change("high")
-                        .map_err(|error| maki_agent::ActorError::InvalidConfig(error.into())),
-                )
+                .resolve(thinking_change("high").map_err(maki_agent::ActorError::InvalidConfig))
                 .unwrap();
             later.wait().await.unwrap();
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
@@ -5751,7 +5743,7 @@ mod tests {
                 };
                 result.unwrap();
                 let commit = commit.unwrap();
-                values.push((commit.generation, commit.config.thinking.enabled()));
+                values.push((commit.generation, commit.config.thinking.is_enabled()));
             }
             values.sort();
             assert_eq!(
@@ -5761,7 +5753,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![true, false]
             );
-            assert!(!actor.effective_config().unwrap().thinking.enabled());
+            assert!(!actor.effective_config().unwrap().thinking.is_enabled());
             release_runtime(runtime);
         });
     }

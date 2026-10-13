@@ -4741,7 +4741,8 @@ maki.session.set_default_thinking({mode})
 ```
 
 Persists the default thinking setting for new sessions without changing
-any live session. `mode` accepts the values `set_thinking` accepts.
+any live session. `mode` is a thinking setting as `Agent:set_model` accepts
+it; the empty toggle that `set_thinking` allows is rejected here.
 
 **Parameters:**
 

@@ -9,8 +9,7 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_providers::{
-    CompleteModelSelection, Model, ModelSelection, RequestOptions, ThinkingConfig,
-    provider::available_model_specs,
+    CompleteModelSelection, Model, ModelSelection, RequestOptions, provider::available_model_specs,
 };
 use maki_storage::id::MakiId;
 use std::sync::{
@@ -245,7 +244,7 @@ pub fn selection_from_options(
     };
     let model = Model::from_spec(value(MODEL_OPTION_ID)?)
         .map_err(|error| HostRootError::InvalidSelection(error.to_string()))?;
-    let thinking = ThinkingConfig::parse_setting(value(THINKING_OPTION_ID)?)
+    let thinking = maki_providers::parse_thinking(value(THINKING_OPTION_ID)?)
         .map_err(|error| HostRootError::InvalidSelection(error.to_string()))?;
     let fast = match value(FAST_OPTION_ID)? {
         ENABLED_VALUE => true,
