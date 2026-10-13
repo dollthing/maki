@@ -248,7 +248,9 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
-    let mode_stub = format!("maki.api.mode.get = function() return '{mode}' end\n\n");
+    let mode_stub = format!(
+        "maki.agent.current = function() return {{ mode = function() return '{mode}' end }} end\n\n"
+    );
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}{mode_stub}\n{TASK_PLUGIN_SRC}"),
@@ -870,7 +872,9 @@ fn load_real_driver_host_with_opts(
 ) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mode_stub = format!("maki.api.mode.get = function() return '{mode}' end\n\n");
+    let mode_stub = format!(
+        "maki.agent.current = function() return {{ mode = function() return '{mode}' end }} end\n\n"
+    );
     host.load_source_with_opts(
         "task_policy_real",
         &format!("{mode_stub}\n{REAL_DRIVER_PRELUDE}\n{TASK_PLUGIN_SRC}"),

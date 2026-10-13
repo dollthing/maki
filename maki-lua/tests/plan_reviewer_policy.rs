@@ -78,7 +78,9 @@ fn load_reviewer_host(mode: &str, real_tools: bool) -> (Arc<ToolRegistry>, Plugi
         Arc::new(ToolRegistry::new())
     };
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mode_stub = format!("maki.api.mode.get = function() return '{mode}' end\n");
+    let mode_stub = format!(
+        "maki.agent.current = function() return {{ mode = function() return '{mode}' end }} end\n"
+    );
     let tools = if real_tools {
         FAKE_READ_WRITE_TOOLS
     } else {

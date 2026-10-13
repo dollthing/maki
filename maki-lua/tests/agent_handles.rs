@@ -469,10 +469,7 @@ impl Fixture {
         if bundled_tasks {
             host.load_source(
                 "pr5_bundled_task",
-                &format!(
-                    "maki.api.mode.get = function() return 'build' end\n{}",
-                    include_str!("../../plugins/task/init.lua")
-                ),
+                include_str!("../../plugins/task/init.lua"),
             )
             .unwrap();
         }
@@ -3804,6 +3801,37 @@ fn inherited_local_capture_belongs_to_executing_grandchild(capture_input: bool) 
             .send(common::canned_reply("parent complete"))
             .unwrap();
         fixture.finish().await;
+    });
+}
+
+#[test]
+fn bundled_task_gates_subagent_types_on_the_executing_agent_mode() {
+    smol::block_on(async {
+        const GENERAL_BLOCKED: &str =
+            "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)";
+        let fixture = Fixture::start_with_options(
+            "pr5_plan_mode_gate",
+            FixtureOptions {
+                mode: Some(AgentMode::Plan("/test/gate-plan.md".into())),
+                bundled_tasks: true,
+                ..Default::default()
+            },
+            &format!(
+                r#"
+            local text, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                description = "blocked", prompt = "write things", subagent_type = "general",
+            }})
+            assert(text == nil and err == "{GENERAL_BLOCKED}", tostring(err))
+        "#
+            ),
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "plan mode gate")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        shutdown_manager(&fixture.manager).await;
     });
 }
 

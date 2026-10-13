@@ -51,8 +51,6 @@ maki.api.register_tool = function(spec)
   return real_register_tool(spec)
 end
 
-maki.api.mode.get = function() return "build" end
-
 local real_session = maki.agent.session
 maki.agent.session = function(ctx, opts)
   opts.inherit_provider = true

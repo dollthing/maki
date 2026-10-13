@@ -134,12 +134,14 @@ local semaphore = maki.async.semaphore(opts.max_concurrent)
 local tasks = {}
 local task_order = {}
 
-local function current_mode()
-  local mode, err = maki.api.mode.get()
-  if err then
+-- The executing agent's own mode, never the focused session's. Plan-specific
+-- gating stays here until plan mode becomes a guest plugin.
+local function current_mode(ctx)
+  local agent = maki.agent.current(ctx)
+  if not agent then
     return nil
   end
-  return mode
+  return (agent:mode(ctx))
 end
 
 -- Validates the shared setup for a subagent and returns
@@ -149,10 +151,10 @@ local function prepare(input, ctx)
   if subagent_type ~= "research" and subagent_type ~= "general" and subagent_type ~= "plan_reviewer" then
     return nil, { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
   end
-  if subagent_type == "plan_reviewer" and current_mode() ~= "plan" then
+  if subagent_type == "plan_reviewer" and current_mode(ctx) ~= "plan" then
     return nil, { llm_output = "plan_reviewer is only available in plan mode", is_error = true }
   end
-  if subagent_type == "general" and current_mode() == "plan" then
+  if subagent_type == "general" and current_mode(ctx) == "plan" then
     return nil, { llm_output = GENERAL_BLOCKED_IN_PLAN_ERR, is_error = true }
   end
 
