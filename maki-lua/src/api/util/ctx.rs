@@ -404,14 +404,13 @@ impl LuaCtx {
             .map_err(|error| error.to_string())?;
         let task = active_task(lua);
         let plugin_origin = lock_cell(&task).plugin_origin.clone();
+        // Tool tasks record the plugin's load generation, which is unrelated to
+        // the authority generation, so they bind to the plugin's live authority.
         let owner = match &self.caps {
             Caps::TrustedHostRoot { authority } => Some(authority.plugin_authority()),
             _ => plugin_origin
                 .as_ref()
-                .map(|(plugin, generation)| {
-                    crate::orchestration::existing_plugin_authority(lua, plugin, *generation)
-                })
-                .transpose()?,
+                .map(|(plugin, _)| crate::orchestration::plugin_authority(lua, plugin.clone())),
         };
         let task = Arc::downgrade(&task);
         let cancel = self.cancel.clone();
@@ -952,6 +951,36 @@ mod tests {
         assert!(validator().is_err());
         assert!(LuaCtx::current_host_root_context(&lua).is_err());
         drop(scope);
+        assert!(validator().is_err());
+    }
+
+    #[test]
+    fn tool_host_model_validator_binds_live_plugin_authority() {
+        const LOAD_GENERATION: u64 = u64::MAX;
+        let lua = mlua::Lua::new();
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        let mut template = populated_ctx();
+        let id = maki_agent::AgentId::generate();
+        template.execution_agent_id = Some(id);
+        let services = Arc::new(HostRootServices::fixed(
+            id,
+            &template.model,
+            maki_providers::RequestOptions::default(),
+            Arc::new(maki_config::ModelPolicy::default()),
+        ));
+        lua.set_app_data(HostRootServicesSlot {
+            services: Some(services.clone()),
+            template: None,
+        });
+        lock_cell(scope.handle()).plugin_origin = Some((Arc::from("owner"), LOAD_GENERATION));
+        let mut ctx = LuaCtx::handler(&template);
+        ctx.pin_host_root(&lua);
+        ctx.bind_origin(scope.handle());
+        let validator = ctx
+            .host_model_validator(&lua, &services, &services.reference())
+            .unwrap();
+        assert!(validator().is_ok());
+        crate::orchestration::revoke_plugin(&lua, "owner");
         assert!(validator().is_err());
     }
 

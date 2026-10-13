@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use crate::actor::{ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
     ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
-    SharedMessages, TurnCancellationReason, TurnId,
+    SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1187,14 +1187,27 @@ impl AgentManagerHandle {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let cut = actor
-                .capture_turn_cancel(&mut state, turn_id, reason)
-                .map_err(|error| match error {
-                    ActorError::Closed | ActorError::Shutdown => {
-                        ManagerError::NonLiveAgent(agent_id)
+            let cut = match actor.capture_turn_cancel(&mut state, turn_id, reason) {
+                Ok(cut) => cut,
+                Err(ActorError::Closed | ActorError::Shutdown) => {
+                    return Err(ManagerError::NonLiveAgent(agent_id));
+                }
+                Err(_) => {
+                    drop(state);
+                    // The runner can retire a turn the UI already cut before
+                    // this request arrives; its delegated children still go.
+                    if !matches!(actor.outcome(turn_id), Some(TurnOutcome::Cancelled { .. })) {
+                        return Err(ManagerError::InactiveTurn { agent_id, turn_id });
                     }
-                    _ => ManagerError::InactiveTurn { agent_id, turn_id },
-                })?;
+                    let descendants =
+                        Self::capture_turn_children(&mut graph, agent_id, Some(turn_id));
+                    drop(graph);
+                    for descendant in descendants {
+                        descendant.close();
+                    }
+                    return Err(ManagerError::InactiveTurn { agent_id, turn_id });
+                }
+            };
             let descendants = Self::capture_turn_children(&mut graph, agent_id, Some(turn_id));
             drop(state);
             (actor, cut, descendants)

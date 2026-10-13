@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use futures_lite::future::race;
-use maki_agent::{CurrentManagedTurn, PromptWaitError, TurnId, TurnTicket};
+use maki_agent::{CurrentManagedTurn, PromptWaitError, TurnCancellationReason, TurnId, TurnTicket};
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Lua, Table, UserDataRef};
 use smol::Timer;
 
-use super::LuaAgentTurn;
 use super::authority::{authorize, observe};
 use super::projection::result_table;
+use super::{AgentRuntime, LuaAgentTurn};
 use crate::agent_errors::TURN_WAIT_TIMEOUT;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -133,8 +133,15 @@ fn ticket_cancel(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(lua, &ctx, &this.agent));
-    let actor = try_pair!(this.agent.manager.actor(this.agent.id));
-    try_pair!(actor.cancel_turn(this.ticket.turn_id()));
+    match (&this.agent.manager, this.agent.id) {
+        (AgentRuntime::Managed(manager), Some(id)) => {
+            try_pair!(manager.cancel_turn(id, this.ticket.turn_id(), TurnCancellationReason::User))
+        }
+        _ => {
+            let actor = try_pair!(this.agent.manager.actor(this.agent.id));
+            try_pair!(actor.cancel_turn(this.ticket.turn_id()));
+        }
+    }
     Ok((Some(true), None))
 }
 

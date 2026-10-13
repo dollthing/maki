@@ -1178,6 +1178,46 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     );
 }
 
+#[test]
+fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let (entered_tx, entered_rx) = flume::unbounded();
+    let root = manager
+        .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+            Ok::<Box<dyn ActorBackend>, String>(Box::new(ReportingCancellableBackend {
+                current: entered_tx,
+            }))
+        })
+        .unwrap();
+    let actor = root.actor().unwrap();
+    let ticket = actor.admit_turn(input(), None, "cut".into()).unwrap();
+    let current = entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    actor.cancel_turn(ticket.turn_id()).unwrap();
+    smol::block_on(ticket.wait());
+    assert_eq!(
+        manager.cancel_turn(
+            root.id(),
+            ticket.turn_id(),
+            crate::TurnCancellationReason::User
+        ),
+        Err(ManagerError::InactiveTurn {
+            agent_id: root.id(),
+            turn_id: ticket.turn_id()
+        })
+    );
+    assert!(child.validate_live().is_err());
+}
+
 #[test_case(false; "admitted")]
 #[test_case(true; "standalone_root")]
 fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bool) {
