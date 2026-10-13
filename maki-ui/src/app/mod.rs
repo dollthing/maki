@@ -2193,7 +2193,7 @@ impl App {
                     self.terminalize_turn(&message);
                     self.retain_live_async_subagents();
                     self.recoverable_queue = self.queue.text_messages();
-                    self.queue.clear();
+                    self.queue.clear_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }

@@ -249,6 +249,22 @@ impl ActorQueue {
         std::mem::take(&mut *items).into()
     }
 
+    /// Drains every item `keep` does not select; kept items stay in order.
+    pub fn drain_except(&self, keep: impl Fn(&ActorWork) -> bool) -> Vec<ActorWork> {
+        let mut items = lock(&self.items);
+        let mut drained = Vec::new();
+        let mut kept = VecDeque::with_capacity(items.len());
+        for work in std::mem::take(&mut *items) {
+            if keep(&work) {
+                kept.push_back(work);
+            } else {
+                drained.push(work);
+            }
+        }
+        *items = kept;
+        drained
+    }
+
     /// A neutral snapshot of the queue for the TUI projection.
     pub fn snapshot(&self) -> Vec<QueueProjection> {
         lock(&self.items).iter().map(Into::into).collect()

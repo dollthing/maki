@@ -833,7 +833,8 @@ impl ActorBackend for TuiActorBackend {
             if explicit {
                 EventSender::new(self.agent_tx.clone(), run_id).try_send(
                     AgentEvent::QueueItemConsumed {
-                        text: input.message.clone(),
+                        text: maki_agent::actor::delivery_summary(&input)
+                            .unwrap_or_else(|| input.message.clone()),
                         images: input.images.clone(),
                         mcp_startup_notice: context
                             .admission

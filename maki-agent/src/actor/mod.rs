@@ -18,7 +18,9 @@ mod actor_error;
 mod config;
 pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
 pub(crate) mod delivery;
-pub use delivery::{ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus};
+pub use delivery::{
+    ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus, delivery_summary,
+};
 mod idle;
 pub use idle::ActorIdleGuard;
 use idle::IdleReservation;
@@ -104,7 +106,7 @@ pub use types::{
     WorkKind,
 };
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
@@ -831,11 +833,18 @@ impl ActorState {
     }
 
     fn drain_work(&mut self) -> Vec<ActorOperation> {
+        self.drain_work_except(|_| false)
+    }
+
+    /// Drains queued work, keeping configuration barriers and entries `keep`
+    /// selects in their original order.
+    fn drain_work_except(&mut self, keep: impl Fn(&ActorOperation) -> bool) -> Vec<ActorOperation> {
         let mut work = Vec::new();
         let mut configs = VecDeque::new();
         for entry in self.operations.drain(..) {
             if matches!(entry, ActorOperation::Config(_))
                 || matches!(&entry, ActorOperation::Prepared(pending) if pending.turn.is_none())
+                || keep(&entry)
             {
                 configs.push_back(entry);
             } else {
@@ -1939,9 +1948,28 @@ impl AgentActorHandle {
     /// Clears every queued item, terminalizing the admitted turns. Returns
     /// the number of items removed.
     pub fn clear(&self) -> usize {
+        self.clear_except(false)
+    }
+
+    /// Clears queued user work after a failed turn while keeping child-result
+    /// deliveries, which the user did not author and cannot resubmit.
+    pub fn clear_user_work(&self) -> usize {
+        self.clear_except(true)
+    }
+
+    fn clear_except(&self, keep_deliveries: bool) -> usize {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let deferred = state.drain_work();
-        let drained = self.inner.queue.drain_all();
+        let deliveries = if keep_deliveries {
+            state.deliveries.keys().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let deferred = state.drain_work_except(|entry| {
+            matches!(entry, ActorOperation::Turn { ticket, .. } if deliveries.contains(&ticket.turn_id()))
+        });
+        let drained = self.inner.queue.drain_except(
+            |work| matches!(work, ActorWork::Turn(admission) if deliveries.contains(&admission.turn_id)),
+        );
         drive_operations(&self.inner, &mut state);
         let len = drained.len()
             + deferred

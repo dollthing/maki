@@ -221,12 +221,23 @@ impl QueueSender {
         self.len() == 0
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&self) {
+        match &self.backend {
+            QueueBackend::Test(items) => lock(items).clear(),
+            QueueBackend::Actor(actor) => {
+                let _ = actor.clear();
+            }
+        }
+    }
+
+    /// Clears what the user queued while keeping child-result deliveries.
+    pub(crate) fn clear_user_work(&self) {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).clear(),
             QueueBackend::Actor(actor) => {
-                let _ = actor.clear();
+                let _ = actor.clear_user_work();
             }
         }
     }

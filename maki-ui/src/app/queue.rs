@@ -85,9 +85,17 @@ impl MessageQueue {
         self.clamp_focus();
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         if let Some(ref shared) = self.shared {
             shared.clear();
+        }
+        self.focus = None;
+    }
+
+    pub(crate) fn clear_user_work(&mut self) {
+        if let Some(ref shared) = self.shared {
+            shared.clear_user_work();
         }
         self.focus = None;
     }

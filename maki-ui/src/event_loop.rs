@@ -113,6 +113,8 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const CLOSED_TARGET_ERR: &str =
+    "the selected agent has closed; switch to a live chat to change its model";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
@@ -755,6 +757,15 @@ fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, &'sta
             },
         ))
     }
+}
+
+/// The agent a session's commands and keymaps address: the selected chat's
+/// agent. A closed agent addresses nothing; there is no fallback to the root.
+fn selected_agent(runtime: &SessionRuntime) -> Option<maki_agent::AgentRef> {
+    let (manager, root) = runtime.handles.manager_and_root();
+    manager
+        .lookup(runtime.app.selected_agent_id().unwrap_or(root))
+        .ok()
 }
 
 fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::Value {
@@ -2318,8 +2329,7 @@ impl<'t> EventLoop<'t> {
                     target: root.clone(),
                     template,
                 });
-            let selected = runtime.app.selected_agent_id().unwrap_or(root_id);
-            if let Ok(target) = manager.lookup(selected) {
+            if let Some(target) = selected_agent(runtime) {
                 if let Ok(template) = maki_lua::orchestration::OrchestrationServices::template(
                     &*self.orchestration,
                     &target,
@@ -4571,11 +4581,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn selected_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
-        let runtime = &self.sessions[idx];
-        let (manager, root) = runtime.handles.manager_and_root();
-        manager
-            .lookup(runtime.app.selected_agent_id().unwrap_or(root))
-            .ok()
+        selected_agent(&self.sessions[idx])
     }
 
     fn dispatch_model_selection(
@@ -4598,7 +4604,7 @@ impl<'t> EventLoop<'t> {
                 .map(|template| template.model_policy)
         });
         let reservation = target
-            .ok_or_else(|| NOT_LIVE_ERR.to_owned())
+            .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
             .and_then(|target| {
                 let runtime_root = manager.lookup(root).map_err(|error| error.to_string())?;
                 if !runtime_root.same_manager(&target) {
