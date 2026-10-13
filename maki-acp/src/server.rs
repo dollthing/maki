@@ -5685,16 +5685,30 @@ mod tests {
                 value(&repeated, maki_agent::session_options::THINKING_OPTION_ID),
                 "off"
             );
-            for input in [
-                format!("/model {OFFLINE_SPEC} fast=true"),
-                "/model fast=true fast=false".into(),
-                "/model thinking=toggle".into(),
-            ] {
-                dispatch_prompt(&mut srv, &input, false, &RequestId::Number(6))
-                    .await
-                    .unwrap_err();
-                assert_eq!(coordinator.read().options(), repeated);
-            }
+            assert!(input_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(&format!("/model {OFFLINE_SPEC} fast=true") ; "fast_unsupported_by_model")]
+    #[test_case("/model fast=true fast=false" ; "duplicate_option")]
+    #[test_case("/model thinking=toggle" ; "thinking_toggle")]
+    fn portable_invalid_model_options_leave_session_options_unchanged(input: &str) {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let before = coordinator.read().options();
+            dispatch_prompt(&mut srv, input, false, &RequestId::Number(3))
+                .await
+                .unwrap_err();
+            assert_eq!(coordinator.read().options(), before);
             assert!(input_rx.is_empty());
             coordinator.close().await.unwrap();
         });

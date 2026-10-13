@@ -918,7 +918,9 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
 mod tests {
     use crate::session_coordinator::SessionCoordinatorHandle;
     use maki_commands::CommandHost;
+    use maki_commands::ModelSelection;
     use maki_config::ModelPolicy;
+    use maki_providers::{Effort, ThinkingConfig};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
@@ -992,7 +994,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    maki_providers::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 history: Vec::new(),
@@ -1238,61 +1240,65 @@ mod tests {
         );
     }
 
-    #[test]
-    fn structured_model_routes_options_and_rejects_invalid_input() {
+    const STRUCTURED_MODEL_SPEC: &str = "openai/gpt-5";
+
+    fn dispatch_model_input(input: &str) -> (maki_commands::InputDispatch, Vec<BuiltinOperation>) {
         let registry = maki_commands::CommandRegistry::new();
         let _commands =
             StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
         let host = Arc::new(RecordingCommandHost::default());
         let target = registry.bind_target(portable_capabilities(), host.clone());
-        for input in [
-            "/model openai/gpt-5{thinking=high, fast=true}",
-            "/model fast=false",
-            "/model thinking=2048",
-        ] {
-            assert!(matches!(
-                smol::block_on(registry.dispatch_input(&target, input.into())),
-                maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
-            ));
-        }
+        let dispatched = smol::block_on(registry.dispatch_input(&target, input.into()));
         let operations = host.0.lock().unwrap().clone();
-        assert_eq!(
-            operations,
-            vec![
-                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
-                    spec: Some(Arc::from("openai/gpt-5")),
-                    thinking: Some(maki_providers::ThinkingConfig::parse_setting("high").unwrap()),
-                    fast: Some(true),
-                }),
-                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
-                    fast: Some(false),
-                    ..Default::default()
-                }),
-                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
-                    thinking: Some(maki_providers::ThinkingConfig::Budget(2048)),
-                    ..Default::default()
-                }),
-            ]
-        );
-        for input in [
-            "/model fast=true fast=false",
-            "/model thinking=high thinking=off",
-            "/model wat=true",
-            "/model fast=on",
-            "/model thinking=0",
-            "/model thinking=toggle",
-            "/model fast=toggle",
-            r#"/model "" fast=false"#,
-            r#"/model "openai/gpt-5" "openai/gpt-4""#,
-            r#"/model "openai/gpt-5" thinking="high" thinking=off"#,
-            "/model openai/gpt-5 openai/gpt-4",
-        ] {
-            assert!(matches!(
-                smol::block_on(registry.dispatch_input(&target, input.into())),
-                maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(_))
-            ));
+        (dispatched, operations)
+    }
+
+    #[test_case(
+        &format!("/model {STRUCTURED_MODEL_SPEC}{{thinking=high, fast=true}}"),
+        ModelSelection {
+            spec: Some(Arc::from(STRUCTURED_MODEL_SPEC)),
+            thinking: Some(ThinkingConfig::Effort(Effort::High)),
+            fast: Some(true),
         }
-        assert_eq!(*host.0.lock().unwrap(), operations);
+        ; "spec_with_brace_options"
+    )]
+    #[test_case(
+        "/model fast=false",
+        ModelSelection { fast: Some(false), ..Default::default() }
+        ; "fast_only"
+    )]
+    #[test_case(
+        "/model thinking=2048",
+        ModelSelection { thinking: Some(ThinkingConfig::Budget(2048)), ..Default::default() }
+        ; "thinking_budget_only"
+    )]
+    fn structured_model_routes_options(input: &str, expected: ModelSelection) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        assert_eq!(operations, vec![BuiltinOperation::SelectModel(expected)]);
+    }
+
+    #[test_case("/model fast=true fast=false" ; "duplicate_fast")]
+    #[test_case("/model thinking=high thinking=off" ; "duplicate_thinking")]
+    #[test_case("/model wat=true" ; "unknown_option")]
+    #[test_case("/model fast=on" ; "invalid_fast")]
+    #[test_case("/model thinking=0" ; "zero_budget")]
+    #[test_case("/model thinking=toggle" ; "thinking_toggle")]
+    #[test_case("/model fast=toggle" ; "fast_toggle")]
+    #[test_case(r#"/model "" fast=false"# ; "empty_quoted_spec")]
+    #[test_case(r#"/model "openai/gpt-5" "openai/gpt-4""# ; "two_quoted_specs")]
+    #[test_case(r#"/model "openai/gpt-5" thinking="high" thinking=off"# ; "duplicate_after_quoted_spec")]
+    #[test_case("/model openai/gpt-5 openai/gpt-4" ; "two_specs")]
+    fn structured_model_rejects_invalid_input(input: &str) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(_))
+        ));
+        assert!(operations.is_empty());
     }
 
     #[test]
