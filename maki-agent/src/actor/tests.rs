@@ -7,7 +7,7 @@ mod config_tests;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -968,7 +968,11 @@ fn admission_constraint_revalidates_fifo_predecessor_before_backend() {
                 CORRELATION.into(),
                 super::TurnAdmissionOptions {
                     policy_constraint: Some(Arc::new(move |config| {
-                        assert!(constraint_actor.inner.state.try_lock().is_ok());
+                        let deadline = Instant::now() + COMPLETION_TIMEOUT;
+                        while constraint_actor.inner.state.try_lock().is_err() {
+                            assert!(Instant::now() < deadline, "{CONDITION_TIMEOUT}");
+                            std::thread::yield_now();
+                        }
                         if config.fast {
                             Err(DENIED.into())
                         } else {

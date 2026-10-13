@@ -309,6 +309,10 @@ local function create_session(ctx, options, blocking)
     local result, wait_err = self:wait(call_ctx, id, nil, true)
     return result, wait_err or (result and result.error)
   end
+  function adapter:idle(call_ctx)
+    local status = agent:status(call_ctx)
+    return status ~= nil and status.status ~= "running" and status.queued == 0
+  end
   function adapter:status(call_ctx)
     local status, status_err = agent:status(call_ctx)
     if not status then
@@ -373,8 +377,7 @@ local function spawn(spec, input, ctx)
     if not task then
       table.remove(task_order, i)
     elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_maki_can_control() then
-      local status = task.sess:status(ctx)
-      if task.closed or (status and status.status ~= "running") then
+      if task.closed or task.sess:idle(ctx) then
         task.sess:close(ctx)
         tasks[id] = nil
         table.remove(task_order, i)

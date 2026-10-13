@@ -1677,7 +1677,7 @@ Unmanaged children use the current host task's authority, not a managed graph.
     report each turn through the Rust structured-output reporting tool.
   - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
   - `auto_deliver` (`boolean`) defaults to true; managed children notify their
-    recorded parent once per settled turn. A wait or result read in the
+    recorded parent once per settled turn. A wait in the
     parent's own turn returns the result directly and withdraws the
     queued notification.
   - `semaphore` (`maki.async.Semaphore`) unmanaged concurrency limit; managed
@@ -2264,7 +2264,9 @@ Read a retained result without waiting or consuming it.
 AgentTurn:wait({ctx}, {opts?})
 ```
 
-Wait for this exact turn. Timeout stops waiting, not the agent.
+Wait for this exact turn. Timeout stops waiting, not the agent. A wait that
+returns a result in the recorded parent's own turn withdraws the queued
+child-result delivery for that turn.
 
 **Parameters:**
 

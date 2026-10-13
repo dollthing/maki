@@ -45,23 +45,24 @@ fn ticket_result(
     this: &LuaAgentTurn,
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
-    let active = try_pair!(observe(lua, &ctx, &this.agent));
+    try_pair!(observe(lua, &ctx, &this.agent));
     if this.ticket.peek().is_none() {
         return Ok((None, None));
     }
-    withdraw_delivery(active.as_ref(), this.ticket.turn_id());
     turn_result(lua, &this.ticket)
 }
 
-/// A result returned to the parent's own turn makes its queued delivery
-/// redundant.
+/// A wait in the parent's own turn hands the result to its model, which makes
+/// the queued delivery redundant. Plain result reads leave the delivery alone.
 fn withdraw_delivery(active: Option<&CurrentManagedTurn>, turn_id: TurnId) {
     if let Some(parent) = active.and_then(|active| active.manager().actor(active.agent_id()).ok()) {
         parent.withdraw_child_delivery(turn_id);
     }
 }
 
-/// Wait for this exact turn. Timeout stops waiting, not the agent.
+/// Wait for this exact turn. Timeout stops waiting, not the agent. A wait that
+/// returns a result in the recorded parent's own turn withdraws the queued
+/// child-result delivery for that turn.
 /// @param ctx LuaCtx Invocation context.
 /// @param opts table? timeout is a nonnegative integer number of seconds. Zero returns nil, nil while pending; positive timeout returns nil and "agent turn wait timed out" without cancelling work.
 /// @return (table?, string?) Per-turn result or error.

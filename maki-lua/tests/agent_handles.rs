@@ -1,7 +1,7 @@
 use maki_agent::{
     ActorBackend, ActorError, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
     BackendResult, ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings,
-    TurnContext, TurnId, TurnOutcome, WorkKind,
+    TurnCancellationReason, TurnContext, TurnId, TurnOutcome, WorkKind,
     actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, TurnOrigin, TurnProvenance},
     tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
 };
@@ -3928,7 +3928,9 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             let statuses = bounded(
                 async {
                     let mut statuses = Vec::new();
-                    while !statuses.contains(&DeliveryStatus::Withdrawn) {
+                    while !statuses.contains(&DeliveryStatus::Discarded(
+                        TurnCancellationReason::Withdrawn,
+                    )) {
                         if let ActorEvent::Delivery(event) = events.recv_async().await.unwrap() {
                             statuses.push(event.status);
                         }
@@ -3940,7 +3942,10 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             .await;
             assert!(matches!(
                 statuses[..],
-                [DeliveryStatus::Accepted { .. }, DeliveryStatus::Withdrawn]
+                [
+                    DeliveryStatus::Accepted { .. },
+                    DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn)
+                ]
             ));
             assert!(fixture.observations.is_empty());
             fixture.finish().await;

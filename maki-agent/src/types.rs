@@ -702,6 +702,9 @@ pub enum TurnCancellationReason {
     Closed,
     Shutdown,
     Interrupted,
+    /// A queued child-result delivery whose result the parent already
+    /// received through an exact wait.
+    Withdrawn,
 }
 
 /// The authoritative terminal result of an accepted turn.

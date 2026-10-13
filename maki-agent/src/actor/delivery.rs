@@ -7,7 +7,7 @@ use super::{
     ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, ConfigCommit,
     TurnOrigin, TurnProvenance, TurnResult, TurnTicket, drive_operations,
 };
-use crate::{AgentId, AgentInput, AgentMode, TurnCancellationReason, TurnId};
+use crate::{AgentId, AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
 
 pub const MAX_PENDING_DELIVERIES: usize = 64;
 
@@ -102,16 +102,10 @@ pub enum DeliveryRejection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryStatus {
-    Accepted {
-        parent_turn_id: TurnId,
-    },
+    Accepted { parent_turn_id: TurnId },
     Rejected(DeliveryRejection),
     Discarded(TurnCancellationReason),
-    /// The parent's own turn received the result through an exact wait.
-    Withdrawn,
-    Executed {
-        parent_turn_id: TurnId,
-    },
+    Executed { parent_turn_id: TurnId },
 }
 
 #[derive(Clone)]
@@ -221,6 +215,17 @@ pub(super) fn publish(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .remove(&ticket.turn_id());
+    // Closing a child is the owner's own decision, so the turns it cuts short
+    // carry nothing the parent does not already know.
+    if matches!(
+        ticket.peek_result().map(|result| result.outcome),
+        Some(TurnOutcome::Cancelled {
+            reason: TurnCancellationReason::Closed | TurnCancellationReason::Shutdown,
+            ..
+        })
+    ) {
+        return;
+    }
     let policy = {
         let state = inner
             .state
@@ -293,18 +298,12 @@ impl AgentActorHandle {
             return false;
         };
         let Ok(cut) =
-            self.capture_turn_cancel(&mut state, delivery_turn, TurnCancellationReason::User)
+            self.capture_turn_cancel(&mut state, delivery_turn, TurnCancellationReason::Withdrawn)
         else {
             return false;
         };
-        if let Some(pending) = state.deliveries.remove(&delivery_turn) {
-            state.emit(ActorEvent::Delivery(DeliveryEvent {
-                delivery: pending.delivery,
-                status: DeliveryStatus::Withdrawn,
-            }));
-        }
         drop(state);
-        self.settle_turn_cancel(cut, TurnCancellationReason::User);
+        self.settle_turn_cancel(cut, TurnCancellationReason::Withdrawn);
         true
     }
 }
@@ -462,7 +461,7 @@ mod tests {
                     DeliveryStatus::Accepted {
                         parent_turn_id: ticket.turn_id()
                     },
-                    DeliveryStatus::Withdrawn,
+                    DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn),
                 ]
             );
             assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
@@ -524,9 +523,17 @@ mod tests {
         });
     }
 
-    #[test_case(false; "clear")]
-    #[test_case(true; "close")]
-    fn discarded_notification_does_not_notify_ancestor(close: bool) {
+    #[derive(Clone, Copy)]
+    enum Discard {
+        Clear,
+        Close,
+        Withdraw,
+    }
+
+    #[test_case(Discard::Clear; "clear")]
+    #[test_case(Discard::Close; "close")]
+    #[test_case(Discard::Withdraw; "withdraw")]
+    fn discarded_notification_does_not_notify_ancestor(discard: Discard) {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);
             let (ancestor, ancestor_task) = AgentActorHandle::spawn_inner(
@@ -559,11 +566,16 @@ mod tests {
             );
             parent.configure_parent_delivery(true, None).unwrap();
             let ancestor_events = ancestor.subscribe_events();
-            let ticket = admit_delivery(&parent.inner, delivery(parent.agent_id())).unwrap();
-            if close {
-                parent.close();
-            } else {
-                parent.clear();
+            let envelope = delivery(parent.agent_id());
+            let ticket = admit_delivery(&parent.inner, Arc::clone(&envelope)).unwrap();
+            match discard {
+                Discard::Clear => {
+                    parent.clear();
+                }
+                Discard::Close => parent.close(),
+                Discard::Withdraw => {
+                    assert!(parent.withdraw_child_delivery(envelope.result.outcome.turn_id()));
+                }
             }
             ticket.wait().await;
             assert!(
