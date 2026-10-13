@@ -10,11 +10,11 @@ use maki_lua::{
     PluginHost, SessionRequest, UiAction,
     agent_errors::{
         AGENT_BUSY, DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION,
-        FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, NO_FOCUSED_AGENT, NOT_DESCENDANT_OF_CALLER,
-        ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME, OUTPUT_SCHEMA_NOT_OBJECT,
-        RESTRICTED_MODE_CHANGE, SELF_TURN_WAIT, STALE_TURN, STRUCTURED_OUTPUT_CONFLICT,
-        TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
-        TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
+        FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_FOCUSED_AGENT,
+        NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
+        OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, SELF_TURN_WAIT, STALE_TURN,
+        STRUCTURED_OUTPUT_CONFLICT, TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED,
+        TRUSTED_TIMER_REQUIRED, TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
     orchestration::{OrchestrationServices, TrustedTarget},
     test_support::InMemoryFs,
@@ -337,7 +337,6 @@ struct FixtureOptions {
     audience_ceiling: bool,
     nested_capture: bool,
     schema_inheritance: bool,
-    callback_diagnostics: bool,
     plugin_source: String,
 }
 
@@ -441,7 +440,6 @@ impl Fixture {
             audience_ceiling,
             nested_capture,
             schema_inheritance,
-            callback_diagnostics,
             plugin_source,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
@@ -515,13 +513,6 @@ impl Fixture {
                     handler = function(input, ctx) return pr5_schema_children_handler(input, ctx) end,
                 }})
             end
-            if {callback_diagnostics} then
-                maki.api.register_command({{ name = "/pr5_callback_diagnostics", tui_only = false,
-                    handler = function()
-                        error("callback states: " .. maki.json.encode(pr5_callback_states) .. "; errors: " .. table.concat(pr5_callback_errors, "\n"))
-                    end,
-                }})
-            end
             if {authority_probes} then
             maki.api.register_tool({{
                 name = "{tool}_probe", description = "probe executing authority",
@@ -592,7 +583,7 @@ impl Fixture {
             definitions.push(json!({ "name": format!("{tool}_write"), "description": "nested write", "input_schema": { "type": "object", "properties": {} } }));
         }
         if audience_ceiling {
-            definitions.push(json!({ "name": "pr5_audience_ceiling_sub", "description": "subagent-only registry tool", "input_schema": { "type": "object", "properties": {} } }));
+            definitions.push(json!({ "name": format!("{tool}_sub"), "description": "subagent-only registry tool", "input_schema": { "type": "object", "properties": {} } }));
         }
         if nested_capture {
             definitions.push(json!({ "name": "pr6_spawn_grandchild", "description": "spawn grandchild", "input_schema": { "type": "object" } }));
@@ -1768,8 +1759,8 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
                     assert(target:set_mode(ctx, "build") == "build")
                     local changed, model_err = target:set_model(ctx, {UPDATED_MODEL:?})
                     assert(changed == nil and model_err == {not_allowed:?}, model_err)
-                    assert(target:set_model(ctx, {{ thinking = "off" }}))
-                    assert(assert(target:model(ctx)).thinking == "off")
+                    assert(target:set_model(ctx, {{ thinking = "low" }}))
+                    assert(assert(target:model(ctx)).thinking == "low")
                 end,
             }})
         "#
@@ -1804,6 +1795,7 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
             .unwrap();
         assert!(matches!(config.mode, AgentMode::Build));
         assert_eq!(config.model.spec(), common::default_model().spec());
+        assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::Low));
         shutdown_manager(&owner.manager).await;
         shutdown_manager(&restricted.manager).await;
     });
@@ -2444,7 +2436,6 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
         let fixture = Fixture::start_with_options(
             "pr5_tool_events",
             FixtureOptions {
-                callback_diagnostics: true,
                 plugin_source: r#"
                     local effects = 0
                     function pr5_timer_escape()
@@ -2485,7 +2476,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 local subscription, err = child[kind](child, ctx, callback)
                 assert(subscription == nil and err == subscription_error, kind .. ": " .. tostring(err))
             end
-            local ran, err = maki.api.run_command("/pr5_callback_diagnostics")
+            local ran, err = maki.api.run_command("/pr5_timer_effect")
             assert(ran == nil and err == command_error)
             local function deny_timers()
                 local id, timer_err = maki.timer.set(0.001, pr5_timer_escape)
@@ -2556,6 +2547,16 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
         assert!(
             fixture.requests.is_empty(),
             "timer callback caused agent work"
+        );
+        assert!(fixture._host.keymap_reader().load().entries.is_empty());
+        let handle = fixture._host.event_handle();
+        assert_ne!(
+            handle.command_generation_for_test("pr5_tool_events", "/pr5_timer_effect"),
+            0
+        );
+        assert_eq!(
+            handle.command_generation_for_test("pr5_tool_events", "/pr5_escape"),
+            0
         );
         shutdown_manager(&fixture.manager).await;
     });
@@ -3190,7 +3191,6 @@ fn delegated_legacy_session_expires_after_creating_managed_turn() {
         const CHECK: &str = "/pr6_delegated_legacy_expired";
         const REPLY: &str = "delegated legacy reply";
         const CHECKPOINT: &str = "delegated legacy status checkpoint";
-        const EXPIRED: &str = "managed agent authority is not active in this invocation";
         let checker_source = format!(
             r#"
             maki.api.register_command({{
@@ -3199,7 +3199,7 @@ fn delegated_legacy_session_expires_after_creating_managed_turn() {
                     local session = assert(maki.store.collect("pr6_delegated_sessions").retained)
                     for _, operation in ipairs({{ "send", "prompt", "status", "close" }}) do
                         local value, err = session[operation](session, "expired legacy request")
-                        assert(value == nil and err == "{EXPIRED}", tostring(err))
+                        assert(value == nil and err == {MANAGED_AUTHORITY_INACTIVE:?}, tostring(err))
                     end
                 end,
             }})
@@ -4435,5 +4435,214 @@ fn public_agent_ticket_surfaces_captured_local_tool_output() {
             .send(common::canned_reply(CAPTURE_REPLY))
             .unwrap();
         fixture.finish().await;
+    });
+}
+
+async fn collect_deliveries(
+    events: &flume::Receiver<ActorEvent>,
+    statuses: &mut Vec<(String, DeliveryStatus)>,
+    done: impl Fn(&[(String, DeliveryStatus)]) -> bool,
+    operation: &str,
+) {
+    bounded(
+        async {
+            while !done(statuses) {
+                if let ActorEvent::Delivery(event) = events.recv_async().await.unwrap() {
+                    statuses.push((event.delivery.result.text.clone(), event.status));
+                }
+            }
+        },
+        operation,
+    )
+    .await
+}
+
+fn statuses_for(statuses: &[(String, DeliveryStatus)], text: &str) -> Vec<DeliveryStatus> {
+    statuses
+        .iter()
+        .filter(|(delivered, _)| delivered == text)
+        .map(|(_, status)| status.clone())
+        .collect()
+}
+
+fn settled_deliveries(statuses: &[(String, DeliveryStatus)]) -> usize {
+    statuses
+        .iter()
+        .filter(|(_, status)| !matches!(status, DeliveryStatus::Accepted { .. }))
+        .count()
+}
+
+fn is_withdrawn(statuses: &[DeliveryStatus]) -> bool {
+    matches!(
+        statuses,
+        [
+            DeliveryStatus::Accepted { .. },
+            DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn)
+        ]
+    )
+}
+
+#[test_case::test_case(false ; "result_read_keeps_delivery")]
+#[test_case::test_case(true ; "settled_wait_withdraws_delivery")]
+fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
+    smol::block_on(async {
+        const FIRST_PROMPT: &str = "settle first child";
+        const SECOND_PROMPT: &str = "settle second child";
+        let fixture = Fixture::start(
+            "pr5_settled_delivery",
+            &format!(
+                r#"
+            local spawn = {{ inherit_provider = true, tools = {{}} }}
+            local first = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {FIRST_PROMPT:?}))
+            local second = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {SECOND_PROMPT:?}))
+            assert(assert(second:wait(ctx)).text == {SECOND_REPLY:?})
+            assert(assert(first:result(ctx)).text == {FIRST_REPLY:?})
+            if {wait_settled} then
+                assert(assert(first:wait(ctx)).text == {FIRST_REPLY:?})
+            end
+        "#
+            ),
+        );
+        let events = fixture
+            .manager
+            .root()
+            .unwrap()
+            .actor()
+            .unwrap()
+            .subscribe_events();
+        let request_a = fixture.request().await;
+        let request_b = fixture.request().await;
+        let (first, second) = if serde_json::to_string(&request_a.messages)
+            .unwrap()
+            .contains(FIRST_PROMPT)
+        {
+            (request_a, request_b)
+        } else {
+            (request_b, request_a)
+        };
+        first.reply.send(common::canned_reply(FIRST_REPLY)).unwrap();
+        let mut statuses = Vec::new();
+        collect_deliveries(
+            &events,
+            &mut statuses,
+            |statuses| !statuses_for(statuses, FIRST_REPLY).is_empty(),
+            "first child delivery acceptance",
+        )
+        .await;
+        second
+            .reply
+            .send(common::canned_reply(SECOND_REPLY))
+            .unwrap();
+        collect_deliveries(
+            &events,
+            &mut statuses,
+            |statuses| settled_deliveries(statuses) == 2,
+            "child delivery settlement",
+        )
+        .await;
+        assert!(is_withdrawn(&statuses_for(&statuses, SECOND_REPLY)));
+        let first_statuses = statuses_for(&statuses, FIRST_REPLY);
+        if wait_settled {
+            assert!(is_withdrawn(&first_statuses), "{first_statuses:?}");
+            assert!(fixture.observations.is_empty());
+        } else {
+            let (parent_turn_id, _, _) = bounded(
+                fixture.observations.recv_async(),
+                "first delivery execution",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                first_statuses,
+                vec![
+                    DeliveryStatus::Accepted { parent_turn_id },
+                    DeliveryStatus::Executed { parent_turn_id },
+                ]
+            );
+        }
+        fixture.finish().await;
+    });
+}
+
+#[test]
+fn trusted_command_wait_keeps_child_delivery() {
+    smol::block_on(async {
+        const PLUGIN: &str = "pr5_trusted_wait";
+        const COMMAND: &str = "/pr5_trusted_wait";
+        let fixture = Fixture::start("pr5_trusted_wait_root", "");
+        assert_eq!(
+            bounded(
+                fixture.completed.recv_async(),
+                "integration channel receive"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "root turn settlement").await;
+        let root = fixture.manager.root().unwrap();
+        let events = root.actor().unwrap().subscribe_events();
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
+        let handle = fixture._host.event_handle();
+        handle.install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
+            TrustedTarget {
+                target: root,
+                template,
+            },
+        ])));
+        fixture
+            ._host
+            .load_source(
+                PLUGIN,
+                &format!(
+                    r#"
+            maki.api.register_command({{
+                name = "{COMMAND}", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}} }}))
+                    local ticket = assert(child:send(ctx, "trusted"))
+                    assert(assert(ticket:wait(ctx)).text == {FIRST_REPLY:?})
+                end,
+            }})
+        "#
+                ),
+            )
+            .unwrap();
+        let command =
+            handle.run_command_for_test(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
+        bounded(fixture.requests.recv_async(), "trusted child request")
+            .await
+            .unwrap()
+            .reply
+            .send(common::canned_reply(FIRST_REPLY))
+            .unwrap();
+        assert_eq!(
+            bounded(command.recv_async(), "trusted command wait")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        let (parent_turn_id, _, _) = bounded(
+            fixture.observations.recv_async(),
+            "trusted delivery execution",
+        )
+        .await
+        .unwrap();
+        let mut statuses = Vec::new();
+        collect_deliveries(
+            &events,
+            &mut statuses,
+            |statuses| settled_deliveries(statuses) == 1,
+            "trusted delivery settlement",
+        )
+        .await;
+        assert_eq!(
+            statuses_for(&statuses, FIRST_REPLY),
+            vec![
+                DeliveryStatus::Accepted { parent_turn_id },
+                DeliveryStatus::Executed { parent_turn_id },
+            ]
+        );
+        shutdown_manager(&fixture.manager).await;
     });
 }
