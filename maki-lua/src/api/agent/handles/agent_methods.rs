@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use maki_agent::actor::{ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel};
+use maki_agent::actor::{
+    ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel,
+};
 use maki_agent::{
     AgentInput, AgentMode, CurrentManagedTurn, ModeId, TranscriptRequest, TurnAdmissionOptions,
     TurnId, TurnOrigin, TurnProvenance,
@@ -21,7 +23,8 @@ use super::subscriptions::{
 use super::tickets::ticket_wait;
 use super::{AgentRuntime, AgentSessions, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
-    AGENT_CONFIG_UNAVAILABLE, NO_PLUGIN_AUTHORITY, RESTRICTED_MODE_CHANGE, TURN_WAIT_TIMEOUT,
+    AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_PLUGIN_AUTHORITY, RESTRICTED_MODE_CHANGE, STALE_TURN,
+    TURN_WAIT_TIMEOUT,
 };
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, TaskOwnerAuthority, build_session_provider,
@@ -219,7 +222,11 @@ fn admit(
     };
     let ticket = actor
         .admit_turn_with_options(input, None, String::new(), options)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| match error {
+            ActorError::Busy => AGENT_BUSY.to_owned(),
+            ActorError::StaleTurn => STALE_TURN.to_owned(),
+            other => other.to_string(),
+        })?;
     Ok(LuaAgentTurn {
         agent: agent.clone(),
         ticket,

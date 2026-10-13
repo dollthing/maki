@@ -356,6 +356,8 @@ default.
 
 - `{handler}` (`function|nil`) Handler `function(msg, level?, opts?)`, or nil.
 
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
+
 **Example:**
 
 ```lua
@@ -586,6 +588,8 @@ browsing memory files or toggling settings.
     typed argument name, type, parsed preceding values,
     and the command completion context. Raw commands do
     not have argument completion providers.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 
 **Example:**
 
@@ -857,6 +861,8 @@ whitespace or trailing sentence punctuation.
 - `{prefix}` (`string`) The prefix this source owns (e.g. "skill"); labels typically carry the prefix (`skill:review`) so the fuzzy filter narrows by kind as the user types.
 - `{spec}` (`table`) `{ get_items = function(ctx) -> { {label, kind, insertion, description?} } }`.
 
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
+
 **Example:**
 
 ```lua
@@ -886,6 +892,8 @@ expander under every alias you accept (e.g. both `"skill"` and `"s"`).
 
 - `{prefix}` (`string`) The prefix this expander owns (e.g. "skill" or "s").
 - `{f}` (`function`) `{ value = string } -> (string, string|nil)`.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 
 **Example:**
 
@@ -936,7 +944,7 @@ registrations, `data.key`.
   - `once` (`boolean`) remove the handler after it fires once (default false).
   - `pattern` (`string|string[]`) only fire when the pattern matches. `"*"` matches everything. Omit to match all.
 
-**Returns:** (`integer`) Autocmd id.
+**Returns:** (`integer|nil`, `string|nil`) Autocmd id. Returns nil and an error when called from a delegated tool handler.
 
 **Example:**
 
@@ -1070,6 +1078,8 @@ tool declares, and a tool declaring none costs every permission. See
 
 - `{name}` (`string`) Slot name to wrap.
 - `{wrapper}` (`function`) Layer: `function(prev, ...)`. Call `prev(...)` to continue.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 
 **Example:**
 
@@ -3806,6 +3816,8 @@ mapped, the old binding is replaced and a warning is logged.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
 
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
+
 **Example:**
 
 ```lua
@@ -3829,6 +3841,8 @@ exists for that key.
 
 - `{mode}` (`string`) Mode letter (reserved for future modes).
 - `{lhs}` (`string`) Key to unmap, in Vim notation.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 
 **Example:**
 
@@ -4810,7 +4824,7 @@ Callback failures are logged and do not stop other callbacks.
 
 - `{callback}` (`function`) Called with `{provider_id, provider, model, status}`.
 
-**Returns:** function Idempotent unsubscribe callback.
+**Returns:** (`function|nil`, `string|nil`) Idempotent unsubscribe callback. Returns nil and an error when called from a delegated tool handler.
 
 
 ## maki.text {#maki-text}

@@ -14,7 +14,7 @@ pub const NO_ORCHESTRATION_SERVICES: &str = "no host orchestration services";
 pub const ORCHESTRATION_SERVICES_EXPIRED: &str = "host orchestration services expired";
 pub const TRUSTED_SUBSCRIPTION_REQUIRED: &str = "agent subscriptions require trusted authority";
 pub const TRUSTED_RUN_COMMAND_REQUIRED: &str = "run_command requires trusted authority";
-pub const TRUSTED_TIMER_REQUIRED: &str = "timers require trusted authority";
+pub const TRUSTED_TIMER_REQUIRED: &str = "timers and deferred callbacks require trusted authority";
 pub const DELEGATED_REGISTRATION: &str = "delegated tool handlers cannot register host callbacks";
 pub const DELEGATED_HOST_MUTATION: &str = "delegated tool handlers cannot change the focused session or global modes; name a session or address an agent explicitly";
 pub const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
@@ -25,6 +25,8 @@ pub const EXPLICIT_MODEL_TARGET_REQUIRED: &str =
 pub const TRUSTED_MODEL_MUTATION_REQUIRED: &str =
     "host model mutation requires trusted handler authority";
 pub const UNKNOWN_SPAWN_OPTION: &str = "unknown spawn option";
+pub const AGENT_BUSY: &str = "agent has pending work";
+pub const STALE_TURN: &str = "after_turn is not the agent's latest settled turn";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
 pub const NOT_DESCENDANT_OF_CALLER: &str = "agent is not a descendant of the caller";
 pub const FOREIGN_AGENT_REFERENCE: &str = "agent reference belongs to another runtime";

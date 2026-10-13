@@ -38,7 +38,7 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
-use crate::agent_errors::TRUSTED_RUN_COMMAND_REQUIRED;
+use crate::agent_errors::{DELEGATED_REGISTRATION, TRUSTED_RUN_COMMAND_REQUIRED};
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -1068,6 +1068,7 @@ fn allow_is_delegated(
 ///                            and the command completion context. Raw commands do
 ///                            not have argument completion providers.
 /// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
 /// local recorded
@@ -1102,9 +1103,13 @@ fn register_command(
     #[ctx] pending: PendingCommandMap,
     #[ctx] plugin: Arc<str>,
     spec: Table,
-) -> LuaResult<()> {
-    crate::runtime::deny_delegated_registration(lua)?;
-    register_command_from_lua(lua, &spec, plugin, pending)
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    let registered = || -> LuaResult<()> { register_command_from_lua(lua, &spec, plugin, pending) };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// Runs a slash command by name, as the explicit name-based executor: the

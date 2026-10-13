@@ -1,7 +1,7 @@
 use maki_agent::{
-    ActorBackend, ActorError, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
-    BackendResult, ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings,
-    TurnCancellationReason, TurnContext, TurnId, TurnOutcome, WorkKind,
+    ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
+    ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings, TurnCancellationReason,
+    TurnContext, TurnId, TurnOutcome, WorkKind,
     actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, TurnOrigin, TurnProvenance},
     tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
 };
@@ -9,9 +9,9 @@ use maki_commands::CommandInvocation;
 use maki_lua::{
     PluginHost, SessionRequest, UiAction,
     agent_errors::{
-        DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION, FOREIGN_AGENT_REFERENCE,
+        AGENT_BUSY, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION, FOREIGN_AGENT_REFERENCE,
         INVOCATION_EXPIRED, NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
-        OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, STRUCTURED_OUTPUT_CONFLICT,
+        OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, STALE_TURN, STRUCTURED_OUTPUT_CONFLICT,
         TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
         TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
@@ -986,7 +986,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
 #[test]
 fn public_agent_tickets_retain_exact_results_across_queued_turns() {
     smol::block_on(async {
-        let busy_error = ActorError::Busy.to_string();
+        let busy_error = AGENT_BUSY;
         let fixture = Fixture::start(
             "pr5_ticket_roundtrip",
             &format!(
@@ -1068,7 +1068,7 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
 #[test]
 fn public_agent_model_change_controls_next_request_without_losing_history() {
     smol::block_on(async {
-        let stale_error = ActorError::StaleTurn.to_string();
+        let stale_error = STALE_TURN;
         let fixture = Fixture::start(
             "pr5_model_change",
             &format!(
@@ -2321,21 +2321,22 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             deny_timers()
             local registrations = {
                 register_command = function()
-                    maki.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
+                    return maki.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
                 end,
-                keymap_set = function() maki.keymap.set("n", "<C-y>", pr5_timer_escape) end,
-                keymap_del = function() maki.keymap.del("n", "<C-y>") end,
-                usage_on_change = function() maki.usage.on_change(pr5_timer_escape) end,
-                set_notify_handler = function() maki.set_notify_handler(pr5_timer_escape) end,
-                notify_assignment = function() maki.notify = pr5_timer_escape end,
-                set_slot = function() maki.api.set_slot("pr5.escape", pr5_timer_escape) end,
-                create_autocmd = function() maki.api.create_autocmd("User", { callback = pr5_timer_escape }) end,
-                register_expander = function() maki.api.register_expander("pr5", pr5_timer_escape) end,
+                keymap_set = function() return maki.keymap.set("n", "<C-y>", pr5_timer_escape) end,
+                keymap_del = function() return maki.keymap.del("n", "<C-y>") end,
+                usage_on_change = function() return maki.usage.on_change(pr5_timer_escape) end,
+                set_notify_handler = function() return maki.set_notify_handler(pr5_timer_escape) end,
+                set_slot = function() return maki.api.set_slot("pr5.escape", pr5_timer_escape) end,
+                create_autocmd = function() return maki.api.create_autocmd("User", { callback = pr5_timer_escape }) end,
+                register_expander = function() return maki.api.register_expander("pr5", pr5_timer_escape) end,
             }
             for name, register in pairs(registrations) do
-                local ok, register_err = pcall(register)
-                assert(not ok and tostring(register_err):find(registration_error, 1, true), name .. ": " .. tostring(register_err))
+                local registered, register_err = register()
+                assert(registered == nil and register_err == registration_error, name .. ": " .. tostring(register_err))
             end
+            local assigned, assignment_err = pcall(function() maki.notify = pr5_timer_escape end)
+            assert(not assigned and tostring(assignment_err):find(registration_error, 1, true), tostring(assignment_err))
             maki.api.exec_autocmds("User", { pattern = "pr5_escape" })
             assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == command_error, tostring(pr5_autocmd_escape.err))
             for name, mutate in pairs({

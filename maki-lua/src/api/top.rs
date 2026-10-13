@@ -11,6 +11,7 @@ use std::time::Duration;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::timer::require_trusted_authority;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -177,20 +178,26 @@ fn notify(
 /// default.
 ///
 /// @param handler function|nil Handler `function(msg, level?, opts?)`, or nil.
-/// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// local Toast = require("maki.toast")
 /// maki.set_notify_handler(function(msg, level, opts)
 ///   Toast.show(msg, { title = opts and opts.title, level = level })
 /// end)
 #[lua_fn]
-fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> LuaResult<()> {
-    install_notify_handler(lua, plugin, handler)
+fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    install_notify_handler(lua, plugin, handler)?;
+    Ok((Some(true), None))
 }
 
 /// Install a `maki.notify` override into the shared slot. Reached both by
 /// `set_notify_handler` and by the `maki.notify = fn` sugar that the `maki`
 /// global's `__newindex` routes here.
+/// The assignment form can only report errors by raising, so a delegated
+/// caller gets a raised error here rather than a `(nil, err)` pair.
 pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value) -> LuaResult<()> {
     crate::runtime::deny_delegated_registration(lua)?;
     // Validate the argument before touching the slot: a wrong-typed
