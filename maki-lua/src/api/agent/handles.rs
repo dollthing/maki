@@ -1,4 +1,4 @@
-use super::{LuaActorState, LuaSession, SessionControl, build_session, derive_result};
+use super::{LuaActorState, LuaSession, SessionControl, build_session};
 use crate::api::util::{
     convert::json_to_lua,
     ctx::LuaCtx,
@@ -25,6 +25,7 @@ pub(crate) const TRUSTED_SUBSCRIPTION_REQUIRED: &str =
 const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
 const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
+const UNSETTLED_TURN_RESULT: &str = "turn has no settled result";
 const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
 
 #[derive(Clone)]
@@ -1380,15 +1381,11 @@ async fn agent_set_mode(
                 Some(path) => path,
                 None => {
                     if let Some(prepare) = lua
-                        .app_data_ref::<super::PlanPathPreparer>()
-                        .map(|prepare| Arc::clone(&prepare))
-                        .or_else(|| {
-                            lua.app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-                                .and_then(|slot| {
-                                    slot.0
-                                        .as_ref()
-                                        .and_then(|service| service.plan_path_preparer())
-                                })
+                        .app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
+                        .and_then(|slot| {
+                            slot.0
+                                .as_ref()
+                                .and_then(|service| service.plan_path_preparer())
                         })
                     {
                         try_pair!(prepare())
@@ -1475,65 +1472,14 @@ fn turn_agent_id(lua: &Lua, this: &LuaAgentTurn) -> mlua::Result<Pair<String>> {
     Ok((Some(this.agent.identity()), None))
 }
 
-fn turn_result(
-    lua: &Lua,
-    _agent: &LuaAgent,
-    ticket: &TurnTicket,
-    outcome: &maki_agent::TurnOutcome,
-) -> mlua::Result<Pair<Table>> {
-    let retained = ticket.peek_result();
-    if let Some(result) = &retained {
-        if let mlua::Value::Table(table) = json_to_lua(lua, &result_json(result))? {
-            return Ok((Some(table), None));
-        }
-        return Err(mlua::Error::runtime(
+fn turn_result(lua: &Lua, ticket: &TurnTicket) -> mlua::Result<Pair<Table>> {
+    let result = try_pair!(ticket.peek_result().ok_or(UNSETTLED_TURN_RESULT));
+    match json_to_lua(lua, &result_json(&result))? {
+        mlua::Value::Table(table) => Ok((Some(table), None)),
+        _ => Err(mlua::Error::runtime(
             "turn result projection is not a table",
-        ));
+        )),
     }
-    let mut result = derive_result(outcome);
-    if let Some(retained) = &retained {
-        result.text = retained.text.clone();
-        result.captured = retained.output.last().cloned();
-    }
-    let table = lua.create_table()?;
-    table.set(
-        "origin",
-        json_to_lua(lua, &origin_json(ticket.provenance()))?,
-    )?;
-    table.set("agent_id", outcome.agent_id().to_string())?;
-    table.set("turn_id", outcome.turn_id().to_string())?;
-    table.set("text", result.text)?;
-    table.set("input_tokens", outcome.usage().total_input())?;
-    table.set("output_tokens", outcome.usage().output)?;
-    table.set(
-        "usage",
-        json_to_lua(
-            lua,
-            &serde_json::to_value(outcome.usage()).map_err(mlua::Error::external)?,
-        )?,
-    )?;
-    table.set("error", result.error)?;
-    table.set(
-        "status",
-        match outcome {
-            maki_agent::TurnOutcome::Completed { .. } => "completed",
-            maki_agent::TurnOutcome::Failed { .. } => "failed",
-            maki_agent::TurnOutcome::Cancelled { reason, .. } => {
-                table.set("cancellation_reason", reason.to_string())?;
-                "cancelled"
-            }
-        },
-    )?;
-    if let Some(captured) = result.captured {
-        table.set("captured", json_to_lua(lua, &captured)?)?;
-    }
-    if let Some(retained) = retained {
-        table.set(
-            "output",
-            json_to_lua(lua, &serde_json::Value::Array(retained.output))?,
-        )?;
-    }
-    Ok((Some(table), None))
 }
 
 /// Read a retained result without waiting or consuming it.
@@ -1546,13 +1492,11 @@ fn ticket_result(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
     let active = try_pair!(observe(lua, &ctx, &this.agent));
-    match this.ticket.peek() {
-        Some(outcome) => {
-            withdraw_delivery(active.as_ref(), this.ticket.turn_id());
-            turn_result(lua, &this.agent, &this.ticket, &outcome)
-        }
-        None => Ok((None, None)),
+    if this.ticket.peek().is_none() {
+        return Ok((None, None));
     }
+    withdraw_delivery(active.as_ref(), this.ticket.turn_id());
+    turn_result(lua, &this.ticket)
 }
 
 /// A result returned to the parent's own turn makes its queued delivery
@@ -1582,15 +1526,15 @@ async fn ticket_wait(
         .map(|opts| opts.get::<Option<u64>>("timeout"))
         .transpose()?
         .flatten();
-    if let Some(outcome) = ticket.peek() {
+    if ticket.peek().is_some() {
         withdraw_delivery(active.as_ref(), ticket.turn_id());
-        return turn_result(&lua, &agent, &ticket, &outcome);
+        return turn_result(&lua, &ticket);
     }
     if timeout == Some(0) {
         return Ok((None, None));
     }
     drop(this);
-    let outcome = if let Some(active) = &active {
+    if let Some(active) = &active {
         if Some(active.agent_id()) == agent.id {
             return Ok(err_pair("cannot wait for a turn on the calling agent"));
         }
@@ -1605,7 +1549,7 @@ async fn ticket_wait(
         try_pair!(wait.wait().await.map_err(|error| match error {
             maki_agent::PromptWaitError::Timeout => TURN_WAIT_TIMEOUT.to_string(),
             maki_agent::PromptWaitError::Cancelled => crate::runtime::CANCELLED_MSG.to_string(),
-        }))
+        }));
     } else {
         match timeout {
             Some(seconds) => try_pair!(
@@ -1616,11 +1560,11 @@ async fn ticket_wait(
                 .await
             ),
             None => ticket.wait().await,
-        }
-    };
+        };
+    }
     try_pair!(ctx.validate_origin(&lua));
     withdraw_delivery(active.as_ref(), retained_ticket.turn_id());
-    turn_result(&lua, &agent, &retained_ticket, &outcome)
+    turn_result(&lua, &retained_ticket)
 }
 
 /// Cancel only this admitted turn.

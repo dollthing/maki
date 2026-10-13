@@ -259,12 +259,6 @@ impl Runner {
                 self.settle_turn(&admission, Some(outcome), true);
                 return;
             }
-            if state.cancelled_turns.remove(&turn_id) {
-                drop(state);
-                let outcome = cancelled_outcome(agent_id, turn_id, TurnCancellationReason::User);
-                self.settle_turn(&admission, Some(outcome), true);
-                return;
-            }
             // A concurrent close may have terminalized the actor; do not
             // start a run into it.
             if state.lifecycle != ActorLifecycle::Open {

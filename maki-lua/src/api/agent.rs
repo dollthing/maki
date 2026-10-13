@@ -71,10 +71,6 @@ const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 pub type PlanPathPreparer = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 
-pub fn install_plan_path_preparer(lua: &Lua, prepare: PlanPathPreparer) {
-    lua.set_app_data(prepare);
-}
-
 pub type SessionProviderPreparer =
     Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
 

@@ -2102,15 +2102,6 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool) {
             super::ActorEvent::Close { .. }
         ));
         assert!(events.is_empty());
-        assert!(
-            !handle
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .cancelled_turns
-                .contains(&turn_id)
-        );
         handle.close();
     });
 }

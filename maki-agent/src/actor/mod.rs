@@ -104,7 +104,7 @@ pub use types::{
     WorkKind,
 };
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
@@ -230,7 +230,6 @@ pub(crate) struct ActorState {
     pub(crate) processing: Option<ProcessingWork>,
     idle: Option<IdleReservation>,
     pub(crate) cancelled_correlations: HashMap<String, TurnCancellationReason>,
-    pub(crate) cancelled_turns: HashSet<TurnId>,
     pub(crate) cancellation_generation: u64,
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
@@ -880,7 +879,6 @@ impl ActorState {
             processing: None,
             idle: None,
             cancelled_correlations: HashMap::new(),
-            cancelled_turns: HashSet::new(),
             cancellation_generation: 0,
             policy_generation: 0,
             policy,
@@ -970,7 +968,6 @@ fn retire_turn(
     };
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
-    state.cancelled_turns.remove(&turn_id);
     if state.release_idle_permission(turn_id) {
         inner.queue.notify();
     }
@@ -1292,7 +1289,8 @@ impl AgentActorHandle {
     }
 
     /// Captures the nominal processing turn, including the pop/install gap.
-    pub fn processing_turn_id(&self) -> Option<TurnId> {
+    #[cfg(test)]
+    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
         self.inner
             .state
             .lock()
@@ -1550,7 +1548,8 @@ impl AgentActorHandle {
         )
     }
 
-    pub fn admit_turn_if_idle(
+    #[cfg(test)]
+    pub(crate) fn admit_turn_if_idle(
         &self,
         input: AgentInput,
         event_sender: Option<EventSender>,
@@ -2269,7 +2268,6 @@ impl AgentActorHandle {
             }
             self.inner.policy_changed.notify(usize::MAX);
             state.cancelled_correlations.clear();
-            state.cancelled_turns.clear();
             (
                 state.active.take(),
                 state.operations.drain(..).collect::<Vec<_>>(),

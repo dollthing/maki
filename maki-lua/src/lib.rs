@@ -17,7 +17,7 @@ mod splash;
 #[cfg(test)]
 mod write_lock_regression;
 
-pub use api::agent::{PlanPathPreparer, install_plan_path_preparer};
+pub use api::agent::PlanPathPreparer;
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::time::format_ago;
