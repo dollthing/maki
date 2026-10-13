@@ -9,8 +9,8 @@ use maki_commands::CommandInvocation;
 use maki_lua::{
     PluginHost, SessionRequest, UiAction,
     agent_errors::{
-        DELEGATED_REGISTRATION, FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED,
-        NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
+        DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION, FOREIGN_AGENT_REFERENCE,
+        INVOCATION_EXPIRED, NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
         OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, STRUCTURED_OUTPUT_CONFLICT,
         TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
         TURN_WAIT_TIMEOUT,
@@ -2278,6 +2278,10 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                     maki.api.register_command({ name = "/pr5_timer_effect", tui_only = false,
                         handler = function() effects = effects + 1 end,
                     })
+                    maki.api.create_autocmd("User", { pattern = "pr5_escape", callback = function()
+                        local ran, err = maki.api.run_command("/pr5_timer_effect")
+                        pr5_autocmd_escape = { ran = ran, err = err }
+                    end })
                     maki.api.register_command({ name = "/pr5_timer_check", tui_only = false,
                         handler = function()
                             assert(effects == 0, "scheduled callback or command escaped")
@@ -2294,7 +2298,8 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 "local subscription_error = {TRUSTED_SUBSCRIPTION_REQUIRED:?}\n\
                  local command_error = {TRUSTED_RUN_COMMAND_REQUIRED:?}\n\
                  local timer_error = {TRUSTED_TIMER_REQUIRED:?}\n\
-                 local registration_error = {DELEGATED_REGISTRATION:?}\n{}",
+                 local registration_error = {DELEGATED_REGISTRATION:?}\n\
+                 local host_mutation_error = {DELEGATED_HOST_MUTATION:?}\n{}",
                 r#"
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             local function callback(_, callback_ctx)
@@ -2323,10 +2328,24 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 set_notify_handler = function() maki.set_notify_handler(pr5_timer_escape) end,
                 notify_assignment = function() maki.notify = pr5_timer_escape end,
                 set_slot = function() maki.api.set_slot("pr5.escape", pr5_timer_escape) end,
+                create_autocmd = function() maki.api.create_autocmd("User", { callback = pr5_timer_escape }) end,
+                register_expander = function() maki.api.register_expander("pr5", pr5_timer_escape) end,
             }
             for name, register in pairs(registrations) do
                 local ok, register_err = pcall(register)
                 assert(not ok and tostring(register_err):find(registration_error, 1, true), name .. ": " .. tostring(register_err))
+            end
+            maki.api.exec_autocmds("User", { pattern = "pr5_escape" })
+            assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == command_error, tostring(pr5_autocmd_escape.err))
+            for name, mutate in pairs({
+                mode_set = function() return maki.api.mode.set("build") end,
+                mode_reset = function() return maki.api.mode.reset() end,
+                session_set_thinking = function() return maki.session.set_thinking({ mode = "max" }) end,
+                session_set_option = function() return maki.session.set_option("fast", "true") end,
+                session_set_default_thinking = function() return maki.session.set_default_thinking("max") end,
+            }) do
+                local changed, mutate_err = mutate()
+                assert(changed == nil and mutate_err == host_mutation_error, name .. ": " .. tostring(mutate_err))
             end
             local async_err = maki.async.await(1, function(done)
                 maki.async.run(deny_timers, function(err) done(err or false) end)

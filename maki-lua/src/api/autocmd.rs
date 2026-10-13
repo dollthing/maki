@@ -198,6 +198,7 @@ fn create_autocmd(
     event: Value,
     opts: Table,
 ) -> LuaResult<u64> {
+    crate::runtime::deny_delegated_registration(lua)?;
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
     let once: bool = opts.get("once").unwrap_or(false);

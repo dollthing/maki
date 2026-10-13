@@ -119,7 +119,8 @@ pub(crate) async fn call_swallowing<R: FromLuaMulti>(
 /// with plugin and seam name, then swallowed. The detached [`TaskScope`]
 /// matters here, because a callback that inherits the firer's scope gets
 /// cancelled when the firer's task dies, and plugin B should not pay for
-/// plugin A's crash.
+/// plugin A's crash. A callback fired from a delegated tool stays delegated,
+/// so synchronous dispatch cannot hand the tool trusted authority.
 pub(crate) fn call_isolated<R: FromLuaMulti>(
     lua: &Lua,
     func: &Function,
@@ -127,7 +128,9 @@ pub(crate) fn call_isolated<R: FromLuaMulti>(
     seam: &str,
     plugin: &str,
 ) -> Option<R> {
-    let _scope = TaskScope::detached(lua);
+    let delegated = crate::runtime::in_delegated_tool(lua);
+    let scope = TaskScope::detached(lua);
+    crate::runtime::lock_cell(scope.handle()).delegated_tool = delegated;
     match func.call::<R>(args) {
         Ok(r) => Some(r),
         Err(e) => {

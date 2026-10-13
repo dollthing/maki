@@ -12,6 +12,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_HOST_MUTATION;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
@@ -319,6 +320,9 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) && !names_session(opts.as_ref())? {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
@@ -421,6 +425,9 @@ async fn set_option(
     value: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(&lua) && !names_session(opts.as_ref())? {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
     if let Err(error) = ensure_validation_not_in_progress(&lua) {
         return Ok(err_pair(error));
     }
@@ -514,6 +521,9 @@ async fn set_thinking(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
     let req = SessionRequest::SetThinking {
         set_default: opts.get("set_default").unwrap_or(false),
         thinking: opts.get("mode")?,
@@ -534,12 +544,24 @@ async fn set_default_thinking(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     mode: String,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
     roundtrip(
         lua,
         tx,
         SessionRequest::SetDefaultThinking { thinking: mode },
     )
     .await
+}
+
+/// Whether {opts} names a session explicitly, rather than addressing focus.
+fn names_session(opts: Option<&Table>) -> LuaResult<bool> {
+    Ok(opts
+        .map(|opts| opts.get::<Option<String>>("session"))
+        .transpose()?
+        .flatten()
+        .is_some())
 }
 
 lua_table! {

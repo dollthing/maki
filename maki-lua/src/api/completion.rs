@@ -108,6 +108,7 @@ fn register_completion_source(
     prefix: String,
     spec: Table,
 ) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     let get_items: Function = spec.get("get_items")?;
     let mut store = lua
         .app_data_mut::<CompletionStore>()
@@ -149,6 +150,7 @@ fn register_expander(
     prefix: String,
     f: Function,
 ) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     let mut store = lua
         .app_data_mut::<ExpanderStore>()
         .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;

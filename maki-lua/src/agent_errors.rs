@@ -16,6 +16,7 @@ pub const TRUSTED_SUBSCRIPTION_REQUIRED: &str = "agent subscriptions require tru
 pub const TRUSTED_RUN_COMMAND_REQUIRED: &str = "run_command requires trusted authority";
 pub const TRUSTED_TIMER_REQUIRED: &str = "timers require trusted authority";
 pub const DELEGATED_REGISTRATION: &str = "delegated tool handlers cannot register host callbacks";
+pub const DELEGATED_HOST_MUTATION: &str = "delegated tool handlers cannot change the focused session or global modes; name a session or address an agent explicitly";
 pub const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
 pub const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
