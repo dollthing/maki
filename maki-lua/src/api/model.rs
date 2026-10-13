@@ -7,7 +7,9 @@ use maki_providers::{
 };
 use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
-use crate::agent_errors::{EXPLICIT_MODEL_TARGET_REQUIRED, TRUSTED_MODEL_MUTATION_REQUIRED};
+use crate::agent_errors::{
+    DELEGATED_FOCUS, EXPLICIT_MODEL_TARGET_REQUIRED, TRUSTED_MODEL_MUTATION_REQUIRED,
+};
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
@@ -28,7 +30,8 @@ async fn roundtrip(
 }
 
 /// Reads the model for an explicit tool context, or the focused session when
-/// a UI is attached. `thinking` uses the spelling `set` accepts.
+/// a UI is attached. Tool handlers must pass their `ctx`, because they cannot
+/// read UI focus. `thinking` uses the spelling `set` accepts.
 ///
 /// @param ctx userdata|nil Optional tool handler context.
 /// @return (table|nil, string|nil) `{spec, thinking, fast}`, or nil and an error.
@@ -52,6 +55,9 @@ async fn get(
     }
     if tx.is_none() {
         return Ok(err_pair(EXPLICIT_MODEL_TARGET_REQUIRED));
+    }
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_FOCUS));
     }
     roundtrip(lua, tx, ModelRequest::Get).await
 }
@@ -94,7 +100,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")
 /// maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-/// maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+/// maki.model.set({ thinking = "" })
 #[lua_fn]
 async fn set(
     lua: Lua,

@@ -4184,7 +4184,8 @@ maki.model.get({ctx?})
 ```
 
 Reads the model for an explicit tool context, or the focused session when
-a UI is attached. `thinking` uses the spelling `set` accepts.
+a UI is attached. Tool handlers must pass their `ctx`, because they cannot
+read UI focus. `thinking` uses the spelling `set` accepts.
 
 **Parameters:**
 
@@ -4253,7 +4254,7 @@ for an explicit target.
 ```lua
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+maki.model.set({ thinking = "" })
 ```
 
 ---
@@ -4366,7 +4367,10 @@ attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
 a session (`prompt`, `set_option`, `set_title`) accept
-only the session its own turn belongs to, named explicitly.
+only the session its own turn belongs to, named explicitly. Tool
+handlers cannot read UI focus either: functions that default to the
+focused session need an explicit `session`, and `current`, `usage` and
+`thinking` are refused. `ctx:session_id()` names the tool's session.
 
 ---
 

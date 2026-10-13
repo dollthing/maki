@@ -22,7 +22,9 @@ use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
-use maki_lua::agent_errors::{DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE};
+use maki_lua::agent_errors::{
+    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE,
+};
 use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
@@ -6580,7 +6582,7 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
 const SESSION_MUTATION_PLUGIN: &str = r#"
 maki.api.register_tool({
     name = "mutate_session",
-    description = "calls one maki.session mutator",
+    description = "calls one maki.session function",
     schema = {
         type = "object",
         properties = { call = { type = "string" }, session = { type = "string" } },
@@ -6596,6 +6598,12 @@ maki.api.register_tool({
             new = function() return maki.session.new() end,
             focus = function() return maki.session.focus(input.session) end,
             delete = function() return maki.session.delete(input.session) end,
+            current = function() return maki.session.current() end,
+            usage = function() return maki.session.usage() end,
+            thinking = function() return maki.session.thinking() end,
+            read = function() return maki.session.read() end,
+            options = function() return maki.session.options() end,
+            model_get = function() return maki.model.get() end,
         }
         local _, err = calls[input.call]()
         return tostring(err)
@@ -6609,7 +6617,13 @@ maki.api.register_tool({
 #[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
 #[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
 #[test_case::test_case("delete", DELEGATED_SESSION_LIFECYCLE ; "delete")]
-fn tool_handlers_cannot_mutate_other_sessions(call: &str, expected: &str) {
+#[test_case::test_case("current", DELEGATED_FOCUS ; "current")]
+#[test_case::test_case("usage", DELEGATED_FOCUS ; "usage")]
+#[test_case::test_case("thinking", DELEGATED_FOCUS ; "thinking")]
+#[test_case::test_case("read", DELEGATED_FOCUS ; "read")]
+#[test_case::test_case("options", DELEGATED_FOCUS ; "options")]
+#[test_case::test_case("model_get", DELEGATED_FOCUS ; "model_get")]
+fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
     let (reg, host) = builtins_host();
     host.load_source("session_mutation", SESSION_MUTATION_PLUGIN)
         .unwrap();
