@@ -4272,7 +4272,10 @@ return an error.
 
 - `{spec}` (`string`) Model spec, e.g. `"anthropic/claude-sonnet-4-20250514"`.
 
-**Returns:** (`table|nil`, `string|nil`) `{spec, provider, id, tier, supports_thinking}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) `{spec, provider, id, tier, supports_thinking,
+  supports_fast, context_window, max_output_tokens, pricing}`, or nil and an
+  error. `max_output_tokens` is nil when unknown. `pricing` is
+  `{input, output, cache_write, cache_read}` in USD per million tokens.
 
 **Example:**
 
