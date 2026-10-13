@@ -36,6 +36,7 @@ const CAPTURE_UNMANAGED_CTX_TOOL_NAME: &str = "capture_unmanaged_ctx";
 const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
+const NESTED_ASYNC_TOOL_NAME: &str = "nested_async_task";
 const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const PREPARATION_ERROR: &str = "provider preparation rejected";
 const CORRELATION: &str = "managed-root";
@@ -572,14 +573,6 @@ fn parent_policy(context: &ToolContext) -> maki_agent::actor::EffectiveAgentConf
     )
 }
 
-fn task_input() -> Value {
-    json!({
-        "description": "nested-child",
-        "prompt": "nested prompt",
-        "subagent_type": "general",
-    })
-}
-
 fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
     let registry = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
@@ -952,9 +945,8 @@ async fn wait_for_runner_finished(manager: &AgentManagerHandle, agent_id: AgentI
     assert!(finished, "managed agent {agent_id} runner did not finish");
 }
 
-#[test_case::test_case("task" ; "deprecated_blocking_adapter")]
-#[test_case::test_case("nested_async_task" ; "managed_nested_async_wait_capacity_one")]
-fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one(tool_name: &'static str) {
+#[test]
+fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one() {
     smol::block_on(async {
         let (registry, _host) = load_task_host();
         let (context, events, _cancel) =
@@ -972,12 +964,8 @@ fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one(tool_na
             Box::new(NestedTaskBackend {
                 registry,
                 context,
-                tool_name,
-                input: if tool_name == "task" {
-                    task_input()
-                } else {
-                    json!({})
-                },
+                tool_name: NESTED_ASYNC_TOOL_NAME,
+                input: json!({}),
                 completed: completed_tx,
                 release: release_rx,
             }),

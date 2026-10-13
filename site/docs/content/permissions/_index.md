@@ -56,7 +56,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `multiedit`    | `<cwd>/**` | Outside cwd requires permission       |
 | `edit_lines`   | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
-| `task`         | `*`        | Subagent spawning always allowed      |
+| `task_spawn`   | `*`        | Subagent spawning always allowed      |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 

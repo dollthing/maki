@@ -809,7 +809,7 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
-    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_SPAWN_TOOL_NAME};
     use maki_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
     use test_case::test_case;
 
@@ -998,7 +998,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: TASK_TOOL_NAME.into(),
+                name: TASK_SPAWN_TOOL_NAME.into(),
             })),
             text: "Find auth".into(),
             images: Vec::new(),
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn task_output_truncated_and_styled() {
-        let task_max = TOL.task;
+        let task_max = TOL.task_spawn;
         let tl = task_truncation_tl(n_lines(200));
         let body_lines = tl.lines.len() - 1;
         assert!(

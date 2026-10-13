@@ -474,7 +474,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Workflow,
         "/workflow",
         &[],
-        "Toggle workflow mode (task callable inside code_execution)",
+        "Toggle workflow mode (task tools callable inside code_execution)",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

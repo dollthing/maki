@@ -36,10 +36,8 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Agent & Knowledge",
         &[
-            "task",
             "task_spawn",
             "task_wait",
-            "task_get",
             "task_send",
             "task_despawn",
             "todo_write",
@@ -162,9 +160,6 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     }
     if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
-    }
-    if info.def.get("deprecated").and_then(Value::as_bool) == Some(true) {
-        badges.push_str(" <span class=\"badge\">deprecated</span>");
     }
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
@@ -399,8 +394,6 @@ mod tests {
         assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
     }
 
-    #[test_case("task"; "blocking_adapter")]
-    #[test_case("task_get"; "polling_adapter")]
     #[test_case("task_wait"; "exact_wait")]
     #[test_case("task_spawn"; "async_spawn")]
     #[test_case("task_send"; "queued_send")]

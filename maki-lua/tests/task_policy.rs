@@ -5,13 +5,15 @@
 use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
+use maki_agent::tools::{
+    DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
+};
 use maki_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
 use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    StreamResponse,
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -24,25 +26,17 @@ const SCHEMA_MISSING_ERROR: &str = "agent finished without calling structured_ou
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const MAX_STRUCTURED_RETRIES: usize = 2;
-const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summary";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
-const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
-const TASK_TOOL: &str = "task";
+const TASK_SPAWN_TOOL: &str = "task_spawn";
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
-const RECOVERED_TEXT: &str = "summary after nudge";
-/// Mirrors the task plugin's `NUDGE_SUMMARY` wording.
-const SUMMARY_NUDGE_FRAGMENT: &str = "concise summary";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
-const RECURSIVE_UNMANAGED_TASK_ERR: &str =
-    "blocking task is unavailable from an unmanaged subagent; use task_spawn";
-const RECURSIVE_UNMANAGED_WAIT_ERR: &str = "blocking task_wait is unavailable from an unmanaged subagent; pass timeout = 0 to check without waiting";
 const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 const TASK_WAIT_TOOL: &str = "task_wait";
 /// Mirrors the task plugin's `max_concurrent` default.
@@ -52,14 +46,15 @@ const RETAINED_TURN_LIMIT: usize = 64;
 const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
 const TURN_LIMIT_ERR: &str = "task turn ticket limit reached";
 
+const NESTED_CHILD_PROMPT: &str = "child prompt";
+const NESTED_CHILD_REPLY: &str = "child finished";
+
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
 const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
-const SCENARIO_NO_SUMMARY: &str = "no_summary";
-const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
 
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stays real; structured-output validation uses the real-driver tests.
@@ -106,17 +101,6 @@ end
 
 behaviors.partial_error = function(sess, msg)
   return { text = "@PARTIAL_TEXT@" }, "@CANCELLED_ERR@"
-end
-
-behaviors.no_summary = function(sess, msg)
-  return { text = "" }
-end
-
-behaviors.no_summary_then_recover = function(sess, msg)
-  if #recorder.prompts == 1 then
-    return { text = "" }
-  end
-  return { text = "@RECOVERED_TEXT@" }
 end
 
 behaviors.raise = function(sess, msg)
@@ -230,7 +214,6 @@ fn load_task_host_with_opts(
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
-        .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
@@ -251,7 +234,6 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
-        .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
     let mode_stub = format!(
@@ -309,6 +291,26 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
     input
 }
 
+/// Spawns a task and blocks in `task_wait` on its first turn. A turn that
+/// settles with an error comes back as `Err`, like a failed spawn.
+fn spawn_and_wait(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<Value, String> {
+    let spawned = common::exec_tool(reg, ctx, TASK_SPAWN_TOOL, input)?;
+    let waited = common::exec_tool(
+        reg,
+        ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
+    )?;
+    match waited["error"].as_str() {
+        Some(error) => Err(error.to_owned()),
+        None => Ok(waited["result"].clone()),
+    }
+}
+
+fn spawn_and_wait_stub(reg: &ToolRegistry, input: Value) -> Result<Value, String> {
+    spawn_and_wait(reg, &stub_ctx(&AgentMode::Build), input)
+}
+
 const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
 
 #[test]
@@ -318,8 +320,8 @@ fn model_spec_forwards_full_spec_to_resolve_model() {
     let (reg, _host) = load_task_host_with_opts(opts);
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
-    assert_eq!(out, PLAIN_TEXT);
+    let result = spawn_and_wait_stub(&reg, input).expect("task with model spec failed");
+    assert_eq!(result["text"], PLAIN_TEXT);
 
     let snap = probe(&reg);
     let opts = snap["resolve_opts"]
@@ -337,8 +339,8 @@ fn model_spec_ignored_when_allow_model_off() {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
-    assert_eq!(out, PLAIN_TEXT);
+    let result = spawn_and_wait_stub(&reg, input).expect("task with model spec failed");
+    assert_eq!(result["text"], PLAIN_TEXT);
 
     let snap = probe(&reg);
     let opts = snap["resolve_opts"]
@@ -366,7 +368,7 @@ fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     for (k, v) in extra.as_object().unwrap() {
         input[k.as_str()] = v.clone();
     }
-    let err = exec_tool(&reg, TASK_TOOL, input).unwrap_err();
+    let err = exec_tool(&reg, TASK_SPAWN_TOOL, input).unwrap_err();
     assert!(err.starts_with(expected_prefix), "got: {err}");
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(0));
@@ -378,7 +380,7 @@ fn general_task_blocked_in_plan_mode() {
     let (reg, _host) = load_task_host_in_mode("plan");
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
-    let err = exec_tool(&reg, TASK_TOOL, input)
+    let err = exec_tool(&reg, TASK_SPAWN_TOOL, input)
         .expect_err("general subagents must be blocked while in plan mode");
     assert!(err.contains("blocked in plan mode"), "got: {err}");
     let snap = probe(&reg);
@@ -391,11 +393,11 @@ fn research_and_reviewer_allowed_in_plan_mode() {
     let (reg, _host) = load_task_host_in_mode("plan");
     let mut research = task_input(SCENARIO_PLAIN, None);
     research["subagent_type"] = json!("research");
-    exec_tool(&reg, TASK_TOOL, research).expect("research must be allowed in plan mode");
+    exec_tool(&reg, TASK_SPAWN_TOOL, research).expect("research must be allowed in plan mode");
 
-    let mut reviewer = task_input(SCENARIO_PLAIN, None);
+    let mut reviewer = task_input(SCENARIO_HAPPY, None);
     reviewer["subagent_type"] = json!("plan_reviewer");
-    exec_tool(&reg, TASK_TOOL, reviewer).expect("plan_reviewer must be allowed in plan mode");
+    exec_tool(&reg, TASK_SPAWN_TOOL, reviewer).expect("plan_reviewer must be allowed in plan mode");
 
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(2));
@@ -406,40 +408,39 @@ fn plan_reviewer_blocked_outside_plan_mode() {
     let (reg, _host) = load_task_host_in_mode("build");
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("plan_reviewer");
-    let err = exec_tool(&reg, TASK_TOOL, input)
+    let err = exec_tool(&reg, TASK_SPAWN_TOOL, input)
         .expect_err("plan_reviewer must be available only inside plan mode");
     assert!(err.contains("only available in plan mode"), "got: {err}");
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(0));
 }
 
-#[test]
-fn prompt_error_maps_to_sub_agent_error() {
-    let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
-    assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
-    let snap = probe(&reg);
-    assert_eq!(snap["closed"], json!(1));
-}
-
-/// Esc during a sub-agent run: the prompt hands back both an error and
+/// Esc during a sub-agent run: the turn settles with both an error and
 /// whatever the sub-agent managed to say, and half a transcript is worth
 /// more to the model than a bare "cancelled".
 #[test]
-fn interrupted_prompt_reports_the_partial_transcript() {
+fn interrupted_turn_reports_the_partial_transcript() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
-    assert_eq!(
-        err,
-        format!("sub-agent interrupted ({CANCELLED_ERR}). Partial output:\n{PARTIAL_TEXT}")
+    let spawned = exec_tool_json(
+        &reg,
+        TASK_SPAWN_TOOL,
+        task_input(SCENARIO_PARTIAL_ERROR, None),
     );
+    let waited = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"] }),
+    );
+    assert_eq!(waited["error"], CANCELLED_ERR);
+    assert_eq!(waited["result"]["text"], PARTIAL_TEXT);
 }
 
 #[test]
 fn plain_path_returns_text_without_local_tools() {
     let (reg, _host) = load_task_host();
-    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
-    assert_eq!(out, PLAIN_TEXT);
+    let result = spawn_and_wait_stub(&reg, task_input(SCENARIO_PLAIN, None)).unwrap();
+    assert_eq!(result["text"], PLAIN_TEXT);
+    exec_tool_json(&reg, "task_despawn", json!({ "task_id": SCENARIO_PLAIN }));
 
     let snap = probe(&reg);
     assert_eq!(snap["has_local_tools"], json!(false));
@@ -449,73 +450,9 @@ fn plain_path_returns_text_without_local_tools() {
 }
 
 #[test]
-fn no_summary_nudges_then_recovers() {
-    let (reg, _host) = load_task_host();
-    let out = exec_tool(
-        &reg,
-        TASK_TOOL,
-        task_input(SCENARIO_NO_SUMMARY_THEN_RECOVER, None),
-    )
-    .unwrap();
-    assert_eq!(out, RECOVERED_TEXT);
-
-    let snap = probe(&reg);
-    assert_eq!(snap["prompt_count"], json!(2));
-    let nudge = snap["prompts"][1].as_str().expect("nudge prompt missing");
-    assert!(nudge.contains(SUMMARY_NUDGE_FRAGMENT), "got: {nudge}");
-    assert_eq!(snap["closed"], json!(1));
-}
-
-#[test]
-fn no_summary_errors_after_nudges() {
-    let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
-    assert_eq!(err, SUMMARY_MISSING_ERROR);
-
-    let snap = probe(&reg);
-    assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
-    assert_eq!(snap["closed"], json!(1));
-}
-
-#[test]
-fn recursive_unmanaged_blocking_task_rejects_before_capacity_wait() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("max_concurrent".into(), json!(1));
-    let (reg, _host) = load_task_host_with_opts(opts);
-    let mut ctx = stub_ctx(&AgentMode::Build);
-    ctx.audience = ToolAudience::GENERAL_SUB;
-
-    let error =
-        common::exec_tool(&reg, &ctx, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap_err();
-    assert_eq!(error, RECURSIVE_UNMANAGED_TASK_ERR);
-    let snapshot = probe(&reg);
-    assert_eq!(snapshot["prompt_count"], json!(0));
-    assert_eq!(snapshot["closed"], json!(0));
-    assert_eq!(snapshot["sem_size"], json!(1));
-}
-
-#[test_case::test_case(None, RECURSIVE_UNMANAGED_WAIT_ERR ; "default_blocks")]
-#[test_case::test_case(Some(5), RECURSIVE_UNMANAGED_WAIT_ERR ; "positive_timeout_blocks")]
-#[test_case::test_case(Some(0), UNKNOWN_TASK_ERR ; "zero_timeout_checks")]
-fn recursive_unmanaged_task_wait_allows_only_nonblocking_checks(
-    timeout: Option<u64>,
-    expected: &str,
-) {
-    let (reg, _host) = load_task_host();
-    let mut ctx = stub_ctx(&AgentMode::Build);
-    ctx.audience = ToolAudience::GENERAL_SUB;
-    let mut input = json!({"task_id": "missing"});
-    if let Some(timeout) = timeout {
-        input["timeout"] = json!(timeout);
-    }
-    let error = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, input).unwrap_err();
-    assert_eq!(error, expected);
-}
-
-#[test]
 fn raising_prompt_does_not_exhaust_semaphore() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
+    let err = exec_tool(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
     assert!(err.contains(RAISE_MSG), "got: {err}");
 
     let snap = probe(&reg);
@@ -524,9 +461,8 @@ fn raising_prompt_does_not_exhaust_semaphore() {
         json!(TASK_DEFAULT_MAX_CONCURRENT),
         "semaphore not sized from the default max_concurrent option"
     );
-    // The next call cannot complete if the failed call retained its permit.
-    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
-    assert_eq!(out, PLAIN_TEXT);
+    let result = spawn_and_wait_stub(&reg, task_input(SCENARIO_PLAIN, None)).unwrap();
+    assert_eq!(result["text"], PLAIN_TEXT);
 }
 
 // --- Four-tool async lifecycle (AC.1 - AC.5, AC.7) --------------------------
@@ -541,9 +477,9 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
 
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
-    let output = run_task(&reg, &ctx, input)
+    let output = spawn_and_wait(&reg, &ctx, input)
         .expect("general child should complete after rejected mutation attempts");
-    assert_eq!(output, "done");
+    assert_eq!(output["text"], "done");
 
     let filter = ToolFilter::All;
     let description_ctx = DescriptionContext {
@@ -552,7 +488,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
         workflow: false,
         mcp: false,
     };
-    for name in ["task_spawn", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
+    for name in [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         assert!(
             !reg.get(name)
                 .expect("lifecycle tool is registered")
@@ -567,7 +503,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
 #[test]
 fn spawn_returns_task_id_immediately() {
     let (reg, _host) = load_task_host();
-    let out = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let out = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     assert!(out["task_id"].is_string(), "missing task_id: {out}");
     assert!(out["turn_id"].is_string(), "missing turn_id: {out}");
 }
@@ -575,7 +511,7 @@ fn spawn_returns_task_id_immediately() {
 #[test]
 fn task_ticket_cache_evicts_oldest_settled_turn() {
     let (reg, _host) = load_task_host();
-    let first = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let first = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = first["task_id"].as_str().unwrap();
     let mut latest = first["turn_id"].clone();
     for _ in 0..RETAINED_TURN_LIMIT {
@@ -603,68 +539,18 @@ fn task_ticket_cache_evicts_oldest_settled_turn() {
 }
 
 #[test]
-fn deprecated_task_tools_are_callable_but_hidden() {
-    let (reg, _host) = load_task_host();
-    let filter = ToolFilter::All;
-    let description_ctx = DescriptionContext {
-        filter: &filter,
-        audience: ToolAudience::GENERAL_SUB,
-        workflow: false,
-        mcp: false,
-    };
-    let definitions = reg.definitions(&maki_agent::template::Vars::new(), &description_ctx, false);
-    for name in ["task", "task_get"] {
-        assert!(
-            !definitions
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|definition| definition["name"] == name)
-        );
-        assert!(reg.get(name).unwrap().tool.deprecated());
-    }
-    let reference_ctx = DescriptionContext {
-        audience: ToolAudience::empty(),
-        ..description_ctx
-    };
-    let reference_definitions =
-        reg.definitions(&maki_agent::template::Vars::new(), &reference_ctx, false);
-    for name in [
-        "task",
-        "task_get",
-        "task_spawn",
-        TASK_WAIT_TOOL,
-        "task_send",
-        "task_despawn",
-    ] {
-        assert!(
-            reference_definitions
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|definition| definition["name"] == name)
-        );
-    }
-    for name in ["task_spawn", TASK_WAIT_TOOL] {
-        assert!(
-            !reg.get(name)
-                .unwrap()
-                .tool
-                .description(&description_ctx)
-                .is_empty()
-        );
-    }
-}
-
-#[test]
 fn unmanaged_nested_task_lifecycle_remains_compatible() {
     let (reg, _host) = load_task_host();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.audience = ToolAudience::GENERAL_SUB;
-    let spawned =
-        exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let spawned = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        TASK_SPAWN_TOOL,
+        task_input(SCENARIO_PLAIN, None),
+    );
     let task_id = spawned["task_id"].as_str().unwrap();
-    let status = exec_tool_json_with_ctx(&reg, &ctx, "task_get", json!({ "task_id": task_id }));
+    let status = exec_tool_json_with_ctx(&reg, &ctx, TASK_WAIT_TOOL, json!({ "task_id": task_id }));
     assert_eq!(status["status"], json!("done"));
     assert_eq!(status["result"]["text"], json!(PLAIN_TEXT));
 
@@ -685,7 +571,7 @@ fn spawn_forwards_output_schema_without_lua_local_tools() {
     let (reg, _host) = load_task_host();
     let out = exec_tool_json(
         &reg,
-        "task_spawn",
+        TASK_SPAWN_TOOL,
         task_input(SCENARIO_HAPPY, Some(answer_schema())),
     );
     assert!(
@@ -700,13 +586,13 @@ fn spawn_forwards_output_schema_without_lua_local_tools() {
 #[test]
 fn duplicate_task_id_is_rejected_without_overwrite() {
     let (reg, _host) = load_task_host();
-    let first = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let first = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = first["task_id"].as_str().unwrap();
 
-    let error = exec_tool(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None)).unwrap_err();
+    let error = exec_tool(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap_err();
     assert_eq!(error, DUPLICATE_TASK_ID_ERR);
 
-    let status = exec_tool_json(&reg, "task_get", json!({ "task_id": task_id }));
+    let status = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({ "task_id": task_id }));
     assert_eq!(status["status"], json!("done"));
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(2));
@@ -716,7 +602,12 @@ fn duplicate_task_id_is_rejected_without_overwrite() {
 #[test]
 fn failed_initial_admission_closes_new_session() {
     let (reg, _host) = load_task_host();
-    let error = exec_tool(&reg, "task_spawn", task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
+    let error = exec_tool(
+        &reg,
+        TASK_SPAWN_TOOL,
+        task_input(SCENARIO_PROMPT_ERROR, None),
+    )
+    .unwrap_err();
     assert_eq!(error, PROMPT_ERR_MSG);
     let snapshot = probe(&reg);
     assert_eq!(snapshot["sessions"], json!(1));
@@ -724,18 +615,22 @@ fn failed_initial_admission_closes_new_session() {
     assert!(
         exec_tool(
             &reg,
-            "task_get",
+            TASK_WAIT_TOOL,
             json!({ "task_id": SCENARIO_PROMPT_ERROR })
         )
         .unwrap_err()
-        .contains("unknown task_id")
+        .contains(UNKNOWN_TASK_ERR)
     );
 }
 
 #[test]
 fn failed_later_admission_closes_existing_session() {
     let (reg, _host) = load_task_host();
-    let spawned = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_NESTED_FAILED, None));
+    let spawned = exec_tool_json(
+        &reg,
+        TASK_SPAWN_TOOL,
+        task_input(SCENARIO_NESTED_FAILED, None),
+    );
     let task_id = spawned["task_id"].as_str().unwrap();
     assert_eq!(
         exec_tool(
@@ -757,11 +652,11 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
     const ACCESS_ERR: &str = "task is owned by another agent branch";
 
     let (reg, _host) = load_task_host();
-    let spawn = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = spawn["task_id"].as_str().unwrap();
     exec_tool(&reg, "set_task_access", json!({ "allowed": false })).unwrap();
 
-    for tool in ["task_get", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
+    for tool in [TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         let input = if tool == "task_send" {
             json!({ "task_id": task_id, "message": "forbidden" })
         } else {
@@ -771,7 +666,7 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
     }
 
     exec_tool(&reg, "set_task_access", json!({ "allowed": true })).unwrap();
-    let status = exec_tool_json(&reg, "task_get", json!({ "task_id": task_id }));
+    let status = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({ "task_id": task_id }));
     assert_eq!(status["status"], json!("done"));
     let closed = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
     assert_eq!(closed["ok"], json!(true));
@@ -780,7 +675,7 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
 #[test]
 fn despawn_releases_permit_and_clears_task() {
     let (reg, _host) = load_task_host();
-    let spawn = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = spawn["task_id"].as_str().unwrap();
 
     let ok = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
@@ -797,7 +692,7 @@ fn despawn_releases_permit_and_clears_task() {
 #[test]
 fn send_queues_and_reactivates() {
     let (reg, _host) = load_task_host();
-    let spawn = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
 
     let queued = exec_tool_json(
@@ -811,7 +706,7 @@ fn send_queues_and_reactivates() {
 #[test]
 fn unknown_task_errors_across_lifecycle_tools() {
     let (reg, _host) = load_task_host();
-    for tool in ["task_get", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
+    for tool in [TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         let input = match tool {
             "task_send" => json!({ "task_id": "missing", "message": "x" }),
             _ => json!({ "task_id": "missing" }),
@@ -874,6 +769,14 @@ fn load_real_driver_host_with_opts(
     mode: &str,
     opts: serde_json::Map<String, Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
+    load_real_driver_host_with_prelude(mode, opts, "")
+}
+
+fn load_real_driver_host_with_prelude(
+    mode: &str,
+    opts: serde_json::Map<String, Value>,
+    extra_prelude: &str,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mode_stub = format!(
@@ -881,7 +784,7 @@ fn load_real_driver_host_with_opts(
     );
     host.load_source_with_opts(
         "task_policy_real",
-        &format!("{mode_stub}\n{REAL_DRIVER_PRELUDE}\n{TASK_PLUGIN_SRC}"),
+        &format!("{mode_stub}\n{REAL_DRIVER_PRELUDE}\n{extra_prelude}\n{TASK_PLUGIN_SRC}"),
         opts,
     )
     .unwrap();
@@ -929,11 +832,6 @@ fn probe_real(reg: &ToolRegistry, ctx: &ToolContext) -> Value {
     common::exec_tool(reg, ctx, "probe", json!({})).expect("probe failed")
 }
 
-/// Run the deprecated blocking adapter against the real agent and canned provider.
-fn run_task(reg: &ToolRegistry, ctx: &ToolContext, input: Value) -> Result<String, String> {
-    common::exec_tool_text(reg, ctx, TASK_TOOL, input)
-}
-
 #[test]
 fn task_policy_spawn_honors_mode_gating_real() {
     let provider = Arc::new(common::CannedProvider::new(vec![
@@ -948,20 +846,21 @@ fn task_policy_spawn_honors_mode_gating_real() {
     let (reg, _host) = load_real_driver_host("plan");
     let mut general = task_input(SCENARIO_PLAIN, None);
     general["subagent_type"] = json!("general");
-    let err = run_task(&reg, &ctx, general).expect_err("general must be blocked in plan mode");
+    let err =
+        spawn_and_wait(&reg, &ctx, general).expect_err("general must be blocked in plan mode");
     assert!(err.contains("blocked in plan mode"), "got: {err}");
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(0));
 
     // plan_reviewer in plan mode -> allowed; outside plan -> blocked.
     let mut reviewer = task_input(SCENARIO_PLAIN, None);
     reviewer["subagent_type"] = json!("plan_reviewer");
-    run_task(&reg, &ctx, reviewer).expect("plan_reviewer must run in plan mode");
+    spawn_and_wait(&reg, &ctx, reviewer).expect("plan_reviewer must run in plan mode");
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
 
     let (reg_build, _host) = load_real_driver_host("build");
     let mut reviewer_build = task_input(SCENARIO_PLAIN, None);
     reviewer_build["subagent_type"] = json!("plan_reviewer");
-    let err = run_task(&reg_build, &ctx, reviewer_build)
+    let err = spawn_and_wait(&reg_build, &ctx, reviewer_build)
         .expect_err("plan_reviewer must be blocked outside plan mode");
     assert!(err.contains("only available in plan mode"), "got: {err}");
     assert_eq!(probe_real(&reg_build, &ctx)["sessions"], json!(0));
@@ -969,12 +868,12 @@ fn task_policy_spawn_honors_mode_gating_real() {
     // research is allowed in every mode.
     let mut research = task_input(SCENARIO_PLAIN, None);
     research["subagent_type"] = json!("research");
-    run_task(&reg, &ctx, research).expect("research must run in plan mode");
+    spawn_and_wait(&reg, &ctx, research).expect("research must run in plan mode");
 
     let (reg_build2, _host) = load_real_driver_host("build");
     let mut research_build = task_input(SCENARIO_PLAIN, None);
     research_build["subagent_type"] = json!("research");
-    run_task(&reg_build2, &ctx, research_build).expect("research must run in build mode");
+    spawn_and_wait(&reg_build2, &ctx, research_build).expect("research must run in build mode");
 
     // The granted sessions were served by the canned provider (real driver),
     // not a Lua stub: the provider recorded the requests it received.
@@ -995,7 +894,8 @@ fn pending_ticket_backpressure_preserves_accepted_turns() {
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let (reg, _host) = load_real_driver_host("build");
-        let spawned = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let spawned =
+            exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
@@ -1055,7 +955,8 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let (reg, _host) = load_real_driver_host("build");
-        let spawned = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let spawned =
+            exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
@@ -1093,7 +994,7 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let (reg, _host) = load_real_driver_host("build");
-        let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = first["task_id"].as_str().unwrap();
         assert!(first["turn_id"].is_string());
         assert_eq!(
@@ -1166,7 +1067,7 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
         opts.insert("max_concurrent".into(), json!(1));
         let (reg, _host) = load_real_driver_host_with_opts("build", opts);
 
-        let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
@@ -1180,11 +1081,16 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
             json!({ "task_id": first_id, "message": "second turn" }),
         );
         assert_eq!(queued["queued"], json!(true));
-        let status =
-            exec_tool_json_with_ctx(&reg, &ctx, "task_get", json!({ "task_id": first_id }));
+        let status = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_WAIT_TOOL,
+            json!({ "task_id": first_id, "timeout": 0 }),
+        );
         assert_eq!(status["status"], json!("running"));
 
-        let second = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("second", None));
+        let second =
+            exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("second", None));
         let second_id = second["task_id"].as_str().unwrap();
         assert!(started_rx.try_recv().is_err());
 
@@ -1221,7 +1127,7 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
         opts.insert("max_concurrent".into(), json!(1));
         let (reg, _host) = load_real_driver_host_with_opts("build", opts);
 
-        let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
@@ -1230,7 +1136,7 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
 
         let mut waiting_input = task_input("waiting", None);
         waiting_input["prompt"] = json!("waiting prompt");
-        let waiting = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", waiting_input);
+        let waiting = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, waiting_input);
         let waiting_id = waiting["task_id"].as_str().unwrap();
         let out =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": waiting_id }));
@@ -1240,7 +1146,7 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
 
         let mut third_input = task_input("third", None);
         third_input["prompt"] = json!("third prompt");
-        let third = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", third_input);
+        let third = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, third_input);
         let third_id = third["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
@@ -1270,23 +1176,24 @@ fn despawn_releases_capacity_from_an_active_turn() {
         opts.insert("max_concurrent".into(), json!(1));
         let (reg, _host) = load_real_driver_host_with_opts("build", opts);
 
-        let first = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("first", None));
+        let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT
         );
 
-        let second = exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input("second", None));
+        let second =
+            exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("second", None));
         let second_id = second["task_id"].as_str().unwrap();
         assert!(started_rx.try_recv().is_err());
 
         let out =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": first_id }));
         assert_eq!(out["ok"], json!(true));
-        let error =
-            common::exec_tool(&reg, &ctx, "task_get", json!({ "task_id": first_id })).unwrap_err();
-        assert!(error.contains("unknown task_id"), "got: {error}");
+        let error = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, json!({ "task_id": first_id }))
+            .unwrap_err();
+        assert!(error.contains(UNKNOWN_TASK_ERR), "got: {error}");
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT
@@ -1310,9 +1217,9 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     let (reg, _host) = load_real_driver_host("audit");
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
-    let out = run_task(&reg, &ctx, input).expect("general task must run in custom mode");
+    let out = spawn_and_wait(&reg, &ctx, input).expect("general task must run in custom mode");
 
-    assert_eq!(out, "done");
+    assert_eq!(out["text"], "done");
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
     let captured_tools = provider.captured_tools();
     assert_eq!(captured_tools.len(), 1);
@@ -1333,10 +1240,9 @@ fn plan_mode_task_supports_structured_output_real_driver() {
     let (reg, _host) = load_real_driver_host("plan");
     let mut input = task_input(SCENARIO_HAPPY, Some(answer_schema()));
     input["subagent_type"] = json!("plan_reviewer");
-    let out = run_task(&reg, &ctx, input).expect("structured plan-mode task failed");
+    let out = spawn_and_wait(&reg, &ctx, input).expect("structured plan-mode task failed");
 
-    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
-    assert_eq!(parsed, json!({ "answer": "42" }));
+    assert_eq!(out["captured"], json!({ "answer": "42" }));
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
 
     let tools = provider.captured_tools();
@@ -1356,7 +1262,7 @@ fn real_schema_validation_rejects_before_provider_request(schema: Value, expecte
     let provider = Arc::new(common::CannedProvider::new(vec![]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
     let (reg, _host) = load_real_driver_host("build");
-    let error = run_task(&reg, &ctx, task_input(SCENARIO_HAPPY, Some(schema))).unwrap_err();
+    let error = spawn_and_wait(&reg, &ctx, task_input(SCENARIO_HAPPY, Some(schema))).unwrap_err();
     assert!(error.contains(expected), "got: {error}");
     assert!(provider.captured_tools().is_empty());
 }
@@ -1370,16 +1276,13 @@ fn real_schema_invalid_report_recovers() {
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
     let (reg, _host) = load_real_driver_host("build");
-    let out = run_task(
+    let out = spawn_and_wait(
         &reg,
         &ctx,
         task_input(SCENARIO_HAPPY, Some(answer_schema())),
     )
     .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&out).unwrap(),
-        json!({ "answer": "42" })
-    );
+    assert_eq!(out["captured"], json!({ "answer": "42" }));
 }
 
 #[test]
@@ -1391,7 +1294,7 @@ fn real_schema_missing_report_fails_boundedly() {
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
     let (reg, _host) = load_real_driver_host("build");
-    let error = run_task(
+    let error = spawn_and_wait(
         &reg,
         &ctx,
         task_input(SCENARIO_HAPPY, Some(answer_schema())),
@@ -1410,14 +1313,13 @@ fn task_policy_structured_output_real_driver() {
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
 
     let (reg, _host) = load_real_driver_host("build");
-    let out = run_task(
+    let out = spawn_and_wait(
         &reg,
         &ctx,
         task_input(SCENARIO_HAPPY, Some(answer_schema())),
     )
     .expect("structured task failed");
-    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
-    assert_eq!(parsed, json!({ "answer": "42" }));
+    assert_eq!(out["captured"], json!({ "answer": "42" }));
 
     // The structured_output local tool was offered to the model.
     let names = common::tool_names(&provider.captured_tools()[0]);
@@ -1425,4 +1327,111 @@ fn task_policy_structured_output_real_driver() {
         names.iter().any(|n| n == STRUCTURED_OUTPUT_TOOL),
         "session tools must include structured_output: {names:?}"
     );
+}
+
+/// General subagents see the lifecycle tools, so a real child can spawn and
+/// wait on a grandchild of its own.
+const NESTED_LIFECYCLE_TOOLS_PRELUDE: &str = r#"
+maki.agent.tools = function(ctx, opts)
+  if opts.audience ~= "general_sub" then
+    return nil
+  end
+  return {
+    { name = "task_spawn", description = "spawn", input_schema = { type = "object" } },
+    { name = "task_wait", description = "wait", input_schema = { type = "object" } },
+  }
+end
+"#;
+
+/// Drives a general subagent through `task_spawn`, then a blocking
+/// `task_wait` on the returned id, then echoes the wait result as its reply.
+/// The grandchild it spawned answers its prompt with a fixed reply.
+struct NestedTaskProvider;
+
+impl NestedTaskProvider {
+    fn tool_use(id: &str, name: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(id, name, input)],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    fn reply(messages: &[Message]) -> StreamResponse {
+        let first_text = messages.first().and_then(|message| {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+        });
+        if first_text == Some(NESTED_CHILD_PROMPT) {
+            return common::canned_reply(NESTED_CHILD_REPLY);
+        }
+        let last_result = messages.last().and_then(|message| {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+        });
+        let Some(last_result) = last_result else {
+            return Self::tool_use(
+                "spawn",
+                TASK_SPAWN_TOOL,
+                json!({ "description": "grandchild", "prompt": NESTED_CHILD_PROMPT }),
+            );
+        };
+        let parsed: Value = serde_json::from_str(last_result).unwrap_or_default();
+        if parsed.get("status").is_none()
+            && let Some(task_id) = parsed["task_id"].as_str()
+        {
+            return Self::tool_use("wait", TASK_WAIT_TOOL, json!({ "task_id": task_id }));
+        }
+        common::canned_reply(last_result)
+    }
+}
+
+impl Provider for NestedTaskProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        messages: &'a [Message],
+        _system: &'a str,
+        _tools: &'a Value,
+        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move { Ok(Self::reply(messages)) })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+/// With one permit, an unmanaged general subagent that blocks in `task_wait`
+/// must hand its permit to the grandchild it waits on, or neither can finish.
+#[test]
+fn unmanaged_blocking_wait_yields_the_only_permit_to_its_child() {
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::new(NestedTaskProvider));
+    let mut opts = serde_json::Map::new();
+    opts.insert("max_concurrent".into(), json!(1));
+    let (reg, _host) =
+        load_real_driver_host_with_prelude("build", opts, NESTED_LIFECYCLE_TOOLS_PRELUDE);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+
+    let mut input = task_input("parent", None);
+    input["subagent_type"] = json!("general");
+    let result = spawn_and_wait(&reg, &ctx, input).expect("general subagent failed");
+
+    let echoed: Value = serde_json::from_str(result["text"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("reply is not the task_wait result ({error}): {result}"));
+    assert_eq!(echoed["status"], "done");
+    assert_eq!(echoed["result"]["text"], NESTED_CHILD_REPLY);
+    assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(2));
 }

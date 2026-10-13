@@ -592,14 +592,7 @@ impl Fixture {
             definitions.push(json!({ "name": "pr5_spawn_schema_children", "description": "spawn schema children", "input_schema": { "type": "object", "properties": {} } }));
         }
         if bundled_tasks {
-            for name in [
-                "task",
-                "task_spawn",
-                "task_send",
-                "task_wait",
-                "task_get",
-                "task_despawn",
-            ] {
+            for name in ["task_spawn", "task_send", "task_wait", "task_despawn"] {
                 definitions.push(json!({ "name": name, "description": "managed task", "input_schema": { "type": "object" } }));
             }
         }
@@ -3532,45 +3525,6 @@ fn public_output_schema_invalid_reports_exhaust_without_committing_output() {
 }
 
 #[test]
-fn bundled_managed_blocking_task_returns_schema_object_without_wrapper() {
-    smol::block_on(async {
-        let fixture = Fixture::start_with_options(
-            "pr5_bundled_schema",
-            FixtureOptions {
-                bundled_tasks: true,
-                ..Default::default()
-            },
-            r#"
-            local text, err = maki.agent.call_tool(ctx, "task", {
-                description = "structured task", prompt = "report answer", subagent_type = "general",
-                output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } },
-            })
-            assert(text ~= nil and err == nil, err)
-            local value = maki.json.decode(text)
-            assert(value.answer == 42)
-            assert(value[1] == nil and value.text == nil and value.output == nil)
-        "#,
-        );
-        let request = fixture.request().await;
-        assert!(common::tool_names(&request.tools).contains(&"structured_output".to_owned()));
-        request
-            .reply
-            .send(common::canned_tool_use(
-                "structured_output",
-                json!({ "answer": 42 }),
-            ))
-            .unwrap();
-        fixture
-            .request()
-            .await
-            .reply
-            .send(common::canned_reply("done"))
-            .unwrap();
-        fixture.finish().await;
-    });
-}
-
-#[test]
 fn public_output_schema_missing_reports_exhaust_bounded_nudges() {
     smol::block_on(async {
         let fixture = Fixture::start(
@@ -4082,42 +4036,6 @@ fn spawn_takes_the_shared_selection_and_rejects_other_options() {
                 .unwrap(),
             Ok(())
         );
-        shutdown_manager(&fixture.manager).await;
-    });
-}
-
-#[test]
-fn abandoned_managed_blocking_task_releases_child_provider() {
-    smol::block_on(async {
-        let fixture = Fixture::start_with_options(
-            "pr6_abandoned_blocking",
-            FixtureOptions {
-                bundled_tasks: true,
-                ..Default::default()
-            },
-            r#"
-            maki.agent.call_tool(ctx, "task", {
-                description = "abandoned child", prompt = "wait forever", subagent_type = "general",
-            })
-        "#,
-        );
-        let gate = fixture.request().await;
-        fixture.manager.root().unwrap().cancel().unwrap();
-        wait_for_gate_drop(&gate, "abandoned blocking child release").await;
-        bounded(
-            async {
-                while fixture.manager.snapshot().iter().any(|node| {
-                    node.parent_id.is_some()
-                        && (node.graph_lifecycle != maki_agent::manager::GraphLifecycle::Closed
-                            || !fixture.manager.runner_finished(node.agent_id).unwrap())
-                }) {
-                    smol::future::yield_now().await;
-                }
-            },
-            "blocking child retirement",
-        )
-        .await;
-        bounded(fixture.root_ticket.wait(), "cancelled root settlement").await;
         shutdown_manager(&fixture.manager).await;
     });
 }

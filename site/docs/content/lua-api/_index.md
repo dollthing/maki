@@ -427,7 +427,6 @@ string or a table with richer output fields.
     - `instructions` (`table`) Array of { path, content } blocks injected as context.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
-  - `deprecated` (`boolean`) Keep the tool callable but leave it out of model tool lists and code_execution listings. The reference marks it deprecated. Default: false.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.

@@ -166,6 +166,9 @@ struct LuaActorState {
     name: String,
     commit: Arc<Mutex<Option<JsonValue>>>,
     semaphore: Option<Arc<async_lock::Semaphore>>,
+    /// The `semaphore` permit held by the running turn, released for the
+    /// length of a blocking wait from that turn.
+    turn_permit: Mutex<Option<async_lock::SemaphoreGuardArc>>,
     start: Instant,
     /// Set only after the adapter backend has actually entered a turn. A
     /// queued admission never sets it, so close cannot mistake queued work for
@@ -179,6 +182,21 @@ struct LuaActorState {
 }
 
 impl LuaActorState {
+    /// Releases the running turn's permit, so the children a blocking wait
+    /// observes can take it. Returns whether the turn held one.
+    fn release_turn_permit(&self) -> bool {
+        self.turn_permit.lock().unwrap().take().is_some()
+    }
+
+    async fn reacquire_turn_permit(&self, cancel: &CancelToken) -> Result<(), String> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(());
+        };
+        let permit = cancel.race(Arc::clone(semaphore).acquire_arc()).await?;
+        *self.turn_permit.lock().unwrap() = Some(permit);
+        Ok(())
+    }
+
     fn init_subagent_info(&self, first_message: &str) {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
@@ -431,6 +449,7 @@ impl ActorBackend for LuaActorBackend {
                 }
                 None => None,
             };
+            *state.turn_permit.lock().unwrap() = permit;
 
             let mut params = state
                 .params
@@ -472,7 +491,7 @@ impl ActorBackend for LuaActorBackend {
             }
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
-            drop(permit);
+            state.turn_permit.lock().unwrap().take();
 
             let text = latest_assistant_text(history);
             let captured = state.commit.lock().unwrap().take().or_else(|| {
@@ -1907,6 +1926,7 @@ async fn build_session(
         name: options.name.clone(),
         commit,
         semaphore: options.semaphore.take(),
+        turn_permit: Mutex::default(),
         start: Instant::now(),
         execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
@@ -3323,6 +3343,7 @@ mod tests {
             name: "probe".to_owned(),
             commit: Arc::new(Mutex::new(None)),
             semaphore,
+            turn_permit: Mutex::default(),
             start: Instant::now(),
             execution_started: std::sync::atomic::AtomicBool::new(false),
             history_relayed: std::sync::atomic::AtomicBool::new(false),

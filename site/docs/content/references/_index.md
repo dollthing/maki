@@ -58,7 +58,7 @@ More than one `@subagent:` token each expands in place, so a single message can 
 
 `@model:` (short `@m:`) lists model specs from the available-models slot, the same list the `/model` picker uses. The list comes from the `model` plugin's completion source.
 
-A `@model:spec` next to a subagent reference sets that subagent's model; the `<model:spec>` token sits beside the `<subagent:type>` token and the agent applies it when spawning the subagent. If the requested model is unavailable (the `task` tool's `allow_model` option is off, so its schema has no `model` parameter), the agent asks you how to proceed via the `question` tool if it is loaded, or rejects the request and asks you to clarify. It does not silently pick another model.
+A `@model:spec` next to a subagent reference sets that subagent's model; the `<model:spec>` token sits beside the `<subagent:type>` token and the agent applies it when spawning the subagent. If the requested model is unavailable (the `task` plugin's `allow_model` option is off, so its schema has no `model` parameter), the agent asks you how to proceed via the `question` tool if it is loaded, or rejects the request and asks you to clarify. It does not silently pick another model.
 
 A `<model:spec>` reference without a subagent has no effect. Use the `/model` command to switch the session model.
 

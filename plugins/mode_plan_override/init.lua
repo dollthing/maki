@@ -89,8 +89,6 @@ local ok, err = maki.api.mode.define({
     "task_wait",
     "task_send",
     "task_despawn",
-    "task",
-    "task_get",
   },
   -- tool search / mcp stay available through the per-request MCP injection.
 })

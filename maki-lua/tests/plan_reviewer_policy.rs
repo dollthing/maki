@@ -1,6 +1,6 @@
 //! plan_reviewer through the real driver (AC.10).
 //!
-//! The reviewer is spawned via the real `task` plugin (`subagent_type =
+//! The reviewer is spawned via the real task plugin (`subagent_type =
 //! "plan_reviewer"`), which gates it to plan mode and hands it a `research_sub`
 //! (read-only) tool set. These tests drive the real `maki.agent.session` (wrapped
 //! only to set `inherit_provider = true`) against a canned provider, so the
@@ -15,18 +15,13 @@ use maki_lua::PluginHost;
 use serde_json::{Value, json};
 
 mod common;
-use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool_text, tool_names};
+use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool, tool_names};
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const PLAN_REVIEWER_ONLY_ERR: &str = "plan_reviewer is only available in plan mode";
-const TASK_FAMILY: [&str; 6] = [
-    "task",
-    "task_spawn",
-    "task_get",
-    "task_wait",
-    "task_send",
-    "task_despawn",
-];
+const TASK_SPAWN_TOOL: &str = "task_spawn";
+const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_FAMILY: [&str; 4] = [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "task_despawn"];
 
 /// Wrap the real `maki.agent.session` to reuse the parent (canned) provider, and
 /// stub the model/system lookups so no real model resolution or file read is
@@ -97,16 +92,24 @@ fn reviewer_input(description: &str) -> Value {
     input
 }
 
-/// Run the blocking `task` composite (which drives the real reviewer session via
-/// `:prompt`) against the canned provider. `:prompt` blocks on the driver's
-/// `done_rx` and `smol::block_on` pumps the background driver to completion, the
-/// same pattern the automode suite proves. No `task_spawn`/`task_get` polling.
+/// Spawn the reviewer and block in `task_wait` until it settles, returning the
+/// reviewer's final text.
 fn run_reviewer(
     reg: &ToolRegistry,
     ctx: &ToolContext,
     description: &str,
 ) -> Result<String, String> {
-    exec_tool_text(reg, ctx, "task", reviewer_input(description))
+    let spawned = exec_tool(reg, ctx, TASK_SPAWN_TOOL, reviewer_input(description))?;
+    let waited = exec_tool(
+        reg,
+        ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
+    )?;
+    waited["result"]["text"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("reviewer turn has no text: {waited}"))
 }
 
 #[test]

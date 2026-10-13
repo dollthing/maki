@@ -4,24 +4,17 @@ local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 local plan_spec = require("maki.plan_spec")
 
-local MAX_NUDGES = 2
 local MAX_RETAINED_TASKS = 128
 local MAX_RETAINED_TURNS = 64
 local TURN_UNAVAILABLE_ERR = "turn_result_unavailable"
 local TURN_LIMIT_ERR = "task turn ticket limit reached"
 local TASK_LIMIT_ERR = "task record limit reached; despawn unused tasks"
-local SUMMARY_MISSING_ERROR = "subagent finished without providing a summary"
 local GENERAL_SEND_IN_PLAN_ERR =
   "general subagents cannot take new work in plan mode; despawn the task or switch to build mode"
 local GENERAL_BLOCKED_IN_PLAN_ERR =
   "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)"
-local NUDGE_SUMMARY =
-  "You finished your work but did not provide a summary. Reply with a concise summary of what you did and found."
 local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
-local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
-local RECURSIVE_UNMANAGED_WAIT_ERR =
-  "blocking task_wait is unavailable from an unmanaged subagent; pass timeout = 0 to check without waiting"
 local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
@@ -35,10 +28,9 @@ Subagent types (set via `subagent_type`):
 - `general`: Full tool access. For delegating implementation work.
 - `plan_reviewer`: Read-only audit of a finished plan. Only available in plan mode. Evaluates shape, test-to-acceptance-criteria coverage, and severity of risks, and answers with VERDICT: pass|fail.
 
-Use `task_spawn` to start work and `task_wait` to observe its exact turn. Managed
-nested waits yield turn capacity while descendants run. Queue follow-up work
-with `task_send` and release the child with `task_despawn`. `task` is a deprecated
-one-shot compatibility adapter.
+Use `task_spawn` to start work and `task_wait` to observe its exact turn. A
+waiting agent yields its turn capacity while its descendants run. Queue
+follow-up work with `task_send` and release the child with `task_despawn`.
 
 Notes:
 1. Launch multiple tasks concurrently when possible.
@@ -74,7 +66,7 @@ local opts = maki.api.register_options({
   max_concurrent = {
     default = 8,
     min = 1,
-    desc = "Deprecated. Process-wide fallback limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns.",
+    desc = "Process-wide subagent turn limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns.",
   },
   allow_model = {
     default = false,
@@ -82,7 +74,7 @@ local opts = maki.api.register_options({
   },
 })
 
-local schema = {
+local spawn_schema = {
   type = "object",
   required = { "description", "prompt" },
   additionalProperties = false,
@@ -115,22 +107,11 @@ local schema = {
 -- Only advertise `model` when the plugin opts in: it costs tokens in every
 -- task schema, and an off-by-default flag keeps the common path lean.
 if opts.allow_model then
-  schema.properties.model = {
+  spawn_schema.properties.model = {
     type = "string",
     description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell makima the model; makima will not guess. Overrides model_tier.',
   }
 end
-
-local examples = {
-  {
-    description = "Find auth middleware",
-    prompt = "Search the codebase for authentication middleware. Return file paths and a summary of how auth is implemented.",
-    model_tier = "weak",
-  },
-}
-
--- Process-wide cap on concurrent subagents, released on despawn or gc.
-local semaphore = maki.async.semaphore(opts.max_concurrent)
 
 -- Live tasks keyed by task_id.
 local tasks = {}
@@ -203,7 +184,10 @@ local function prepare(input, ctx)
     nil
 end
 
-local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
+-- Process-wide cap on concurrent subagents, released on despawn or gc.
+local semaphore = maki.async.semaphore(opts.max_concurrent)
+
+local function spawn_options(spec, input)
   return {
     model = { spec = spec.model.spec, thinking = input.thinking },
     system = spec.system,
@@ -211,18 +195,17 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
     output_schema = spec.output_schema,
     audience = spec.audience,
     name = input.description,
-    semaphore = turn_semaphore,
-    auto_deliver = auto_deliver,
+    semaphore = semaphore,
   }
 end
 
-local function project_result(result, status)
+local function project_result(result)
   local output = result.output or {}
   return {
     text = result.text,
     duration_ms = result.duration_ms,
-    input_tokens = status.input_tokens,
-    output_tokens = status.output_tokens,
+    input_tokens = result.input_tokens,
+    output_tokens = result.output_tokens,
     captured = result.captured or output[#output],
     error = result.error or (result.status == "cancelled" and (result.cancellation_reason or "cancelled")),
     user_message = result.user_message,
@@ -233,17 +216,10 @@ local function project_result(result, status)
   }
 end
 
-local function create_session(ctx, options, blocking)
+local function create_session(ctx, options)
   local agent, err = maki.agent.spawn(ctx, options)
   if not agent then
     return nil, err
-  end
-  if blocking then
-    local registered, close_err = agent:defer_close(ctx)
-    if not registered then
-      agent:close(ctx)
-      return nil, close_err
-    end
   end
   local latest
   local tickets = {}
@@ -286,7 +262,7 @@ local function create_session(ctx, options, blocking)
     order[#order + 1] = latest
     return latest
   end
-  function adapter:wait(call_ctx, turn_id, timeout, cumulative)
+  function adapter:wait(call_ctx, turn_id, timeout)
     -- Without an id, wait on the child's latest turn, which may be one the
     -- runtime admitted to hand it a result from its own subagents.
     local ticket
@@ -302,51 +278,11 @@ local function create_session(ctx, options, blocking)
     if not result then
       return nil, wait_err
     end
-    if not cumulative then
-      return project_result(result, result)
-    end
-    local status, status_err = agent:status(call_ctx)
-    if not status then
-      return nil, status_err
-    end
-    return project_result(result, status)
-  end
-  function adapter:prompt(message, call_ctx)
-    local id, send_err = self:send(message, call_ctx)
-    if not id then
-      return nil, send_err
-    end
-    local result, wait_err = self:wait(call_ctx, id, nil, true)
-    return result, wait_err or (result and result.error)
+    return project_result(result)
   end
   function adapter:idle(call_ctx)
     local status = agent:status(call_ctx)
     return status ~= nil and status.status ~= "running" and status.queued == 0
-  end
-  function adapter:status(call_ctx)
-    local status, status_err = agent:status(call_ctx)
-    if not status then
-      return nil, status_err
-    end
-    if status.status == "closed" then
-      return { status = "closed" }
-    end
-    if status.status == "running" or status.queued > 0 then
-      return { status = "running" }
-    end
-    local result, result_err = self:wait(call_ctx, latest, 0, true)
-    if result_err then
-      return nil, result_err
-    end
-    if not result then
-      return { status = "running" }
-    end
-    return {
-      status = "done",
-      result = result,
-      error = result.error,
-      retryable = result.retryable,
-    }
   end
   return adapter
 end
@@ -403,7 +339,7 @@ local function spawn(spec, input, ctx)
     return nil, TASK_LIMIT_ERR
   end
   local ok, sess, sess_err = pcall(function()
-    return create_session(ctx, ctx_opts(spec, input, semaphore, true))
+    return create_session(ctx, spawn_options(spec, input))
   end)
   if not ok then
     return nil, tostring(sess)
@@ -435,13 +371,6 @@ end
 
 -- task_spawn -----------------------------------------------------------------
 
-local spawn_schema = {
-  type = "object",
-  required = { "description", "prompt" },
-  additionalProperties = false,
-  properties = schema.properties,
-}
-
 local function spawn_handler(input, ctx)
   local spec, err = prepare(input, ctx)
   if err then
@@ -466,36 +395,6 @@ local function resolve_task(task_id)
     return nil, TASK_ACCESS_ERR
   end
   return task, nil
-end
-
--- task_get -------------------------------------------------------------------
-
-local get_schema = {
-  type = "object",
-  required = { "task_id" },
-  additionalProperties = false,
-  properties = {
-    task_id = { type = "string", description = "Task id returned by task_spawn." },
-  },
-}
-
-local function get_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
-  end
-  if task.closed then
-    return { llm_output = maki.json.encode({ status = "closed", error = task.error }) }
-  end
-  local status, err = task.sess:status(ctx)
-  if err then
-    return { llm_output = err, is_error = true }
-  end
-  if task.closed and task.error then
-    status.status = "closed"
-    status.error = task.error
-  end
-  return { llm_output = maki.json.encode(status) }
 end
 
 -- task_send ------------------------------------------------------------------
@@ -555,55 +454,6 @@ local function despawn_handler(input, ctx)
   return { llm_output = maki.json.encode({ ok = true }) }
 end
 
--- task (blocking composite) --------------------------------------------------
-local function handler(input, ctx)
-  if ctx:audience() == "general_sub" and not ctx:_maki_managed() then
-    return { llm_output = RECURSIVE_UNMANAGED_TASK_ERR, is_error = true }
-  end
-  local spec, err = prepare(input, ctx)
-  if err then
-    return err
-  end
-  local sess
-  local ok, out = pcall(function()
-    local session_err
-    sess, session_err = create_session(ctx, ctx_opts(spec, input, semaphore, false), true)
-    if not sess then
-      return { llm_output = tostring(session_err), is_error = true }
-    end
-    local result, prompt_err = sess:prompt(input.prompt, ctx)
-    local retries = 0
-    while result and result.text == "" and not spec.output_schema and not prompt_err and retries < MAX_NUDGES do
-      retries = retries + 1
-      result, prompt_err = sess:prompt(NUDGE_SUMMARY, ctx)
-    end
-    if prompt_err then
-      local text = result and result.text
-      return {
-        llm_output = text
-            and text ~= ""
-            and ("sub-agent interrupted (" .. prompt_err .. "). Partial output:\n" .. text)
-          or ("sub-agent error: " .. prompt_err),
-        is_error = true,
-      }
-    end
-    if not spec.output_schema and result.text == "" then
-      return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
-    end
-    return {
-      llm_output = result.captured and maki.json.encode(result.captured) or result.text,
-      format = "markdown",
-    }
-  end)
-  if sess then
-    sess:close(ctx)
-  end
-  if not ok then
-    return { llm_output = tostring(out), is_error = true }
-  end
-  return out
-end
-
 local wait_schema = {
   type = "object",
   required = { "task_id" },
@@ -619,9 +469,6 @@ local wait_schema = {
 }
 
 local function wait_handler(input, ctx)
-  if input.timeout ~= 0 and ctx:audience() == "general_sub" and not ctx:_maki_managed() then
-    return { llm_output = RECURSIVE_UNMANAGED_WAIT_ERR, is_error = true }
-  end
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
@@ -650,7 +497,7 @@ end
 local function restore(_input, output, is_error, ctx)
   local tol = ctx:tool_output_lines()
   return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
     width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
@@ -659,7 +506,7 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait. Managed nested waits yield turn capacity. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
+  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
     .. description,
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
@@ -672,28 +519,13 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_wait",
-  description = "Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent should finish its work before ending a turn; follow-up turns it runs after its own subagents report are not delivered on their own. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. Managed descendant waits release turn capacity while waiting. Also callable from code_execution.",
+  description = "Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent should finish its work before ending a turn; follow-up turns it runs after its own subagents report are not delivered on their own. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = wait_schema,
   handler = wait_handler,
   header = function(input)
     return "task_wait → " .. input.task_id
-  end,
-  restore = restore,
-})
-
-maki.api.register_tool({
-  name = "task_get",
-  deprecated = true,
-  description = "Deprecated nonblocking task observation. Returns {status, result?, error?, retryable?}. Use task_wait instead.",
-  kind = "execute",
-  audiences = { "main", "general_sub", "interpreter", "workflow" },
-  examples = {},
-  schema = get_schema,
-  handler = get_handler,
-  header = function()
-    return "task_get"
   end,
   restore = restore,
 })
@@ -723,19 +555,6 @@ maki.api.register_tool({
   header = function(input)
     return "task_despawn → " .. input.task_id
   end,
-  restore = restore,
-})
-
-maki.api.register_tool({
-  name = "task",
-  description = description,
-  deprecated = true,
-  kind = "execute",
-  audiences = { "main", "general_sub", "workflow" },
-  examples = examples,
-  schema = schema,
-  handler = handler,
-  header = header,
   restore = restore,
 })
 

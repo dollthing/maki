@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::tools::TASK_SPAWN_TOOL_NAME;
 use maki_agent::{
     AgentId, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
     McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -2094,8 +2095,8 @@ fn sub_usage_text() -> String {
 #[test]
 fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
     let mut app = streaming_app();
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
-    app.update(agent_msg(tool_start("task2", "task")));
+    app.update(agent_msg(tool_start(TASK_ID, TASK_SPAWN_TOOL_NAME)));
+    app.update(agent_msg(tool_start("task2", TASK_SPAWN_TOOL_NAME)));
 
     app.update(sub_turn_complete());
     // The second turn's tokens differ, so a sum or a stale first turn would fail.
@@ -2126,7 +2127,7 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
         "main-model",
         MAIN_COST,
     )));
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, TASK_SPAWN_TOOL_NAME)));
     if subagent_ran {
         app.update(sub_turn_complete());
     }
@@ -2148,7 +2149,7 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
 fn tool_inside_subagent_chat_gets_its_turn_usage() {
     const TOOL_ID: &str = "sub_bash";
     let mut app = streaming_app();
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, TASK_SPAWN_TOOL_NAME)));
     app.update(subagent_msg(
         tool_start(TOOL_ID, "bash"),
         TASK_ID,
@@ -2248,7 +2249,7 @@ fn cancel_resets_all_chats_and_indices() {
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
-        tool: "task".into(),
+        tool: TASK_SPAWN_TOOL_NAME.into(),
         output: ToolOutput::Plain("result".into()),
         is_error,
         annotation: None,
@@ -3493,7 +3494,7 @@ fn theme_arg_ambiguous_flashes() {
 fn tick_drains_live_bufs_of_background_chats() {
     let mut app = test_app();
     app.run_id = 1;
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, TASK_SPAWN_TOOL_NAME)));
     app.update(subagent_msg(tool_start(SUB_TOOL_ID, "bash"), TASK_ID, None));
     let buf = Arc::new(maki_agent::SharedBuf::new());
     app.update(subagent_msg(
@@ -4422,7 +4423,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: TASK_ID.into(),
-        tool: "task".into(),
+        tool: TASK_SPAWN_TOOL_NAME.into(),
         summary: "research".into(),
         annotation: None,
         input: None,
@@ -5833,7 +5834,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     let mut app = streaming_app_with_history();
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
-        tool: "task".into(),
+        tool: TASK_SPAWN_TOOL_NAME.into(),
         summary: "research".into(),
         annotation: None,
         input: None,
@@ -7109,7 +7110,7 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
     let count_after_outcome = app.chats[1].message_count();
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: TASK_ID.into(),
-        tool: "task".into(),
+        tool: TASK_SPAWN_TOOL_NAME.into(),
         output: ToolOutput::Plain("answer".into()),
         is_error: false,
         annotation: None,

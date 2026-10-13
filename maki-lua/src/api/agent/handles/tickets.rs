@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_lite::future::race;
@@ -8,8 +9,9 @@ use smol::Timer;
 
 use super::authority::{authorize, observe};
 use super::projection::result_table;
-use super::{AgentRuntime, LuaAgentTurn};
+use super::{AgentRuntime, LuaAgentTurn, session_state};
 use crate::agent_errors::{SELF_TURN_WAIT, TURN_WAIT_TIMEOUT};
+use crate::api::agent::LuaActorState;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
@@ -105,22 +107,42 @@ pub(super) async fn ticket_wait(
             PromptWaitError::Timeout => TURN_WAIT_TIMEOUT,
             PromptWaitError::Cancelled => CANCELLED_MSG,
         }));
-    } else if let Some(seconds) = timeout {
-        let settled = async {
-            ticket.wait().await;
-            Ok(())
-        };
-        let expired = async {
-            Timer::after(Duration::from_secs(seconds)).await;
-            Err(TURN_WAIT_TIMEOUT)
-        };
-        try_pair!(race(settled, expired).await);
     } else {
-        ticket.wait().await;
+        let released = release_caller_permit(&lua, &ctx);
+        let waited = wait_unmanaged(ticket, timeout).await;
+        if let Some(state) = released {
+            try_pair!(state.reacquire_turn_permit(&ctx.cancel).await);
+        }
+        try_pair!(waited);
     }
     try_pair!(ctx.validate_origin(&lua));
     withdraw_delivery(active.as_ref(), retained_ticket.turn_id());
     turn_result(&lua, &retained_ticket)
+}
+
+/// A turn on the plugin semaphore keeps its permit while it runs. Waiting on
+/// a child with the permit held could leave every permit with a waiter and
+/// none for the children, so the wait releases it until the child settles.
+fn release_caller_permit(lua: &Lua, ctx: &LuaCtx) -> Option<Arc<LuaActorState>> {
+    let caller = ctx.agent()?.execution_agent_id?;
+    let state = session_state(lua, caller)?;
+    state.release_turn_permit().then_some(state)
+}
+
+async fn wait_unmanaged(ticket: TurnTicket, timeout: Option<u64>) -> Result<(), &'static str> {
+    let Some(seconds) = timeout else {
+        ticket.wait().await;
+        return Ok(());
+    };
+    let settled = async {
+        ticket.wait().await;
+        Ok(())
+    };
+    let expired = async {
+        Timer::after(Duration::from_secs(seconds)).await;
+        Err(TURN_WAIT_TIMEOUT)
+    };
+    race(settled, expired).await
 }
 
 /// Cancel only this admitted turn.
