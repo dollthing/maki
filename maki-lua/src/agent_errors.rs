@@ -18,3 +18,9 @@ pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 pub const TRUSTED_MODEL_MUTATION_REQUIRED: &str =
     "host model mutation requires trusted handler authority";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
+pub const NOT_DESCENDANT_OF_CALLER: &str = "agent is not a descendant of the caller";
+pub const FOREIGN_AGENT_REFERENCE: &str = "agent reference belongs to another runtime";
+pub const ORCHESTRATION_CONTEXT_EXPIRED: &str = "orchestration context expired";
+pub const OUTPUT_SCHEMA_NOT_OBJECT: &str = "output_schema must have type object";
+pub const STRUCTURED_OUTPUT_CONFLICT: &str =
+    "output_schema conflicts with existing structured_output tool";

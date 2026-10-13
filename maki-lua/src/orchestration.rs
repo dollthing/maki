@@ -1,4 +1,6 @@
-use crate::agent_errors::{NO_ORCHESTRATION_SERVICES, ORCHESTRATION_SERVICES_EXPIRED};
+use crate::agent_errors::{
+    NO_ORCHESTRATION_SERVICES, ORCHESTRATION_CONTEXT_EXPIRED, ORCHESTRATION_SERVICES_EXPIRED,
+};
 use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
@@ -14,7 +16,6 @@ use std::{
     },
 };
 
-const EXPIRED_CONTEXT: &str = "orchestration context expired";
 const WRONG_TASK: &str = "orchestration context belongs to another task";
 static NEXT_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -43,7 +44,7 @@ pub(crate) fn existing_plugin_authority(
     lua.app_data_ref::<PluginAuthorities>()
         .and_then(|owners| owners.0.get(plugin).cloned())
         .filter(|owner| owner.generation == generation && owner.is_alive())
-        .ok_or_else(|| EXPIRED_CONTEXT.into())
+        .ok_or_else(|| ORCHESTRATION_CONTEXT_EXPIRED.into())
 }
 
 pub struct AgentEventRequest {
@@ -357,7 +358,7 @@ impl TrustedContext {
 
 impl ScopeAuthority {
     fn validate(&self, lua: &Lua) -> Result<(), String> {
-        let task = self.task.upgrade().ok_or(EXPIRED_CONTEXT)?;
+        let task = self.task.upgrade().ok_or(ORCHESTRATION_CONTEXT_EXPIRED)?;
         let current_id = active_task_id(lua);
         let cell = lock_cell(&task);
         if !cell.scope_alive
@@ -368,7 +369,7 @@ impl ScopeAuthority {
                 .is_some_and(|deadline| Instant::now() > deadline)
             || !self.owner.alive.load(Ordering::Acquire)
         {
-            return Err(EXPIRED_CONTEXT.into());
+            return Err(ORCHESTRATION_CONTEXT_EXPIRED.into());
         }
         if current_id != Some(cell.id) {
             return Err(WRONG_TASK.into());
@@ -410,9 +411,10 @@ pub(crate) fn validate_pinned_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPIRED_CONTEXT, ScopeAuthority, WRONG_TASK, close_event_callback, event_callback,
-        plugin_authority, register_event_callback, revoke_plugin,
+        ScopeAuthority, WRONG_TASK, close_event_callback, event_callback, plugin_authority,
+        register_event_callback, revoke_plugin,
     };
+    use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
     use maki_agent::cancel::CancelToken;
     use mlua::Lua;
@@ -432,12 +434,18 @@ mod tests {
         drop(sibling);
         assert!(authority.validate(&lua).is_ok());
         revoke_plugin(&lua, "owner");
-        assert_eq!(authority.validate(&lua).unwrap_err(), EXPIRED_CONTEXT);
+        assert_eq!(
+            authority.validate(&lua).unwrap_err(),
+            ORCHESTRATION_CONTEXT_EXPIRED
+        );
         authority.owner = plugin_authority(&lua, Arc::from("owner"));
         assert!(authority.validate(&lua).is_ok());
         let retained = first.handle().clone();
         drop(first);
-        assert_eq!(authority.validate(&lua).unwrap_err(), EXPIRED_CONTEXT);
+        assert_eq!(
+            authority.validate(&lua).unwrap_err(),
+            ORCHESTRATION_CONTEXT_EXPIRED
+        );
         drop(retained);
     }
 
@@ -472,7 +480,10 @@ mod tests {
             owner: plugin_authority(&lua, Arc::from("owner")),
         };
         drop(trigger);
-        assert_eq!(authority.validate(&lua).unwrap_err(), EXPIRED_CONTEXT);
+        assert_eq!(
+            authority.validate(&lua).unwrap_err(),
+            ORCHESTRATION_CONTEXT_EXPIRED
+        );
         let callback = lua.create_function(|_, ()| Ok(())).unwrap();
         let id = register_event_callback(&lua, Arc::from("owner"), callback).unwrap();
         let (_, _, first) = event_callback(&lua, id).unwrap();

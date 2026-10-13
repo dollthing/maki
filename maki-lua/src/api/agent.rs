@@ -58,7 +58,7 @@ use tracing::{info, warn};
 
 use crate::agent_errors::{
     INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY,
-    ORCHESTRATION_SERVICES_EXPIRED,
+    ORCHESTRATION_SERVICES_EXPIRED, STRUCTURED_OUTPUT_CONFLICT,
 };
 use crate::api::r#async::LuaSemaphore;
 use crate::api::tool::{audiences_to_lua, parse_audience};
@@ -1310,9 +1310,7 @@ async fn build_session(
                 })
             })
         {
-            return Ok(err_pair(
-                "output_schema conflicts with existing structured_output tool",
-            ));
+            return Ok(err_pair(STRUCTURED_OUTPUT_CONFLICT));
         }
         tools_json
             .as_array_mut()

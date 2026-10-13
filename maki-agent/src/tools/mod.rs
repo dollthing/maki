@@ -229,7 +229,7 @@ pub const TODOWRITE_TOOL_NAME: &str = "todo_write";
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
-pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 

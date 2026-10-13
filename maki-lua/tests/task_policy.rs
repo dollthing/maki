@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
-use maki_lua::PluginHost;
+use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
@@ -1352,8 +1352,8 @@ fn plan_mode_task_supports_structured_output_real_driver() {
     assert_eq!(structured_output["input_schema"], answer_schema());
 }
 
-#[test_case::test_case(json!({"type": "array"}), "output_schema must have type object" ; "non_object")]
-#[test_case::test_case(json!({"description": "missing type"}), "output_schema must have type object" ; "missing_type")]
+#[test_case::test_case(json!({"type": "array"}), OUTPUT_SCHEMA_NOT_OBJECT ; "non_object")]
+#[test_case::test_case(json!({"description": "missing type"}), OUTPUT_SCHEMA_NOT_OBJECT ; "missing_type")]
 #[test_case::test_case(json!({"type": "object", "properties": {"x": {"type": 42}}}), "invalid output_schema" ; "invalid_schema")]
 fn real_schema_validation_rejects_before_provider_request(schema: Value, expected: &str) {
     let provider = Arc::new(common::CannedProvider::new(vec![]));

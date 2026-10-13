@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use crate::agent_errors::OUTPUT_SCHEMA_NOT_OBJECT;
 use maki_agent::{
     TurnOutput,
     tools::{LocalTool, ToolAudience, local_tool},
@@ -29,7 +30,7 @@ pub(super) struct StructuredOutput {
 impl StructuredOutput {
     pub(super) fn compile(schema: Value) -> Result<Arc<Self>, String> {
         if schema.get("type").and_then(Value::as_str) != Some("object") {
-            return Err("output_schema must have type object".into());
+            return Err(OUTPUT_SCHEMA_NOT_OBJECT.into());
         }
         let validator = jsonschema::validator_for(&schema)
             .map_err(|error| format!("invalid output_schema: {error}"))?;

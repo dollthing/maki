@@ -1,8 +1,8 @@
 use super::{LuaActorState, LuaSession, SessionControl, build_session};
 use crate::agent_errors::{
-    DELEGATED_FOCUS, MANAGED_AUTHORITY_INACTIVE, NO_FOCUSED_AGENT, NO_ORCHESTRATION_SERVICES,
-    NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY, OTHER_RUNTIME, RESTRICTED_MODE_CHANGE,
-    TRUSTED_SUBSCRIPTION_REQUIRED, TURN_WAIT_TIMEOUT,
+    DELEGATED_FOCUS, FOREIGN_AGENT_REFERENCE, MANAGED_AUTHORITY_INACTIVE, NO_FOCUSED_AGENT,
+    NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY, NOT_DESCENDANT_OF_CALLER,
+    OTHER_RUNTIME, RESTRICTED_MODE_CHANGE, TRUSTED_SUBSCRIPTION_REQUIRED, TURN_WAIT_TIMEOUT,
 };
 use crate::api::util::{
     convert::json_to_lua,
@@ -407,7 +407,7 @@ fn observe(
     }
     let current = crate::runtime::current_managed_turn(lua).ok_or("managed authority expired")?;
     if !agent.ancestors.contains(&current.agent_id()) {
-        return Err("agent is not a descendant of the caller".into());
+        return Err(NOT_DESCENDANT_OF_CALLER.into());
     }
     Ok(Some(current))
 }
@@ -618,7 +618,7 @@ pub(super) fn get(
     }
     let (manager, _) = try_pair!(context_graph(lua, &ctx));
     if ctx.trusted(lua).is_err() && !manager.same_manager(try_pair!(reference.manager.managed())) {
-        return Ok(err_pair("agent reference belongs to another runtime"));
+        return Ok(err_pair(FOREIGN_AGENT_REFERENCE));
     }
     let agent = try_pair!(lookup(
         try_pair!(reference.manager.managed()).clone(),
