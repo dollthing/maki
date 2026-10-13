@@ -147,8 +147,11 @@ pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::C
     while let Some(token) = tokens.next() {
         let mut end = token.range.end;
         let token_raw = &arguments[token.range.clone()];
-        let literal = token_raw.starts_with(['\'', '"']);
+        let literal = token_raw.starts_with(['\'', '"', '\\']);
         if literal && token_raw.contains(['{', '}']) {
+            if token_raw.starts_with('\\') {
+                return Err(invalid("mixed quoted model syntax".into()));
+            }
             let quote = token_raw.chars().next().unwrap();
             let mut escaped = false;
             let close = token_raw.char_indices().skip(1).find_map(|(index, ch)| {

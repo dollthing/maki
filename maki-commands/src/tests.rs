@@ -105,6 +105,7 @@ fn model_selection_braces_and_trailing_options_agree(input: &str) {
 
 #[test_case("\"openai/gpt-5\"{thinking=high}"; "quoted_spec_with_options")]
 #[test_case("openai/\"gpt-5\"{thinking=high}"; "partially_quoted_spec")]
+#[test_case("\\a/b{thinking=high fast=true}"; "escaped_spec_with_split_options")]
 #[test_case("openai/gpt-5{fast=true} fast=false"; "duplicate_fast")]
 #[test_case("openai/gpt-5{thinking=high} thinking=off"; "duplicate_thinking")]
 #[test_case("fast=true fast=false"; "duplicate_options_only")]

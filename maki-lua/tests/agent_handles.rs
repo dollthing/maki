@@ -741,6 +741,9 @@ fn public_agent_prompt_timeout_retains_recoverable_ticket(timeout: u64) {
             &format!(
                 r#"
             local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            assert(not pcall(child.prompt, child, ctx, "malformed timeout", {{ timeout = -1 }}))
+            local untouched = assert(child:status(ctx))
+            assert(untouched.queued == 0 and untouched.active_turn == nil)
             local result, err = child:prompt(ctx, "held prompt", {{ timeout = {timeout} }})
             assert(result == nil and type(err) == "table")
             assert(err.kind == "timeout" and err.message == "{TURN_WAIT_TIMEOUT}")

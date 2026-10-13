@@ -1686,6 +1686,24 @@ fn exact_wait_observes_idle_actor() {
 }
 
 #[test]
+fn subscriptions_after_close_are_disconnected() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        handle.close();
+        task.await;
+        assert!(handle.subscribe_events().recv_async().await.is_err());
+        assert!(handle.subscribe_leased_events().recv_async().await.is_err());
+        assert!(
+            handle
+                .subscribe_config_commits()
+                .recv_async()
+                .await
+                .is_err()
+        );
+    });
+}
+
+#[test]
 fn close_releases_leases_stranded_in_unread_subscriptions() {
     smol::block_on(async {
         let (handle, task) = spawn(ScriptedBackend::new());

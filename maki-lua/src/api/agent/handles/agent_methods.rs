@@ -284,6 +284,10 @@ async fn agent_prompt(
     message: String,
     opts: Option<Table>,
 ) -> mlua::Result<(Option<Table>, Option<LuaValue>)> {
+    // Malformed options must fail before admission, not strand a queued turn.
+    if let Some(opts) = &opts {
+        opts.get::<Option<u64>>("timeout")?;
+    }
     let admitted = after_turn(opts.as_ref())?
         .and_then(|after_turn| admit(&lua, &this, &ctx, message, true, after_turn));
     let turn = match admitted {

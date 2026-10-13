@@ -803,7 +803,14 @@ impl ActorState {
             // channels whose receivers stopped before draining.
             self.event_observers.clear();
             self.leased_event_observers.clear();
+            self.config_observers.clear();
         }
+    }
+
+    /// After Close, a new subscriber gets a disconnected channel rather than
+    /// one that never receives anything.
+    fn close_emitted(&self) -> bool {
+        self.lifecycle != ActorLifecycle::Open && !self.close_pending
     }
 
     pub(crate) fn active_matches_correlation(&self, correlation: &str) -> bool {
@@ -1410,12 +1417,12 @@ impl AgentActorHandle {
 
     pub fn subscribe_leased_events(&self) -> flume::Receiver<LeasedActorEvent> {
         let (sender, receiver) = flume::unbounded();
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .leased_event_observers
-            .push((sender, Arc::clone(&self.inner.callback_drain)));
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state
+                .leased_event_observers
+                .push((sender, Arc::clone(&self.inner.callback_drain)));
+        }
         receiver
     }
 
@@ -1448,12 +1455,10 @@ impl AgentActorHandle {
 
     pub fn subscribe_events(&self) -> flume::Receiver<ActorEvent> {
         let (sender, receiver) = flume::unbounded();
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .event_observers
-            .push(sender);
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state.event_observers.push(sender);
+        }
         receiver
     }
 
@@ -1476,12 +1481,10 @@ impl AgentActorHandle {
 
     pub fn subscribe_config_commits(&self) -> flume::Receiver<ConfigCommit> {
         let (sender, receiver) = flume::unbounded();
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .config_observers
-            .push(sender);
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state.config_observers.push(sender);
+        }
         receiver
     }
 
@@ -2249,6 +2252,7 @@ impl AgentActorHandle {
                 return;
             }
             state.lifecycle = lifecycle;
+            state.close_pending = true;
             state.preparing = None;
             for entry in &state.operations {
                 if let ActorOperation::Prepared(pending) = entry {
@@ -2286,7 +2290,6 @@ impl AgentActorHandle {
         terminalize_work(&self.inner, drained, reason);
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.close_pending = true;
             state.finish_close(&self.inner);
         }
         self.inner.queue.notify();
