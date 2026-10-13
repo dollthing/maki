@@ -62,9 +62,7 @@ use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -1382,9 +1380,9 @@ impl App {
         }
 
         if !(self.status == Status::Streaming && is_streaming_stop_key(key))
-            && self.dispatch_override(key)
+            && let Some(id) = self.dispatch_override(key)
         {
-            return vec![];
+            return vec![Action::RunKeybind(id)];
         }
 
         if let Some(actions) = self.handle_ctrl(key) {
@@ -1413,16 +1411,14 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
-    fn dispatch_override(&self, key: KeyEvent) -> bool {
-        self.dispatch_keymap(key.code, key.modifiers)
-    }
-
-    fn dispatch_keymap(&self, key: KeyCode, modifiers: KeyModifiers) -> bool {
-        self.keymap_reader.load().entries.iter().any(|entry| {
-            entry.key == key
-                && entry.modifiers == modifiers
-                && self.lua_event_handle.run_keybind_callback(entry.id)
-        })
+    fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
+        self.keymap_reader
+            .load()
+            .entries
+            .iter()
+            .find(|entry| entry.key == key.code && entry.modifiers == key.modifiers)
+            .filter(|_| !self.lua_event_handle.is_disconnected())
+            .map(|entry| entry.id)
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {

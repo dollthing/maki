@@ -6606,25 +6606,28 @@ fn install_override(
         modifiers,
         desc: "plugin override".into(),
         plugin: Arc::from("test-plugin"),
-        id: 1,
+        id: OVERRIDE_ID,
     }]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     probe
 }
 
+const OVERRIDE_ID: u64 = 1;
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
 
 #[test]
 fn override_shadows_builtin_ctrl_when_no_overlay_open() {
     let mut app = test_app();
-    let probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
+    let _probe = install_override(&mut app, kb::HELP.code, kb::HELP.modifiers);
 
     let actions = app.update(Msg::Key(kb::HELP.to_key_event()));
 
-    assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(
+        matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]),
+        "{OVERRIDE_DISPATCHED}"
+    );
     assert!(
         !app.help_modal.is_open(),
         "override must consume the key before the built-in HELP handler runs"
@@ -6635,12 +6638,14 @@ fn override_shadows_builtin_ctrl_when_no_overlay_open() {
 fn override_shadows_quit_builtin() {
     let mut app = test_app();
     app.status = Status::Idle;
-    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
+    let _probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
 
-    assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(
+        matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]),
+        "{OVERRIDE_DISPATCHED}"
+    );
     assert_eq!(
         app.exit_request,
         ExitRequest::None,
@@ -6652,12 +6657,14 @@ fn override_shadows_quit_builtin() {
 fn override_shadows_tab_mode_toggle() {
     let mut app = test_app();
     let initial_mode = app.state.mode.clone();
-    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let _probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
 
-    assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(
+        matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]),
+        "{OVERRIDE_DISPATCHED}"
+    );
     assert_eq!(
         app.state.mode, initial_mode,
         "override must consume Tab before the built-in mode toggle runs"
@@ -6667,12 +6674,14 @@ fn override_shadows_tab_mode_toggle() {
 #[test]
 fn override_shadows_esc_builtin() {
     let mut app = test_app();
-    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let _probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(
+        matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]),
+        "{OVERRIDE_DISPATCHED}"
+    );
     assert!(
         app.last_esc.is_none(),
         "override must consume Esc before the built-in esc handler runs"
@@ -6683,7 +6692,7 @@ fn override_shadows_esc_builtin() {
 #[test]
 fn override_does_not_shadow_suspend() {
     let mut app = test_app();
-    let probe = install_override(&mut app, kb::SUSPEND.code, kb::SUSPEND.modifiers);
+    let _probe = install_override(&mut app, kb::SUSPEND.code, kb::SUSPEND.modifiers);
 
     let actions = app.update(Msg::Key(kb::SUSPEND.to_key_event()));
 
@@ -6691,7 +6700,12 @@ fn override_does_not_shadow_suspend() {
         actions.iter().any(|a| matches!(a, Action::Suspend)),
         "suspend is non-remappable: override must not shadow Ctrl+Z"
     );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::RunKeybind(_))),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]
@@ -6706,21 +6720,26 @@ fn builtin_runs_when_no_override() {
 #[test]
 fn plan_toggle_beats_override_when_open_and_after_dismiss() {
     let mut app = plan_app();
-    let probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
+    let _probe = install_override(&mut app, kb::PLAN_TOGGLE.code, kb::PLAN_TOGGLE.modifiers);
     assert!(app.plan_form.is_visible());
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    let mut actions = app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
     assert!(
         !app.plan_form.is_visible(),
         "open plan form must consume Ctrl+T before the override"
     );
 
-    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    actions.extend(app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event())));
     assert!(
         app.plan_form.is_visible(),
         "Ctrl+T must reopen the dismissed plan form despite the override"
     );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::RunKeybind(_))),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]
@@ -6728,7 +6747,7 @@ fn streaming_cancel_wins_over_quit_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
+    let _probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
 
@@ -6738,7 +6757,12 @@ fn streaming_cancel_wins_over_quit_override() {
     );
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.exit_request, ExitRequest::None);
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::RunKeybind(_))),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]
@@ -6762,7 +6786,7 @@ fn streaming_cancel_wins_over_esc_override() {
     app.run_id = 1;
     app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
-    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let _probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
@@ -6771,7 +6795,12 @@ fn streaming_cancel_wins_over_esc_override() {
         "built-in cancel must win while streaming even when Esc is overridden"
     );
     assert_eq!(app.status, Status::Idle);
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::RunKeybind(_))),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]

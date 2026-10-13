@@ -20,6 +20,7 @@ use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentR
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
+use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
@@ -1327,9 +1328,14 @@ impl EventHandle {
             .is_ok()
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    /// Runs keymap callback {id} against the target the host captured when
+    /// the key was pressed.
+    pub fn run_keybind_callback(&self, id: u64, target: Option<TrustedTarget>) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback {
+                id,
+                target: target.map(Box::new),
+            })
             .is_ok()
     }
 
@@ -2353,7 +2359,7 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        handle.run_keybind_callback(entry.id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2479,7 +2485,7 @@ mod tests {
         assert_eq!(keymaps.entries.len(), 1);
         assert_eq!(keymaps.entries[0].desc, "old keymap");
         host.event_handle()
-            .run_keybind_callback(keymaps.entries[0].id);
+            .run_keybind_callback(keymaps.entries[0].id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !command_snapshot(&host)

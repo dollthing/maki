@@ -521,6 +521,27 @@ async fn set_thinking(
     roundtrip(lua, tx, req).await
 }
 
+/// Persists the default thinking setting for new sessions without changing
+/// any live session. `mode` accepts the values `set_thinking` accepts.
+///
+/// @param mode string The thinking setting.
+/// @return (table|nil, string|nil) `{mode}` with the normalized setting, or nil and an error.
+/// @example
+/// maki.session.set_default_thinking("medium")
+#[lua_fn]
+async fn set_default_thinking(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    mode: String,
+) -> LuaResult<Pair<Value>> {
+    roundtrip(
+        lua,
+        tx,
+        SessionRequest::SetDefaultThinking { thinking: mode },
+    )
+    .await
+}
+
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once; these functions let plugins list, create, focus, rename, and
@@ -528,7 +549,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx)]
+    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx), set_default_thinking(tx)]
 }
 
 #[cfg(test)]

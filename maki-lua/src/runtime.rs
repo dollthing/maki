@@ -325,6 +325,7 @@ pub enum Request {
     },
     RunKeybindCallback {
         id: u64,
+        target: Option<Box<crate::orchestration::TrustedTarget>>,
     },
     /// Host list-picker dialog event, reported by id because the mlua
     /// callbacks stay in Lua app-data and never cross the UI channel.
@@ -5375,14 +5376,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             })
                             .detach();
                         }
-                        Request::RunKeybindCallback { id } => {
+                        Request::RunKeybindCallback { id, target } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
                                 let plugin = store.snapshot_entries().into_iter().find(|entry| entry.id == id)?.plugin;
                                 let key = store.callback_for_id(id)?;
                                 Some((rt.lua.registry_value::<Function>(key).ok()?, plugin))
                             });
                             if let Some((func, plugin)) = func {
-                                let target = crate::orchestration::resolve_target(&rt.lua, None);
+                                let target = crate::orchestration::validate_pinned_target(&rt.lua, target.map(|target| *target));
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let scope = TaskScope::detached(&lua);

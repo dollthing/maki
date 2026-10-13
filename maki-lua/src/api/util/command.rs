@@ -476,6 +476,9 @@ pub enum SessionRequest {
         set_default: bool,
         thinking: String,
     },
+    SetDefaultThinking {
+        thinking: String,
+    },
     Options {
         session: String,
     },

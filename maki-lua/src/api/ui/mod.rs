@@ -10,6 +10,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
+use crate::api::agent::{LuaAgentRef, focused_agent_ref};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
     StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
@@ -672,6 +673,23 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 
+/// Resolve the agent that has UI focus now. Later focus changes do not
+/// retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+/// control; this call grants no authority. Delegated tool handlers cannot read
+/// UI focus.
+///
+/// @return (AgentRef?, string?) Visibility-only reference, or nil and an error when no agent has focus.
+/// @example
+/// local focused, err = maki.ui.focused_agent()
+/// if focused then
+///   local agent = assert(maki.agent.get(ctx, focused))
+///   local selection = assert(agent:model(ctx))
+/// end
+#[lua_fn]
+fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
+    Ok((Some(try_pair!(focused_agent_ref(lua))), None))
+}
+
 lua_table! {
     /// Functions for building interactive UI. Create buffers to hold
     /// content, open floating or split windows to display them, highlight
@@ -684,7 +702,7 @@ lua_table! {
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
-        display_width, truncate_text,
+        display_width, truncate_text, focused_agent,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
         manual set_status_content, manual set_status_hint, manual set_window_title,
     ]

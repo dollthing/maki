@@ -399,6 +399,22 @@ pub(crate) fn resolve_target(
     Ok(target)
 }
 
+/// Revalidates a target the host pinned before the request reached Lua; a
+/// target that closed in between resolves to none rather than to focus.
+pub(crate) fn validate_pinned_target(
+    lua: &Lua,
+    target: Option<TrustedTarget>,
+) -> Result<Option<TrustedTarget>, String> {
+    let Some(target) = target.filter(|target| target.target.validate_live().is_ok()) else {
+        return Ok(None);
+    };
+    lua.app_data_ref::<OrchestrationServicesSlot>()
+        .and_then(|slot| slot.0.clone())
+        .ok_or("no host orchestration services")?
+        .validate_target(&target.target)?;
+    Ok(Some(target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

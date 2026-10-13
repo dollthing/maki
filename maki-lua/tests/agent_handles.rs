@@ -6,7 +6,7 @@ use maki_agent::{
 };
 use maki_commands::CommandInvocation;
 use maki_lua::{
-    PluginHost,
+    PluginHost, SessionRequest, UiAction,
     orchestration::{OrchestrationServices, TrustedTarget},
     test_support::InMemoryFs,
 };
@@ -1777,6 +1777,185 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
         assert_eq!(config.model.spec(), common::default_model().spec());
         shutdown_manager(&owner.manager).await;
         shutdown_manager(&restricted.manager).await;
+    });
+}
+
+#[test]
+fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
+    smol::block_on(async {
+        const PLUGIN: &str = "pr5_focus_pinning";
+        const KEY: &str = "<C-y>";
+        let focused = Fixture::start("pr5_focus_first", "");
+        let pinned = Fixture::start("pr5_focus_second", "");
+        for fixture in [&focused, &pinned] {
+            assert_eq!(
+                bounded(
+                    fixture.completed.recv_async(),
+                    "integration channel receive"
+                )
+                .await
+                .unwrap(),
+                Ok(())
+            );
+        }
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
+        let pinned_target = TrustedTarget {
+            target: pinned.manager.root().unwrap(),
+            template: template.clone(),
+        };
+        let services = Arc::new(RegisteredOrchestrationTargets::new(vec![
+            pinned_target.clone(),
+            TrustedTarget {
+                target: focused.manager.root().unwrap(),
+                template,
+            },
+        ]));
+        let handle = focused._host.event_handle();
+        handle.install_orchestration_services(services.clone());
+        focused
+            ._host
+            .load_source(
+                PLUGIN,
+                &format!(
+                    r#"
+            local captured
+            maki.api.register_command({{
+                name = "/pr5_focus_capture", tui_only = false,
+                handler = function() captured = assert(maki.ui.focused_agent()) end,
+            }})
+            maki.api.register_command({{
+                name = "/pr5_focus_check", tui_only = false,
+                handler = function(_, ctx)
+                    assert(assert(maki.ui.focused_agent()):id() ~= captured:id())
+                    assert(assert(maki.agent.get(ctx, captured)):id() == captured:id())
+                end,
+            }})
+            maki.keymap.set("n", "{KEY}", function(_, ctx)
+                assert(assert(maki.agent.current(ctx)):set_model(ctx, {{ thinking = "low" }}))
+            end)
+        "#
+                ),
+            )
+            .unwrap();
+        for (selected, command) in [(0, "/pr5_focus_capture"), (1, "/pr5_focus_check")] {
+            services.selected.store(selected, Ordering::SeqCst);
+            assert_eq!(
+                handle
+                    .run_command_for_test(Arc::from(PLUGIN), Arc::from(command), String::new(), 0)
+                    .recv_timeout(TEST_TIMEOUT)
+                    .unwrap(),
+                Ok(())
+            );
+        }
+        let keymap = focused._host.keymap_reader().load().entries[0].id;
+        assert!(handle.run_keybind_callback(keymap, Some(pinned_target)));
+        let thinking = |fixture: &Fixture| {
+            fixture
+                .manager
+                .root()
+                .unwrap()
+                .actor()
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .thinking
+        };
+        bounded(
+            async {
+                while thinking(&pinned) != ThinkingConfig::Effort(Effort::Low) {
+                    smol::future::yield_now().await;
+                }
+            },
+            "pinned keybind target update",
+        )
+        .await;
+        assert_eq!(thinking(&focused), ThinkingConfig::Off);
+        shutdown_manager(&focused.manager).await;
+        shutdown_manager(&pinned.manager).await;
+    });
+}
+
+#[test]
+fn bundled_thinking_command_updates_only_its_target_agent() {
+    smol::block_on(async {
+        const PLUGIN: &str = "thinking";
+        let target = Fixture::start("pr5_thinking_target", "");
+        let other = Fixture::start("pr5_thinking_other", "");
+        for fixture in [&target, &other] {
+            assert_eq!(
+                bounded(
+                    fixture.completed.recv_async(),
+                    "integration channel receive"
+                )
+                .await
+                .unwrap(),
+                Ok(())
+            );
+        }
+        let (template, _events, _cancel) = common::ctx_with_canned_provider();
+        let services = Arc::new(RegisteredOrchestrationTargets::new(vec![
+            TrustedTarget {
+                target: target.manager.root().unwrap(),
+                template: template.clone(),
+            },
+            TrustedTarget {
+                target: other.manager.root().unwrap(),
+                template,
+            },
+        ]));
+        let handle = target._host.event_handle();
+        handle.install_orchestration_services(services);
+        target
+            ._host
+            .load_source(PLUGIN, include_str!("../../plugins/thinking/init.lua"))
+            .unwrap();
+        let ui = target._host.ui_action_rx();
+        let (flash_tx, flashes) = flume::unbounded();
+        let (default_tx, defaults) = flume::unbounded();
+        std::thread::spawn(move || {
+            while let Ok(action) = ui.recv() {
+                match action {
+                    UiAction::Flash(message) => {
+                        let _ = flash_tx.send(message);
+                    }
+                    UiAction::Session {
+                        req: SessionRequest::SetDefaultThinking { thinking },
+                        reply_tx,
+                    } => {
+                        let _ = reply_tx.send(Ok(json!({ "mode": thinking.clone() })));
+                        let _ = default_tx.send(thinking);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        assert_eq!(
+            handle
+                .run_command_for_test(Arc::from(PLUGIN), Arc::from("/thinking"), "low".into(), 0)
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(defaults.recv_timeout(TEST_TIMEOUT).unwrap(), "low");
+        assert_eq!(
+            flashes.recv_timeout(TEST_TIMEOUT).unwrap(),
+            "Thinking: low (default for new sessions)"
+        );
+        let thinking = |fixture: &Fixture| {
+            fixture
+                .manager
+                .root()
+                .unwrap()
+                .actor()
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .thinking
+        };
+        assert_eq!(thinking(&target), ThinkingConfig::Effort(Effort::Low));
+        assert_eq!(thinking(&other), ThinkingConfig::Off);
+        shutdown_manager(&target.manager).await;
+        shutdown_manager(&other.manager).await;
     });
 }
 

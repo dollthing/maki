@@ -4214,6 +4214,48 @@ maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
+---
+
+### `maki.model.info()` {#maki-model-info}
+
+```lua
+maki.model.info({spec})
+```
+
+Describes a model by spec without addressing any agent. Unknown specs
+return an error.
+
+**Parameters:**
+
+- `{spec}` (`string`) Model spec, e.g. `"anthropic/claude-sonnet-4-20250514"`.
+
+**Returns:** (`table|nil`, `string|nil`) `{spec, provider, id, tier, supports_thinking}`, or nil and an error.
+
+**Example:**
+
+```lua
+local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
+```
+
+---
+
+### `maki.model.thinking_levels()` {#maki-model-thinking_levels}
+
+```lua
+maki.model.thinking_levels()
+```
+
+Lists the thinking levels a selection accepts, from `off` to `max`. A
+token budget is also accepted.
+
+**Returns:** table Array of thinking level names.
+
+**Example:**
+
+```lua
+local levels = maki.model.thinking_levels()
+```
+
 
 ## maki.net {#maki-net}
 
@@ -4677,6 +4719,29 @@ See [Configuration changes](/docs/modes/#configuration-changes).
 
 ```lua
 maki.session.set_thinking({ mode = "medium", set_default = true })
+```
+
+---
+
+### `maki.session.set_default_thinking()` {#maki-session-set_default_thinking}
+
+```lua
+maki.session.set_default_thinking({mode})
+```
+
+Persists the default thinking setting for new sessions without changing
+any live session. `mode` accepts the values `set_thinking` accepts.
+
+**Parameters:**
+
+- `{mode}` (`string`) The thinking setting.
+
+**Returns:** (`table|nil`, `string|nil`) `{mode}` with the normalized setting, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.set_default_thinking("medium")
 ```
 
 
@@ -6410,6 +6475,31 @@ Splits a string at a display-cell boundary.
 ```lua
 local t = maki.ui.truncate_text("hello world", 5)
 -- t.head == "hello", t.tail == " world"
+```
+
+---
+
+### `maki.ui.focused_agent()` {#maki-ui-focused_agent}
+
+```lua
+maki.ui.focused_agent()
+```
+
+Resolve the agent that has UI focus now. Later focus changes do not
+retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+control; this call grants no authority. Delegated tool handlers cannot read
+UI focus.
+
+**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Visibility-only reference, or nil and an error when no agent has focus.
+
+**Example:**
+
+```lua
+local focused, err = maki.ui.focused_agent()
+if focused then
+  local agent = assert(maki.agent.get(ctx, focused))
+  local selection = assert(agent:model(ctx))
+end
 ```
 
 ---

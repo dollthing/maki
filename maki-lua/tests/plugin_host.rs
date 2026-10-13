@@ -6432,7 +6432,7 @@ fn sessions_keybind_initializes_and_closes(close_key: &str) {
                 && entry.plugin.as_ref() == "sessions"
         })
         .expect("bundled sessions Ctrl+P keybind is missing");
-    assert!(handle.run_keybind_callback(entry.id));
+    assert!(handle.run_keybind_callback(entry.id, None));
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close(close_key);

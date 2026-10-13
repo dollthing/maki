@@ -24,6 +24,8 @@ pub(crate) const TRUSTED_SUBSCRIPTION_REQUIRED: &str =
     "agent subscriptions require trusted authority";
 const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
+const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
+const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
 
 #[derive(Clone)]
 enum AgentRuntime {
@@ -123,7 +125,7 @@ impl LuaAgent {
 }
 
 #[derive(Clone)]
-pub(super) struct LuaAgentRef {
+pub(crate) struct LuaAgentRef {
     manager: AgentRuntime,
     id: Option<AgentId>,
     held: Option<AgentRef>,
@@ -535,6 +537,21 @@ pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
     try_pair!(scope(lua, &ctx, id));
     Ok((Some(try_pair!(lookup(manager, id, lua))), None))
+}
+
+/// Resolves the agent that has UI focus now, pinned against later focus changes.
+pub(crate) fn focused_agent_ref(lua: &Lua) -> Result<LuaAgentRef, String> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Err(DELEGATED_FOCUS.into());
+    }
+    let held = crate::orchestration::resolve_target(lua, None)?
+        .ok_or(NO_FOCUSED_AGENT)?
+        .target;
+    Ok(LuaAgentRef {
+        manager: AgentRuntime::Managed(held.manager()),
+        id: Some(held.id()),
+        held: Some(held),
+    })
 }
 
 /// Read the root agent of this context's graph.

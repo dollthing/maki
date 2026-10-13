@@ -6,7 +6,7 @@ use maki_providers::{
     CompleteModelSelection, Model, ModelSelection, RequestOptions, ThinkingConfig,
     ThinkingConfigExt,
 };
-use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, UserDataRef, Value};
+use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
@@ -249,6 +249,39 @@ async fn set(
     roundtrip(lua, tx, req).await
 }
 
+/// Describes a model by spec without addressing any agent. Unknown specs
+/// return an error.
+///
+/// @param spec string Model spec, e.g. `"anthropic/claude-sonnet-4-20250514"`.
+/// @return (table|nil, string|nil) `{spec, provider, id, tier, supports_thinking}`, or nil and an error.
+/// @example
+/// local info = assert(maki.model.info("anthropic/claude-sonnet-4-20250514"))
+#[lua_fn]
+fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
+    let model = match Model::from_spec(&spec) {
+        Ok(model) => model,
+        Err(error) => return Ok(err_pair(error.to_string())),
+    };
+    let table = lua.create_table()?;
+    table.set("spec", model.spec())?;
+    table.set("provider", model.provider.to_string())?;
+    table.set("id", model.id.clone())?;
+    table.set("tier", model.tier.to_string())?;
+    table.set("supports_thinking", model.supports_thinking())?;
+    Ok((Some(table), None))
+}
+
+/// Lists the thinking levels a selection accepts, from `off` to `max`. A
+/// token budget is also accepted.
+///
+/// @return table Array of thinking level names.
+/// @example
+/// local levels = maki.model.thinking_levels()
+#[lua_fn]
+fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
+    lua.create_sequence_from(ThinkingConfig::options().iter().copied())
+}
+
 fn host_root_services(lua: &Lua) -> Option<Arc<HostRootServices>> {
     if crate::runtime::current_managed_turn(lua).is_some() {
         return None;
@@ -262,7 +295,7 @@ lua_table! {
     /// model for a keybind. Non-UI hosts supply root reads and discovery; SDK
     /// and ACP also support selection updates. Fixed print roots reject updates.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx)]
+    DOCS [get(tx), available(tx), set(tx), info, thinking_levels]
 }
 
 #[cfg(test)]

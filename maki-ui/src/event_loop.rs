@@ -3525,6 +3525,22 @@ impl<'t> EventLoop<'t> {
                 set_default,
                 thinking,
             } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
+            SessionRequest::SetDefaultThinking { thinking } => {
+                let reply =
+                    DomainThinkingConfig::parse(thinking.trim(), DomainThinkingConfig::default())
+                        .map_err(str::to_owned)
+                        .and_then(|thinking| {
+                            write_prefs(
+                                &self.ctx.storage,
+                                &Prefs {
+                                    default_thinking: Some(thinking.into()),
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                            Ok(json!({ "mode": thinking.to_string() }))
+                        });
+                let _ = reply_tx.send(reply);
+            }
         }
     }
 
@@ -4205,8 +4221,9 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::RunKeybind(id) => self.run_keybind(idx, id),
             Action::SelectModel(selection) => {
-                let target = self.selected_model_target(idx);
+                let target = self.selected_target(idx);
                 self.dispatch_model_selection(idx, target, selection, None);
             }
             Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
@@ -4525,7 +4542,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, idx: usize, spec: &str) {
-        let target = self.selected_model_target(idx);
+        let target = self.selected_target(idx);
         self.dispatch_model_selection(
             idx,
             target,
@@ -4537,7 +4554,25 @@ impl<'t> EventLoop<'t> {
         );
     }
 
-    fn selected_model_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
+    /// Pins the keymap callback to the agent selected when the key was
+    /// pressed, so later focus changes do not retarget it.
+    fn run_keybind(&mut self, idx: usize, id: u64) {
+        self.sync_orchestration();
+        let target = self.selected_target(idx).and_then(|target| {
+            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, &target)
+                .ok()
+                .map(|template| maki_lua::orchestration::TrustedTarget { target, template })
+        });
+        if !self.sessions[idx]
+            .app
+            .lua_event_handle
+            .run_keybind_callback(id, target)
+        {
+            tracing::warn!(keybind_id = id, "keybind callback queue is full");
+        }
+    }
+
+    fn selected_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
         let runtime = &self.sessions[idx];
         let (manager, root) = runtime.handles.manager_and_root();
         manager
