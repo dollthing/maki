@@ -17,6 +17,9 @@ pub type CommandFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub const MAX_COMMAND_DEPTH: usize = 8;
 pub const COMPACT_COMMAND_NAME: &str = "/compact";
 pub const MODEL_COMMAND_NAME: &str = "/model";
+pub(crate) const MALFORMED_MODEL_OPTIONS: &str = "malformed model options";
+pub(crate) const MIXED_QUOTED_MODEL_SYNTAX: &str = "mixed quoted model syntax";
+pub(crate) const MODEL_OPTION_KEY_VALUE: &str = "expected model option key=value";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -150,7 +153,7 @@ pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::C
         let literal = token_raw.starts_with(['\'', '"', '\\']);
         if literal && token_raw.contains(['{', '}']) {
             if token_raw.starts_with('\\') {
-                return Err(invalid("mixed quoted model syntax".into()));
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
             }
             let quote = token_raw.chars().next().unwrap();
             let mut escaped = false;
@@ -166,13 +169,13 @@ pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::C
                 }
             });
             if close.is_none_or(|close| close + quote.len_utf8() != token_raw.len()) {
-                return Err(invalid("mixed quoted model syntax".into()));
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
             }
         }
         if !literal && arguments[token.range.clone()].contains('{') {
             while !arguments[token.range.start..end].ends_with('}') {
                 let Some(next) = tokens.next() else {
-                    return Err(invalid("malformed model options".into()));
+                    return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
                 };
                 end = next.range.end;
             }
@@ -184,15 +187,15 @@ pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::C
                 .map_err(|error| invalid(error.to_string()))?;
         } else if let Some(open) = raw.find('{') {
             if !raw.ends_with('}') || raw[..open].contains('}') {
-                return Err(invalid("malformed model options".into()));
+                return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
             }
             let spec = &raw[..open];
             if spec.contains(['\'', '"', '\\']) {
-                return Err(invalid("mixed quoted model syntax".into()));
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
             }
             let options = &raw[open + 1..raw.len() - 1];
             if options.is_empty() || options.contains(['{', '}']) {
-                return Err(invalid("malformed model options".into()));
+                return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
             }
             selection
                 .set_spec(spec)
@@ -201,17 +204,17 @@ pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::C
                 let tokens =
                     crate::lex_strict(option).map_err(|error| invalid(error.to_string()))?;
                 let [token] = tokens.as_slice() else {
-                    return Err(invalid("malformed model options".into()));
+                    return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
                 };
                 let Some((key, value)) = token.value.split_once('=') else {
-                    return Err(invalid("expected model option key=value".into()));
+                    return Err(invalid(MODEL_OPTION_KEY_VALUE.into()));
                 };
                 selection
                     .set_option(key, value)
                     .map_err(|error| invalid(error.to_string()))?;
             }
         } else if raw.contains('}') {
-            return Err(invalid("malformed model options".into()));
+            return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
         } else if let Some((key, value)) = token.value.split_once('=') {
             selection
                 .set_option(key, value)

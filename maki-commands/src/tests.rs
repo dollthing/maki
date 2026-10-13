@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use super::*;
 use crate::completion::{CompletionInvalidation, CompletionPublisher, CompletionSource};
+use crate::spec::{MALFORMED_MODEL_OPTIONS, MIXED_QUOTED_MODEL_SYNTAX, MODEL_OPTION_KEY_VALUE};
+use maki_domain::{MODEL_FAST_KEY, MODEL_THINKING_KEY, ModelSelectionError, parse_thinking};
 use test_case::test_case;
 
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+const UNKNOWN_OPTION_KEY: &str = "unknown";
 
 struct OutcomeBehavior(CommandOutcome);
 struct CountingBehavior(Arc<AtomicU64>);
@@ -103,23 +106,35 @@ fn model_selection_braces_and_trailing_options_agree(input: &str) {
     );
 }
 
-#[test_case("\"openai/gpt-5\"{thinking=high}"; "quoted_spec_with_options")]
-#[test_case("openai/\"gpt-5\"{thinking=high}"; "partially_quoted_spec")]
-#[test_case("\\a/b{thinking=high fast=true}"; "escaped_spec_with_split_options")]
-#[test_case("openai/gpt-5{fast=true} fast=false"; "duplicate_fast")]
-#[test_case("openai/gpt-5{thinking=high} thinking=off"; "duplicate_thinking")]
-#[test_case("fast=true fast=false"; "duplicate_options_only")]
-#[test_case("thinking=off thinking=high"; "duplicate_thinking_only")]
-#[test_case("unknown=true"; "unknown_options_only")]
-#[test_case("fast=maybe"; "invalid_bool")]
-#[test_case("thinking=unknown"; "invalid_thinking")]
-#[test_case("openai/gpt-5{unknown=true}"; "unknown")]
-#[test_case("openai/gpt-5{fast=true"; "unclosed")]
-#[test_case("openai/gpt-5{}"; "empty")]
-#[test_case("openai/gpt-5{fast=true,}"; "trailing_comma")]
-#[test_case("openai/gpt-5{fast=true}{thinking=high}"; "multiple_blocks")]
-fn model_selection_rejects_duplicate_and_malformed_options(input: &str) {
-    assert!(parse_model_selection(input).is_err());
+#[test_case("\"openai/gpt-5\"{thinking=high}", MIXED_QUOTED_MODEL_SYNTAX.into(); "quoted_spec_with_options")]
+#[test_case("openai/\"gpt-5\"{thinking=high}", MIXED_QUOTED_MODEL_SYNTAX.into(); "partially_quoted_spec")]
+#[test_case("\\a/b{thinking=high fast=true}", MIXED_QUOTED_MODEL_SYNTAX.into(); "escaped_spec_with_split_options")]
+#[test_case("openai/gpt-5{fast=true} fast=false", duplicate(MODEL_FAST_KEY); "duplicate_fast")]
+#[test_case("openai/gpt-5{thinking=high} thinking=off", duplicate(MODEL_THINKING_KEY); "duplicate_thinking")]
+#[test_case("fast=true fast=false", duplicate(MODEL_FAST_KEY); "duplicate_options_only")]
+#[test_case("thinking=off thinking=high", duplicate(MODEL_THINKING_KEY); "duplicate_thinking_only")]
+#[test_case("unknown=true", unknown_option(); "unknown_options_only")]
+#[test_case("fast=maybe", ModelSelectionError::InvalidFast.to_string(); "invalid_bool")]
+#[test_case("thinking=unknown", parse_thinking("unknown").unwrap_err().to_string(); "invalid_thinking")]
+#[test_case("openai/gpt-5{unknown=true}", unknown_option(); "unknown")]
+#[test_case("openai/gpt-5{fast=true", MALFORMED_MODEL_OPTIONS.into(); "unclosed")]
+#[test_case("openai/gpt-5{}", MALFORMED_MODEL_OPTIONS.into(); "empty")]
+#[test_case("openai/gpt-5{fast=true,}", MALFORMED_MODEL_OPTIONS.into(); "trailing_comma")]
+#[test_case("openai/gpt-5{fast=true}{thinking=high}", MALFORMED_MODEL_OPTIONS.into(); "multiple_blocks")]
+#[test_case("openai/gpt-5{fast}", MODEL_OPTION_KEY_VALUE.into(); "missing_option_value")]
+fn model_selection_rejects_duplicate_and_malformed_options(input: &str, expected: String) {
+    assert_eq!(
+        parse_model_selection(input).unwrap_err(),
+        CommandError::Producer(Arc::from(expected))
+    );
+}
+
+fn duplicate(key: &str) -> String {
+    ModelSelectionError::Duplicate(key.into()).to_string()
+}
+
+fn unknown_option() -> String {
+    ModelSelectionError::Unknown(UNKNOWN_OPTION_KEY.into()).to_string()
 }
 
 #[test_case("\"openai/gpt-5{thinking=high}\"", "openai/gpt-5{thinking=high}"; "quoted_options_literal")]
@@ -132,17 +147,6 @@ fn fully_quoted_model_token_preserves_literal(input: &str, expected: &str) {
     assert_eq!(selection.spec.as_deref(), Some(expected));
     assert_eq!(selection.thinking, None);
     assert_eq!(selection.fast, None);
-}
-
-#[test]
-fn quoted_model_selection_token_is_literal() {
-    assert_eq!(
-        parse_model_selection("\"fast=true\"")
-            .unwrap()
-            .spec
-            .as_deref(),
-        Some("fast=true")
-    );
 }
 
 #[test_case(1, Some(1); "pinned_subject")]
