@@ -2346,48 +2346,46 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn sdk_structured_model_command_routes_partial_selection() {
-        for (input, expected) in [
-            (
-                "/model gpt-5 thinking=high fast=true",
-                maki_commands::ModelSelection {
-                    spec: Some(Arc::from("openai/gpt-5")),
-                    thinking: Some(maki_providers::ThinkingConfig::Effort(
-                        maki_providers::Effort::High,
-                    )),
-                    fast: Some(true),
-                },
-            ),
-            (
-                "/model thinking=off fast=false",
-                maki_commands::ModelSelection {
-                    spec: None,
-                    thinking: Some(maki_providers::ThinkingConfig::Off),
-                    fast: Some(false),
-                },
-            ),
-        ] {
-            let commands = sdk_commands(CommandRegistry::new());
-            let registry = commands.registry.clone();
-            let target = commands.target.clone();
-            let content = CommandContent::from(input);
-            let dispatch =
-                smol::spawn(async move { registry.dispatch_input(&target, content).await });
-            let CommandRoute::Selection {
-                selection,
-                response,
-            } = commands.route_rx.recv().unwrap()
-            else {
-                panic!("expected structured model route");
-            };
-            assert_eq!(selection, expected);
-            response.send(Ok(HostResponse::Completed)).unwrap();
-            assert!(matches!(
-                smol::block_on(dispatch),
-                InputDispatch::Dispatched(CommandOutcome::Completed)
-            ));
-        }
+    #[test_case(
+        "/model gpt-5 thinking=high fast=true",
+        maki_commands::ModelSelection {
+            spec: Some(Arc::from(TARGET_MODEL)),
+            thinking: Some(maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High)),
+            fast: Some(true),
+        };
+        "spec_thinking_and_fast"
+    )]
+    #[test_case(
+        "/model thinking=off fast=false",
+        maki_commands::ModelSelection {
+            spec: None,
+            thinking: Some(maki_providers::ThinkingConfig::Off),
+            fast: Some(false),
+        };
+        "options_only"
+    )]
+    fn sdk_structured_model_command_routes_partial_selection(
+        input: &str,
+        expected: maki_commands::ModelSelection,
+    ) {
+        let commands = sdk_commands(CommandRegistry::new());
+        let registry = commands.registry.clone();
+        let target = commands.target.clone();
+        let content = CommandContent::from(input);
+        let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
+        let CommandRoute::Selection {
+            selection,
+            response,
+        } = commands.route_rx.recv().unwrap()
+        else {
+            panic!("expected structured model route");
+        };
+        assert_eq!(selection, expected);
+        response.send(Ok(HostResponse::Completed)).unwrap();
+        assert!(matches!(
+            smol::block_on(dispatch),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
     }
 
     #[test]
@@ -2549,20 +2547,21 @@ mod tests {
             maki_providers::ThinkingConfig::Off
         );
         let before_version = coordinator.read().options().version;
+        let thinking = maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High);
         let selection = smol::block_on(root.set_model(
             &reference,
             maki_providers::ModelSelection {
-                fast: Some(false),
-                thinking: Some(maki_providers::ThinkingConfig::Off),
+                thinking: Some(thinking),
                 ..Default::default()
             },
         ))
         .unwrap();
+        assert_eq!(selection.spec.as_ref(), TARGET_MODEL);
         assert!(!selection.fast);
-        assert_eq!(selection.thinking, maki_providers::ThinkingConfig::Off);
-        assert_eq!(selection, before_selection);
-        assert_eq!(coordinator.read().options().version, before_version);
-        assert_eq!(checkpointed.lock().unwrap().len(), 1);
+        assert_eq!(selection.thinking, thinking);
+        assert_eq!(root.model(&reference).unwrap(), selection);
+        assert!(coordinator.read().options().version > before_version);
+        assert_eq!(checkpointed.lock().unwrap().len(), 2);
         assert!(matches!(
             root.unsupported(&reference),
             Err(maki_lua::host_root::HostRootError::UnsupportedOperation)
