@@ -7177,8 +7177,8 @@ mod tests {
         release_runtime(runtime);
     }
 
-    #[test_case("/model anthropic/claude-opus-4-6 thinking=off fast=false"; "trailing_options")]
-    #[test_case("/model anthropic/claude-opus-4-6{thinking=off,fast=false}"; "embedded_options")]
+    #[test_case("/model anthropic/claude-opus-4-6 thinking=high fast=false"; "trailing_options")]
+    #[test_case("/model anthropic/claude-opus-4-6{thinking=high,fast=false}"; "embedded_options")]
     fn live_session_requests_remain_independent_during_changes_and_restore(command: &str) {
         use maki_agent::actor::PreparedModel;
         use maki_providers::{RequestOptions, Role, StopReason, StreamResponse};
@@ -7281,6 +7281,14 @@ mod tests {
                 }
                 .clamped(&model(spec))
             };
+            let changed = |fast| {
+                RequestOptions {
+                    thinking: DomainThinkingConfig::Effort(maki_providers::Effort::High),
+                    fast,
+                }
+                .clamped(&model(FIRST))
+            };
+            assert_ne!(changed(false), expected(FIRST, false));
             send(event_loop, 1);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
@@ -7332,7 +7340,7 @@ mod tests {
             send(event_loop, 2);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
-                ("changed", FIRST.into(), expected(FIRST, false))
+                ("changed", FIRST.into(), changed(false))
             );
 
             event_loop.set_focused(2);
@@ -7359,7 +7367,7 @@ mod tests {
             send(event_loop, 2);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
-                ("changed", FIRST.into(), expected(FIRST, true))
+                ("changed", FIRST.into(), changed(true))
             );
 
             let mut stored = AppSession::new(THIRD, &event_loop.session_cwd);
