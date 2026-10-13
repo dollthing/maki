@@ -1897,6 +1897,7 @@ struct OrchestrationRevision {
     live: bool,
     root_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
     selected_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
+    model_policy: Arc<ModelPolicy>,
     cwd: Arc<PathBuf>,
 }
 
@@ -1917,6 +1918,7 @@ impl OrchestrationRevision {
             && self.cwd == other.cwd
             && same_config(&self.root_config, &other.root_config)
             && same_config(&self.selected_config, &other.selected_config)
+            && Arc::ptr_eq(&self.model_policy, &other.model_policy)
     }
 }
 
@@ -1930,6 +1932,7 @@ fn orchestration_revision(runtime: &SessionRuntime) -> OrchestrationRevision {
         live: manager.lookup(selected).is_ok(),
         root_config: config(root),
         selected_config: config(selected),
+        model_policy: Arc::clone(&runtime.handles.orchestration_template.model_policy),
         cwd: runtime.handles.cwd_slot().load_full(),
     }
 }
@@ -2345,6 +2348,22 @@ impl<'t> EventLoop<'t> {
         }
         self.ctx.command_runtime.sync_admissions(admissions);
         self.orchestration.select(focused);
+        self.sync_model_discovery();
+    }
+
+    fn sync_model_discovery(&mut self) {
+        for runtime in &mut self.sessions {
+            let specs = selected_agent(runtime)
+                .and_then(|target| {
+                    maki_lua::orchestration::OrchestrationServices::available_models(
+                        &*self.orchestration,
+                        &target,
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            runtime.app.project_model_discovery(specs);
+        }
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -3757,47 +3776,32 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
         let timeouts = self.ctx.timeouts;
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
         smol::spawn(async move {
             let mut committed = None;
             let result = match reservation {
-                Ok(reservation) => {
-                    let requested_spec = spec.clone();
-                    prepare_config_change(
-                        reservation,
-                        async move {
-                            let model = smol::unblock(move || {
-                                requested_spec
-                                    .map(|spec| {
-                                        if !policy.allows(&spec) {
-                                            return Err(format!("model is not allowed: {spec}"));
-                                        }
-                                        let model = Model::from_spec(&spec)
-                                            .map_err(|error| error.to_string())?;
-                                        prepare_provider(model, timeouts)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                    .transpose()
-                            })
-                            .await?;
-                            Ok(maki_agent::actor::ConfigChange::Patch(
-                                maki_agent::actor::ConfigPatch {
-                                    model,
-                                    thinking,
-                                    toggle_thinking,
-                                    fast,
-                                    ..Default::default()
-                                },
-                            ))
+                Ok(reservation) => prepare_config_change(
+                    reservation,
+                    prepare_model_patch(
+                        spec.as_deref().map(Arc::from),
+                        maki_agent::actor::ConfigPatch {
+                            thinking,
+                            toggle_thinking,
+                            fast,
+                            ..Default::default()
                         },
-                        async {
-                            smol::Timer::after(SESSION_OP_TIMEOUT).await;
-                        },
-                    )
-                    .await
-                    .map(|commit| {
-                        committed = Some(commit);
-                    })
-                }
+                        policy,
+                        prepare,
+                        timeouts,
+                    ),
+                    async {
+                        smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                    },
+                )
+                .await
+                .map(|commit| {
+                    committed = Some(commit);
+                }),
                 Err(error) => Err(error),
             };
             let _ = internal_tx.send(InternalEvent::SessionOp {
@@ -4530,6 +4534,7 @@ impl<'t> EventLoop<'t> {
             return;
         }
         self.published_model_specs = available.clone();
+        self.sync_model_discovery();
         // A refresh clears the list before refetching; publishing the empty
         // state would strip every session back to its current model.
         let Some(available) = available else {
@@ -4711,30 +4716,17 @@ impl<'t> EventLoop<'t> {
             let result = match reservation {
                 Ok(ticket) => prepare_config_change(
                     ticket,
-                    async move {
-                        let model = smol::unblock(move || {
-                            selection
-                                .spec
-                                .map(|spec| {
-                                    if !policy.allows(&spec) {
-                                        return Err(format!("model is not allowed: {spec}"));
-                                    }
-                                    let model = Model::from_spec(&spec)
-                                        .map_err(|error| error.to_string())?;
-                                    prepare(model, timeouts).map_err(|error| error.to_string())
-                                })
-                                .transpose()
-                        })
-                        .await?;
-                        Ok(maki_agent::actor::ConfigChange::Patch(
-                            maki_agent::actor::ConfigPatch {
-                                model,
-                                thinking: selection.thinking,
-                                fast: selection.fast,
-                                ..Default::default()
-                            },
-                        ))
-                    },
+                    prepare_model_patch(
+                        selection.spec,
+                        maki_agent::actor::ConfigPatch {
+                            thinking: selection.thinking,
+                            fast: selection.fast,
+                            ..Default::default()
+                        },
+                        policy,
+                        prepare,
+                        timeouts,
+                    ),
                     async {
                         smol::Timer::after(SESSION_OP_TIMEOUT).await;
                     },
@@ -5034,6 +5026,27 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
     }
+}
+
+async fn prepare_model_patch(
+    spec: Option<Arc<str>>,
+    mut patch: maki_agent::actor::ConfigPatch,
+    policy: Arc<ModelPolicy>,
+    prepare: PrepareProvider,
+    timeouts: Timeouts,
+) -> Result<maki_agent::actor::ConfigChange, String> {
+    patch.model = smol::unblock(move || {
+        spec.map(|spec| {
+            if !policy.allows(&spec) {
+                return Err(format!("model is not allowed: {spec}"));
+            }
+            let model = Model::from_spec(&spec).map_err(|error| error.to_string())?;
+            prepare(model, timeouts).map_err(|error| error.to_string())
+        })
+        .transpose()
+    })
+    .await?;
+    Ok(maki_agent::actor::ConfigChange::Patch(patch))
 }
 
 async fn prepare_config_change<F, E>(
@@ -5389,7 +5402,7 @@ mod tests {
         }
     }
     use crate::selection::SelectionZone;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
@@ -8241,6 +8254,10 @@ mod tests {
         const ALLOWED: &str = "anthropic/claude-opus-4-6";
         const EXCLUDED: &str = "openai/gpt-5";
         with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let app = &mut event_loop.sessions[0].app;
+            app.command_runtime = Arc::clone(&command_runtime);
+            app.command_target = command_runtime.bind_target();
             event_loop
                 .ctx
                 .available_models
@@ -8259,6 +8276,59 @@ mod tests {
                 panic!("model specs request failed");
             };
             assert_eq!(&*specs, [Arc::<str>::from(ALLOWED)]);
+            let complete = |target: &maki_commands::TargetHandle| {
+                let registry = &command_runtime.registry;
+                let command = registry.resolve_for(target, "/model").unwrap();
+                let completion = registry.open_completion(command, target.id()).unwrap();
+                let maki_commands::CompletionResult::Items(items) = smol::block_on(
+                    completion.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")),
+                ) else {
+                    panic!("expected model completions");
+                };
+                items
+                    .iter()
+                    .map(|item| item.item().insertion.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let original = event_loop.sessions[0].app.command_target.clone();
+            let items = complete(&original);
+            assert!(items.iter().any(|spec| spec == ALLOWED));
+            assert!(!items.iter().any(|spec| spec == EXCLUDED));
+            assert!(items.iter().any(|spec| spec == "thinking=high"));
+            assert!(items.iter().any(|spec| spec == "fast=true"));
+            let picker = &mut event_loop.sessions[0].app.model_picker;
+            picker.set_recents(vec![EXCLUDED.into()]);
+            picker.open(EXCLUDED);
+            assert!(matches!(
+                picker.handle_key(crate::components::key(KeyCode::Enter)),
+                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == ALLOWED
+            ));
+
+            picker.open(ALLOWED);
+            event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .model_policy = Arc::new(ModelPolicy::new(&[], &[ALLOWED.into()]).unwrap());
+            event_loop.sync_orchestration();
+            assert!(matches!(
+                event_loop.sessions[0].app.model_picker.handle_key(crate::components::key(KeyCode::Enter)),
+                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == EXCLUDED
+            ));
+
+            let mut second = test_runtime(model_named("other-model"));
+            second.app.command_runtime = Arc::clone(&command_runtime);
+            second.app.command_target = command_runtime.bind_target();
+            second.handles.orchestration_template.model_policy =
+                Arc::new(ModelPolicy::new(&[], &[EXCLUDED.into()]).unwrap());
+            event_loop.sessions.push(second);
+            event_loop.set_focused(1);
+            event_loop.sync_orchestration();
+            let original_items = complete(&original);
+            assert!(!original_items.iter().any(|spec| spec == ALLOWED));
+            assert!(original_items.iter().any(|spec| spec == EXCLUDED));
+            let focused_items = complete(&event_loop.sessions[1].app.command_target);
+            assert!(focused_items.iter().any(|spec| spec == ALLOWED));
+            assert!(!focused_items.iter().any(|spec| spec == EXCLUDED));
         });
     }
 

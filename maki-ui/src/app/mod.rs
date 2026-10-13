@@ -396,6 +396,7 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) theme_provider: Arc<dyn ThemesProvider>,
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
+    model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
@@ -482,6 +483,7 @@ impl App {
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
+        let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
         let prepared_command_target = command_runtime.prepare_target();
         let command_target = prepared_command_target.handle().clone();
         let mut app = Self {
@@ -509,7 +511,7 @@ impl App {
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&available_models)),
+            model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
             model_picker_purpose: ModelPickerPurpose::Session,
             plan_approval_pending: false,
             login_picker: LoginPicker::new(),
@@ -551,6 +553,7 @@ impl App {
             trust_question: None,
             theme_provider,
             available_models,
+            model_picker_models,
             shared_history: None,
             btw_system: None,
             image_paste_rx: vec![],
@@ -1233,6 +1236,12 @@ impl App {
         }
 
         None
+    }
+
+    pub(crate) fn project_model_discovery(&mut self, specs: Vec<String>) {
+        self.model_picker_models.store(Some(Arc::new(specs)));
+        self.command_palette.refresh_model_arguments();
+        self.pending_dirty |= self.model_picker.refresh();
     }
 
     fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {

@@ -131,6 +131,8 @@ impl CommandRuntime {
         theme_completion: Arc<ThemeArgSource>,
     ) -> (Self, flume::Receiver<CommandEvent>) {
         let (event_tx, event_rx) = flume::unbounded();
+        let admissions = Arc::default();
+        let model_completion = Arc::new(model_completion.with_targets(Arc::clone(&admissions)));
         let standard_commands = StandardCommands::register(
             &registry,
             custom_commands,
@@ -143,7 +145,7 @@ impl CommandRuntime {
         (
             Self {
                 registry,
-                admissions: Arc::default(),
+                admissions,
                 event_tx,
                 #[cfg(test)]
                 event_rx: event_rx.clone(),

@@ -1090,6 +1090,19 @@ impl CommandPalette {
         self.reset_argument_state();
     }
 
+    pub(crate) fn refresh_model_arguments(&mut self) {
+        let Some((input, cursor, mode)) = self.latest_argument_context.clone() else {
+            return;
+        };
+        if self
+            .argument_command(&input)
+            .is_some_and(|(command, _)| command.spec().name.as_ref() == "/model")
+        {
+            self.cancel_arguments();
+            self.sync_arguments(&input, cursor, &mode);
+        }
+    }
+
     fn replace_argument(&self, input: &str, replacement: &str) -> String {
         let Some((start, end)) = self.argument_range else {
             return input.to_string();

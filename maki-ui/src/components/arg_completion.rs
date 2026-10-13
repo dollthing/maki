@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -12,17 +13,32 @@ use maki_commands::{
     CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
 
+use maki_lua::orchestration::TrustedTarget;
 use maki_providers::{FAST_VALUES, MODEL_FAST_KEY, MODEL_THINKING_KEY};
 
 const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
+    targets: Option<Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>>,
 }
 
 impl ModelArgSource {
     pub(crate) fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
-        Self { models }
+        Self {
+            models,
+            targets: None,
+        }
+    }
+
+    pub(crate) fn with_targets(
+        &self,
+        targets: Arc<Mutex<HashMap<InvocationTargetId, TrustedTarget>>>,
+    ) -> Self {
+        Self {
+            models: Arc::clone(&self.models),
+            targets: Some(targets),
+        }
     }
 }
 
@@ -171,9 +187,23 @@ impl CommandCompletion for ModelArgSource {
         context: CompletionContext,
         _cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let target = self.targets.as_ref().and_then(|targets| {
+            targets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&context.target_id)
+                .filter(|target| target.target.validate_live().is_ok())
+                .cloned()
+        });
         let mut items = self.models.load_full().map_or_else(Vec::new, |specs| {
             specs
                 .iter()
+                .filter(|spec| {
+                    self.targets.is_none()
+                        || target
+                            .as_ref()
+                            .is_some_and(|target| target.template.model_policy.allows(spec))
+                })
                 .map(|spec| CompletionItem {
                     label: Arc::from(spec.as_str()),
                     insertion: Arc::from(spec.as_str()),
