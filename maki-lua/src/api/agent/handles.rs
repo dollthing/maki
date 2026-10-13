@@ -1,4 +1,9 @@
 use super::{LuaActorState, LuaSession, SessionControl, build_session};
+use crate::agent_errors::{
+    DELEGATED_FOCUS, MANAGED_AUTHORITY_INACTIVE, NO_FOCUSED_AGENT, NO_ORCHESTRATION_SERVICES,
+    NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY, OTHER_RUNTIME, RESTRICTED_MODE_CHANGE,
+    TRUSTED_SUBSCRIPTION_REQUIRED, TURN_WAIT_TIMEOUT,
+};
 use crate::api::util::{
     convert::json_to_lua,
     ctx::LuaCtx,
@@ -20,13 +25,7 @@ use std::{
     time::Duration,
 };
 
-pub(crate) const TRUSTED_SUBSCRIPTION_REQUIRED: &str =
-    "agent subscriptions require trusted authority";
-const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
-const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
-const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 const UNSETTLED_TURN_RESULT: &str = "turn has no settled result";
-const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
 
 #[derive(Clone)]
 enum AgentRuntime {
@@ -59,7 +58,7 @@ impl AgentRuntime {
             Self::Managed(manager) => manager.actor(id).map_err(|error| error.to_string()),
             Self::Unmanaged { actor, .. } if actor.agent_id() == id => Ok(actor.as_ref().clone()),
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Unmanaged { .. } => Err("agent belongs to another runtime".into()),
+            Self::Unmanaged { .. } => Err(OTHER_RUNTIME.into()),
         }
     }
 
@@ -215,7 +214,7 @@ fn validate_unmanaged(lua: &Lua, ctx: &LuaCtx, runtime: &AgentRuntime) -> Result
     let active = lua
         .app_data_ref::<crate::runtime::TaskHandle>()
         .map(|task| Arc::clone(&task))
-        .ok_or("no active task authority")?;
+        .ok_or(NO_TASK_AUTHORITY)?;
     if !crate::runtime::current_plugin(lua)
         .is_some_and(|current| current.0 == *plugin && current.1 == *generation)
         || !Arc::ptr_eq(
@@ -264,7 +263,7 @@ fn validate_host_root(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Result<(), S
         .host_root(lua)?
         .ok_or("host root authority is unavailable")?;
     if !Arc::ptr_eq(services, &current) {
-        return Err("agent belongs to another runtime".into());
+        return Err(OTHER_RUNTIME.into());
     }
     services
         .validate(reference)
@@ -280,10 +279,9 @@ fn context_graph(lua: &Lua, ctx: &LuaCtx) -> Result<(AgentManagerHandle, AgentId
         .agent()
         .and_then(|agent| agent.managed_turn.as_ref())
         .ok_or_else(|| "current/root/list require a managed graph".to_owned())?;
-    let active = crate::runtime::current_managed_turn(lua)
-        .ok_or("managed agent authority is not active in this invocation")?;
+    let active = crate::runtime::current_managed_turn(lua).ok_or(MANAGED_AUTHORITY_INACTIVE)?;
     if !current.same_authority(&active) {
-        return Err("managed agent authority is not active in this invocation".into());
+        return Err(MANAGED_AUTHORITY_INACTIVE.into());
     }
     current
         .validate_active()
@@ -314,7 +312,7 @@ fn scope(lua: &Lua, ctx: &LuaCtx, target: AgentId) -> Result<Option<CurrentManag
             trusted.validate_target(lua, &target)?;
             Ok(None)
         }
-        _ => Err("managed agent authority is not active in this invocation".into()),
+        _ => Err(MANAGED_AUTHORITY_INACTIVE.into()),
     }
 }
 
@@ -342,7 +340,7 @@ fn authorize(
     retire_closed(lua);
     let (manager, _) = context_graph(lua, ctx)?;
     if !manager.same_manager(agent.manager.managed()?) {
-        return Err("agent belongs to another runtime".into());
+        return Err(OTHER_RUNTIME.into());
     }
     scope(lua, ctx, agent.id.ok_or(UNSUPPORTED_OPERATION_ERROR)?)
 }
@@ -356,15 +354,7 @@ fn destination_template(lua: &Lua, agent: &LuaAgent) -> Result<super::AgentConte
             .map_err(|error| error.to_string())?
             .effective_config()
         {
-            template.model = Arc::new(config.model.clone());
-            template.provider = Arc::clone(&config.provider);
-            template.opts = maki_providers::RequestOptions {
-                thinking: config.thinking,
-                fast: config.fast,
-            };
-            template.workflow = config.workflow;
-            template.mode = config.mode.clone();
-            template.mode_def = config.mode_def.clone().map(Arc::new);
+            template.apply_effective_config(&config);
         }
         return Ok(super::AgentContext::from(&template));
     }
@@ -372,10 +362,8 @@ fn destination_template(lua: &Lua, agent: &LuaAgent) -> Result<super::AgentConte
         .manager
         .lookup(agent.id)
         .map_err(|error| error.to_string())?;
-    let service = lua
-        .app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-        .and_then(|slot| slot.0.clone())
-        .ok_or("destination template is unavailable")?;
+    let service =
+        crate::orchestration::services(lua).ok_or("destination template is unavailable")?;
     Ok(super::AgentContext::from(&service.template(&target)?))
 }
 
@@ -398,10 +386,10 @@ fn observe(
             .as_ref()
             .ok_or("managed root identity is unavailable")?;
         if !root.manager().same_manager(agent.manager.managed()?) {
-            return Err("agent belongs to another runtime".into());
+            return Err(OTHER_RUNTIME.into());
         }
         if !trusted.target.manager().same_manager(&root.manager()) {
-            return Err("agent belongs to another runtime".into());
+            return Err(OTHER_RUNTIME.into());
         }
         let subject = trusted
             .target
@@ -415,7 +403,7 @@ fn observe(
     retire_closed(lua);
     let (manager, _) = context_graph(lua, ctx)?;
     if !manager.same_manager(agent.manager.managed()?) {
-        return Err("agent belongs to another runtime".into());
+        return Err(OTHER_RUNTIME.into());
     }
     let current = crate::runtime::current_managed_turn(lua).ok_or("managed authority expired")?;
     if !agent.ancestors.contains(&current.agent_id()) {
@@ -517,7 +505,7 @@ pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<
         });
         let (id, actor, state) = try_pair!(session.ok_or("execution subject is unavailable"));
         let (plugin, generation) =
-            try_pair!(crate::runtime::current_plugin(lua).ok_or("no active plugin authority"));
+            try_pair!(crate::runtime::current_plugin(lua).ok_or(NO_PLUGIN_AUTHORITY));
         let agent = LuaAgent {
             manager: AgentRuntime::Unmanaged {
                 actor,
@@ -786,7 +774,7 @@ pub(super) async fn spawn(
         let handle = try_pair!(
             lua.app_data_ref::<crate::runtime::TaskHandle>()
                 .map(|task| Arc::clone(&task))
-                .ok_or("no active task authority")
+                .ok_or(NO_TASK_AUTHORITY)
         );
         let cell = crate::runtime::lock_cell(&handle);
         if !cell.scope_alive
@@ -816,7 +804,7 @@ pub(super) async fn spawn(
             let active = try_pair!(
                 lua.app_data_ref::<crate::runtime::TaskHandle>()
                     .map(|task| Arc::clone(&task))
-                    .ok_or("no active task authority")
+                    .ok_or(NO_TASK_AUTHORITY)
             );
             let cell = crate::runtime::lock_cell(&active);
             if !Arc::ptr_eq(&active, &captured)
@@ -830,20 +818,15 @@ pub(super) async fn spawn(
             AgentRuntime::Unmanaged {
                 actor: Arc::clone(&session.actor),
                 parent: Arc::clone(parent_cancels),
-                plugin: try_pair!(
-                    crate::runtime::current_plugin(&lua).ok_or("no active plugin authority")
-                )
-                .0,
+                plugin: try_pair!(crate::runtime::current_plugin(&lua).ok_or(NO_PLUGIN_AUTHORITY))
+                    .0,
                 generation: try_pair!(
-                    crate::runtime::current_plugin(&lua).ok_or("no active plugin authority")
+                    crate::runtime::current_plugin(&lua).ok_or(NO_PLUGIN_AUTHORITY)
                 )
                 .1,
                 owner: crate::orchestration::plugin_authority(
                     &lua,
-                    try_pair!(
-                        crate::runtime::current_plugin(&lua).ok_or("no active plugin authority")
-                    )
-                    .0,
+                    try_pair!(crate::runtime::current_plugin(&lua).ok_or(NO_PLUGIN_AUTHORITY)).0,
                 ),
             }
         }
@@ -1027,11 +1010,8 @@ fn agent_available_models(
         }
         return Ok((Some(mlua::Value::Table(table)), None));
     }
-    let service = try_pair!(
-        lua.app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-            .and_then(|slot| slot.0.clone())
-            .ok_or("host model catalog is unavailable")
-    );
+    let service =
+        try_pair!(crate::orchestration::services(lua).ok_or("host model catalog is unavailable"));
     let target = try_pair!(this.manager.lookup(this.id));
     let models = try_pair!(service.available_models(&target));
     let table = lua.create_table()?;
@@ -1380,13 +1360,8 @@ async fn agent_set_mode(
             let path = match path {
                 Some(path) => path,
                 None => {
-                    if let Some(prepare) = lua
-                        .app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-                        .and_then(|slot| {
-                            slot.0
-                                .as_ref()
-                                .and_then(|service| service.plan_path_preparer())
-                        })
+                    if let Some(prepare) = crate::orchestration::services(&lua)
+                        .and_then(|service| service.plan_path_preparer())
                     {
                         try_pair!(prepare())
                     } else {
@@ -1603,11 +1578,7 @@ fn subscribe(
     try_pair!(authorize(lua, ctx, agent));
     let plugin = try_pair!(crate::runtime::current_plugin(lua).ok_or("no active plugin identity"));
     let target = try_pair!(agent.manager.lookup(agent.id));
-    let service = try_pair!(
-        lua.app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-            .and_then(|slot| slot.0.clone())
-            .ok_or("no host orchestration services")
-    );
+    let service = try_pair!(crate::orchestration::services(lua).ok_or(NO_ORCHESTRATION_SERVICES));
     let template = try_pair!(service.template(&target));
     let tx = try_pair!(
         lua.app_data_ref::<crate::runtime::RequestTx>()
@@ -1860,7 +1831,7 @@ fn agent_internal_methods<M: mlua::UserDataMethods<LuaAgent>>(methods: &mut M) {
             authority: match &this.manager {
                 AgentRuntime::Managed(manager) => {
                     let (plugin, generation) = crate::runtime::current_plugin(lua)
-                        .ok_or_else(|| mlua::Error::runtime("no active plugin authority"))?;
+                        .ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
                     super::TaskOwnerAuthority::Agent {
                         owner: crate::orchestration::plugin_authority(lua, plugin.clone()),
                         plugin,
@@ -1879,7 +1850,7 @@ fn agent_internal_methods<M: mlua::UserDataMethods<LuaAgent>>(methods: &mut M) {
                 }
                 AgentRuntime::Unmanaged { parent, .. } => {
                     let (plugin, generation) = crate::runtime::current_plugin(lua)
-                        .ok_or_else(|| mlua::Error::runtime("no active plugin authority"))?;
+                        .ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
                     super::TaskOwnerAuthority::StandaloneAgent {
                         owner: crate::orchestration::plugin_authority(lua, plugin.clone()),
                         plugin,

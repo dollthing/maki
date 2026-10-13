@@ -83,8 +83,6 @@ const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
-pub(crate) const ERR_DELEGATED_REGISTRATION: &str =
-    "delegated tool handlers cannot register host callbacks";
 static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
@@ -1433,7 +1431,9 @@ pub(crate) fn in_delegated_tool(lua: &Lua) -> bool {
 /// trusted contexts, so registration requires a non-delegated caller.
 pub(crate) fn deny_delegated_registration(lua: &Lua) -> mlua::Result<()> {
     if in_delegated_tool(lua) {
-        return Err(mlua::Error::runtime(ERR_DELEGATED_REGISTRATION));
+        return Err(mlua::Error::runtime(
+            crate::agent_errors::DELEGATED_REGISTRATION,
+        ));
     }
     Ok(())
 }
@@ -5079,7 +5079,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     let _event_lease = request.lease;
                                     let scope = TaskScope::new(&lua, TaskCell::new(cancel.clone(), None, None));
                                     let mut target = request.target;
-                                    if let Some(services) = lua.app_data_ref::<crate::orchestration::OrchestrationServicesSlot>().and_then(|slot| slot.0.clone())
+                                    if let Some(services) = crate::orchestration::services(&lua)
                                         && let Ok(template) = services.template(&target.target)
                                     {
                                         target.template = template;

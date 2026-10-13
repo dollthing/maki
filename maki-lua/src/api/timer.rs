@@ -7,10 +7,10 @@ use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 
+use crate::agent_errors::TRUSTED_TIMER_REQUIRED;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::runtime::{ASYNC_RUN_DEFAULT_DEADLINE, MAX_LUA_SECONDS, PendingAsyncTask};
 
-const ERR_TRUSTED_AUTHORITY: &str = "timers require trusted authority";
 const ERR_SECONDS_RANGE: &str = "seconds must be a finite number > 0 and < 1e9";
 
 /// One recurring schedule. The callback is pinned once at registration
@@ -191,7 +191,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
 
 pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), &'static str> {
     if crate::runtime::in_delegated_tool(lua) {
-        return Err(ERR_TRUSTED_AUTHORITY);
+        return Err(TRUSTED_TIMER_REQUIRED);
     }
     Ok(())
 }

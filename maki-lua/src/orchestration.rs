@@ -1,3 +1,4 @@
+use crate::agent_errors::{NO_ORCHESTRATION_SERVICES, ORCHESTRATION_SERVICES_EXPIRED};
 use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
@@ -71,9 +72,7 @@ pub(crate) fn register_event_callback(
 ) -> mlua::Result<u64> {
     let plugin = crate::runtime::current_plugin(lua).map_or(plugin, |(plugin, _)| plugin);
     let owner = plugin_authority(lua, plugin.clone());
-    let services = lua
-        .app_data_ref::<OrchestrationServicesSlot>()
-        .and_then(|slot| slot.0.clone());
+    let services = services(lua);
     if lua.app_data_ref::<EventCallbacks>().is_none() {
         lua.set_app_data(EventCallbacks::default());
     }
@@ -109,9 +108,7 @@ pub(crate) fn close_event_callback(lua: &Lua, id: u64) {
 pub(crate) fn event_callback(lua: &Lua, id: u64) -> Option<(Function, Arc<str>, CancelToken)> {
     let callbacks = lua.app_data_ref::<EventCallbacks>()?;
     let callback = callbacks.0.get(&id)?;
-    let current = lua
-        .app_data_ref::<OrchestrationServicesSlot>()
-        .and_then(|slot| slot.0.clone());
+    let current = services(lua);
     let same_host = match (&callback.services, &current) {
         (Some(captured), Some(current)) => Arc::ptr_eq(captured, current),
         (None, None) => true,
@@ -163,6 +160,12 @@ pub trait OrchestrationServices: Send + Sync + 'static {
 
 #[derive(Clone, Default)]
 pub struct OrchestrationServicesSlot(pub Option<Arc<dyn OrchestrationServices>>);
+
+/// The orchestration services the host installed, if any.
+pub(crate) fn services(lua: &Lua) -> Option<Arc<dyn OrchestrationServices>> {
+    lua.app_data_ref::<OrchestrationServicesSlot>()
+        .and_then(|slot| slot.0.clone())
+}
 
 #[derive(Clone, Default)]
 pub struct HostRootServicesSlot {
@@ -302,9 +305,7 @@ impl TrustedContext {
             plugin,
             generation: owner.generation,
             event_scope: false,
-            services: lua
-                .app_data_ref::<OrchestrationServicesSlot>()
-                .and_then(|slot| slot.0.clone()),
+            services: services(lua),
             authority: ScopeAuthority {
                 task: Arc::downgrade(task),
                 owner,
@@ -324,20 +325,14 @@ impl TrustedContext {
         }
         self.services
             .as_ref()
-            .ok_or("no host orchestration services")?
+            .ok_or(NO_ORCHESTRATION_SERVICES)?
             .validate_target(&self.target)
     }
 
     pub(crate) fn validate_host(&self, lua: &Lua) -> Result<(), String> {
         self.authority.validate(lua)?;
-        let captured = self
-            .services
-            .as_ref()
-            .ok_or("no host orchestration services")?;
-        let current = lua
-            .app_data_ref::<OrchestrationServicesSlot>()
-            .and_then(|slot| slot.0.clone())
-            .ok_or("host orchestration services expired")?;
+        let captured = self.services.as_ref().ok_or(NO_ORCHESTRATION_SERVICES)?;
+        let current = services(lua).ok_or(ORCHESTRATION_SERVICES_EXPIRED)?;
         if !Arc::ptr_eq(captured, &current) {
             return Err("agent target does not belong to this host scope".into());
         }
@@ -348,7 +343,7 @@ impl TrustedContext {
         self.validate_host(lua)?;
         self.services
             .as_ref()
-            .ok_or("no host orchestration services")?
+            .ok_or(NO_ORCHESTRATION_SERVICES)?
             .validate_target(target)
     }
 
@@ -356,7 +351,7 @@ impl TrustedContext {
         self.validate(lua)?;
         self.services
             .as_ref()
-            .ok_or_else(|| "no host orchestration services".into())
+            .ok_or_else(|| NO_ORCHESTRATION_SERVICES.into())
     }
 }
 
@@ -386,9 +381,7 @@ pub(crate) fn resolve_target(
     lua: &Lua,
     invocation: Option<&CommandInvocation>,
 ) -> Result<Option<TrustedTarget>, String> {
-    let services = lua
-        .app_data_ref::<OrchestrationServicesSlot>()
-        .and_then(|slot| slot.0.clone());
+    let services = services(lua);
     let Some(services) = services else {
         return Ok(None);
     };
@@ -408,9 +401,8 @@ pub(crate) fn validate_pinned_target(
     let Some(target) = target.filter(|target| target.target.validate_live().is_ok()) else {
         return Ok(None);
     };
-    lua.app_data_ref::<OrchestrationServicesSlot>()
-        .and_then(|slot| slot.0.clone())
-        .ok_or("no host orchestration services")?
+    services(lua)
+        .ok_or(NO_ORCHESTRATION_SERVICES)?
         .validate_target(&target.target)?;
     Ok(Some(target))
 }

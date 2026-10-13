@@ -7,6 +7,10 @@ use maki_agent::{
 use maki_commands::CommandInvocation;
 use maki_lua::{
     PluginHost, SessionRequest, UiAction,
+    agent_errors::{
+        DELEGATED_REGISTRATION, TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED,
+        TRUSTED_TIMER_REQUIRED, TURN_WAIT_TIMEOUT,
+    },
     orchestration::{OrchestrationServices, TrustedTarget},
     test_support::InMemoryFs,
 };
@@ -40,7 +44,6 @@ const CAPTURE_REPLY: &str = "structured response committed";
 const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
 const SYNTHETIC_PLAN_PATH: &str = "/test/host-plan.md";
-const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 const MODEL_CATALOG_UNAVAILABLE: &str = "host model catalog is unavailable";
 
 async fn bounded<T>(future: impl Future<Output = T>, operation: &str) -> T {
@@ -2263,9 +2266,12 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 .into(),
                 ..Default::default()
             },
-            r#"
-            local subscription_error = "agent subscriptions require trusted authority"
-            local command_error = "run_command requires trusted authority"
+            &format!(
+                "local subscription_error = {TRUSTED_SUBSCRIPTION_REQUIRED:?}\n\
+                 local command_error = {TRUSTED_RUN_COMMAND_REQUIRED:?}\n\
+                 local timer_error = {TRUSTED_TIMER_REQUIRED:?}\n\
+                 local registration_error = {DELEGATED_REGISTRATION:?}\n{}",
+                r#"
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             local function callback(_, callback_ctx)
                 assert(assert(child:send(callback_ctx, "forbidden callback")):wait(callback_ctx))
@@ -2276,7 +2282,6 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             end
             local ran, err = maki.api.run_command("/pr5_callback_diagnostics")
             assert(ran == nil and err == command_error)
-            local timer_error = "timers require trusted authority"
             local function deny_timers()
                 local id, timer_err = maki.timer.set(0.001, pr5_timer_escape)
                 assert(id == nil and timer_err == timer_error, tostring(timer_err))
@@ -2284,7 +2289,6 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 assert(handle == nil and defer_err == timer_error, tostring(defer_err))
             end
             deny_timers()
-            local registration_error = "delegated tool handlers cannot register host callbacks"
             local registrations = {
                 register_command = function()
                     maki.api.register_command({ name = "/pr5_escape", tui_only = false, handler = pr5_timer_escape })
@@ -2306,7 +2310,8 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             assert(async_err == false, tostring(async_err))
             assert(child:set_model(ctx, { thinking = "low" }))
             assert(child:close(ctx))
-        "#,
+        "#
+            ),
         );
         assert_eq!(
             bounded(fixture.completed.recv_async(), "delegated timer denial")

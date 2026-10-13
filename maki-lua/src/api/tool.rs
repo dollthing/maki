@@ -38,6 +38,7 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::agent_errors::TRUSTED_RUN_COMMAND_REQUIRED;
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -1150,7 +1151,7 @@ async fn run_command(
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(&lua) {
-        return Ok(err_pair("run_command requires trusted authority"));
+        return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
     }
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));

@@ -56,6 +56,10 @@ use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as Lua
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
+use crate::agent_errors::{
+    INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY,
+    ORCHESTRATION_SERVICES_EXPIRED,
+};
 use crate::api::r#async::LuaSemaphore;
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
@@ -1092,15 +1096,7 @@ async fn build_session(
         Some(trusted) => {
             let mut template = trusted.template.clone();
             if let Some(config) = try_pair!(trusted.target.effective_config()) {
-                template.model = Arc::new(config.model.clone());
-                template.provider = Arc::clone(&config.provider);
-                template.opts = RequestOptions {
-                    thinking: config.thinking,
-                    fast: config.fast,
-                };
-                template.workflow = config.workflow;
-                template.mode = config.mode.clone();
-                template.mode_def = config.mode_def.clone().map(Arc::new);
+                template.apply_effective_config(&config);
             }
             AgentContext::from(&template)
         }
@@ -1131,9 +1127,7 @@ async fn build_session(
         (Some(expected), Some(active)) if expected.same_authority(&active) => Some(active),
         (None, None) => None,
         _ => {
-            return Ok(err_pair(
-                "managed agent authority is not active in this invocation",
-            ));
+            return Ok(err_pair(MANAGED_AUTHORITY_INACTIVE));
         }
     };
     let model_spec: Option<String> = opts.get("model_spec")?;
@@ -1686,9 +1680,7 @@ async fn build_session(
     };
     let _ = sess.state.template.set(child_template.clone());
     if let SessionControl::Managed { agent, .. } = &sess.control
-        && let Some(service) = lua
-            .app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-            .and_then(|slot| slot.0.clone())
+        && let Some(service) = crate::orchestration::services(&lua)
         && let Err(error) = service.register_target(crate::orchestration::TrustedTarget {
             target: agent.clone(),
             template: child_template,
@@ -1819,7 +1811,7 @@ impl InvocationGuard {
         let task = lua
             .app_data_ref::<crate::runtime::TaskHandle>()
             .map(|task| Arc::clone(&task))
-            .ok_or("no active task authority")?;
+            .ok_or(NO_TASK_AUTHORITY)?;
         let plugin = crate::runtime::current_plugin(lua).map(|(plugin, _)| {
             let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
             (plugin, owner)
@@ -1833,11 +1825,11 @@ impl InvocationGuard {
     }
 
     fn validate(&self, lua: &Lua) -> Result<(), String> {
-        let task = self.task.upgrade().ok_or("context invocation expired")?;
+        let task = self.task.upgrade().ok_or(INVOCATION_EXPIRED)?;
         let current = lua
             .app_data_ref::<crate::runtime::TaskHandle>()
             .map(|task| Arc::clone(&task))
-            .ok_or("no active task authority")?;
+            .ok_or(NO_TASK_AUTHORITY)?;
         let cell = crate::runtime::lock_cell(&task);
         if !cell.scope_alive
             || cell.cancel.is_cancelled()
@@ -1846,7 +1838,7 @@ impl InvocationGuard {
                 .get()
                 .is_some_and(|deadline| Instant::now() > deadline)
         {
-            return Err("context invocation expired".into());
+            return Err(INVOCATION_EXPIRED.into());
         }
         if !Arc::ptr_eq(&task, &current) {
             return Err("context belongs to another invocation".into());
@@ -1914,8 +1906,7 @@ impl SessionAuthority {
                 services,
             } => {
                 InvocationGuard::capture(lua)?.validate(lua)?;
-                let current =
-                    crate::runtime::current_plugin(lua).ok_or("no active plugin authority")?;
+                let current = crate::runtime::current_plugin(lua).ok_or(NO_PLUGIN_AUTHORITY)?;
                 if current.0 != *plugin
                     || current.1 != *generation
                     || !Arc::ptr_eq(
@@ -1925,10 +1916,8 @@ impl SessionAuthority {
                 {
                     return Err("session belongs to another plugin generation".into());
                 }
-                let current = lua
-                    .app_data_ref::<crate::orchestration::OrchestrationServicesSlot>()
-                    .and_then(|slot| slot.0.clone())
-                    .ok_or("host orchestration services expired")?;
+                let current =
+                    crate::orchestration::services(lua).ok_or(ORCHESTRATION_SERVICES_EXPIRED)?;
                 if !Arc::ptr_eq(services, &current) {
                     return Err("session belongs to another host scope".into());
                 }
@@ -1983,9 +1972,7 @@ impl SessionAuthority {
                         }
                     }
                     _ => {
-                        return Err(
-                            "managed agent authority is not active in this invocation".into()
-                        );
+                        return Err(MANAGED_AUTHORITY_INACTIVE.into());
                     }
                 }
             }
@@ -3228,7 +3215,7 @@ mod tests {
     #[test]
     fn invocation_guard_rejects_transfer_and_retirement() {
         const WRONG_INVOCATION: &str = "context belongs to another invocation";
-        const EXPIRED_INVOCATION: &str = "context invocation expired";
+        const EXPIRED_INVOCATION: &str = INVOCATION_EXPIRED;
         let lua = Lua::new();
         let scope = crate::runtime::TaskScope::detached(&lua);
         let guard = InvocationGuard::capture(&lua).unwrap();
@@ -3244,7 +3231,7 @@ mod tests {
     #[test]
     fn unmanaged_session_authority_follows_parent_scope() {
         const WRONG_PARENT: &str = "session belongs to another parent scope";
-        const NO_ACTIVE_AUTHORITY: &str = "no active task authority";
+        const NO_ACTIVE_AUTHORITY: &str = NO_TASK_AUTHORITY;
         let lua = Lua::new();
         let parent = Arc::new(CancelMap::new());
         let creator = crate::runtime::TaskScope::detached(&lua);

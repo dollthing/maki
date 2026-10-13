@@ -12,6 +12,7 @@ use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
+use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME};
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
@@ -396,7 +397,7 @@ impl LuaCtx {
             .host_root(lua)?
             .ok_or("host root authority is unavailable")?;
         if !Arc::ptr_eq(&bound, services) {
-            return Err("agent belongs to another runtime".into());
+            return Err(OTHER_RUNTIME.into());
         }
         services
             .validate(reference)
@@ -419,7 +420,7 @@ impl LuaCtx {
         Ok(Arc::new(move || {
             let task = task
                 .upgrade()
-                .ok_or_else(|| Arc::<str>::from("context invocation expired"))?;
+                .ok_or_else(|| Arc::<str>::from(INVOCATION_EXPIRED))?;
             let cell = lock_cell(&task);
             if !cell.scope_alive
                 || cell.cancel.is_cancelled()
@@ -431,7 +432,7 @@ impl LuaCtx {
                 || cell.plugin_origin != plugin_origin
                 || owner.as_ref().is_some_and(|owner| !owner.is_alive())
             {
-                return Err(Arc::from("context invocation expired"));
+                return Err(Arc::from(INVOCATION_EXPIRED));
             }
             services
                 .validate(&reference)
@@ -835,7 +836,7 @@ fn validate_task_origin(
                     .get()
                     .is_some_and(|deadline| Instant::now() > deadline)))
     {
-        return Err("context invocation expired".into());
+        return Err(INVOCATION_EXPIRED.into());
     }
     if current != Some(cell.id) {
         return Err("context belongs to another invocation".into());
@@ -879,10 +880,7 @@ mod tests {
         drop(sibling);
         assert!(ctx.validate_origin(&lua).is_ok());
         drop(scope);
-        assert_eq!(
-            ctx.validate_origin(&lua).unwrap_err(),
-            "context invocation expired"
-        );
+        assert_eq!(ctx.validate_origin(&lua).unwrap_err(), INVOCATION_EXPIRED);
     }
 
     #[test]
@@ -1034,7 +1032,7 @@ mod tests {
     }
 
     const FOREIGN_CONTEXT_MSG: &str = "context belongs to another invocation";
-    const EXPIRED_CONTEXT_MSG: &str = "context invocation expired";
+    const EXPIRED_CONTEXT_MSG: &str = INVOCATION_EXPIRED;
     const READ_PATH: &str = "/missing/ctx-lifetime-test";
 
     #[test]

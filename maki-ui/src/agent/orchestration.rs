@@ -146,13 +146,7 @@ impl OrchestrationServices for AgentOrchestration {
             .effective_config()
             .map_err(|error| error.to_string())?
             .ok_or("agent configuration is unavailable")?;
-        template.provider = Arc::clone(&config.settings.provider);
-        template.model = Arc::new(config.settings.model.clone());
-        template.opts.thinking = config.settings.thinking;
-        template.opts.fast = config.settings.fast;
-        template.workflow = config.settings.workflow;
-        template.mode = config.mode.clone();
-        template.mode_def = config.mode_def.clone().map(Arc::new);
+        template.apply_effective_config(&config);
         template.managed_turn = None;
         template.tool_use_id = None;
         template.live_sink = None;

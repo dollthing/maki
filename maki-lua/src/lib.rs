@@ -1,4 +1,5 @@
 pub mod agent_autocmd;
+pub mod agent_errors;
 mod api;
 mod coalesced_latest;
 pub mod docs;

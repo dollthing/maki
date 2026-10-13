@@ -514,6 +514,19 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Overlays an agent's committed configuration onto this template.
+    pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
+        self.model = Arc::new(config.settings.model.clone());
+        self.provider = Arc::clone(&config.settings.provider);
+        self.opts = RequestOptions {
+            thinking: config.settings.thinking,
+            fast: config.settings.fast,
+        };
+        self.workflow = config.settings.workflow;
+        self.mode = config.mode.clone();
+        self.mode_def = config.mode_def.clone().map(Arc::new);
+    }
+
     pub fn defer_output_limits(&self, mut opts: offload::OutputLimitOptions) -> bool {
         let Some(pending) = &self.pending_output_limits else {
             return false;
