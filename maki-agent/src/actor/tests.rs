@@ -1665,6 +1665,38 @@ fn exact_wait_and_lookup() {
 }
 
 #[test]
+fn exact_wait_observes_idle_actor() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let first = handle
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        first.wait().await;
+        let second = handle
+            .admit_turn_if_idle(input("second"), None, "second".into(), None)
+            .unwrap();
+        second.wait().await;
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn close_releases_leases_stranded_in_unread_subscriptions() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let events = handle.subscribe_leased_events();
+        let ticket = handle.admit_turn(input("work"), None, "w".into()).unwrap();
+        ticket.wait().await;
+        handle.close();
+        task.await;
+        assert!(!handle.callbacks_drained());
+        drop(events);
+        assert!(handle.callbacks_drained());
+    });
+}
+
+#[test]
 fn failed_actor_is_reusable() {
     smol::block_on(async {
         let backend = ScriptedBackend::failing_setup();

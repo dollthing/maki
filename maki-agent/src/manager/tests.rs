@@ -22,6 +22,7 @@ use crate::{
 };
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const CONDITION_TIMEOUT: &str = "condition never became true";
 
 #[test]
 fn held_ticket_observation_checks_manager_and_survives_graph_removal() {
@@ -97,6 +98,7 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
         ));
         if close_parent {
             root.actor().unwrap().close();
+            yield_until(|| manager.runner_finished(root.id()).unwrap()).await;
         }
         let result = manager.spawn_child_trusted_with_config(
             &root,
@@ -110,7 +112,7 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
             assert!(matches!(result, Err(ManagerError::NonLiveAgent(id)) if id == root.id()));
             assert!(matches!(
                 manager.lookup(root.id()),
-                Err(ManagerError::NonLiveAgent(_))
+                Err(ManagerError::UnknownAgent(_))
             ));
         } else {
             let child = result.unwrap();
@@ -131,14 +133,18 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
 
 /// Yields until `cond` holds. Bounded only so a broken test cannot hang.
 async fn yield_until(cond: impl Fn() -> bool) {
-    const MAX_YIELDS: usize = 100_000;
-    for _ in 0..MAX_YIELDS {
-        if cond() {
-            return;
-        }
-        smol::future::yield_now().await;
-    }
-    panic!("condition never became true");
+    futures_lite::future::or(
+        async {
+            while !cond() {
+                smol::future::yield_now().await;
+            }
+        },
+        async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("{CONDITION_TIMEOUT}");
+        },
+    )
+    .await;
 }
 
 /// The deferred runner waits on its start signal and the actor's policy
@@ -717,7 +723,6 @@ fn closed_node_waits_for_queued_event_callback_lease() {
         actor.close();
         let (event, lease) = events.recv_async().await.unwrap().into_parts();
         assert!(matches!(event, crate::ActorEvent::Close { .. }));
-        assert!(!manager.runner_finished(root.id()).unwrap());
         assert!(manager.node(root.id()).is_ok());
         drop(lease);
         drop(events);

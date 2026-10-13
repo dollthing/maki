@@ -239,10 +239,20 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        let node = graph
-            .nodes
-            .get(&agent.agent_id)
-            .ok_or(ManagerError::UnknownAgent(agent.agent_id))?;
+        let Some(node) = graph.nodes.get(&agent.agent_id) else {
+            return Err(
+                if agent
+                    .terminal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                {
+                    ManagerError::NonLiveAgent(agent.agent_id)
+                } else {
+                    ManagerError::UnknownAgent(agent.agent_id)
+                },
+            );
+        };
         if node.lifecycle != GraphLifecycle::Live
             || node
                 .actor

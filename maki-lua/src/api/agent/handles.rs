@@ -645,9 +645,9 @@ pub(super) fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Tab
                 let Some((plugin, generation)) = crate::runtime::current_plugin(lua) else {
                     continue;
                 };
-                if !lua
+                if lua
                     .app_data_ref::<AgentOwners>()
-                    .is_some_and(|owners| owners.0.get(&session.agent_id) == Some(&plugin))
+                    .is_none_or(|owners| owners.0.get(&session.agent_id) != Some(&plugin))
                 {
                     continue;
                 }

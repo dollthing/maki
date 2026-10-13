@@ -176,14 +176,10 @@ impl TurnTicket {
         }
     }
 
-    pub(crate) fn resolve(&self, outcome: TurnOutcome) {
-        let mut outcome_slot = self
-            .shared
-            .outcome
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if outcome_slot.is_none() {
-            let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+    /// Freezes the result for [`Self::peek_result`] without waking waiters.
+    pub(crate) fn seal(&self, outcome: &TurnOutcome) {
+        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.result.is_none() {
             state.result = Some(TurnResult {
                 outcome: outcome.clone(),
                 text: take(&mut state.text),
@@ -193,6 +189,17 @@ impl TurnTicket {
                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
                 }),
             });
+        }
+    }
+
+    pub(crate) fn resolve(&self, outcome: TurnOutcome) {
+        let mut outcome_slot = self
+            .shared
+            .outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if outcome_slot.is_none() {
+            self.seal(&outcome);
             *outcome_slot = Some(outcome);
             self.shared.event.notify(usize::MAX);
         }

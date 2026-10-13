@@ -800,6 +800,10 @@ impl ActorState {
                 agent_id: inner.agent_id,
                 lifecycle: self.lifecycle,
             });
+            // Close is terminal: dropping the senders frees leases stranded in
+            // channels whose receivers stopped before draining.
+            self.event_observers.clear();
+            self.leased_event_observers.clear();
         }
     }
 
@@ -838,6 +842,7 @@ impl ActorState {
 
     pub(crate) fn settle_runner(&mut self) {
         self.active = None;
+        self.processing = None;
         self.status = ActorStatus::Idle;
     }
 
@@ -1068,7 +1073,7 @@ fn retire_and_publish(
             let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
         }
         if let Some(ticket) = &ticket {
-            ticket.resolve(outcome.clone());
+            ticket.seal(&outcome);
             delivery::publish(inner, ticket, admission);
         }
         delivery::settle(
