@@ -111,7 +111,6 @@ maki.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
-  recorder.auto_deliver = opts.auto_deliver
   local sess = { opts = opts }
   function sess:enqueue(call_ctx, msg)
     recorder.prompts[#recorder.prompts + 1] = msg
@@ -184,12 +183,7 @@ maki.api.register_tool({
       closed = recorder.closed,
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
-      auto_deliver = recorder.auto_deliver,
       output_schema = recorder.output_schema,
-      first_ack = recorder.first_ack,
-      first_err = recorder.first_err,
-      second_ack = recorder.second_ack,
-      second_err = recorder.second_err,
       sem_size = recorder.sem_size,
     }
     if recorder.resolve_opts then
@@ -460,7 +454,7 @@ fn plain_path_returns_text_without_local_tools() {
 }
 
 #[test]
-fn raising_prompt_does_not_exhaust_semaphore() {
+fn raising_prompt_preserves_error_and_next_spawn() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
     assert!(err.contains(RAISE_MSG), "got: {err}");
@@ -483,7 +477,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
         "done",
     )]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host("build");
+    let (reg, _host) = load_real_driver_host();
 
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
@@ -511,7 +505,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
 }
 
 #[test]
-fn spawn_returns_task_id_immediately() {
+fn spawn_returns_task_and_turn_ids() {
     let (reg, _host) = load_task_host();
     let out = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     assert!(out["task_id"].is_string(), "missing task_id: {out}");
@@ -700,7 +694,7 @@ fn despawn_releases_permit_and_clears_task() {
 }
 
 #[test]
-fn send_queues_and_reactivates() {
+fn send_reports_queued_turn() {
     let (reg, _host) = load_task_host();
     let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
@@ -771,19 +765,17 @@ maki.api.register_tool({
 })
 "#;
 
-fn load_real_driver_host(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
-    load_real_driver_host_with_opts(mode, serde_json::Map::new())
+fn load_real_driver_host() -> (Arc<ToolRegistry>, PluginHost) {
+    load_real_driver_host_with_opts(serde_json::Map::new())
 }
 
 fn load_real_driver_host_with_opts(
-    mode: &str,
     opts: serde_json::Map<String, Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
-    load_real_driver_host_with_prelude(mode, opts, "")
+    load_real_driver_host_with_prelude(opts, "")
 }
 
 fn load_real_driver_host_with_prelude(
-    _mode: &str,
     opts: serde_json::Map<String, Value>,
     extra_prelude: &str,
 ) -> (Arc<ToolRegistry>, PluginHost) {
@@ -852,7 +844,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
     // general in plan mode -> blocked before any session is spawned.
-    let (reg, _host) = load_real_driver_host("plan");
+    let (reg, _host) = load_real_driver_host();
     let mut general = task_input(SCENARIO_PLAIN, None);
     general["subagent_type"] = json!("general");
     let err =
@@ -869,7 +861,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     let mut build_ctx = ctx.clone();
     build_ctx.mode = AgentMode::Build;
     build_ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Build)));
-    let (reg_build, _host) = load_real_driver_host("build");
+    let (reg_build, _host) = load_real_driver_host();
     let mut reviewer_build = task_input(SCENARIO_PLAIN, None);
     reviewer_build["subagent_type"] = json!("plan_reviewer");
     let err = spawn_and_wait(&reg_build, &build_ctx, reviewer_build)
@@ -882,7 +874,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     research["subagent_type"] = json!("research");
     spawn_and_wait(&reg, &ctx, research).expect("research must run in plan mode");
 
-    let (reg_build2, _host) = load_real_driver_host("build");
+    let (reg_build2, _host) = load_real_driver_host();
     let mut research_build = task_input(SCENARIO_PLAIN, None);
     research_build["subagent_type"] = json!("research");
     spawn_and_wait(&reg_build2, &build_ctx, research_build)
@@ -906,7 +898,7 @@ fn pending_ticket_backpressure_preserves_accepted_turns() {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host("build");
+        let (reg, _host) = load_real_driver_host();
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
@@ -967,7 +959,7 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host("build");
+        let (reg, _host) = load_real_driver_host();
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
@@ -1006,7 +998,7 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host("build");
+        let (reg, _host) = load_real_driver_host();
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = first["task_id"].as_str().unwrap();
         assert!(first["turn_id"].is_string());
@@ -1078,7 +1070,7 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let mut opts = serde_json::Map::new();
         opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts("build", opts);
+        let (reg, _host) = load_real_driver_host_with_opts(opts);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1138,7 +1130,7 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let mut opts = serde_json::Map::new();
         opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts("build", opts);
+        let (reg, _host) = load_real_driver_host_with_opts(opts);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1187,7 +1179,7 @@ fn despawn_releases_capacity_from_an_active_turn() {
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
         let mut opts = serde_json::Map::new();
         opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts("build", opts);
+        let (reg, _host) = load_real_driver_host_with_opts(opts);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1227,7 +1219,7 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     ctx.mode = AgentMode::Custom(ModeId::parse("audit"));
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ctx.mode.id())));
 
-    let (reg, _host) = load_real_driver_host("audit");
+    let (reg, _host) = load_real_driver_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
     let out = spawn_and_wait(&reg, &ctx, input).expect("general task must run in custom mode");
@@ -1252,7 +1244,7 @@ fn plan_mode_task_supports_structured_output_real_driver() {
     ctx.mode = AgentMode::Plan("/test/task-plan.md".into());
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
-    let (reg, _host) = load_real_driver_host("plan");
+    let (reg, _host) = load_real_driver_host();
     let mut input = task_input(SCENARIO_HAPPY, Some(answer_schema()));
     input["subagent_type"] = json!("plan_reviewer");
     let out = spawn_and_wait(&reg, &ctx, input).expect("structured plan-mode task failed");
@@ -1276,7 +1268,7 @@ fn plan_mode_task_supports_structured_output_real_driver() {
 fn real_schema_validation_rejects_before_provider_request(schema: Value, expected: &str) {
     let provider = Arc::new(common::CannedProvider::new(vec![]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host("build");
+    let (reg, _host) = load_real_driver_host();
     let error = spawn_and_wait(&reg, &ctx, task_input(SCENARIO_HAPPY, Some(schema))).unwrap_err();
     assert!(error.contains(expected), "got: {error}");
     assert!(provider.captured_tools().is_empty());
@@ -1290,7 +1282,7 @@ fn real_schema_invalid_report_recovers() {
         common::canned_reply("done"),
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-    let (reg, _host) = load_real_driver_host("build");
+    let (reg, _host) = load_real_driver_host();
     let out = spawn_and_wait(
         &reg,
         &ctx,
@@ -1308,7 +1300,7 @@ fn real_schema_missing_report_fails_boundedly() {
         common::canned_reply("no report"),
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host("build");
+    let (reg, _host) = load_real_driver_host();
     let error = spawn_and_wait(
         &reg,
         &ctx,
@@ -1327,7 +1319,7 @@ fn task_policy_structured_output_real_driver() {
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
 
-    let (reg, _host) = load_real_driver_host("build");
+    let (reg, _host) = load_real_driver_host();
     let out = spawn_and_wait(
         &reg,
         &ctx,
@@ -1435,8 +1427,7 @@ fn unmanaged_blocking_wait_yields_the_only_permit_to_its_child() {
     let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::new(NestedTaskProvider));
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
-    let (reg, _host) =
-        load_real_driver_host_with_prelude("build", opts, NESTED_LIFECYCLE_TOOLS_PRELUDE);
+    let (reg, _host) = load_real_driver_host_with_prelude(opts, NESTED_LIFECYCLE_TOOLS_PRELUDE);
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
 
