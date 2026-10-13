@@ -19,7 +19,7 @@ use crate::agent_errors::{
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::command_invocation;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
@@ -38,6 +38,7 @@ async fn roundtrip(
     tx: Option<flume::Sender<UiAction>>,
     req: SessionRequest,
 ) -> LuaResult<Pair<Value>> {
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
         req,
         reply_tx,
@@ -50,6 +51,7 @@ pub(crate) async fn resolve_coordinator(
     tx: Option<&flume::Sender<UiAction>>,
     opts: Option<&Table>,
 ) -> Result<SessionCoordinatorHandle, String> {
+    crate::runtime::validate_plugin_effect(lua)?;
     let raw_id = match opts {
         Some(opts) => opts
             .get::<Option<String>>("session")
@@ -90,6 +92,7 @@ pub(crate) async fn resolve_coordinator(
             }
         }
     };
+    crate::runtime::validate_plugin_effect(lua)?;
     let id = raw_id.parse::<MakiId>().map_err(|e| e.to_string())?;
     SessionCoordinatorHandle::resolve(id).map_err(|e| e.to_string())
 }
@@ -471,6 +474,7 @@ async fn set_option(
     {
         return Ok(err_pair(error));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     if let Some(tx) = tx {
         let (reply_tx, reply_rx) = flume::bounded(1);
         if let Err(error) = tx.send(UiAction::Session {

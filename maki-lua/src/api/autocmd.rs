@@ -7,7 +7,7 @@ use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_isolated};
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -203,6 +203,7 @@ fn create_autocmd(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<u64> {
         let events = parse_string_or_seq(event, "event")?;
         let callback: Function = opts.get("callback")?;

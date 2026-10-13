@@ -31,6 +31,7 @@ pub(super) fn validate_unmanaged(
     runtime: &AgentRuntime,
 ) -> Result<(), String> {
     ctx.validate_origin(lua)?;
+    ctx.host_root(lua)?;
     let AgentRuntime::Unmanaged {
         parent,
         plugin,

@@ -218,16 +218,23 @@ impl LuaCtx {
     ) -> Self {
         let agent = Box::new(AgentContext::from(&target.template));
         let cancel = lock_cell(&active_task(lua)).cancel.clone();
-        let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
+        let task = active_task(lua);
+        let owner = lock_cell(&task)
+            .plugin_owner
+            .clone()
+            .unwrap_or_else(|| crate::orchestration::plugin_authority(lua, plugin.clone()));
         let authority = Box::new(crate::orchestration::TrustedContext::new(
             lua,
             target,
-            &active_task(lua),
+            &task,
             plugin,
-            owner,
+            owner.clone(),
         ));
-        lock_cell(&active_task(lua)).plugin_origin =
-            Some((authority.plugin.clone(), authority.generation));
+        {
+            let mut cell = lock_cell(&task);
+            cell.plugin_origin = Some((authority.plugin.clone(), authority.generation));
+            cell.plugin_owner = Some(owner);
+        }
         Self {
             caps: Caps::Trusted { authority, agent },
             origin: None,
@@ -254,6 +261,7 @@ impl LuaCtx {
         lua: &mlua::Lua,
         plugin: Arc<str>,
     ) -> Result<Option<Self>, String> {
+        crate::runtime::validate_plugin_effect(lua)?;
         let task = active_task(lua);
         {
             let cell = lock_cell(&task);
@@ -264,8 +272,12 @@ impl LuaCtx {
                 return Ok(None);
             }
         }
-        let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
-        let Some(authority) = TrustedHostRootContext::new(lua, &task, plugin.clone(), owner)?
+        let owner = lock_cell(&task)
+            .plugin_owner
+            .clone()
+            .unwrap_or_else(|| crate::orchestration::plugin_authority(lua, plugin.clone()));
+        let Some(authority) =
+            TrustedHostRootContext::new(lua, &task, plugin.clone(), owner.clone())?
         else {
             return Ok(None);
         };
@@ -280,6 +292,7 @@ impl LuaCtx {
             return Err("plugin generation expired before host root admission".into());
         }
         cell.plugin_origin = Some((authority.plugin.clone(), authority.generation));
+        cell.plugin_owner = Some(owner);
         Ok(Some(Self {
             caps: Caps::TrustedHostRoot {
                 authority: Box::new(authority),
@@ -354,14 +367,7 @@ impl LuaCtx {
             .map_err(|error| error.to_string())?;
         let task = active_task(lua);
         let plugin_origin = lock_cell(&task).plugin_origin.clone();
-        // Tool tasks record the plugin's load generation, which is unrelated to
-        // the authority generation, so they bind to the plugin's live authority.
-        let owner = match &self.caps {
-            Caps::TrustedHostRoot { authority } => Some(authority.plugin_authority()),
-            _ => plugin_origin
-                .as_ref()
-                .map(|(plugin, _)| crate::orchestration::plugin_authority(lua, plugin.clone())),
-        };
+        let owner = lock_cell(&task).plugin_owner.clone();
         let task = Arc::downgrade(&task);
         let cancel = self.cancel.clone();
         let services = services.clone();
@@ -480,6 +486,13 @@ impl UserData for LuaCtx {
             let selection =
                 maki_providers::CompleteModelSelection::from_model(&agent.model, agent.opts);
             Ok((Some(lua.to_value(&selection)?), None))
+        });
+        methods.add_method("mode", |lua, this, ()| {
+            try_pair!(this.validate_origin(lua));
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("mode"));
+            };
+            Ok((Some(agent.mode.id().key().to_string()), None))
         });
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
         methods.add_function(
@@ -775,6 +788,9 @@ fn validate_task_origin(
     if !cell.scope_alive || (!cleanup && !cell.is_live()) {
         return Err(INVOCATION_EXPIRED.into());
     }
+    if !cleanup {
+        cell.validate_plugin_effect()?;
+    }
     if current != Some(cell.id) {
         return Err("context belongs to another invocation".into());
     }
@@ -895,9 +911,8 @@ mod tests {
 
     #[test]
     fn tool_host_model_validator_binds_live_plugin_authority() {
-        const LOAD_GENERATION: u64 = u64::MAX;
         let lua = mlua::Lua::new();
-        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
+        let owner = crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
         let mut template = populated_ctx();
         let id = maki_agent::AgentId::generate();
@@ -912,7 +927,7 @@ mod tests {
             services: Some(services.clone()),
             template: None,
         });
-        lock_cell(scope.handle()).plugin_origin = Some((Arc::from("owner"), LOAD_GENERATION));
+        crate::runtime::bind_plugin_owner(&lua, Arc::from("owner"), owner).unwrap();
         let mut ctx = LuaCtx::handler(&template);
         ctx.pin_host_root(&lua);
         ctx.bind_origin(scope.handle());

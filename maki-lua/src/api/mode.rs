@@ -10,7 +10,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::DELEGATED_HOST_MUTATION;
 use crate::api::util::command::{SessionRequest, UiAction, ui_send};
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const NO_REGISTRY_ERR: &str = "mode registry not available";
 
@@ -84,6 +84,7 @@ fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let spec = spec_from_table(lua, opts)?;
     let reg = registry(lua)?;
     match reg.define(spec) {
@@ -127,6 +128,7 @@ async fn set(
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     set_inner(&lua, tx, name).await
 }
 
@@ -190,6 +192,7 @@ fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let reg = registry(lua)?;
     let result = match name {
         Some(name) => reg.reset(&ModeId::parse(&name)),

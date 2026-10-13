@@ -12,7 +12,7 @@ use crate::agent_errors::{
 };
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
@@ -110,6 +110,7 @@ async fn set(
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_MODEL_MUTATION_REQUIRED));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     let (opts, toggle_thinking) = match opts {
         Value::Table(table) => {
             // `thinking = ""` is the documented toggle, not a selection value.

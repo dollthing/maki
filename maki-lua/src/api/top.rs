@@ -136,19 +136,24 @@ fn notify(
     level: Option<String>,
     opts: Option<Table>,
 ) -> LuaResult<()> {
+    crate::runtime::validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
     let title = match &opts {
         Some(t) => t.get::<Option<String>>("title")?,
         None => None,
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
         let guard = locked(&slot);
-        let (_, key) = guard.as_ref()?;
-        lua.registry_value::<Function>(key).ok()
+        let (plugin, key) = guard.as_ref()?;
+        Some((plugin.clone(), lua.registry_value::<Function>(key).ok()?))
     });
-    if let Some(func) = handler_fn {
+    if let Some((owner_plugin, func)) = handler_fn {
         // Trusted plugin code installed the handler, so it keeps that
         // authority when a delegated tool notifies; its own timers must work.
         let _scope = crate::runtime::TaskScope::detached(lua);
+        let owner = crate::orchestration::plugin_authority(lua, owner_plugin.clone());
+        if owner.is_alive() {
+            crate::runtime::bind_plugin_owner(lua, owner_plugin, owner)?;
+        }
         // A broken override must not swallow the message, so fall through.
         match func.call::<()>((msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
@@ -189,6 +194,7 @@ fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> Lua
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     install_notify_handler(lua, plugin, handler)?;
     Ok((Some(true), None))
 }

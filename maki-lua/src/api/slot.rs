@@ -11,7 +11,7 @@ use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
@@ -398,6 +398,7 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
+    crate::runtime::deny_delegated_registration(lua)?;
     if name.starts_with(HOST_PREFIX) {
         return Err(mlua::Error::runtime(format!(
             "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
@@ -458,6 +459,7 @@ fn set_slot(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> {
         with_slot_store(lua, &plugin, |store| {
             store.slots.entry(name).or_default().layers.push(SlotLayer {

@@ -173,6 +173,18 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     deadline: Some(now + ASYNC_RUN_DEFAULT_DEADLINE),
                     live_ctx: None,
                     owner: None,
+                    plugin_grant: lua
+                        .app_data_ref::<TimerStore>()
+                        .and_then(|store| {
+                            store
+                                .entries
+                                .get(&timer_id)
+                                .map(|entry| entry.plugin.clone())
+                        })
+                        .map(|plugin| {
+                            let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
+                            (plugin, owner)
+                        }),
                     managed_turn: None,
                     agent_parent: None,
                     delegated_tool: None,
@@ -190,11 +202,11 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
         .collect()
 }
 
-pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), &'static str> {
+pub(crate) fn require_trusted_authority(lua: &Lua) -> Result<(), String> {
     if crate::runtime::in_delegated_tool(lua) {
-        return Err(TRUSTED_TIMER_REQUIRED);
+        return Err(TRUSTED_TIMER_REQUIRED.into());
     }
-    Ok(())
+    crate::runtime::validate_plugin_effect(lua)
 }
 
 /// Schedule {callback} to run every {seconds} on the runtime's timer pump.

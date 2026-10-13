@@ -113,6 +113,7 @@ fn on_change(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function) -> LuaResul
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<Function> {
         let mut mirror = lua
             .app_data_mut::<UsageMirror>()

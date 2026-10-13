@@ -227,8 +227,6 @@ fn load_task_host_with_opts(
     (reg, host)
 }
 
-/// Loads the task plugin with `maki.api.mode.get` stubbed, so plan-mode gating
-/// can be exercised without a UI (the real `mode.get` replies via the UI lane).
 fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -237,7 +235,19 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
     let mode_stub = format!(
-        "maki.agent.current = function() return {{ mode = function() return '{mode}' end }} end\n\n"
+        r#"
+        local register_tool = maki.api.register_tool
+        maki.api.register_tool = function(spec)
+            local handler = spec.handler
+            spec.handler = function(input, ctx)
+                return handler(input, {{
+                    mode = function() return {mode:?} end,
+                    tool_output_lines = function() return ctx:tool_output_lines() end,
+                }})
+            end
+            return register_tool(spec)
+        end
+    "#
     );
     host.load_source_with_opts(
         "task_policy",
@@ -773,18 +783,15 @@ fn load_real_driver_host_with_opts(
 }
 
 fn load_real_driver_host_with_prelude(
-    mode: &str,
+    _mode: &str,
     opts: serde_json::Map<String, Value>,
     extra_prelude: &str,
 ) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mode_stub = format!(
-        "maki.agent.current = function() return {{ mode = function() return '{mode}' end }} end\n\n"
-    );
     host.load_source_with_opts(
         "task_policy_real",
-        &format!("{mode_stub}\n{REAL_DRIVER_PRELUDE}\n{extra_prelude}\n{TASK_PLUGIN_SRC}"),
+        &format!("{REAL_DRIVER_PRELUDE}\n{extra_prelude}\n{TASK_PLUGIN_SRC}"),
         opts,
     )
     .unwrap();
@@ -840,7 +847,9 @@ fn task_policy_spawn_honors_mode_gating_real() {
         common::canned_reply("ok"),
         common::canned_reply("ok"),
     ]));
-    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    ctx.mode = AgentMode::Plan("/test/task-plan.md".into());
+    ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
     // general in plan mode -> blocked before any session is spawned.
     let (reg, _host) = load_real_driver_host("plan");
@@ -857,13 +866,16 @@ fn task_policy_spawn_honors_mode_gating_real() {
     spawn_and_wait(&reg, &ctx, reviewer).expect("plan_reviewer must run in plan mode");
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
 
+    let mut build_ctx = ctx.clone();
+    build_ctx.mode = AgentMode::Build;
+    build_ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Build)));
     let (reg_build, _host) = load_real_driver_host("build");
     let mut reviewer_build = task_input(SCENARIO_PLAIN, None);
     reviewer_build["subagent_type"] = json!("plan_reviewer");
-    let err = spawn_and_wait(&reg_build, &ctx, reviewer_build)
+    let err = spawn_and_wait(&reg_build, &build_ctx, reviewer_build)
         .expect_err("plan_reviewer must be blocked outside plan mode");
     assert!(err.contains("only available in plan mode"), "got: {err}");
-    assert_eq!(probe_real(&reg_build, &ctx)["sessions"], json!(0));
+    assert_eq!(probe_real(&reg_build, &build_ctx)["sessions"], json!(0));
 
     // research is allowed in every mode.
     let mut research = task_input(SCENARIO_PLAIN, None);
@@ -873,7 +885,8 @@ fn task_policy_spawn_honors_mode_gating_real() {
     let (reg_build2, _host) = load_real_driver_host("build");
     let mut research_build = task_input(SCENARIO_PLAIN, None);
     research_build["subagent_type"] = json!("research");
-    spawn_and_wait(&reg_build2, &ctx, research_build).expect("research must run in build mode");
+    spawn_and_wait(&reg_build2, &build_ctx, research_build)
+        .expect("research must run in build mode");
 
     // The granted sessions were served by the canned provider (real driver),
     // not a Lua stub: the provider recorded the requests it received.
@@ -1235,7 +1248,9 @@ fn plan_mode_task_supports_structured_output_real_driver() {
         common::canned_tool_use(STRUCTURED_OUTPUT_TOOL, json!({ "answer": "42" })),
         common::canned_reply("done"),
     ]));
-    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    ctx.mode = AgentMode::Plan("/test/task-plan.md".into());
+    ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
     let (reg, _host) = load_real_driver_host("plan");
     let mut input = task_input(SCENARIO_HAPPY, Some(answer_schema()));

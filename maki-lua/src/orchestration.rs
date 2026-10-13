@@ -25,7 +25,6 @@ pub(crate) struct PluginAuthority {
 }
 
 impl PluginAuthority {
-    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -59,8 +58,12 @@ pub(crate) fn register_event_callback(
     plugin: Arc<str>,
     function: Function,
 ) -> mlua::Result<u64> {
+    crate::runtime::validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
     let plugin = crate::runtime::current_plugin(lua).map_or(plugin, |(plugin, _)| plugin);
-    let owner = plugin_authority(lua, plugin.clone());
+    let owner = lua
+        .app_data_ref::<TaskHandle>()
+        .and_then(|task| lock_cell(&task).plugin_owner.clone())
+        .unwrap_or_else(|| plugin_authority(lua, plugin.clone()));
     let services = services(lua);
     if lua.app_data_ref::<EventCallbacks>().is_none() {
         lua.set_app_data(EventCallbacks::default());
@@ -193,10 +196,6 @@ impl TrustedHostRootContext {
                 owner,
             },
         }))
-    }
-
-    pub(crate) fn plugin_authority(&self) -> Arc<PluginAuthority> {
-        self.authority.owner.clone()
     }
 
     pub(crate) fn validate(&self, lua: &Lua) -> Result<(), String> {
@@ -474,6 +473,7 @@ mod tests {
             authority.validate(&lua).unwrap_err(),
             ORCHESTRATION_CONTEXT_EXPIRED
         );
+        drop(scope);
         let callback = lua.create_function(|_, ()| Ok(())).unwrap();
         let id = register_event_callback(&lua, Arc::from("owner"), callback).unwrap();
         let (_, _, first) = event_callback(&lua, id).unwrap();

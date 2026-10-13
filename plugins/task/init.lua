@@ -123,11 +123,7 @@ local task_order = {}
 -- The executing agent's own mode, never the focused session's. Plan-specific
 -- gating stays here until plan mode becomes a guest plugin.
 local function current_mode(ctx)
-  local agent = maki.agent.current(ctx)
-  if not agent then
-    return nil
-  end
-  return (agent:mode(ctx))
+  return ctx:mode()
 end
 
 -- Validates the shared setup for a subagent and returns
@@ -137,10 +133,14 @@ local function prepare(input, ctx)
   if subagent_type ~= "research" and subagent_type ~= "general" and subagent_type ~= "plan_reviewer" then
     return nil, { llm_output = "unknown subagent type: " .. subagent_type, is_error = true }
   end
-  if subagent_type == "plan_reviewer" and current_mode(ctx) ~= "plan" then
+  local mode, mode_err = current_mode(ctx)
+  if mode_err then
+    return nil, { llm_output = mode_err, is_error = true }
+  end
+  if subagent_type == "plan_reviewer" and mode ~= "plan" then
     return nil, { llm_output = "plan_reviewer is only available in plan mode", is_error = true }
   end
-  if subagent_type == "general" and current_mode(ctx) == "plan" then
+  if subagent_type == "general" and mode == "plan" then
     return nil, { llm_output = GENERAL_BLOCKED_IN_PLAN_ERR, is_error = true }
   end
 
@@ -232,7 +232,7 @@ local function create_session(ctx, options)
     return agent:_maki_session_id()
   end
   function adapter:_maki_task_owner()
-    return agent:_maki_task_owner()
+    return agent:_maki_task_owner(ctx)
   end
   function adapter:close(call_ctx)
     return agent:close(call_ctx)
@@ -420,7 +420,11 @@ local function send_handler(input, ctx)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  if task.writes and current_mode(ctx) == "plan" then
+  local mode, mode_err = current_mode(ctx)
+  if mode_err then
+    return { llm_output = mode_err, is_error = true }
+  end
+  if task.writes and mode == "plan" then
     return { llm_output = GENERAL_SEND_IN_PLAN_ERR, is_error = true }
   end
   local ok, err = enqueue(task, input.message, ctx)

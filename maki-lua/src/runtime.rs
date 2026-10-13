@@ -549,6 +549,7 @@ pub(crate) struct TaskCell {
     pub(crate) cancel: CancelToken,
     pub(crate) managed_turn: Option<CurrentManagedTurn>,
     pub(crate) plugin_origin: Option<(Arc<str>, u64)>,
+    pub(crate) plugin_owner: Option<Arc<crate::orchestration::PluginAuthority>>,
     pub(crate) scope_alive: bool,
     pub(crate) delegated_tool: Option<DelegatedTool>,
     pub(crate) agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
@@ -595,6 +596,20 @@ pub(crate) struct TaskCell {
 }
 
 impl TaskCell {
+    pub(crate) fn validate_plugin_effect(&self) -> Result<(), String> {
+        if self
+            .plugin_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_alive())
+        {
+            return Err(crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED.into());
+        }
+        if !self.is_live() {
+            return Err(crate::agent_errors::INVOCATION_EXPIRED.into());
+        }
+        Ok(())
+    }
+
     /// Whether the task may still act: its scope is open, it is not
     /// cancelled and its deadline has not passed.
     pub(crate) fn is_live(&self) -> bool {
@@ -618,6 +633,7 @@ impl TaskCell {
             delegated_tool: None,
             agent_parent: None,
             plugin_origin: None,
+            plugin_owner: None,
             scope_alive: true,
             defer_close: Vec::new(),
             kill_at: Cell::new(None),
@@ -1388,6 +1404,25 @@ pub(crate) fn current_plugin(lua: &Lua) -> Option<(Arc<str>, u64)> {
         .flatten()
 }
 
+pub(crate) fn bind_plugin_owner(
+    lua: &Lua,
+    plugin: Arc<str>,
+    owner: Arc<crate::orchestration::PluginAuthority>,
+) -> mlua::Result<()> {
+    let task = active_task(lua);
+    let mut cell = lock_cell(&task);
+    cell.plugin_origin = Some((plugin, owner.generation()));
+    cell.plugin_owner = Some(owner);
+    cell.validate_plugin_effect().map_err(mlua::Error::runtime)
+}
+
+pub(crate) fn validate_plugin_effect(lua: &Lua) -> Result<(), String> {
+    let Some(task) = lua.app_data_ref::<TaskHandle>() else {
+        return Ok(());
+    };
+    lock_cell(&task).validate_plugin_effect()
+}
+
 pub(crate) fn register_defer_close(
     lua: &Lua,
     close: Box<dyn FnOnce() + Send>,
@@ -1467,7 +1502,7 @@ pub(crate) fn deny_delegated_registration(lua: &Lua) -> mlua::Result<()> {
             crate::agent_errors::DELEGATED_REGISTRATION,
         ));
     }
-    Ok(())
+    validate_plugin_effect(lua).map_err(mlua::Error::runtime)
 }
 
 /// Task id for job ownership; `None` under a delivery scope.
@@ -1536,6 +1571,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
         owner: None,
+        plugin_grant: None,
         managed_turn,
         agent_parent,
         delegated_tool: handle
@@ -1772,6 +1808,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
+    pub plugin_grant: Option<(Arc<str>, Arc<crate::orchestration::PluginAuthority>)>,
     pub managed_turn: Option<CurrentManagedTurn>,
     pub agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
     pub delegated_tool: Option<DelegatedTool>,
@@ -1885,6 +1922,7 @@ fn spawn_deferred_callback(
     gate: &Rc<InflightGate>,
     cb: DeferredCallback,
 ) {
+    let owner = crate::orchestration::plugin_authority(lua, cb.plugin.clone());
     let lua = lua.clone();
     let gate = Rc::clone(gate);
     ex.spawn(async move {
@@ -1901,6 +1939,7 @@ fn spawn_deferred_callback(
             return;
         }
         let run = async {
+            bind_plugin_owner(&lua, cb.plugin.clone(), owner)?;
             let func: Function = lua.registry_value(&cb.func)?;
             let thread = lua.create_thread(func)?;
             thread.into_async::<()>(())?.await
@@ -1996,10 +2035,15 @@ fn spawn_async_task(
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         cell.pinned_target = task.pinned_target;
-        cell.plugin_origin = task
-            .owner
-            .as_ref()
-            .and_then(|owner| lock_cell(&owner.0).plugin_origin.clone());
+        if let Some(owner) = &task.owner {
+            let owner = lock_cell(&owner.0);
+            cell.plugin_origin = owner.plugin_origin.clone();
+            cell.plugin_owner = owner.plugin_owner.clone();
+        }
+        if let Some((plugin, owner)) = task.plugin_grant {
+            cell.plugin_origin = Some((plugin, owner.generation()));
+            cell.plugin_owner = Some(owner);
+        }
         let scope = TaskScope::new(&lua, cell);
         let handle = Arc::clone(scope.handle());
         let result = covered(
@@ -2475,6 +2519,7 @@ pub(crate) fn loading_plugin_generation(lua: &Lua, plugin: &str) -> Option<u64> 
 }
 
 pub(crate) fn require_plugin_load(lua: &Lua, plugin: &str, api: &str) -> mlua::Result<()> {
+    validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
     if loading_plugin_is(lua, plugin) {
         Ok(())
     } else {
@@ -4497,6 +4542,7 @@ async fn run_tool_call(
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
     cell.plugin_origin = Some((plugin.clone(), generation));
+    cell.plugin_owner = Some(crate::orchestration::plugin_authority(&lua, plugin.clone()));
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
     ctx.pin_host_root(&lua);
@@ -5051,9 +5097,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             if let Some((func, typed, parsed)) = command_data {
                                 let args = args.trim().to_owned();
                                 let target = crate::orchestration::resolve_target(&rt.lua, None);
+                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let run = async {
+                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
                                         let parsed = match parsed {
                                             Ok(parsed) => parsed,
                                             Err(error) => {
@@ -5151,10 +5199,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             );
                             if let Some(func) = handler_fn {
                                 let target = crate::orchestration::resolve_target(&rt.lua, Some(&invocation));
+                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let options_invocation = invocation.clone();
                                     let run = async {
+                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
                                         let opts = lua.create_table()?;
                                         set_lua_command_options(&lua, &opts, &options_invocation)?;
                                         let ctx = match target.map_err(mlua::Error::runtime)? {
@@ -5423,6 +5473,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             });
                             if let Some((func, plugin)) = func {
                                 let target = crate::orchestration::validate_pinned_target(&rt.lua, target.map(|target| *target));
+                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let scope = TaskScope::detached(&lua);
@@ -5430,6 +5481,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         lock_cell(scope.handle()).pinned_target = Some(target.clone());
                                     }
                                     let run = async {
+                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
                                         let ctx = match target.map_err(mlua::Error::runtime)? {
                                             Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin)),
                                             None => LuaCtx::trusted_host_root_context(&lua, plugin)
@@ -6436,6 +6488,7 @@ mod tests {
             deadline,
             live_ctx: None,
             owner: None,
+            plugin_grant: None,
             managed_turn: None,
             agent_parent: None,
             delegated_tool: None,
@@ -6971,6 +7024,7 @@ mod tests {
             deadline: None,
             live_ctx: None,
             owner: None,
+            plugin_grant: None,
             managed_turn: None,
             agent_parent: None,
             delegated_tool: None,

@@ -7,7 +7,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table};
 
 use crate::agent_errors::DELEGATED_REGISTRATION;
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -376,6 +376,7 @@ fn set(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> {
         if mode != "n" {
             return Err(mlua::Error::runtime(format!(
@@ -430,6 +431,7 @@ fn del(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> {
         let _ = mode;
         let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;

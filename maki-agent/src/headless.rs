@@ -911,6 +911,14 @@ pub fn spawn_interactive_with_preparation(
     spawn_interactive_with_preparation_and_history(params, prepare, None)
 }
 
+struct StandaloneChildren(Arc<CancelMap<String>>);
+
+impl Drop for StandaloneChildren {
+    fn drop(&mut self) {
+        self.0.cancel_all();
+    }
+}
+
 fn spawn_interactive_with_preparation_and_history(
     params: InteractiveParams,
     prepare: ProviderPreparation,
@@ -999,7 +1007,9 @@ fn spawn_interactive_with_preparation_and_history(
         let permissions = Arc::clone(&permissions);
         let file_write_locks = Arc::clone(&file_write_locks);
         let _stream_guard = guard;
+        let children = StandaloneChildren(Arc::new(CancelMap::new()));
         async move {
+            let children = children;
             let (mut model, mut provider) = match prepare(params.model, params.timeouts).await {
                 Ok(prepared) => prepared,
                 Err(e) => {
@@ -1270,7 +1280,7 @@ fn spawn_interactive_with_preparation_and_history(
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         modes: Arc::clone(&modes),
-                        subagent_cancels: Arc::new(CancelMap::new()),
+                        subagent_cancels: Arc::clone(&children.0),
                         ledger: Arc::new(RunLedger::default()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
@@ -1359,9 +1369,13 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::LocalTool;
     use crate::tools::offload::{OffloadBackend, OffloadError};
+    use maki_providers::{ContentBlock, RequestOptions, StopReason, StreamResponse};
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use std::collections::HashMap;
     use std::io;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use test_case::test_case;
 
@@ -2141,8 +2155,58 @@ mod tests {
         });
     }
 
+    struct OwnershipProbeProvider {
+        provider: Arc<dyn Provider>,
+        tool_name: &'static str,
+        invoked: StdMutex<bool>,
+    }
+
+    impl Provider for OwnershipProbeProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            events: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: RequestOptions,
+            session: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, crate::AgentError>>
+        {
+            if !std::mem::replace(&mut *self.invoked.lock().unwrap(), true) {
+                return Box::pin(async move {
+                    Ok(StreamResponse {
+                        message: Message {
+                            role: maki_providers::Role::Assistant,
+                            content: vec![ContentBlock::tool_use(
+                                self.tool_name,
+                                self.tool_name,
+                                serde_json::json!({}),
+                            )],
+                            ..Default::default()
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(StopReason::ToolUse),
+                    })
+                });
+            }
+            self.provider
+                .stream_message(model, messages, system, tools, events, options, session)
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            self.provider.list_models()
+        }
+    }
+
     #[test]
     fn headless_queued_settings_survive_config_change() {
+        const OWNERSHIP_PROBE: &str = "headless_ownership_probe";
         const FIRST: &str = "first provider";
         const SECOND: &str = "second provider";
         let (requests, received) = flume::unbounded();
@@ -2248,8 +2312,8 @@ mod tests {
             )
             .unwrap();
 
-        let first = rx.recv().unwrap();
-        let second = rx.recv().unwrap();
+        let mut first = rx.recv().unwrap();
+        let mut second = rx.recv().unwrap();
         assert!(Arc::ptr_eq(&first.settings.provider, &first_provider));
         assert!(first.input.fast && first.input.workflow);
         assert!(!second.input.fast && !second.input.workflow);
@@ -2280,6 +2344,38 @@ mod tests {
             (FIRST, first.settings.model.spec(), first.input.fast),
             (SECOND, second.settings.model.spec(), second.input.fast),
         ];
+        for turn in [&mut first, &mut second] {
+            turn.settings.provider = Arc::new(OwnershipProbeProvider {
+                provider: turn.settings.provider.clone(),
+                tool_name: OWNERSHIP_PROBE,
+                invoked: StdMutex::new(false),
+            });
+        }
+        let ownership = Arc::new(StdMutex::new(None::<(Arc<CancelMap<String>>, CancelToken)>));
+        let observed_ownership = ownership.clone();
+        let probe = LocalTool {
+            audience: ToolAudience::MAIN,
+            handler: Arc::new(move |_, ctx| {
+                let mut observed = observed_ownership.lock().unwrap();
+                if let Some((parent, cancel)) = &*observed {
+                    assert!(Arc::ptr_eq(parent, &ctx.subagent_cancels));
+                    assert!(!cancel.is_cancelled());
+                } else {
+                    let (trigger, cancel) = CancelToken::new();
+                    ctx.subagent_cancels.insert(OWNERSHIP_PROBE.into(), trigger);
+                    *observed = Some((ctx.subagent_cancels.clone(), cancel));
+                }
+                Box::pin(async { Ok("observed".into()) })
+            }),
+        };
+        let local_tools = Arc::new(HashMap::from([(OWNERSHIP_PROBE.into(), probe)]));
+        for turn in [&mut first, &mut second] {
+            turn.admission.bindings = Arc::new(crate::tools::TurnToolBindings::capture(
+                ToolRegistry::global(),
+                &local_tools,
+                None,
+            ));
+        }
         smol::block_on(async {
             let params = test_params();
             let session_id = MakiId::generate();
@@ -2343,7 +2439,7 @@ mod tests {
                     question_mode: crate::tools::QuestionMode::Headless,
                     plugin_rules: params.plugin_rules,
                     project_config: params.project_config,
-                    local_tools: Default::default(),
+                    local_tools,
                     state_dir: None,
                 },
                 Box::new(|model, _| {
@@ -2376,6 +2472,7 @@ mod tests {
                 }
             }
             handle.task.cancel().await;
+            assert!(ownership.lock().unwrap().as_ref().unwrap().1.is_cancelled());
             coordinator.close().await.unwrap();
         });
         for (name, model, fast) in expected {

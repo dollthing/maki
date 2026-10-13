@@ -1100,6 +1100,7 @@ fn register_command(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> { register_command_from_lua(lua, &spec, plugin, pending) };
     registered()?;
     Ok((Some(true), None))
@@ -1158,6 +1159,7 @@ async fn run_command(
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {

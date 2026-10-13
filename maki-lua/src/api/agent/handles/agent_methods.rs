@@ -552,7 +552,11 @@ pub(crate) fn agent_defer_close(
     Ok((Some(true), None))
 }
 
-fn task_owner_authority(lua: &Lua, this: &LuaAgent) -> mlua::Result<TaskOwnerAuthority> {
+fn task_owner_authority(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: &LuaCtx,
+) -> mlua::Result<TaskOwnerAuthority> {
     let plugin_identity =
         || current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY));
     match &this.manager {
@@ -576,16 +580,17 @@ fn task_owner_authority(lua: &Lua, this: &LuaAgent) -> mlua::Result<TaskOwnerAut
                 plugin,
                 generation,
                 parent: parent.clone(),
+                host_root: ctx.host_root(lua).map_err(mlua::Error::runtime)?,
             })
         }
     }
 }
 
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method("_maki_task_owner", |lua, this, ()| {
+    methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
         Ok(LuaTaskOwner {
             owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
-            authority: task_owner_authority(lua, this)?,
+            authority: task_owner_authority(lua, this, &ctx)?,
             child_id: this
                 .id
                 .ok_or_else(|| mlua::Error::runtime(UNSUPPORTED_OPERATION_ERROR))?,

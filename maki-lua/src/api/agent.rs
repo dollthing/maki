@@ -67,6 +67,7 @@ use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::host_root::HostRootServices;
 use crate::orchestration::TrustedContext;
 use crate::runtime::CANCELLED_MSG;
 
@@ -2787,6 +2788,7 @@ enum TaskOwnerAuthority {
         generation: u64,
         owner: Arc<crate::orchestration::PluginAuthority>,
         parent: Arc<CancelMap<String>>,
+        host_root: Option<Arc<HostRootServices>>,
     },
     Agent {
         plugin: Arc<str>,
@@ -2824,7 +2826,14 @@ impl mlua::UserData for LuaTaskOwner {
                     generation,
                     owner,
                     parent,
+                    host_root,
                 } => {
+                    if host_root
+                        .as_ref()
+                        .is_some_and(|services| services.validate(&services.reference()).is_err())
+                    {
+                        return Ok(false);
+                    }
                     if InvocationGuard::capture(lua).is_err()
                         || !crate::orchestration::holds_plugin_grant(
                             lua,

@@ -21,7 +21,7 @@ use crate::api::util::command::{
     CommandArgumentItem, CommandCompletionCallbacks, CommandHandlerMap,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{
     CommandArgumentContext, CommandArgumentLifecycle, CommandArgumentLifecycleRequest,
 };
@@ -112,6 +112,7 @@ fn register_completion_source(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> {
         let get_items: Function = spec.get("get_items")?;
         let mut store = lua
@@ -160,6 +161,7 @@ fn register_expander(
     if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_REGISTRATION));
     }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let registered = || -> LuaResult<()> {
         let mut store = lua
             .app_data_mut::<ExpanderStore>()
