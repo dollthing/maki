@@ -1680,6 +1680,7 @@ fn exact_wait_observes_idle_actor() {
             .admit_turn(input("first"), None, "first".into())
             .unwrap();
         first.wait().await;
+        assert_eq!(handle.snapshot().status, ActorStatus::Idle);
         let second = handle
             .admit_turn_if_idle(input("second"), None, "second".into(), None)
             .unwrap();

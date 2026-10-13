@@ -2738,6 +2738,16 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 }
+                if let (
+                    maki_commands::HostRequest::Context(
+                        maki_commands::HostContextRequest::ModelSpecs,
+                    ),
+                    Some(pinned),
+                ) = (&request, &admission)
+                {
+                    let _ = reply.send(self.target_model_specs(&pinned.target));
+                    return;
+                }
                 let result = self.sessions[index].app.execute_host_request(request);
                 match result {
                     Ok((response, actions)) => {
@@ -4624,6 +4634,33 @@ impl<'t> EventLoop<'t> {
         {
             tracing::warn!(keybind_id = id, "keybind callback queue is full");
         }
+    }
+
+    /// The model catalog filtered by {target}'s model policy, so `/model`
+    /// fragments resolve only to models the pinned agent may use.
+    fn target_model_specs(
+        &self,
+        target: &maki_agent::AgentRef,
+    ) -> Result<maki_commands::HostResponse, maki_commands::CommandError> {
+        let policy =
+            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, target)
+                .map_err(|_| maki_commands::CommandError::StaleTarget)?
+                .model_policy;
+        let specs = self
+            .ctx
+            .available_models
+            .load_full()
+            .map(|models| {
+                models
+                    .iter()
+                    .filter(|spec| policy.allows(spec))
+                    .map(|spec| Arc::from(spec.as_str()))
+                    .collect()
+            })
+            .unwrap_or_else(|| Arc::from([]));
+        Ok(maki_commands::HostResponse::Context(
+            maki_commands::HostContextResponse::Values(specs),
+        ))
     }
 
     fn selected_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
@@ -8196,6 +8233,32 @@ mod tests {
                 },
             ));
             assert_eq!(manager.snapshot().len(), 1);
+        });
+    }
+
+    #[test]
+    fn model_spec_requests_follow_the_pinned_target_policy() {
+        const ALLOWED: &str = "anthropic/claude-opus-4-6";
+        const EXCLUDED: &str = "openai/gpt-5";
+        with_event_loop(|event_loop| {
+            event_loop
+                .ctx
+                .available_models
+                .store(Some(Arc::new(vec![ALLOWED.into(), EXCLUDED.into()])));
+            event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .model_policy = Arc::new(ModelPolicy::new(&[], &[EXCLUDED.into()]).unwrap());
+            event_loop.sync_orchestration();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            let Ok(maki_commands::HostResponse::Context(
+                maki_commands::HostContextResponse::Values(specs),
+            )) = event_loop.target_model_specs(&target)
+            else {
+                panic!("model specs request failed");
+            };
+            assert_eq!(&*specs, [Arc::<str>::from(ALLOWED)]);
         });
     }
 
