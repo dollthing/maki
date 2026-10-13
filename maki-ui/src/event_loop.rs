@@ -5317,7 +5317,7 @@ mod tests {
     use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
-    use maki_providers::TokenUsage;
+    use maki_providers::{Effort, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -8152,6 +8152,119 @@ mod tests {
                 },
             ));
             assert_eq!(manager.snapshot().len(), 1);
+        });
+    }
+
+    #[test]
+    fn nested_lua_command_acts_on_target_pinned_before_selection_changes() {
+        const PINNED_THINKING: &str = "high";
+        const CHILD_CHAT: &str = "nested pin child";
+        const SPAWNED: &str = "nested pin child spawned";
+        const INNER_DONE: &str = "nested pin inner command finished";
+        const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "nested_pin_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-pin-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/pin-outer", tui_only = false,
+                        handler = function()
+                            assert(maki.fn.winsaveview())
+                            assert(maki.api.run_command("/pin-inner"))
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/pin-inner", tui_only = false,
+                        handler = function(_, ctx)
+                            local target = assert(maki.agent.current(ctx))
+                            assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
+                            maki.ui.flash("{INNER_DONE}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            let command_target = event_loop.sessions[0].app.command_target.clone();
+            smol::block_on(registry.dispatch_input(&command_target, "/spawn-pin-child".into()));
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let thinking = |id| {
+                manager
+                    .actor(id)
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .thinking
+            };
+            let pinned_thinking = DomainThinkingConfig::Effort(Effort::High);
+            let child_thinking = thinking(child_id);
+            assert_ne!(thinking(root_id), pinned_thinking);
+            assert_ne!(child_thinking, pinned_thinking);
+
+            smol::block_on(registry.dispatch_input(&command_target, "/pin-outer".into()));
+            let UiAction::WinSaveView { reply_tx } = actions.recv_timeout(ACTION_TIMEOUT).unwrap()
+            else {
+                panic!("outer command did not reach its gate");
+            };
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                CHILD_CHAT.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            app.chats.push(chat);
+            app.active_chat = 1;
+            assert_eq!(app.selected_agent_id(), Some(child_id));
+            event_loop.sync_orchestration();
+            reply_tx
+                .send(maki_lua::WinView {
+                    scroll_top: 0,
+                    line_count: 0,
+                    height: 0,
+                    auto_scroll: false,
+                })
+                .unwrap();
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == INNER_DONE
+            ));
+            assert_eq!(thinking(root_id), pinned_thinking);
+            assert_eq!(thinking(child_id), child_thinking);
         });
     }
 
