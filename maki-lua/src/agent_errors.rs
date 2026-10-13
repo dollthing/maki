@@ -22,6 +22,7 @@ pub const DELEGATED_FOREIGN_SESSION: &str =
 pub const DELEGATED_SESSION_LIFECYCLE: &str =
     "delegated tool handlers cannot create, focus or delete sessions";
 pub const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
+pub const SELF_TURN_WAIT: &str = "cannot wait for a turn on the calling agent";
 pub const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 pub const EXPLICIT_MODEL_TARGET_REQUIRED: &str =

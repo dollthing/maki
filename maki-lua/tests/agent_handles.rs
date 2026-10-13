@@ -9,9 +9,10 @@ use maki_commands::CommandInvocation;
 use maki_lua::{
     PluginHost, SessionRequest, UiAction,
     agent_errors::{
-        AGENT_BUSY, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION, FOREIGN_AGENT_REFERENCE,
-        INVOCATION_EXPIRED, NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
-        OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, STALE_TURN, STRUCTURED_OUTPUT_CONFLICT,
+        AGENT_BUSY, DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION,
+        FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, NO_FOCUSED_AGENT, NOT_DESCENDANT_OF_CALLER,
+        ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME, OUTPUT_SCHEMA_NOT_OBJECT,
+        RESTRICTED_MODE_CHANGE, SELF_TURN_WAIT, STALE_TURN, STRUCTURED_OUTPUT_CONFLICT,
         TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
         TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
@@ -1900,6 +1901,69 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
         assert_eq!(thinking(&focused), ThinkingConfig::Off);
         shutdown_manager(&focused.manager).await;
         shutdown_manager(&pinned.manager).await;
+    });
+}
+
+#[test]
+fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
+    smol::block_on(async {
+        const PLUGIN: &str = "pr5_no_focus";
+        let fixture = Fixture::start(
+            "pr5_self_wait",
+            &format!(
+                r#"
+            local own = assert(assert(maki.agent.current(ctx)):latest_turn(ctx))
+            local waited, wait_err = own:wait(ctx)
+            assert(waited == nil and wait_err == {SELF_TURN_WAIT:?}, wait_err)
+            local focused, focus_err = maki.ui.focused_agent()
+            assert(focused == nil and focus_err == {DELEGATED_FOCUS:?}, focus_err)
+        "#
+            ),
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "self wait refusal")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        fixture
+            ._host
+            .event_handle()
+            .install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(
+                Vec::new(),
+            )));
+        fixture
+            ._host
+            .load_source(
+                PLUGIN,
+                &format!(
+                    r#"
+            maki.api.register_command({{
+                name = "/pr5_no_focus", tui_only = false,
+                handler = function()
+                    local focused, focus_err = maki.ui.focused_agent()
+                    assert(focused == nil and focus_err == {NO_FOCUSED_AGENT:?}, focus_err)
+                end,
+            }})
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                ._host
+                .event_handle()
+                .run_command_for_test(
+                    Arc::from(PLUGIN),
+                    Arc::from("/pr5_no_focus"),
+                    String::new(),
+                    0
+                )
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap(),
+            Ok(())
+        );
+        shutdown_manager(&fixture.manager).await;
     });
 }
 

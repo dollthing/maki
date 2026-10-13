@@ -9,7 +9,7 @@ use smol::Timer;
 use super::authority::{authorize, observe};
 use super::projection::result_table;
 use super::{AgentRuntime, LuaAgentTurn};
-use crate::agent_errors::TURN_WAIT_TIMEOUT;
+use crate::agent_errors::{SELF_TURN_WAIT, TURN_WAIT_TIMEOUT};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
@@ -91,7 +91,7 @@ pub(super) async fn ticket_wait(
     drop(this);
     if let Some(active) = &active {
         if Some(active.agent_id()) == agent.id {
-            return Ok(err_pair("cannot wait for a turn on the calling agent"));
+            return Ok(err_pair(SELF_TURN_WAIT));
         }
         let actor = try_pair!(agent.manager.actor(agent.id));
         let wait = try_pair!(active.lease().observe_descendant(
