@@ -34,7 +34,7 @@ Everything above applies to delegated work too: any subagent you spawn is strict
 - **`research`** — generic read-only research: investigate the codebase and report back.
 - **`plan_reviewer`** — reviews a completed plan file against the plan specification (see "Plan review before handoff" below).
 
-Give each subagent a scoped task with `task_spawn`, then observe its report with `task_wait`. `general` spawns are blocked in plan mode.
+Give each subagent a scoped task with `task_spawn`, then observe its report with `task_wait`. `general` spawns are blocked in plan mode, and `general` tasks started earlier cannot take new work through `task_send`.
 
 ## Classifying user intent
 

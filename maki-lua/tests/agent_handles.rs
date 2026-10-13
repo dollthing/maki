@@ -3836,6 +3836,41 @@ fn bundled_task_gates_subagent_types_on_the_executing_agent_mode() {
 }
 
 #[test]
+fn bundled_task_refuses_new_work_for_general_tasks_after_entering_plan_mode() {
+    smol::block_on(async {
+        const SEND_REFUSED: &str = "general subagents cannot take new work in plan mode; despawn the task or switch to build mode";
+        let fixture = Fixture::start_with_options(
+            "pr5_plan_mode_send",
+            FixtureOptions {
+                bundled_tasks: true,
+                ..Default::default()
+            },
+            &format!(
+                r#"
+            local text = assert(maki.agent.call_tool(ctx, "task_spawn", {{
+                description = "writer", prompt = "edit things", subagent_type = "general",
+            }}))
+            local task = maki.json.decode(text)
+            assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan") == "plan")
+            local sent, err = maki.agent.call_tool(ctx, "task_send", {{
+                task_id = task.task_id, message = "keep editing",
+            }})
+            assert(sent == nil and err == "{SEND_REFUSED}", tostring(err))
+            assert(maki.agent.call_tool(ctx, "task_despawn", {{ task_id = task.task_id }}))
+        "#
+            ),
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "plan mode send refusal")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
 fn abandoned_managed_blocking_task_releases_child_provider() {
     smol::block_on(async {
         let fixture = Fixture::start_with_options(

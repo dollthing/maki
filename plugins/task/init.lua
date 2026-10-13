@@ -11,6 +11,8 @@ local TURN_UNAVAILABLE_ERR = "turn_result_unavailable"
 local TURN_LIMIT_ERR = "task turn ticket limit reached"
 local TASK_LIMIT_ERR = "task record limit reached; despawn unused tasks"
 local SUMMARY_MISSING_ERROR = "subagent finished without providing a summary"
+local GENERAL_SEND_IN_PLAN_ERR =
+  "general subagents cannot take new work in plan mode; despawn the task or switch to build mode"
 local GENERAL_BLOCKED_IN_PLAN_ERR =
   "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)"
 local NUDGE_SUMMARY =
@@ -412,6 +414,7 @@ local function spawn(spec, input, ctx)
     sess = sess,
     owner = sess:_maki_task_owner(),
     closed = false,
+    writes = spec.subagent_type == "general",
   }
   tasks[task_id] = task
   task_order[#task_order + 1] = task_id
@@ -508,6 +511,9 @@ local function send_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
+  end
+  if task.writes and current_mode(ctx) == "plan" then
+    return { llm_output = GENERAL_SEND_IN_PLAN_ERR, is_error = true }
   end
   local ok, err = enqueue(task, input.message, ctx)
   if not ok then
