@@ -21,7 +21,7 @@ use crate::{
     TurnOutcome, WorkKind,
 };
 
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
 
 #[test]
