@@ -145,6 +145,9 @@ fn notify(
         lua.registry_value::<Function>(key).ok()
     });
     if let Some(func) = handler_fn {
+        // Trusted plugin code installed the handler, so it keeps that
+        // authority when a delegated tool notifies; its own timers must work.
+        let _scope = crate::runtime::TaskScope::detached(lua);
         // A broken override must not swallow the message, so fall through.
         match func.call::<()>((msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
@@ -355,6 +358,25 @@ mod tests {
         clear_notify_handler(&lua, "maki_b");
         lua.load(r#"maki.notify("back to flash")"#).exec().unwrap();
         assert_eq!(flashed(&rx), "back to flash");
+    }
+
+    #[test]
+    fn notify_handler_keeps_installer_authority_in_delegated_tools() {
+        let lua = Lua::new();
+        let (tx, _rx) = flume::unbounded();
+        install(&lua, Some(tx), "maki");
+        let delegated = lua
+            .create_function(|lua, ()| Ok(crate::runtime::in_delegated_tool(lua)))
+            .unwrap();
+        lua.globals().set("delegated", delegated).unwrap();
+        lua.load(r#"maki.set_notify_handler(function() seen = delegated() end)"#)
+            .exec()
+            .unwrap();
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        crate::runtime::lock_cell(scope.handle()).delegated_tool = true;
+        lua.load(r#"maki.notify("from a tool")"#).exec().unwrap();
+        assert!(!lua.globals().get::<bool>("seen").unwrap());
+        assert!(crate::runtime::in_delegated_tool(&lua));
     }
 
     #[test]

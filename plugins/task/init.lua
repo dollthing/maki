@@ -374,7 +374,8 @@ local function spawn(spec, input, ctx)
   while i <= #task_order do
     local id = task_order[i]
     local task = tasks[id]
-    if not task then
+    if not task or task.owner:_maki_retired() then
+      tasks[id] = nil
       table.remove(task_order, i)
     elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_maki_can_control() then
       if task.closed or task.sess:idle(ctx) then

@@ -153,6 +153,9 @@ maki.agent.spawn = function(ctx, opts)
       _maki_can_control = function()
         return recorder.can_control ~= false
       end,
+      _maki_retired = function()
+        return false
+      end,
     }
   end
   function sess:defer_close(call_ctx)

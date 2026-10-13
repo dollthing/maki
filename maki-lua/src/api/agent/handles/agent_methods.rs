@@ -584,7 +584,8 @@ lua_class! {
     /// Internal compatibility adapters are supported only for the bundled task plugin:
     /// _maki_session_id() reads the existing task/UI identity without granting control;
     /// _maki_task_owner() returns a host-stamped owner guard whose _maki_can_control()
-    /// checks the current invocation's plugin generation, host and permitted parent branch.
+    /// checks the current invocation's plugin generation, host and permitted parent branch,
+    /// and whose _maki_retired() reports a managed child that has closed.
     /// The guard cannot authorize effects, transfer control or revive expired authority.
     /// Each effect still uses the public ctx-taking Agent or AgentTurn operation.
     /// Third-party plugins should use id(), explicit references and public scoped operations;

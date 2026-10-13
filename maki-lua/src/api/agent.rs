@@ -2554,6 +2554,14 @@ struct LuaTaskOwner {
 
 impl mlua::UserData for LuaTaskOwner {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // A managed task whose child has closed, for instance because its owner
+        // was closed, can be dropped without anyone's authority.
+        methods.add_method("_maki_retired", |_, this, ()| {
+            Ok(matches!(
+                &this.authority,
+                TaskOwnerAuthority::Agent { target, .. } if target.validate_live().is_err()
+            ))
+        });
         methods.add_method("_maki_can_control", |lua, this, ()| {
             match &this.authority {
                 TaskOwnerAuthority::Session(authority) => {
