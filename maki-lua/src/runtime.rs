@@ -3393,6 +3393,7 @@ impl LuaRuntime {
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
+                    deprecated: t.deprecated,
                 });
                 (
                     tool,

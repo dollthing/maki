@@ -170,7 +170,7 @@ Use this tool when you need to ask the user questions during execution. This all
 
 ## Agent & Knowledge
 
-### `task` {#task}
+### `task` <span class="badge">deprecated</span> {#task}
 
 Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -206,7 +206,7 @@ Wait for one exact task turn. Omitted turn_id snapshots the latest admitted turn
 | `timeout` | integer | no | Observation timeout in seconds. Zero checks without waiting; timeout never cancels work. |
 | `turn_id` | string | no | Exact admitted turn. Omit to snapshot the latest retained turn once. |
 
-### `task_get` {#task_get}
+### `task_get` <span class="badge">deprecated</span> {#task_get}
 
 Deprecated nonblocking task observation. Returns {status, result?, error?, retryable?}. Use task_wait instead.
 

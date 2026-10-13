@@ -222,6 +222,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) deprecated: bool,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -252,6 +253,7 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) deprecated: bool,
 }
 
 impl Tool for LuaTool {
@@ -304,6 +306,10 @@ impl Tool for LuaTool {
 
     fn tool_kind(&self) -> Option<&str> {
         self.kind.as_deref()
+    }
+
+    fn deprecated(&self) -> bool {
+        self.deprecated
     }
 
     fn examples(&self) -> Option<Value> {
@@ -797,6 +803,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
+///   deprecated      (boolean) Keep the tool callable but leave it out of model tool lists and code_execution listings. The reference marks it deprecated. Default: false.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
@@ -1450,6 +1457,7 @@ fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
+    t.set("deprecated", entry.tool.deprecated())?;
     Ok(t)
 }
 
@@ -1788,6 +1796,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             start_annotation,
             examples,
             describe_key,
+            deprecated: spec_opt::<bool>(spec, "deprecated", "a boolean")?.unwrap_or(false),
         });
 
     Ok(())
@@ -2848,6 +2857,7 @@ mod tests {
             has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            deprecated: false,
         }
     }
 

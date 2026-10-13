@@ -248,6 +248,10 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    /// Deprecated tools stay callable but are left out of model tool lists.
+    fn deprecated(&self) -> bool {
+        false
+    }
     fn required_permission(&self) -> Option<Permission> {
         None
     }
@@ -538,6 +542,10 @@ impl ToolRegistry {
             if !ctx.filter.matches(entry.name()) {
                 continue;
             }
+            let reference = ctx.audience.is_empty();
+            if entry.tool.deprecated() && !reference {
+                continue;
+            }
             let description = vars.apply(&entry.tool.description(ctx)).into_owned();
             if description.trim().is_empty() {
                 continue;
@@ -547,6 +555,9 @@ impl ToolRegistry {
                 "description": description,
                 "input_schema": sanitize_tool_input_schema(entry.tool.schema()),
             });
+            if reference && entry.tool.deprecated() {
+                def["deprecated"] = Value::Bool(true);
+            }
             if let Some(examples) = entry.tool.examples() {
                 if supports_examples {
                     def["input_examples"] = examples;

@@ -174,7 +174,7 @@ local function interpreter_tools(tools, audience, workflow)
     for _, a in ipairs(t.audiences) do
       aud[a] = true
     end
-    if aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
+    if not t.deprecated and aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
       t.workflow_only = not aud.interpreter
       out[#out + 1] = t
     end

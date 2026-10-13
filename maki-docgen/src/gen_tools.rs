@@ -163,6 +163,9 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
     }
+    if info.def.get("deprecated").and_then(Value::as_bool) == Some(true) {
+        badges.push_str(" <span class=\"badge\">deprecated</span>");
+    }
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();

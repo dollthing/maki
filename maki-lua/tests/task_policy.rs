@@ -615,13 +615,7 @@ fn deprecated_task_tools_are_callable_but_hidden() {
                 .iter()
                 .any(|definition| definition["name"] == name)
         );
-        assert!(
-            reg.get(name)
-                .unwrap()
-                .tool
-                .description(&description_ctx)
-                .is_empty()
-        );
+        assert!(reg.get(name).unwrap().tool.deprecated());
     }
     let reference_ctx = DescriptionContext {
         audience: ToolAudience::empty(),

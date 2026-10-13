@@ -671,12 +671,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_get",
-  describe = function(ctx)
-    if ctx.audience == "reference" then
-      return nil
-    end
-    return ""
-  end,
+  deprecated = true,
   description = "Deprecated nonblocking task observation. Returns {status, result?, error?, retryable?}. Use task_wait instead.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
@@ -720,12 +715,7 @@ maki.api.register_tool({
 maki.api.register_tool({
   name = "task",
   description = description,
-  describe = function(ctx)
-    if ctx.audience == "reference" then
-      return nil
-    end
-    return ""
-  end,
+  deprecated = true,
   kind = "execute",
   audiences = { "main", "general_sub", "workflow" },
   examples = examples,
