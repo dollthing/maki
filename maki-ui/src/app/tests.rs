@@ -17,10 +17,11 @@ use maki_agent::{
     McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
+use maki_commands::ModelSelection;
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{ContentBlock, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Effort, Message, Role, ThinkingConfig, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
@@ -3169,49 +3170,68 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
     });
 }
 
-/// `/model <provider/id>` emits `ChangeModel` for the spec without the picker,
-/// even when the spec is absent from the discovered list (explicit specs
-/// bypass the list).
-#[test]
-fn model_structured_selection_emits_one_atomic_action() {
+fn late_model_selection(thinking: ThinkingConfig, fast: bool) -> ModelSelection {
+    ModelSelection {
+        spec: Some(Arc::from(LATE_MODEL_SPEC)),
+        thinking: Some(thinking),
+        fast: Some(fast),
+    }
+}
+
+/// `/model` with a spec and options, in brace or trailing `key=value` form,
+/// or with options alone, emits one `SelectModel` carrying the whole
+/// selection and leaves the picker closed. A spec absent from the
+/// discovered list is still accepted.
+#[test_case(
+    format!("{LATE_MODEL_SPEC}{{thinking=high,fast=true}}"),
+    late_model_selection(ThinkingConfig::Effort(Effort::High), true)
+    ; "brace_options"
+)]
+#[test_case(
+    format!("{LATE_MODEL_SPEC} thinking=high fast=true"),
+    late_model_selection(ThinkingConfig::Effort(Effort::High), true)
+    ; "trailing_options"
+)]
+#[test_case(
+    "thinking=off fast=false".into(),
+    ModelSelection { spec: None, thinking: Some(ThinkingConfig::Off), fast: Some(false) }
+    ; "options_only"
+)]
+fn model_structured_selection_emits_one_atomic_action(args: String, expected: ModelSelection) {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
-    for args in [
-        format!("{LATE_MODEL_SPEC} thinking=high fast=true"),
-        "thinking=off fast=false".into(),
-    ] {
-        let expected = maki_commands::parse_model_selection(&args).unwrap();
-        let actions = app.execute_command(
-            ParsedCommand {
-                name: "/model".into(),
-                args,
-            },
-            0,
-        );
-        assert!(
-            matches!(actions.as_slice(), [Action::SelectModel(selection)] if selection == &expected)
-        );
-        assert!(!app.model_picker.is_open());
-    }
-    for args in [
-        "fast=true fast=false",
-        "fast=on",
-        "thinking=0",
-        "unknown=value",
-    ] {
-        let actions = app.execute_command(
-            ParsedCommand {
-                name: "/model".into(),
-                args: args.into(),
-            },
-            0,
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::SelectModel(_) | Action::ChangeModel(_)))
-        );
-    }
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/model".into(),
+            args,
+        },
+        0,
+    );
+    assert!(
+        matches!(actions.as_slice(), [Action::SelectModel(selection)] if selection == &expected)
+    );
+    assert!(!app.model_picker.is_open());
+}
+
+#[test_case("fast=true fast=false" ; "duplicate_option")]
+#[test_case("fast=on" ; "invalid_fast")]
+#[test_case("thinking=0" ; "zero_budget")]
+#[test_case("unknown=value" ; "unknown_option")]
+fn model_invalid_selection_emits_no_model_change(args: &str) {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/model".into(),
+            args: args.into(),
+        },
+        0,
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::SelectModel(_) | Action::ChangeModel(_)))
+    );
 }
 
 #[test]
