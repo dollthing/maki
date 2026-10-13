@@ -1805,11 +1805,14 @@ fn close_drains_queued_turns_and_cancels_active_with_closed_reason() {
 fn cancel_all_is_reusable() {
     smol::block_on(async {
         let backend = CancellableBackend::new();
+        let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let t1 = handle
             .admit_turn(input("running"), None, "t1".into())
             .unwrap();
-        until(|| handle.snapshot().status != ActorStatus::Idle).await;
+        // Status leaves Idle at pop; only the backend entering guarantees
+        // t1, not t3, is the run that blocks until cancelled.
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
 
         handle
             .rush(RootWork::new(

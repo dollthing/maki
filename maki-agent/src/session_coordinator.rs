@@ -1488,17 +1488,13 @@ async fn run(
                     continue;
                 }
                 if hold_lease(&ctx, &rx, &wait, &mut deferred).await.is_break() {
-                    for operation in deferred.drain(..).chain(rx.try_iter()) {
-                        reject_operation(operation, ctx.session_id);
-                    }
+                    reject_until_disconnected(&mut deferred, &rx, ctx.session_id).await;
                     return;
                 }
             }
             other => {
                 if handle_operation(&ctx, other, reservation).await.is_break() {
-                    for operation in deferred.drain(..).chain(rx.try_iter()) {
-                        reject_operation(operation, ctx.session_id);
-                    }
+                    reject_until_disconnected(&mut deferred, &rx, ctx.session_id).await;
                     return;
                 }
             }
@@ -1506,6 +1502,23 @@ async fn run(
     }
     unregister(ctx.session_id, ctx.generation);
     ctx.catalog.unregister(ctx.session_id, ctx.generation);
+}
+
+/// Rejects deferred operations and every later send until the last handle
+/// drops. A single drain before returning would strand an operation sent
+/// between the drain and the receiver dropping, and its caller would wait on
+/// a reply that never comes.
+async fn reject_until_disconnected(
+    deferred: &mut VecDeque<Operation>,
+    rx: &flume::Receiver<Operation>,
+    session_id: MakiId,
+) {
+    for operation in deferred.drain(..) {
+        reject_operation(operation, session_id);
+    }
+    while let Ok(operation) = rx.recv_async().await {
+        reject_operation(operation, session_id);
+    }
 }
 
 /// Serves operations for as long as the lease is held. History replacement and
