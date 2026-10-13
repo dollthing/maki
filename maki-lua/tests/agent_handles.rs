@@ -1,7 +1,7 @@
 use maki_agent::{
     ActorBackend, ActorError, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
-    BackendResult, ControlWork, DoneReason, History, ManagerError, RunSettings, TurnContext,
-    TurnId, TurnOutcome, WorkKind,
+    BackendResult, ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings,
+    TurnContext, TurnId, TurnOutcome, WorkKind,
     actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, TurnOrigin, TurnProvenance},
     tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
 };
@@ -49,6 +49,7 @@ const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
 const SYNTHETIC_PLAN_PATH: &str = "/test/host-plan.md";
 const MODEL_CATALOG_UNAVAILABLE: &str = "host model catalog is unavailable";
+const TOOLS_ONLY_MODE: &str = "pr5_tools_only";
 
 async fn bounded<T>(future: impl Future<Output = T>, operation: &str) -> T {
     futures_lite::future::race(future, async {
@@ -580,6 +581,7 @@ impl Fixture {
                     ..Default::default()
                 })
                 .unwrap();
+            definition = context.modes.current(&mode);
         }
         context.mode_def = Some(Arc::new(definition.clone()));
         let mut definitions = vec![json!({
@@ -1110,20 +1112,17 @@ fn public_agent_model_change_controls_next_request_without_losing_history() {
     });
 }
 
-#[test_case::test_case(false ; "build")]
-#[test_case::test_case(true ; "restricted_plan")]
-fn executing_child_tool_cannot_control_ancestor_or_sibling(restricted: bool) {
+#[test_case::test_case(AgentMode::Build, "pr5_tool_authority_build", false, false ; "build")]
+#[test_case::test_case(AgentMode::Plan("/test/authority-plan.md".into()), "pr5_tool_authority_plan", true, true ; "restricted_plan")]
+#[test_case::test_case(AgentMode::Custom(ModeId::Custom(TOOLS_ONLY_MODE.into())), "pr5_tool_authority_tools_only", true, false ; "tools_only_custom")]
+fn executing_child_tool_cannot_control_ancestor_or_sibling(
+    mode: AgentMode,
+    tool: &'static str,
+    mode_locked: bool,
+    write_restricted: bool,
+) {
     smol::block_on(async {
-        let mode = if restricted {
-            AgentMode::Plan("/test/authority-plan.md".into())
-        } else {
-            AgentMode::Build
-        };
-        let tool = if restricted {
-            "pr5_tool_authority_plan"
-        } else {
-            "pr5_tool_authority_build"
-        };
+        let mode_key = mode.id().key().to_owned();
         let probe = format!("{tool}_probe");
         let (parent_id, child_id) = (AgentId::generate(), AgentId::generate());
         let not_descendant = ManagerError::NotDescendant {
@@ -1151,9 +1150,12 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(restricted: bool) {
                     local function not_descendant(target)
                         return (({not_descendant:?}):gsub({child_placeholder:?}, target:id()):gsub({parent_placeholder:?}, current:id()))
                     end
-                    if {restricted} then
+                    if {mode_locked} then
+                        assert(assert(current:mode(child_ctx)) == {mode_key:?})
                         local changed, mode_err = current:set_mode(child_ctx, "build")
                         assert(changed == nil and mode_err == {RESTRICTED_MODE_CHANGE:?}, mode_err)
+                    end
+                    if {write_restricted} then
                         local written, write_err = maki.agent.call_tool(child_ctx, "{tool}_write", {{ path = "/test/forbidden.txt" }})
                         assert(written == nil and write_err == {PLAN_WRITE_RESTRICTED:?}, write_err)
                         assert(not pr5_nested_write_entered)
@@ -1215,7 +1217,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(restricted: bool) {
         let first = fixture.request().await;
         assert!(
             common::tool_names(&first.tools).contains(&probe),
-            "child admission filtered probe before dispatch (restricted={restricted}): {:?}",
+            "child admission filtered probe before dispatch (mode={mode_key}): {:?}",
             first.tools
         );
         first
