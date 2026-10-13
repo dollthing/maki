@@ -292,8 +292,14 @@ local function create_session(ctx, options, blocking)
     if not result then
       return nil, wait_err
     end
-    local status = cumulative and agent:status(call_ctx) or result
-    return project_result(result, status or result)
+    if not cumulative then
+      return project_result(result, result)
+    end
+    local status, status_err = agent:status(call_ctx)
+    if not status then
+      return nil, status_err
+    end
+    return project_result(result, status)
   end
   function adapter:prompt(message, call_ctx)
     local id, send_err = self:send(message, call_ctx)

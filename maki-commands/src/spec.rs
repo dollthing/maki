@@ -16,6 +16,7 @@ pub type CommandFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub const MAX_COMMAND_DEPTH: usize = 8;
 pub const COMPACT_COMMAND_NAME: &str = "/compact";
+pub const MODEL_COMMAND_NAME: &str = "/model";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -386,7 +387,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
     ),
     builtin!(
         Model,
-        "/model",
+        MODEL_COMMAND_NAME,
         &[],
         "Switch model",
         typed MODEL_ARGUMENTS,

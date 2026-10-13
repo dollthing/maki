@@ -12,7 +12,7 @@ use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
-use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME};
+use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME, TRUSTED_MODEL_MUTATION_REQUIRED};
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
@@ -314,16 +314,16 @@ impl LuaCtx {
         let task = lua
             .app_data_ref::<crate::runtime::TaskHandle>()
             .map(|task| Arc::clone(&task))
-            .ok_or("host model mutation requires trusted handler authority")?;
+            .ok_or(TRUSTED_MODEL_MUTATION_REQUIRED)?;
         let (plugin, generation, cancel) = {
             let cell = lock_cell(&task);
             if cell.delegated_tool || cell.managed_turn.is_some() {
-                return Err("host model mutation requires trusted handler authority".into());
+                return Err(TRUSTED_MODEL_MUTATION_REQUIRED.into());
             }
             let (plugin, generation) = cell
                 .plugin_origin
                 .clone()
-                .ok_or("host model mutation requires trusted handler authority")?;
+                .ok_or(TRUSTED_MODEL_MUTATION_REQUIRED)?;
             (plugin, generation, cell.cancel.clone())
         };
         let owner = crate::orchestration::existing_plugin_authority(lua, &plugin, generation)?;

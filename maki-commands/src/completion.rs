@@ -12,7 +12,10 @@ use crate::arguments::{
 use crate::completion_providers::CompletionProviders;
 use crate::dispatch::ResolvedCommand;
 use crate::registry::{RegistryInner, normalize};
-use crate::spec::{CommandFuture, CommandId, CompletionSessionId, InvocationTargetId, ProducerId};
+use crate::spec::{
+    CommandFuture, CommandId, CompletionSessionId, InvocationTargetId, MODEL_COMMAND_NAME,
+    ProducerId,
+};
 
 pub const MAX_COMPLETION_CANDIDATES: usize = 640;
 
@@ -604,7 +607,7 @@ pub struct CompletionInput {
 
 impl CompletionInput {
     pub fn normalized(mut self, command: &str, cursor: usize) -> Self {
-        if command != "/model" {
+        if command != MODEL_COMMAND_NAME {
             return self;
         }
         let Some(prefix) = self.arguments.get(..cursor) else {

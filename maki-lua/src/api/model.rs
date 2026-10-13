@@ -8,6 +8,7 @@ use maki_providers::{
 };
 use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
+use crate::agent_errors::TRUSTED_MODEL_MUTATION_REQUIRED;
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
@@ -134,8 +135,9 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// Answers with the committed state, in the same shape `get` returns. Changes
 /// apply to subsequent admissions. UI actors save asynchronously after commit;
 /// SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
-/// print roots reject all patches. Prefer `Agent:set_model(ctx, patch)` for an
-/// explicit target.
+/// print roots reject all patches. Delegated tool handlers cannot call it,
+/// because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
+/// for an explicit target.
 ///
 /// @param opts string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
@@ -153,10 +155,14 @@ async fn set(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(TRUSTED_MODEL_MUTATION_REQUIRED));
+    }
     let req = match opts {
         Value::String(spec) => ModelRequest::Set {
             spec: Some(spec.to_str()?.to_owned()),
             thinking: None,
+            toggle_thinking: false,
             fast: None,
         },
         Value::Table(opts) => {
@@ -171,11 +177,8 @@ async fn set(
             };
             ModelRequest::Set {
                 spec: selection.spec.map(|spec| spec.to_string()),
-                thinking: if toggle {
-                    Some(String::new())
-                } else {
-                    selection.thinking.map(|thinking| thinking.to_string())
-                },
+                thinking: selection.thinking,
+                toggle_thinking: toggle,
                 fast: selection.fast,
             }
         }
@@ -199,6 +202,7 @@ async fn set(
         let ModelRequest::Set {
             spec,
             thinking,
+            toggle_thinking,
             fast,
         } = req
         else {
@@ -209,18 +213,17 @@ async fn set(
             Ok(validator) => validator,
             Err(error) => return Ok(err_pair(error)),
         };
-        let thinking = match thinking {
-            Some(value) => {
-                let current = match services.model(&reference) {
-                    Ok(selection) => selection.thinking,
-                    Err(error) => return Ok(err_pair(error.to_string())),
-                };
-                match ThinkingConfig::parse(&value, current) {
-                    Ok(thinking) => Some(thinking),
-                    Err(error) => return Ok(err_pair(error.to_string())),
-                }
+        let thinking = if toggle_thinking {
+            let current = match services.model(&reference) {
+                Ok(selection) => selection.thinking,
+                Err(error) => return Ok(err_pair(error.to_string())),
+            };
+            match ThinkingConfig::parse("", current) {
+                Ok(thinking) => Some(thinking),
+                Err(error) => return Ok(err_pair(error.to_string())),
             }
-            None => None,
+        } else {
+            thinking
         };
         let result = services
             .set_model_guarded(
@@ -349,8 +352,17 @@ mod tests {
             ModelRequest::Set {
                 spec,
                 thinking,
+                toggle_thinking,
                 fast,
-            } => json!({ "spec": spec, "thinking": thinking, "fast": fast }),
+            } => json!({
+                "spec": spec,
+                "thinking": if toggle_thinking {
+                    Some(String::new())
+                } else {
+                    thinking.map(|thinking| thinking.to_string())
+                },
+                "fast": fast,
+            }),
         }))
     }
 
@@ -370,6 +382,19 @@ mod tests {
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
     fn requests_cross_the_channel_and_answer_with_the_new_state(script: &str, expected: Json) {
         assert_eq!(eval(&stub_ui(echo), script), (expected, None));
+    }
+
+    #[test]
+    fn delegated_tool_cannot_use_context_free_setter() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_model(Some(tx));
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        lock_cell(scope.handle()).delegated_tool = true;
+        assert_eq!(
+            eval(&lua, "return model.set({ thinking = 'low' })"),
+            (Json::Null, Some(TRUSTED_MODEL_MUTATION_REQUIRED.into()))
+        );
+        assert!(rx.is_empty());
     }
 
     #[test_case("return model.set({ unknown = true })" ; "unknown_key")]

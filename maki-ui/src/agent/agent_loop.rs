@@ -2053,7 +2053,7 @@ mod tests {
                 )
                 .unwrap(),
             };
-            orchestration.select(HashMap::new(), Some(root.clone()));
+            orchestration.select(Some(root.clone()));
             host.event_handle()
                 .install_orchestration_services(orchestration);
             host.load_source(

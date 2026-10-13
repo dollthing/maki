@@ -499,7 +499,8 @@ pub enum ModelRequest {
     Available,
     Set {
         spec: Option<String>,
-        thinking: Option<String>,
+        thinking: Option<maki_providers::ThinkingConfig>,
+        toggle_thinking: bool,
         fast: Option<bool>,
     },
 }

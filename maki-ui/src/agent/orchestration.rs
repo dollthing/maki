@@ -5,9 +5,8 @@ use maki_agent::{
     cancel::CancelToken,
     tools::{Deadline, ToolContext, TurnToolBindings},
 };
-use maki_commands::{CommandInvocation, InvocationTargetId};
+use maki_commands::CommandInvocation;
 use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -41,11 +40,7 @@ impl AgentOrchestration {
         targets.roots.push(target);
     }
 
-    pub(crate) fn select(
-        &self,
-        _commands: HashMap<InvocationTargetId, AgentRef>,
-        focused: Option<AgentRef>,
-    ) {
+    pub(crate) fn select(&self, focused: Option<AgentRef>) {
         let mut targets = self
             .targets
             .lock()

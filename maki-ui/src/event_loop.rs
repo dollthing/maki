@@ -2338,7 +2338,7 @@ impl<'t> EventLoop<'t> {
             }
         }
         self.ctx.command_runtime.sync_admissions(admissions);
-        self.orchestration.select(HashMap::new(), focused);
+        self.orchestration.select(focused);
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -2719,8 +2719,16 @@ impl<'t> EventLoop<'t> {
                         _ => None,
                     };
                     if let Some(selection) = selection {
-                        let target = admission.map(|pinned| pinned.target);
-                        self.dispatch_model_selection(index, target, selection, Some(reply));
+                        let Some(pinned) = admission else {
+                            let _ = reply.send(Err(maki_commands::CommandError::StaleTarget));
+                            return;
+                        };
+                        self.dispatch_model_selection(
+                            index,
+                            Some(pinned.target),
+                            selection,
+                            Some(reply),
+                        );
                         return;
                     }
                 }
@@ -2952,8 +2960,9 @@ impl<'t> EventLoop<'t> {
                 ModelRequest::Set {
                     spec,
                     thinking,
+                    toggle_thinking,
                     fast,
-                } => self.dispatch_model_set(spec, thinking, fast, reply_tx),
+                } => self.dispatch_model_set(spec, thinking, toggle_thinking, fast, reply_tx),
                 req => {
                     let _ = reply_tx.send(self.handle_model_request(req));
                 }
@@ -3701,25 +3710,12 @@ impl<'t> EventLoop<'t> {
     fn dispatch_model_set(
         &mut self,
         spec: Option<String>,
-        thinking: Option<String>,
+        thinking: Option<DomainThinkingConfig>,
+        toggle_thinking: bool,
         fast: Option<bool>,
         reply_tx: flume::Sender<UiReply>,
     ) {
         let idx = self.focused;
-        let toggle_thinking = thinking
-            .as_ref()
-            .is_some_and(|input| input.trim().is_empty());
-        let thinking = match thinking
-            .filter(|_| !toggle_thinking)
-            .map(|input| DomainThinkingConfig::parse(input.trim(), DomainThinkingConfig::default()))
-            .transpose()
-        {
-            Ok(thinking) => thinking,
-            Err(error) => {
-                let _ = reply_tx.send(Err(error.to_owned()));
-                return;
-            }
-        };
         if spec.is_some() {
             self.note_if_deferred(idx, "model");
         }
@@ -4223,6 +4219,7 @@ impl<'t> EventLoop<'t> {
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
             Action::RunKeybind(id) => self.run_keybind(idx, id),
             Action::SelectModel(selection) => {
+                self.note_if_deferred(idx, "model");
                 let target = self.selected_target(idx);
                 self.dispatch_model_selection(idx, target, selection, None);
             }
@@ -4542,6 +4539,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, idx: usize, spec: &str) {
+        self.note_if_deferred(idx, "model");
         let target = self.selected_target(idx);
         self.dispatch_model_selection(
             idx,

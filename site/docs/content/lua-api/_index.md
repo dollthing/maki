@@ -4191,8 +4191,9 @@ you leave out stay as they are, so this doubles as a thinking-only switch.
 Answers with the committed state, in the same shape `get` returns. Changes
 apply to subsequent admissions. UI actors save asynchronously after commit;
 SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
-print roots reject all patches. Prefer `Agent:set_model(ctx, patch)` for an
-explicit target.
+print roots reject all patches. Delegated tool handlers cannot call it,
+because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
+for an explicit target.
 
 **Parameters:**
 
