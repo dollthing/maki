@@ -1,3 +1,5 @@
+> Historical plan: the final PR5 implementation deviates from this plan. In particular, it removes `task` and `task_get`, makes standalone nested waits permit-safe, and replaces the old Session/spawn model options. The implementation and public documentation describe the current API. The execution links and verification status below refer to an earlier revision and are not current acceptance evidence.
+
 ## Goal
 
 Implement PR 5 of issue #24: first-class explicitly authorized Lua agents, exact-turn tickets/results, concurrent typed event handlers, and atomic model/options selection. Migrate task/session compatibility adapters and validate the public API using deterministic fake-provider scenarios. /goal is a separate downstream plugin, not part of this implementation.
