@@ -296,11 +296,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
         let context = try_pair!(ctx.agent().ok_or_else(|| ctx.cap_err("orchestration")));
         let handle = try_pair!(task_authority(&lua));
         let cell = lock_cell(&handle);
-        if !cell.scope_alive
-            || cell.cancel.is_cancelled()
-            || context.cancel.is_cancelled()
-            || cell.managed_turn.is_some()
-        {
+        if !cell.is_live() || context.cancel.is_cancelled() || cell.managed_turn.is_some() {
             return Ok(err_pair(UNMANAGED_AUTHORITY_INACTIVE));
         }
     }
@@ -326,11 +322,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
             let captured = try_pair!(task.upgrade().ok_or("unmanaged owner expired"));
             let active = try_pair!(task_authority(&lua));
             let cell = lock_cell(&active);
-            if !Arc::ptr_eq(&active, &captured)
-                || !cell.scope_alive
-                || cell.cancel.is_cancelled()
-                || cell.managed_turn.is_some()
-            {
+            if !Arc::ptr_eq(&active, &captured) || !cell.is_live() || cell.managed_turn.is_some() {
                 return Ok(err_pair("unmanaged owner expired during preparation"));
             }
             drop(cell);

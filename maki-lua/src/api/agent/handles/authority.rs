@@ -10,8 +10,8 @@ use crate::agent_errors::{
 };
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::host_root::{HostRootServices, UNSUPPORTED_OPERATION_ERROR};
-use crate::orchestration::{self, plugin_authority};
-use crate::runtime::{TaskHandle, current_managed_turn, current_plugin, lock_cell};
+use crate::orchestration::{self, holds_plugin_grant};
+use crate::runtime::{TaskHandle, current_managed_turn, lock_cell};
 
 pub(super) fn retire_closed(lua: &Lua) {
     if let Some(sessions) = lua.app_data_ref::<AgentSessions>() {
@@ -51,14 +51,11 @@ pub(super) fn validate_unmanaged(
         .or(template.as_ref())
         .ok_or_else(|| ctx.cap_err("orchestration"))?;
     let active = task_authority(lua)?;
-    let same_generation =
-        current_plugin(lua).is_some_and(|current| current.0 == *plugin && current.1 == *generation);
-    if !same_generation || !Arc::ptr_eq(owner, &plugin_authority(lua, plugin.clone())) {
+    if !holds_plugin_grant(lua, plugin, *generation, owner) {
         return Err(OTHER_PLUGIN_GENERATION.into());
     }
     let cell = lock_cell(&active);
-    if !cell.scope_alive
-        || cell.cancel.is_cancelled()
+    if !cell.is_live()
         || context.cancel.is_cancelled()
         || context.managed_turn.is_some()
         || cell.managed_turn.is_some()

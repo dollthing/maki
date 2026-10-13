@@ -1831,13 +1831,7 @@ impl InvocationGuard {
             .map(|task| Arc::clone(&task))
             .ok_or(NO_TASK_AUTHORITY)?;
         let cell = crate::runtime::lock_cell(&task);
-        if !cell.scope_alive
-            || cell.cancel.is_cancelled()
-            || cell
-                .deadline
-                .get()
-                .is_some_and(|deadline| Instant::now() > deadline)
-        {
+        if !cell.is_live() {
             return Err(INVOCATION_EXPIRED.into());
         }
         if !Arc::ptr_eq(&task, &current) {
@@ -1906,14 +1900,8 @@ impl SessionAuthority {
                 services,
             } => {
                 InvocationGuard::capture(lua)?.validate(lua)?;
-                let current = crate::runtime::current_plugin(lua).ok_or(NO_PLUGIN_AUTHORITY)?;
-                if current.0 != *plugin
-                    || current.1 != *generation
-                    || !Arc::ptr_eq(
-                        owner,
-                        &crate::orchestration::plugin_authority(lua, plugin.clone()),
-                    )
-                {
+                crate::runtime::current_plugin(lua).ok_or(NO_PLUGIN_AUTHORITY)?;
+                if !crate::orchestration::holds_plugin_grant(lua, plugin, *generation, owner) {
                     return Err("session belongs to another plugin generation".into());
                 }
                 let current =
@@ -2581,11 +2569,11 @@ impl mlua::UserData for LuaTaskOwner {
                     parent,
                 } => {
                     if InvocationGuard::capture(lua).is_err()
-                        || !crate::runtime::current_plugin(lua)
-                            .is_some_and(|current| current.0 == *plugin && current.1 == *generation)
-                        || !Arc::ptr_eq(
+                        || !crate::orchestration::holds_plugin_grant(
+                            lua,
+                            plugin,
+                            *generation,
                             owner,
-                            &crate::orchestration::plugin_authority(lua, plugin.clone()),
                         )
                         || crate::runtime::current_managed_turn(lua).is_some()
                     {
@@ -2609,11 +2597,11 @@ impl mlua::UserData for LuaTaskOwner {
                     target,
                 } => {
                     if InvocationGuard::capture(lua).is_err()
-                        || !crate::runtime::current_plugin(lua)
-                            .is_some_and(|current| current.0 == *plugin && current.1 == *generation)
-                        || !Arc::ptr_eq(
+                        || !crate::orchestration::holds_plugin_grant(
+                            lua,
+                            plugin,
+                            *generation,
                             owner,
-                            &crate::orchestration::plugin_authority(lua, plugin.clone()),
                         )
                     {
                         return Ok(false);

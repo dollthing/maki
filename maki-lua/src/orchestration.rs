@@ -7,7 +7,6 @@ use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use mlua::{Function, Lua, RegistryKey};
-use std::time::Instant;
 use std::{
     collections::HashMap,
     sync::{
@@ -257,6 +256,19 @@ pub(crate) fn plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthori
         })
 }
 
+/// Whether the running code belongs to {plugin} at {generation} and the
+/// plugin's live authority is still {owner}.
+pub(crate) fn holds_plugin_grant(
+    lua: &Lua,
+    plugin: &Arc<str>,
+    generation: u64,
+    owner: &Arc<PluginAuthority>,
+) -> bool {
+    crate::runtime::current_plugin(lua).is_some_and(|(current, current_generation)| {
+        current == *plugin && current_generation == generation
+    }) && Arc::ptr_eq(owner, &plugin_authority(lua, plugin.clone()))
+}
+
 /// Grants a fresh authority when a plugin load commits; the previous one
 /// must already be revoked.
 pub(crate) fn install_plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {
@@ -344,14 +356,7 @@ impl ScopeAuthority {
         let task = self.task.upgrade().ok_or(ORCHESTRATION_CONTEXT_EXPIRED)?;
         let current_id = active_task_id(lua);
         let cell = lock_cell(&task);
-        if !cell.scope_alive
-            || cell.cancel.is_cancelled()
-            || cell
-                .deadline
-                .get()
-                .is_some_and(|deadline| Instant::now() > deadline)
-            || !self.owner.alive.load(Ordering::Acquire)
-        {
+        if !cell.is_live() || !self.owner.alive.load(Ordering::Acquire) {
             return Err(ORCHESTRATION_CONTEXT_EXPIRED.into());
         }
         if current_id != Some(cell.id) {

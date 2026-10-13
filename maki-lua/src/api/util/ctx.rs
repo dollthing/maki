@@ -371,13 +371,8 @@ impl LuaCtx {
                 .upgrade()
                 .ok_or_else(|| Arc::<str>::from(INVOCATION_EXPIRED))?;
             let cell = lock_cell(&task);
-            if !cell.scope_alive
-                || cell.cancel.is_cancelled()
+            if !cell.is_live()
                 || cancel.is_cancelled()
-                || cell
-                    .deadline
-                    .get()
-                    .is_some_and(|deadline| Instant::now() > deadline)
                 || cell.plugin_origin != plugin_origin
                 || owner.as_ref().is_some_and(|owner| !owner.is_alive())
             {
@@ -777,14 +772,7 @@ fn validate_task_origin(
     let origin = origin.ok_or("context is not bound to an invocation")?;
     let current = crate::runtime::active_task_id(lua);
     let cell = lock_cell(origin);
-    if !cell.scope_alive
-        || (!cleanup
-            && (cell.cancel.is_cancelled()
-                || cell
-                    .deadline
-                    .get()
-                    .is_some_and(|deadline| Instant::now() > deadline)))
-    {
+    if !cell.scope_alive || (!cleanup && !cell.is_live()) {
         return Err(INVOCATION_EXPIRED.into());
     }
     if current != Some(cell.id) {

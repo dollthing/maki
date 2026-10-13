@@ -595,6 +595,17 @@ pub(crate) struct TaskCell {
 }
 
 impl TaskCell {
+    /// Whether the task may still act: its scope is open, it is not
+    /// cancelled and its deadline has not passed.
+    pub(crate) fn is_live(&self) -> bool {
+        self.scope_alive
+            && !self.cancel.is_cancelled()
+            && self
+                .deadline
+                .get()
+                .is_none_or(|deadline| Instant::now() <= deadline)
+    }
+
     pub(crate) fn new(
         cancel: CancelToken,
         deadline: Option<Instant>,
