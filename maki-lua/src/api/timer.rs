@@ -175,7 +175,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     owner: None,
                     managed_turn: None,
                     agent_parent: None,
-                    delegated_tool: false,
+                    delegated_tool: None,
                     command_depth: 0,
                     command_invocation: None,
                     pinned_target: None,

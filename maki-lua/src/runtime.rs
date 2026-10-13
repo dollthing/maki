@@ -43,7 +43,7 @@ use maki_commands::{
     Registration, RegistrationError, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::{self, AutocmdStore};
 use crate::api::completion::{self, CompletionCtx, ItemSpec};
@@ -550,7 +550,7 @@ pub(crate) struct TaskCell {
     pub(crate) managed_turn: Option<CurrentManagedTurn>,
     pub(crate) plugin_origin: Option<(Arc<str>, u64)>,
     pub(crate) scope_alive: bool,
-    pub(crate) delegated_tool: bool,
+    pub(crate) delegated_tool: Option<DelegatedTool>,
     pub(crate) agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
     defer_close: Vec<Box<dyn FnOnce() + Send>>,
     /// End of the current kill grace, armed by the first watchdog poke that
@@ -604,7 +604,7 @@ impl TaskCell {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
             managed_turn: None,
-            delegated_tool: false,
+            delegated_tool: None,
             agent_parent: None,
             plugin_origin: None,
             scope_alive: true,
@@ -1430,10 +1430,22 @@ pub(crate) fn command_invocation(lua: &Lua) -> Option<CommandTaskInvocation> {
         .and_then(|handle| lock_cell(&handle).command_invocation.clone())
 }
 
+/// A tool handler acting for a delegated turn, and the session that turn
+/// belongs to.
+#[derive(Clone, Default)]
+pub(crate) struct DelegatedTool {
+    pub(crate) session: Option<MakiId>,
+}
+
+pub(crate) fn delegated_tool(lua: &Lua) -> Option<DelegatedTool> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).delegated_tool.clone())
+}
+
 /// Whether the running code is a tool handler acting for a delegated turn.
 pub(crate) fn in_delegated_tool(lua: &Lua) -> bool {
     lua.app_data_ref::<TaskHandle>()
-        .is_some_and(|handle| lock_cell(&handle).delegated_tool)
+        .is_some_and(|handle| lock_cell(&handle).delegated_tool.is_some())
 }
 
 /// Host entry points registered from a delegated tool would later run with
@@ -1517,7 +1529,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         agent_parent,
         delegated_tool: handle
             .as_ref()
-            .is_some_and(|handle| lock_cell(handle).delegated_tool),
+            .and_then(|handle| lock_cell(handle).delegated_tool.clone()),
         command_depth,
         command_invocation,
         pinned_target: handle
@@ -1751,7 +1763,7 @@ pub(crate) struct PendingAsyncTask {
     pub owner: Option<Arc<BufsClaim>>,
     pub managed_turn: Option<CurrentManagedTurn>,
     pub agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
-    pub delegated_tool: bool,
+    pub delegated_tool: Option<DelegatedTool>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     pub pinned_target: Option<crate::orchestration::TrustedTarget>,
@@ -4400,7 +4412,7 @@ async fn run_tool_start(
     mut ctx: Box<LuaCtx>,
 ) {
     let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
-    cell.delegated_tool = true;
+    cell.delegated_tool = Some(ctx.delegated_tool());
     let scope = TaskScope::new(lua, cell);
     ctx.bind_origin(scope.handle());
     let run = async {
@@ -4471,7 +4483,7 @@ async fn run_tool_call(
     };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
-    cell.delegated_tool = true;
+    cell.delegated_tool = Some(ctx.delegated_tool());
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
     cell.plugin_origin = Some((plugin.clone(), generation));
@@ -6416,7 +6428,7 @@ mod tests {
             owner: None,
             managed_turn: None,
             agent_parent: None,
-            delegated_tool: false,
+            delegated_tool: None,
             command_depth: 0,
             command_invocation: None,
             pinned_target: None,
@@ -6951,7 +6963,7 @@ mod tests {
             owner: None,
             managed_turn: None,
             agent_parent: None,
-            delegated_tool: false,
+            delegated_tool: None,
             command_depth: 0,
             command_invocation: None,
             pinned_target: None,

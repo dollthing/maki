@@ -4363,7 +4363,10 @@ Host session primitives. The interactive UI can run several sessions
 at once; these functions let plugins list, create, focus, rename, and
 delete them. Session management returns `nil, "no interactive UI
 attached"` without a UI. `notify` instead targets a live agent mailbox
-directly, so it also works under ACP and SDK frontends.
+directly, so it also works under ACP and SDK frontends. A tool handler
+cannot create, focus or delete sessions, and the functions that change
+a session (`prompt`, `set_option`, `set_title`) accept
+only the session its own turn belongs to, named explicitly.
 
 ---
 

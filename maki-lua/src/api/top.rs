@@ -380,7 +380,7 @@ mod tests {
             .exec()
             .unwrap();
         let scope = crate::runtime::TaskScope::detached(&lua);
-        crate::runtime::lock_cell(scope.handle()).delegated_tool = true;
+        crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
         lua.load(r#"maki.notify("from a tool")"#).exec().unwrap();
         assert!(!lua.globals().get::<bool>("seen").unwrap());
         assert!(crate::runtime::in_delegated_tool(&lua));

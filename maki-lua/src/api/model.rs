@@ -276,7 +276,7 @@ mod tests {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_model(Some(tx));
         let scope = crate::runtime::TaskScope::detached(&lua);
-        crate::runtime::lock_cell(scope.handle()).delegated_tool = true;
+        crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
         assert_eq!(
             eval(&lua, "return model.set({ thinking = 'low' })"),
             (Json::Null, Some(TRUSTED_MODEL_MUTATION_REQUIRED.into()))

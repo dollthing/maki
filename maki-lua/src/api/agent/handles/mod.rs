@@ -365,7 +365,7 @@ mod tests {
         ctx.bind_origin(scope.handle());
         let plugin: Arc<str> = Arc::from("child-tool");
         lock_cell(scope.handle()).plugin_origin = Some((plugin, 0));
-        lock_cell(scope.handle()).delegated_tool = true;
+        lock_cell(scope.handle()).delegated_tool = Some(Default::default());
         let userdata = lua.create_userdata(ctx).unwrap();
         let (child, error) = current(&lua, userdata.borrow().unwrap()).unwrap();
         assert!(error.is_none(), "{error:?}");

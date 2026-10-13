@@ -128,7 +128,7 @@ pub(crate) fn call_isolated<R: FromLuaMulti>(
     seam: &str,
     plugin: &str,
 ) -> Option<R> {
-    let delegated = crate::runtime::in_delegated_tool(lua);
+    let delegated = crate::runtime::delegated_tool(lua);
     let scope = TaskScope::detached(lua);
     crate::runtime::lock_cell(scope.handle()).delegated_tool = delegated;
     match func.call::<R>(args) {

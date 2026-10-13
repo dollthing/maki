@@ -158,6 +158,12 @@ impl LuaCtx {
         }
     }
 
+    pub(crate) fn delegated_tool(&self) -> crate::runtime::DelegatedTool {
+        crate::runtime::DelegatedTool {
+            session: self.session_id().flatten().map(SessionRef::id),
+        }
+    }
+
     pub(crate) fn validate_origin(&self, lua: &mlua::Lua) -> Result<(), String> {
         if matches!(self.caps, Caps::Trusted { .. }) {
             return self.trusted(lua).map(|_| ());
@@ -274,7 +280,7 @@ impl LuaCtx {
         let task = active_task(lua);
         {
             let cell = lock_cell(&task);
-            if cell.delegated_tool {
+            if cell.delegated_tool.is_some() {
                 return Err("delegated tools cannot mint host root authority".into());
             }
             if cell.managed_turn.is_some() {
@@ -1025,7 +1031,7 @@ mod tests {
         assert!(LuaCtx::trusted_host_root_context(&lua, plugin.clone()).is_err());
         assert_eq!(lock_cell(scope.handle()).plugin_origin, captured);
         lock_cell(scope.handle()).plugin_origin = None;
-        lock_cell(scope.handle()).delegated_tool = true;
+        lock_cell(scope.handle()).delegated_tool = Some(Default::default());
         assert!(LuaCtx::trusted_host_root_context(&lua, plugin).is_err());
         assert!(lock_cell(scope.handle()).plugin_origin.is_none());
     }

@@ -1921,7 +1921,10 @@ impl SessionAuthority {
                 if !Arc::ptr_eq(services, &current) {
                     return Err("session belongs to another host scope".into());
                 }
-                if crate::runtime::lock_cell(&crate::runtime::active_task(lua)).delegated_tool {
+                if crate::runtime::lock_cell(&crate::runtime::active_task(lua))
+                    .delegated_tool
+                    .is_some()
+                {
                     return Err("trusted session requires trusted coroutine authority".into());
                 }
             }
@@ -2590,7 +2593,7 @@ impl mlua::UserData for LuaTaskOwner {
                     }
                     let scope = crate::runtime::active_task(lua);
                     let cell = crate::runtime::lock_cell(&scope);
-                    if !cell.delegated_tool {
+                    if cell.delegated_tool.is_none() {
                         return Ok(true);
                     }
                     drop(cell);

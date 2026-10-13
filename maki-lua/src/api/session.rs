@@ -12,7 +12,9 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::agent_errors::DELEGATED_HOST_MUTATION;
+use crate::agent_errors::{
+    DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION, DELEGATED_SESSION_LIFECYCLE,
+};
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
@@ -209,6 +211,9 @@ async fn focus(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
@@ -225,6 +230,9 @@ async fn delete(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
@@ -295,6 +303,9 @@ async fn new(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_SESSION_LIFECYCLE));
+    }
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
@@ -320,13 +331,13 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    if crate::runtime::in_delegated_tool(&lua) && !names_session(opts.as_ref())? {
-        return Ok(err_pair(DELEGATED_HOST_MUTATION));
-    }
-    let id = match opts {
+    let id: Option<String> = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
     };
+    if let Some(denial) = delegated_tool_denial(&lua, id.as_deref()) {
+        return Ok(err_pair(denial));
+    }
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
 }
 
@@ -425,8 +436,13 @@ async fn set_option(
     value: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
-    if crate::runtime::in_delegated_tool(&lua) && !names_session(opts.as_ref())? {
-        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    let session = opts
+        .as_ref()
+        .map(|opts| opts.get::<Option<String>>("session"))
+        .transpose()?
+        .flatten();
+    if let Some(denial) = delegated_tool_denial(&lua, session.as_deref()) {
+        return Ok(err_pair(denial));
     }
     if let Err(error) = ensure_validation_not_in_progress(&lua) {
         return Ok(err_pair(error));
@@ -485,8 +501,12 @@ async fn set_title(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
+    let id: String = opts.get("id")?;
+    if let Some(denial) = delegated_tool_denial(&lua, Some(&id)) {
+        return Ok(err_pair(denial));
+    }
     let req = SessionRequest::SetTitle {
-        id: opts.get("id")?,
+        id,
         title: opts.get("title")?,
     };
     roundtrip(lua, tx, req).await
@@ -556,13 +576,17 @@ async fn set_default_thinking(
     .await
 }
 
-/// Whether {opts} names a session explicitly, rather than addressing focus.
-fn names_session(opts: Option<&Table>) -> LuaResult<bool> {
-    Ok(opts
-        .map(|opts| opts.get::<Option<String>>("session"))
-        .transpose()?
-        .flatten()
-        .is_some())
+/// Delegated tools may change only the session their turn belongs to, and
+/// must name it rather than address focus.
+fn delegated_tool_denial(lua: &Lua, session: Option<&str>) -> Option<&'static str> {
+    let tool = crate::runtime::delegated_tool(lua)?;
+    let Some(session) = session else {
+        return Some(DELEGATED_HOST_MUTATION);
+    };
+    let own = session
+        .parse::<MakiId>()
+        .is_ok_and(|id| tool.session == Some(id));
+    (!own).then_some(DELEGATED_FOREIGN_SESSION)
 }
 
 lua_table! {
@@ -570,7 +594,10 @@ lua_table! {
     /// at once; these functions let plugins list, create, focus, rename, and
     /// delete them. Session management returns `nil, "no interactive UI
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
-    /// directly, so it also works under ACP and SDK frontends.
+    /// directly, so it also works under ACP and SDK frontends. A tool handler
+    /// cannot create, focus or delete sessions, and the functions that change
+    /// a session (`prompt`, `set_option`, `set_title`) accept
+    /// only the session its own turn belongs to, named explicitly.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx), set_default_thinking(tx)]
 }
