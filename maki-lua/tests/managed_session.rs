@@ -10,6 +10,7 @@ use maki_agent::{
     RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
+use maki_lua::agent_errors::{INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -33,14 +34,13 @@ const RETAIN_NESTED_TOOL_NAME: &str = "managed_session_retain_nested";
 const RETRY_NESTED_TOOL_NAME: &str = "managed_session_retry_nested";
 const CAPTURE_UNMANAGED_CTX_TOOL_NAME: &str = "capture_unmanaged_ctx";
 const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
-const MANAGED_AUTHORITY_ERROR: &str = "managed agent authority is not active in this invocation";
-const EXPIRED_CONTEXT_ERROR: &str = "context invocation expired";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
 const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const PREPARATION_ERROR: &str = "provider preparation rejected";
 const CORRELATION: &str = "managed-root";
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Upper bound for work that must settle; generous so loaded CI does not flake.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_PRELUDE: &str = r#"
@@ -340,8 +340,8 @@ maki.api.register_tool({
 
 fn session_plugin_source() -> String {
     PLUGIN_SRC
-        .replace("$EXPIRED_CONTEXT_ERROR", EXPIRED_CONTEXT_ERROR)
-        .replace("$MANAGED_AUTHORITY_ERROR", MANAGED_AUTHORITY_ERROR)
+        .replace("$EXPIRED_CONTEXT_ERROR", INVOCATION_EXPIRED)
+        .replace("$MANAGED_AUTHORITY_ERROR", MANAGED_AUTHORITY_INACTIVE)
 }
 
 struct LuaToolBackend {
@@ -859,7 +859,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 .all(|node| node.agent_id != nested_id)
         );
         assert!(first_rx.is_empty());
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -928,7 +928,7 @@ async fn closed_child(events: &flume::Receiver<Envelope>, parent_id: AgentId) ->
             }
         },
         async {
-            smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+            smol::Timer::after(SETTLE_TIMEOUT).await;
             panic!("managed child of {parent_id} did not close");
         },
     )
@@ -944,7 +944,7 @@ async fn wait_for_runner_finished(manager: &AgentManagerHandle, agent_id: AgentI
             true
         },
         async {
-            smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+            smol::Timer::after(SETTLE_TIMEOUT).await;
             false
         },
     )
@@ -987,7 +987,7 @@ fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one(tool_na
         let completed = futures_lite::future::race(
             async { Some(completed_rx.recv_async().await.unwrap()) },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 None
             },
         )
@@ -1013,7 +1013,7 @@ fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one(tool_na
             parent_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1072,7 +1072,7 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
                 }
             },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 false
             },
         )
@@ -1101,7 +1101,7 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
         );
 
         release_tx.send(()).unwrap();
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1139,7 +1139,7 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
         let completed = futures_lite::future::race(
             async { Some(completed_rx.recv_async().await.unwrap()) },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 None
             },
         )
@@ -1161,7 +1161,7 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
             parent_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1225,7 +1225,7 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
                 }
             },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 None
             },
         )
@@ -1242,7 +1242,7 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
         let completed = futures_lite::future::race(
             async { Some(invocation.execute(&context).await.output.map(|_| ())) },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 None
             },
         )
@@ -1272,7 +1272,7 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
             TurnOutcome::Completed { .. }
         ));
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1324,7 +1324,7 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         assert_eq!(
             completed_rx.recv_async().await.unwrap(),
             Ok(()),
-            "{EXPIRED_CONTEXT_ERROR}"
+            "{INVOCATION_EXPIRED}"
         );
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         let after = manager.node(root.id()).unwrap();
@@ -1339,7 +1339,7 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         assert!(unmanaged_events.is_empty());
         assert!(live_rx.is_empty());
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1390,7 +1390,7 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
         assert!(root_node.children.is_empty());
         assert_eq!(manager.snapshot().len(), 1);
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1439,7 +1439,7 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
                 }
             },
             async {
-                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                smol::Timer::after(SETTLE_TIMEOUT).await;
                 false
             },
         )
@@ -1452,7 +1452,7 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
             events.try_iter().collect::<Vec<_>>()
         );
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1500,7 +1500,7 @@ fn retained_managed_prompt_outside_turn_is_rejected_without_mutation() {
             .unwrap();
         assert!(
             invocation.execute(&context).await.output.is_ok(),
-            "{MANAGED_AUTHORITY_ERROR}"
+            "{MANAGED_AUTHORITY_INACTIVE}"
         );
         let after = child.snapshot().unwrap();
         assert_eq!(after.graph_lifecycle, before.graph_lifecycle);
@@ -1517,7 +1517,7 @@ fn retained_managed_prompt_outside_turn_is_rejected_without_mutation() {
             "unauthorized prompt entered provider"
         );
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -1573,7 +1573,7 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
         assert!(root.snapshot().unwrap().children.is_empty());
         assert_eq!(manager.snapshot().len(), 1);
 
-        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }

@@ -2,7 +2,7 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 mod common;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
-const WAIT_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 const SCHEMA_MISSING_ERROR: &str = "agent finished without calling structured_output";
 
 // Mirrors of the plugin's error contracts and policy numbers.
@@ -43,11 +42,15 @@ const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
 const RECURSIVE_UNMANAGED_TASK_ERR: &str =
     "blocking task is unavailable from an unmanaged subagent; use task_spawn";
-/// Mirrors the task plugin's `max_concurrent` default.
 const RECURSIVE_UNMANAGED_WAIT_ERR: &str = "blocking task_wait is unavailable from an unmanaged subagent; pass timeout = 0 to check without waiting";
 const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 const TASK_WAIT_TOOL: &str = "task_wait";
+/// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
+/// Mirrors the task plugin's per-task turn ticket cap.
+const RETAINED_TURN_LIMIT: usize = 64;
+const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
+const TURN_LIMIT_ERR: &str = "task turn ticket limit reached";
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -549,7 +552,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
         workflow: false,
         mcp: false,
     };
-    for name in ["task_spawn", "task_wait", "task_send", "task_despawn"] {
+    for name in ["task_spawn", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         assert!(
             !reg.get(name)
                 .expect("lifecycle tool is registered")
@@ -571,8 +574,6 @@ fn spawn_returns_task_id_immediately() {
 
 #[test]
 fn task_ticket_cache_evicts_oldest_settled_turn() {
-    const RETAINED_TURN_LIMIT: usize = 64;
-    const TURN_UNAVAILABLE: &str = "turn_result_unavailable";
     let (reg, _host) = load_task_host();
     let first = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
     let task_id = first["task_id"].as_str().unwrap();
@@ -588,13 +589,13 @@ fn task_ticket_cache_evicts_oldest_settled_turn() {
     assert_eq!(
         exec_tool(
             &reg,
-            "task_wait",
+            TASK_WAIT_TOOL,
             json!({"task_id": task_id, "turn_id": first["turn_id"]})
         )
         .unwrap_err(),
-        TURN_UNAVAILABLE
+        TURN_UNAVAILABLE_ERR
     );
-    let result = exec_tool_json(&reg, "task_wait", json!({"task_id": task_id}));
+    let result = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({"task_id": task_id}));
     assert_eq!(result["result"]["turn_id"], latest);
     assert_eq!(result["result"]["text"], PLAIN_TEXT);
     exec_tool_json(&reg, "task_despawn", json!({"task_id": task_id}));
@@ -632,7 +633,7 @@ fn deprecated_task_tools_are_callable_but_hidden() {
         "task",
         "task_get",
         "task_spawn",
-        "task_wait",
+        TASK_WAIT_TOOL,
         "task_send",
         "task_despawn",
     ] {
@@ -644,7 +645,7 @@ fn deprecated_task_tools_are_callable_but_hidden() {
                 .any(|definition| definition["name"] == name)
         );
     }
-    for name in ["task_spawn", "task_wait"] {
+    for name in ["task_spawn", TASK_WAIT_TOOL] {
         assert!(
             !reg.get(name)
                 .unwrap()
@@ -760,7 +761,7 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
     let task_id = spawn["task_id"].as_str().unwrap();
     exec_tool(&reg, "set_task_access", json!({ "allowed": false })).unwrap();
 
-    for tool in ["task_get", "task_wait", "task_send", "task_despawn"] {
+    for tool in ["task_get", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         let input = if tool == "task_send" {
             json!({ "task_id": task_id, "message": "forbidden" })
         } else {
@@ -810,7 +811,7 @@ fn send_queues_and_reactivates() {
 #[test]
 fn unknown_task_errors_across_lifecycle_tools() {
     let (reg, _host) = load_task_host();
-    for tool in ["task_get", "task_wait", "task_send", "task_despawn"] {
+    for tool in ["task_get", TASK_WAIT_TOOL, "task_send", "task_despawn"] {
         let input = match tool {
             "task_send" => json!({ "task_id": "missing", "message": "x" }),
             _ => json!({ "task_id": "missing" }),
@@ -985,8 +986,6 @@ fn task_policy_spawn_honors_mode_gating_real() {
 
 #[test]
 fn pending_ticket_backpressure_preserves_accepted_turns() {
-    const RETAINED_TURN_LIMIT: usize = 64;
-    const TURN_LIMIT_ERROR: &str = "task turn ticket limit reached";
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
@@ -1020,14 +1019,14 @@ fn pending_ticket_backpressure_preserves_accepted_turns() {
                 json!({"task_id": task_id, "message": TASK_PROMPT})
             )
             .unwrap_err(),
-            TURN_LIMIT_ERROR
+            TURN_LIMIT_ERR
         );
         for (index, turn_id) in turns.iter().enumerate() {
             release_tx.send(()).unwrap();
             let settled = exec_tool_json_with_ctx(
                 &reg,
                 &ctx,
-                "task_wait",
+                TASK_WAIT_TOOL,
                 json!({"task_id": task_id, "turn_id": turn_id}),
             );
             assert_eq!(settled["result"]["turn_id"], *turn_id);
@@ -1065,7 +1064,7 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
         let pending = exec_tool_json_with_ctx(
             &reg,
             &ctx,
-            "task_wait",
+            TASK_WAIT_TOOL,
             json!({"task_id": task_id, "turn_id": spawned["turn_id"], "timeout": timeout}),
         );
         assert_eq!(pending["status"], "running");
@@ -1073,7 +1072,7 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
         let settled = exec_tool_json_with_ctx(
             &reg,
             &ctx,
-            "task_wait",
+            TASK_WAIT_TOOL,
             json!({"task_id": task_id, "turn_id": spawned["turn_id"]}),
         );
         assert_eq!(settled["result"]["turn_id"], spawned["turn_id"]);
@@ -1107,7 +1106,7 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
             wait_input["turn_id"] = first["turn_id"].clone();
         }
         let invocation = reg
-            .get("task_wait")
+            .get(TASK_WAIT_TOOL)
             .unwrap()
             .tool
             .parse(&wait_input)
@@ -1138,13 +1137,7 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
             "second turn"
         );
 
-        let completed = futures_lite::future::race(wait, async {
-            smol::Timer::after(WAIT_DEADLOCK_TIMEOUT).await;
-            panic!("wait for A was retargeted to gated B");
-        })
-        .await
-        .output
-        .unwrap();
+        let completed = common::bounded(wait).await.output.unwrap();
         let (ToolOutput::Plain(completed) | ToolOutput::Markdown(completed)) = completed else {
             panic!("unexpected task_wait output");
         };
