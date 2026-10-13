@@ -158,28 +158,23 @@ async fn set(
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_MODEL_MUTATION_REQUIRED));
     }
-    let req = match opts {
-        Value::String(spec) => ModelRequest::Set {
-            spec: Some(spec.to_str()?.to_owned()),
-            thinking: None,
-            toggle_thinking: false,
-            fast: None,
-        },
+    let (selection, toggle_thinking) = match opts {
+        Value::String(spec) => (
+            ModelSelection {
+                spec: Some(Arc::from(spec.to_str()?.as_ref())),
+                ..ModelSelection::default()
+            },
+            false,
+        ),
         Value::Table(opts) => {
             let toggle = matches!(opts.get::<Value>("thinking")?, Value::String(value) if value.to_str()?.is_empty());
             let mut value = crate::api::util::convert::lua_to_json(&lua, &Value::Table(opts))?;
             if toggle && let Some(value) = value.as_object_mut() {
                 value.remove("thinking");
             }
-            let selection: ModelSelection = match serde_json::from_value(value) {
-                Ok(selection) => selection,
+            match serde_json::from_value(value) {
+                Ok(selection) => (selection, toggle),
                 Err(error) => return Ok(err_pair(error.to_string())),
-            };
-            ModelRequest::Set {
-                spec: selection.spec.map(|spec| spec.to_string()),
-                thinking: selection.thinking,
-                toggle_thinking: toggle,
-                fast: selection.fast,
             }
         }
         other => {
@@ -192,64 +187,61 @@ async fn set(
     if tx.is_none()
         && let Some(services) = host_root_services(&lua)
     {
-        let authority = match LuaCtx::current_host_root_context(&lua) {
-            Ok(ctx) => ctx,
-            Err(error) => return Ok(err_pair(error)),
+        return set_host_root_model(&lua, &services, selection, toggle_thinking).await;
+    }
+    let req = ModelRequest::Set {
+        spec: selection.spec.map(|spec| spec.to_string()),
+        thinking: selection.thinking,
+        toggle_thinking,
+        fast: selection.fast,
+    };
+    roundtrip(lua, tx, req).await
+}
+
+/// Applies a `maki.model.set` patch to the host root through its coordinator.
+async fn set_host_root_model(
+    lua: &Lua,
+    services: &Arc<HostRootServices>,
+    mut selection: ModelSelection,
+    toggle_thinking: bool,
+) -> LuaResult<Pair<Value>> {
+    let authority = match LuaCtx::current_host_root_context(lua) {
+        Ok(ctx) => ctx,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    if let Err(error) = authority.trusted_host_root(lua) {
+        return Ok(err_pair(error));
+    }
+    let reference = services.reference();
+    let validator = match authority.host_model_validator(lua, services, &reference) {
+        Ok(validator) => validator,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    if toggle_thinking {
+        let current = match services.model(&reference) {
+            Ok(selection) => selection.thinking,
+            Err(error) => return Ok(err_pair(error.to_string())),
         };
-        if let Err(error) = authority.trusted_host_root(&lua) {
-            return Ok(err_pair(error));
-        }
-        let ModelRequest::Set {
-            spec,
-            thinking,
-            toggle_thinking,
-            fast,
-        } = req
-        else {
-            unreachable!()
-        };
-        let reference = services.reference();
-        let validator = match authority.host_model_validator(&lua, &services, &reference) {
-            Ok(validator) => validator,
-            Err(error) => return Ok(err_pair(error)),
-        };
-        let thinking = if toggle_thinking {
-            let current = match services.model(&reference) {
-                Ok(selection) => selection.thinking,
-                Err(error) => return Ok(err_pair(error.to_string())),
-            };
-            match ThinkingConfig::parse("", current) {
-                Ok(thinking) => Some(thinking),
-                Err(error) => return Ok(err_pair(error.to_string())),
-            }
-        } else {
-            thinking
-        };
-        let result = services
-            .set_model_guarded(
-                &reference,
-                ModelSelection {
-                    spec: spec.map(Arc::from),
-                    thinking,
-                    fast,
-                },
-                Some(validator),
-            )
-            .await;
-        if let Err(error) = authority.validate_origin(&lua) {
-            return Ok(err_pair(error));
-        }
-        return match result {
-            Ok(selection) => {
-                if let Err(error) = authority.trusted_host_root(&lua) {
-                    return Ok(err_pair(error));
-                }
-                Ok((Some(lua.to_value(&selection)?), None))
-            }
-            Err(error) => Ok(err_pair(error.to_string())),
+        selection.thinking = match ThinkingConfig::parse("", current) {
+            Ok(thinking) => Some(thinking),
+            Err(error) => return Ok(err_pair(error.to_string())),
         };
     }
-    roundtrip(lua, tx, req).await
+    let result = services
+        .set_model_guarded(&reference, selection, Some(validator))
+        .await;
+    if let Err(error) = authority.validate_origin(lua) {
+        return Ok(err_pair(error));
+    }
+    match result {
+        Ok(selection) => {
+            if let Err(error) = authority.trusted_host_root(lua) {
+                return Ok(err_pair(error));
+            }
+            Ok((Some(lua.to_value(&selection)?), None))
+        }
+        Err(error) => Ok(err_pair(error.to_string())),
+    }
 }
 
 /// Describes a model by spec without addressing any agent. Unknown specs

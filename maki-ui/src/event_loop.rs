@@ -4690,7 +4690,8 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn dispatch_prepared_model(&self, idx: usize, spec: String, refresh: bool) {
+    /// Re-prepares the root's current model, for instance after logging in to its provider.
+    fn reprepare_root_model(&self, idx: usize, spec: String) {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let actor = manager.actor(root).map_err(|error| error.to_string());
         let reserved = actor.and_then(|actor| {
@@ -4711,7 +4712,7 @@ impl<'t> EventLoop<'t> {
         smol::spawn(async move {
             let result = match reserved {
                 Ok((ticket, expected)) => {
-                    let requested = spec.clone();
+                    let requested = spec;
                     prepare_config_change(
                         ticket,
                         async move {
@@ -4724,21 +4725,12 @@ impl<'t> EventLoop<'t> {
                                 prepare(model, timeouts).map_err(|error| error.to_string())
                             })
                             .await?;
-                            Ok(if refresh {
-                                maki_agent::actor::ConfigChange::Refresh {
-                                    expected: maki_agent::actor::PreparedModel {
-                                        provider: Arc::clone(&expected.provider),
-                                        model: expected.model.clone(),
-                                    },
-                                    replacement,
-                                }
-                            } else {
-                                maki_agent::actor::ConfigChange::Patch(
-                                    maki_agent::actor::ConfigPatch {
-                                        model: Some(replacement),
-                                        ..Default::default()
-                                    },
-                                )
+                            Ok(maki_agent::actor::ConfigChange::Refresh {
+                                expected: maki_agent::actor::PreparedModel {
+                                    provider: Arc::clone(&expected.provider),
+                                    model: expected.model.clone(),
+                                },
+                                replacement,
                             })
                         },
                         async {
@@ -4750,15 +4742,10 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => Err(error),
             };
-            let kind = if refresh {
-                SessionOpKind::ProviderRefreshed
-            } else {
-                SessionOpKind::ModelChanged { spec }
-            };
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime: identity,
-                kind,
+                kind: SessionOpKind::ProviderRefreshed,
                 result,
             });
         })
@@ -4786,7 +4773,7 @@ impl<'t> EventLoop<'t> {
         let slot = Arc::clone(self.focused_model_slot());
         let model = slot.load().model.clone();
         if model.provider.to_string() == slug {
-            self.dispatch_prepared_model(idx, model.spec(), true);
+            self.reprepare_root_model(idx, model.spec());
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
             self.change_model(self.focused, builtin.default_model);
         }
