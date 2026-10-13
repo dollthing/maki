@@ -36,17 +36,6 @@ impl PluginAuthority {
     }
 }
 
-pub(crate) fn existing_plugin_authority(
-    lua: &Lua,
-    plugin: &str,
-    generation: u64,
-) -> Result<Arc<PluginAuthority>, String> {
-    lua.app_data_ref::<PluginAuthorities>()
-        .and_then(|owners| owners.0.get(plugin).cloned())
-        .filter(|owner| owner.generation == generation && owner.is_alive())
-        .ok_or_else(|| ORCHESTRATION_CONTEXT_EXPIRED.into())
-}
-
 pub struct AgentEventRequest {
     pub callback_id: u64,
     pub payload: serde_json::Value,
@@ -258,21 +247,35 @@ pub(crate) fn revoke_plugin(lua: &Lua, plugin: &str) {
     }
 }
 
+/// The plugin's current authority. A plugin with no committed load, such as
+/// one being unloaded, gets an authority that is already revoked, so nothing
+/// minted or validated against it can act.
 pub(crate) fn plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {
+    lua.app_data_ref::<PluginAuthorities>()
+        .and_then(|owners| owners.0.get(&plugin).cloned())
+        .unwrap_or_else(|| {
+            Arc::new(PluginAuthority {
+                alive: AtomicBool::new(false),
+                generation: 0,
+            })
+        })
+}
+
+/// Grants a fresh authority when a plugin load commits; the previous one
+/// must already be revoked.
+pub(crate) fn install_plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {
     if lua.app_data_ref::<PluginAuthorities>().is_none() {
         lua.set_app_data(PluginAuthorities::default());
     }
+    let authority = Arc::new(PluginAuthority {
+        alive: AtomicBool::new(true),
+        generation: NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed),
+    });
     lua.app_data_mut::<PluginAuthorities>()
         .expect("authority map installed")
         .0
-        .entry(plugin)
-        .or_insert_with(|| {
-            Arc::new(PluginAuthority {
-                alive: AtomicBool::new(true),
-                generation: NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed),
-            })
-        })
-        .clone()
+        .insert(plugin, Arc::clone(&authority));
+    authority
 }
 
 #[derive(Clone)]
@@ -411,8 +414,8 @@ pub(crate) fn validate_pinned_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScopeAuthority, WRONG_TASK, close_event_callback, event_callback, plugin_authority,
-        register_event_callback, revoke_plugin,
+        ScopeAuthority, WRONG_TASK, close_event_callback, event_callback, install_plugin_authority,
+        plugin_authority, register_event_callback, revoke_plugin,
     };
     use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
@@ -426,7 +429,7 @@ mod tests {
         let first = TaskScope::detached(&lua);
         let mut authority = ScopeAuthority {
             task: Arc::downgrade(first.handle()),
-            owner: plugin_authority(&lua, Arc::from("owner")),
+            owner: install_plugin_authority(&lua, Arc::from("owner")),
         };
         assert!(authority.validate(&lua).is_ok());
         let sibling = TaskScope::detached(&lua);
@@ -438,7 +441,8 @@ mod tests {
             authority.validate(&lua).unwrap_err(),
             ORCHESTRATION_CONTEXT_EXPIRED
         );
-        authority.owner = plugin_authority(&lua, Arc::from("owner"));
+        assert!(!plugin_authority(&lua, Arc::from("owner")).is_alive());
+        authority.owner = install_plugin_authority(&lua, Arc::from("owner"));
         assert!(authority.validate(&lua).is_ok());
         let retained = first.handle().clone();
         drop(first);
@@ -463,6 +467,7 @@ mod tests {
         let lua = Lua::new();
         let callback = lua.create_function(|_, ()| Ok(())).unwrap();
         lua.set_app_data(super::OrchestrationServicesSlot(Some(Arc::new(Services))));
+        install_plugin_authority(&lua, Arc::from("owner"));
         let id = register_event_callback(&lua, Arc::from("owner"), callback).unwrap();
         assert!(event_callback(&lua, id).is_some());
         lua.set_app_data(super::OrchestrationServicesSlot(Some(Arc::new(Services))));
@@ -477,7 +482,7 @@ mod tests {
         let scope = TaskScope::new(&lua, TaskCell::new(cancel, None, None));
         let authority = ScopeAuthority {
             task: Arc::downgrade(scope.handle()),
-            owner: plugin_authority(&lua, Arc::from("owner")),
+            owner: install_plugin_authority(&lua, Arc::from("owner")),
         };
         drop(trigger);
         assert_eq!(

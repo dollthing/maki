@@ -111,7 +111,7 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
-| [`maki.model`](#maki-model) | Read a tool context's model without a UI, or the focused session's |
+| [`maki.model`](#maki-model) | Compatibility model access. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
@@ -4134,9 +4134,10 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-Read a tool context's model without a UI, or the focused session's
-model for a keybind. Non-UI hosts supply root reads and discovery; SDK
-and ACP also support selection updates. Fixed print roots reject updates.
+Compatibility model access. With a ctx, `get` reads that invocation's
+admitted model. Without a ctx, calls address the focused session and
+need an interactive UI; other hosts use the Agent API with an explicit
+ctx instead.
 
 ---
 

@@ -233,6 +233,7 @@ mod tests {
     #[test]
     fn subscription_gc_preserves_registration_until_registry_close() {
         let lua = Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, Arc::from("gc-owner"));
         let handler = lua.create_function(|_, ()| Ok(())).unwrap();
         let id = register_event_callback(&lua, Arc::from("gc-owner"), handler).unwrap();
         let cancel = event_callback(&lua, id).unwrap().2;

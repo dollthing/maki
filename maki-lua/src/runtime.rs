@@ -3568,6 +3568,7 @@ impl LuaRuntime {
             });
         }
         crate::orchestration::revoke_plugin(&self.lua, &name);
+        crate::orchestration::install_plugin_authority(&self.lua, Arc::clone(&name));
         activate_session_options(&self.lua, &pending_session_options);
         if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
             store.commit(Arc::clone(&name), generation);

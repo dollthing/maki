@@ -1,20 +1,16 @@
-//! `maki.model`. UI calls read the focused session; explicit tool contexts
-//! read their own model without a UI.
+//! `maki.model`. Context-free calls address the focused session and need a
+//! UI; explicit tool contexts read their own admitted model anywhere.
 
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{
     CompleteModelSelection, Model, ModelSelection, RequestOptions, ThinkingConfig,
-    ThinkingConfigExt,
 };
 use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, UserDataRef, Value};
 
-use crate::agent_errors::TRUSTED_MODEL_MUTATION_REQUIRED;
+use crate::agent_errors::{EXPLICIT_MODEL_TARGET_REQUIRED, TRUSTED_MODEL_MUTATION_REQUIRED};
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
-use crate::host_root::HostRootServices;
-use crate::orchestration::HostRootServicesSlot;
-use crate::runtime::{TaskHandle, lock_cell};
 use std::sync::Arc;
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
@@ -55,52 +51,7 @@ async fn get(
         return model_value(&lua, &agent.model, &agent.opts);
     }
     if tx.is_none() {
-        if let Some(services) = host_root_services(&lua) {
-            return match services.model(&services.reference()) {
-                Ok(selection) => Ok((Some(lua.to_value(&selection)?), None)),
-                Err(error) => Ok(err_pair(error.to_string())),
-            };
-        }
-        if let Some(handle) = lua.app_data_ref::<TaskHandle>()
-            && let Some(policy) = lock_cell(&handle)
-                .managed_turn
-                .as_ref()
-                .and_then(|turn| turn.policy_snapshot().cloned())
-        {
-            return model_value(
-                &lua,
-                &policy.model,
-                &RequestOptions {
-                    thinking: policy.thinking,
-                    fast: policy.fast,
-                },
-            );
-        }
-        if let Some(slot) = lua.app_data_ref::<crate::api::session::SessionSnapshotSlot>() {
-            let snapshot = match (slot.0)(None) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return Ok(err_pair(error)),
-            };
-            let Some(spec) = snapshot.get("model").and_then(serde_json::Value::as_str) else {
-                return Ok(err_pair("session model is unavailable"));
-            };
-            let model = match Model::from_spec(spec) {
-                Ok(model) => model,
-                Err(error) => return Ok(err_pair(error.to_string())),
-            };
-            let opts = RequestOptions {
-                fast: snapshot
-                    .get("fast")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                thinking: snapshot
-                    .get("thinking")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|thinking| thinking.parse().ok())
-                    .unwrap_or_default(),
-            };
-            return model_value(&lua, &model, &opts);
-        }
+        return Ok(err_pair(EXPLICIT_MODEL_TARGET_REQUIRED));
     }
     roundtrip(lua, tx, ModelRequest::Get).await
 }
@@ -119,13 +70,8 @@ fn model_value(lua: &Lua, model: &Model, opts: &RequestOptions) -> LuaResult<Pai
 /// local specs = maki.model.available()
 #[lua_fn]
 async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    if tx.is_none()
-        && let Some(services) = host_root_services(&lua)
-    {
-        return match services.available_models(&services.reference()) {
-            Ok(specs) => Ok((Some(lua.to_value(&specs)?), None)),
-            Err(error) => Ok(err_pair(error.to_string())),
-        };
+    if tx.is_none() {
+        return Ok(err_pair(EXPLICIT_MODEL_TARGET_REQUIRED));
     }
     roundtrip(lua, tx, ModelRequest::Available).await
 }
@@ -184,10 +130,8 @@ async fn set(
             )));
         }
     };
-    if tx.is_none()
-        && let Some(services) = host_root_services(&lua)
-    {
-        return set_host_root_model(&lua, &services, selection, toggle_thinking).await;
+    if tx.is_none() {
+        return Ok(err_pair(EXPLICIT_MODEL_TARGET_REQUIRED));
     }
     let req = ModelRequest::Set {
         spec: selection.spec.map(|spec| spec.to_string()),
@@ -196,52 +140,6 @@ async fn set(
         fast: selection.fast,
     };
     roundtrip(lua, tx, req).await
-}
-
-/// Applies a `maki.model.set` patch to the host root through its coordinator.
-async fn set_host_root_model(
-    lua: &Lua,
-    services: &Arc<HostRootServices>,
-    mut selection: ModelSelection,
-    toggle_thinking: bool,
-) -> LuaResult<Pair<Value>> {
-    let authority = match LuaCtx::current_host_root_context(lua) {
-        Ok(ctx) => ctx,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    if let Err(error) = authority.trusted_host_root(lua) {
-        return Ok(err_pair(error));
-    }
-    let reference = services.reference();
-    let validator = match authority.host_model_validator(lua, services, &reference) {
-        Ok(validator) => validator,
-        Err(error) => return Ok(err_pair(error)),
-    };
-    if toggle_thinking {
-        let current = match services.model(&reference) {
-            Ok(selection) => selection.thinking,
-            Err(error) => return Ok(err_pair(error.to_string())),
-        };
-        selection.thinking = match ThinkingConfig::parse("", current) {
-            Ok(thinking) => Some(thinking),
-            Err(error) => return Ok(err_pair(error.to_string())),
-        };
-    }
-    let result = services
-        .set_model_guarded(&reference, selection, Some(validator))
-        .await;
-    if let Err(error) = authority.validate_origin(lua) {
-        return Ok(err_pair(error));
-    }
-    match result {
-        Ok(selection) => {
-            if let Err(error) = authority.trusted_host_root(lua) {
-                return Ok(err_pair(error));
-            }
-            Ok((Some(lua.to_value(&selection)?), None))
-        }
-        Err(error) => Ok(err_pair(error.to_string())),
-    }
 }
 
 /// Describes a model by spec without addressing any agent. Unknown specs
@@ -277,18 +175,11 @@ fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
     lua.create_sequence_from(ThinkingConfig::options().iter().copied())
 }
 
-fn host_root_services(lua: &Lua) -> Option<Arc<HostRootServices>> {
-    if crate::runtime::current_managed_turn(lua).is_some() {
-        return None;
-    }
-    lua.app_data_ref::<HostRootServicesSlot>()
-        .and_then(|slot| slot.services.clone())
-}
-
 lua_table! {
-    /// Read a tool context's model without a UI, or the focused session's
-    /// model for a keybind. Non-UI hosts supply root reads and discovery; SDK
-    /// and ACP also support selection updates. Fixed print roots reject updates.
+    /// Compatibility model access. With a ctx, `get` reads that invocation's
+    /// admitted model. Without a ctx, calls address the focused session and
+    /// need an interactive UI; other hosts use the Agent API with an explicit
+    /// ctx instead.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [get(tx), available(tx), set(tx), info, thinking_levels]
 }
@@ -381,7 +272,7 @@ mod tests {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_model(Some(tx));
         let scope = crate::runtime::TaskScope::detached(&lua);
-        lock_cell(scope.handle()).delegated_tool = true;
+        crate::runtime::lock_cell(scope.handle()).delegated_tool = true;
         assert_eq!(
             eval(&lua, "return model.set({ thinking = 'low' })"),
             (Json::Null, Some(TRUSTED_MODEL_MUTATION_REQUIRED.into()))
@@ -421,94 +312,21 @@ mod tests {
                 Some("context is not bound to an invocation".into())
             )
         );
-        assert_eq!(
-            eval(&lua, "return model.get()"),
-            (Json::Null, Some(NO_UI_ERR.to_owned()))
-        );
-    }
-
-    #[test_case("return model.set({ fast = false })"; "options_only")]
-    #[test_case("return model.set({})"; "empty")]
-    #[test_case("return model.set({ thinking = '' })"; "toggle")]
-    fn fixed_host_compatibility_setter_rejects_without_mutation(script: &str) {
-        let lua = lua_with_model(None);
-        let services = Arc::new(HostRootServices::fixed(
-            maki_agent::AgentId::generate(),
-            &Model::from_spec(SPEC).unwrap(),
-            RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        let reference = services.reference();
-        let before = services.model(&reference).unwrap();
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(Arc::clone(&services)),
-            template: None,
-        });
-        let scope = crate::runtime::TaskScope::detached(&lua);
-        LuaCtx::trusted_host_root_context(&lua, Arc::from("model-test"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            eval(&lua, script),
-            (Json::Null, Some(crate::host_root::FIXED_MODEL_ERROR.into()))
-        );
-        assert_eq!(services.model(&reference).unwrap(), before);
-        drop(scope);
-    }
-
-    #[test]
-    fn installed_host_root_reads_discovery_and_retirement_without_ui() {
-        let lua = lua_with_model(None);
-        let services = Arc::new(HostRootServices::fixed(
-            maki_agent::AgentId::generate(),
-            &Model::from_spec(SPEC).unwrap(),
-            RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(Arc::clone(&services)),
-            template: None,
-        });
-        let (selection, error) = eval(&lua, "return model.get()");
-        assert_eq!(error, None);
-        assert_eq!(selection["spec"], SPEC);
-        assert_eq!(selection["fast"], false);
-        let (available, error) = eval(&lua, "return model.available()");
-        assert_eq!(error, None);
-        assert_eq!(
-            available,
-            json!(services.available_models(&services.reference()).unwrap())
-        );
-        services.retire();
-        let stale = crate::host_root::HostRootError::Stale.to_string();
-        assert_eq!(
-            eval(&lua, "return model.get()"),
-            (Json::Null, Some(stale.clone()))
-        );
-        assert_eq!(
-            eval(&lua, "return model.available()"),
-            (Json::Null, Some(stale))
-        );
-    }
-
-    #[test]
-    fn headless_single_session_model_fallback() {
-        let lua = lua_with_model(None);
-        lua.set_app_data(crate::api::session::SessionSnapshotSlot(Box::new(|id| {
-            assert!(id.is_none());
-            Ok(json!({ "model": SPEC, "fast": true, "thinking": THINKING }))
-        })));
-        let model = Model::from_spec(SPEC).unwrap();
-        let (actual, error) = eval(&lua, "return model.get()");
-        assert_eq!(error, None);
-        assert_eq!(actual["spec"], model.spec());
-        assert_eq!(actual["fast"], false);
-        assert_eq!(actual["thinking"], THINKING);
+        for script in [
+            "return model.get()",
+            "return model.available()",
+            "return model.set({ fast = false })",
+        ] {
+            assert_eq!(
+                eval(&lua, script),
+                (Json::Null, Some(EXPLICIT_MODEL_TARGET_REQUIRED.to_owned()))
+            );
+        }
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of
     /// throwing or parking forever.
-    #[test_case(lua_with_model(None), NO_UI_ERR ; "no_ui_attached")]
+    #[test_case(lua_with_model(None), EXPLICIT_MODEL_TARGET_REQUIRED ; "no_ui_attached")]
     #[test_case(closed_ui(), NO_UI_ERR ; "event_loop_closed")]
     #[test_case(stub_ui(|_| None), UI_DROPPED_ERR ; "reply_channel_dropped")]
     #[test_case(stub_ui(|_| Some(Err(UI_FAILURE.to_owned()))), UI_FAILURE ; "ui_refused")]

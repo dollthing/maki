@@ -300,7 +300,12 @@ mod tests {
     fn plugin_scope(lua: &Lua, plugin: &str) -> TaskScope {
         let scope = TaskScope::detached(lua);
         let plugin: Arc<str> = Arc::from(plugin);
-        let owner = plugin_authority(lua, plugin.clone());
+        let current = plugin_authority(lua, plugin.clone());
+        let owner = if current.is_alive() {
+            current
+        } else {
+            crate::orchestration::install_plugin_authority(lua, plugin.clone())
+        };
         lock_cell(scope.handle()).plugin_origin = Some((plugin, owner.generation()));
         scope
     }
@@ -335,6 +340,7 @@ mod tests {
     #[test]
     fn standalone_current_returns_execution_child_not_installed_root() {
         let lua = Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, Arc::from("child-tool"));
         let scope = TaskScope::detached(&lua);
         let provider = Arc::new(StreamOnceProvider::new_replies(Vec::new()));
         let (actor, state, session, _) = session_with_provider(provider, None, None);
@@ -574,6 +580,7 @@ mod tests {
     fn abandoned_defer_close_scope_removes_retained_session_without_gc() {
         smol::block_on(async {
             let lua = Lua::new();
+            crate::orchestration::install_plugin_authority(&lua, Arc::from("agent-test"));
             let scope = TaskScope::detached(&lua);
             let context = stub_ctx(&AgentMode::Build);
             let config = EffectiveAgentConfig::new(
@@ -709,6 +716,7 @@ mod tests {
                 })
                 .unwrap();
             let lua = Lua::new();
+            crate::orchestration::install_plugin_authority(&lua, Arc::from("agent-test"));
             let scope = TaskScope::detached(&lua);
             let mut template = stub_ctx(&AgentMode::Build);
             template.provider = Arc::clone(&params.provider);

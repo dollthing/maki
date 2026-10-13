@@ -12,7 +12,7 @@ use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
-use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME, TRUSTED_MODEL_MUTATION_REQUIRED};
+use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME};
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
@@ -308,39 +308,6 @@ impl LuaCtx {
             tool_output_lines: ToolOutputLines::default(),
             finish_tx: None,
         }))
-    }
-
-    pub(crate) fn current_host_root_context(lua: &mlua::Lua) -> Result<Self, String> {
-        let task = lua
-            .app_data_ref::<crate::runtime::TaskHandle>()
-            .map(|task| Arc::clone(&task))
-            .ok_or(TRUSTED_MODEL_MUTATION_REQUIRED)?;
-        let (plugin, generation, cancel) = {
-            let cell = lock_cell(&task);
-            if cell.delegated_tool || cell.managed_turn.is_some() {
-                return Err(TRUSTED_MODEL_MUTATION_REQUIRED.into());
-            }
-            let (plugin, generation) = cell
-                .plugin_origin
-                .clone()
-                .ok_or(TRUSTED_MODEL_MUTATION_REQUIRED)?;
-            (plugin, generation, cell.cancel.clone())
-        };
-        let owner = crate::orchestration::existing_plugin_authority(lua, &plugin, generation)?;
-        let authority = TrustedHostRootContext::new(lua, &task, plugin, owner)?
-            .ok_or("host root authority is unavailable")?;
-        authority.validate(lua)?;
-        Ok(Self {
-            caps: Caps::TrustedHostRoot {
-                authority: Box::new(authority),
-            },
-            origin: None,
-            host_services: None,
-            subject: None,
-            cancel,
-            tool_output_lines: ToolOutputLines::default(),
-            finish_tx: None,
-        })
     }
 
     pub(crate) fn trusted_host_root(
@@ -885,6 +852,7 @@ mod tests {
     #[test]
     fn host_root_context_rejects_service_replacement_retirement_and_scope_exit() {
         let lua = mlua::Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
         let template = populated_ctx();
         let services = Arc::new(HostRootServices::fixed(
@@ -921,6 +889,7 @@ mod tests {
     #[test]
     fn captured_host_model_validator_rejects_revoked_plugin_and_expired_task() {
         let lua = mlua::Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
         let template = populated_ctx();
         let services = Arc::new(HostRootServices::fixed(
@@ -949,7 +918,6 @@ mod tests {
         assert!(validator().is_ok());
         crate::orchestration::revoke_plugin(&lua, "owner");
         assert!(validator().is_err());
-        assert!(LuaCtx::current_host_root_context(&lua).is_err());
         drop(scope);
         assert!(validator().is_err());
     }
@@ -958,6 +926,7 @@ mod tests {
     fn tool_host_model_validator_binds_live_plugin_authority() {
         const LOAD_GENERATION: u64 = u64::MAX;
         let lua = mlua::Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
         let mut template = populated_ctx();
         let id = maki_agent::AgentId::generate();
@@ -1033,6 +1002,7 @@ mod tests {
     #[test]
     fn host_root_mint_rejects_stale_generation_and_delegated_tools() {
         let lua = mlua::Lua::new();
+        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
         let template = populated_ctx();
         lua.set_app_data(HostRootServicesSlot {

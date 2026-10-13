@@ -20,6 +20,8 @@ pub const DELEGATED_HOST_MUTATION: &str = "delegated tool handlers cannot change
 pub const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus";
 pub const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
+pub const EXPLICIT_MODEL_TARGET_REQUIRED: &str =
+    "no interactive UI attached; pass ctx or use the Agent API";
 pub const TRUSTED_MODEL_MUTATION_REQUIRED: &str =
     "host model mutation requires trusted handler authority";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
