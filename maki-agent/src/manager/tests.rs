@@ -4584,6 +4584,7 @@ impl ActorBackend for JoiningBackend {
 #[derive(Clone, Copy)]
 enum JoinCase {
     ReportingChildOfChild,
+    CancelledSuccessorOfRunningTurn,
     NonReportingChildOfChild,
     ChildOfRoot,
 }
@@ -4592,6 +4593,7 @@ enum JoinCase {
 /// running, and it yields its permit so that child can run at capacity one.
 /// Roots and children without automatic delivery are never joined.
 #[test_case(JoinCase::ReportingChildOfChild; "subagent_joins_reporting_child")]
+#[test_case(JoinCase::CancelledSuccessorOfRunningTurn; "joins_running_turn_behind_settled_latest")]
 #[test_case(JoinCase::NonReportingChildOfChild; "non_reporting_child_not_joined")]
 #[test_case(JoinCase::ChildOfRoot; "root_does_not_join")]
 fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
@@ -4679,13 +4681,28 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
             .configure_parent_delivery(!matches!(case, JoinCase::NonReportingChildOfChild), None)
             .unwrap();
         let child_ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
+        let cancelled_successor = matches!(case, JoinCase::CancelledSuccessorOfRunningTurn);
+        if cancelled_successor {
+            let successor = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
+            child_actor.cancel_turn(successor.turn_id()).unwrap();
+            assert!(matches!(
+                successor.wait().await,
+                TurnOutcome::Cancelled { .. }
+            ));
+        }
         start.release(1);
-        if matches!(case, JoinCase::ReportingChildOfChild) {
+        if matches!(
+            case,
+            JoinCase::ReportingChildOfChild | JoinCase::CancelledSuccessorOfRunningTurn
+        ) {
             child_rx.recv_async().await.unwrap();
             assert!(joined_rx.is_empty());
             assert!(joiner_ticket.peek().is_none());
             child_gate.release(1);
-            assert_eq!(joined_rx.recv_async().await.unwrap(), 1);
+            assert_eq!(
+                joined_rx.recv_async().await.unwrap(),
+                1 + usize::from(cancelled_successor)
+            );
             assert!(child_ticket.peek().is_some());
         } else {
             assert_eq!(joined_rx.recv_async().await.unwrap(), 0);

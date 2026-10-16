@@ -100,6 +100,7 @@ impl ActorTurnInbox {
 
     fn unsettled_reporting_child(
         current: &CurrentManagedTurn,
+        skipped: &[AgentId],
     ) -> Option<(AgentId, AgentActorHandle, TurnTicket)> {
         let manager = current.manager();
         current
@@ -107,13 +108,13 @@ impl ActorTurnInbox {
             .ok()?
             .children
             .into_iter()
+            .filter(|child_id| !skipped.contains(child_id))
             .find_map(|child_id| {
                 let actor = manager.actor(child_id).ok()?;
                 if !actor.reports_to_parent() {
                     return None;
                 }
-                let ticket = actor.latest_ticket()?;
-                ticket.peek().is_none().then_some((child_id, actor, ticket))
+                Some((child_id, actor.clone(), actor.unsettled_ticket()?))
             })
     }
 
@@ -202,15 +203,19 @@ impl TurnInbox for ActorTurnInbox {
             if !self.is_managed_child() {
                 return;
             }
-            while let Some((child_id, actor, ticket)) = Self::unsettled_reporting_child(current) {
-                let Ok(wait) = current
+            let mut skipped = Vec::new();
+            while let Some((child_id, actor, ticket)) =
+                Self::unsettled_reporting_child(current, &skipped)
+            {
+                let waited = match current
                     .lease()
                     .observe_descendant(current, child_id, &actor, ticket, None)
-                else {
-                    return;
+                {
+                    Ok(wait) => wait.wait().await.is_ok(),
+                    Err(_) => false,
                 };
-                if wait.wait().await.is_err() {
-                    return;
+                if !waited {
+                    skipped.push(child_id);
                 }
             }
         })

@@ -1371,6 +1371,28 @@ impl AgentActorHandle {
         self.inner.agent_id
     }
 
+    /// Any admitted turn whose ticket has not resolved, including one retired
+    /// but still publishing its delivery.
+    pub(crate) fn unsettled_ticket(&self) -> Option<TurnTicket> {
+        let active = self
+            .inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .find(|ticket| ticket.peek().is_none())
+            .cloned();
+        active.or_else(|| {
+            self.inner
+                .retained_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .find(|ticket| ticket.peek().is_none())
+                .cloned()
+        })
+    }
+
     /// Whether settled turns are published to the recorded parent's inbox.
     pub(crate) fn reports_to_parent(&self) -> bool {
         self.inner
