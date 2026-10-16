@@ -1118,8 +1118,10 @@ mod tests {
     use std::pin::pin;
 
     use futures_lite::future::poll_once;
+    use maki_agent::actor::{ActorEvent, DeliveryStatus};
     use maki_agent::{AgentMode, McpPromptRef, ReasonedCancelToken};
     use maki_config::PermissionsConfig;
+    use maki_providers::ContentBlock;
     use test_case::test_case;
 
     use super::*;
@@ -2518,6 +2520,167 @@ mod tests {
                 panic!("child completion did not reach the production TUI path");
             }).await;
         });
+    }
+
+    #[test]
+    fn child_completion_mid_tool_batch_reaches_next_request_of_same_turn() {
+        smol::block_on(async {
+            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            futures_lite::future::or(async {
+                let (mut backend, mut input, _events) = failing_backend();
+                input.prompt = None;
+                let (release, released) = flume::unbounded();
+                let (requests, request_rx) = flume::unbounded();
+                let config = maki_agent::EffectiveAgentConfig::new(
+                    maki_agent::RunSettings {
+                        provider: Arc::new(ToolBatchProvider { release: released, requests }),
+                        model: crate::components::test_model(),
+                        fast: false, workflow: false, thinking: Default::default(),
+                    }, AgentMode::Build,
+                ).with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
+                let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+                let root = manager.create_root_with_config(
+                    Some(config.clone()), Vec::new(), None, |agent_id| {
+                        backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    },
+                ).unwrap();
+                let actor = root.actor().unwrap();
+                let actor_events = actor.subscribe_events();
+                let parent = actor.admit_turn(input, None, String::new()).unwrap();
+                request_rx.recv_async().await.unwrap();
+
+                let (mut child_backend, mut child_input, _child_events) = failing_backend();
+                child_input.prompt = None;
+                let (child_release, child_released) = flume::unbounded();
+                child_release.send(()).unwrap();
+                let mut child_config = config;
+                child_config.settings.provider = Arc::new(ExplicitProvider { release: child_released });
+                let child = manager.spawn_child_trusted_with_config(
+                    &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
+                        child_backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend))
+                    },
+                ).unwrap();
+                let child_actor = child.actor().unwrap();
+                child_actor.configure_parent_delivery(true, None).unwrap();
+                let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
+                assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
+                let mut seen = Vec::new();
+                loop {
+                    let event = actor_events.recv_async().await.unwrap();
+                    let accepted = matches!(&event, ActorEvent::Delivery(delivery)
+                        if delivery.status == DeliveryStatus::Accepted
+                            && delivery.delivery.result.outcome.turn_id() == child_ticket.turn_id());
+                    seen.push(event);
+                    if accepted { break; }
+                }
+                release.send(()).unwrap();
+
+                let request = request_rx.recv_async().await.unwrap();
+                let child_turn = child_ticket.turn_id().to_string();
+                let tool_result = request.iter().position(|message| message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_BATCH_CALL_ID)
+                })).expect("tool result missing from the follow-up request");
+                let observation = request.iter().position(|message| {
+                    let serialized = serde_json::to_string(message).unwrap();
+                    serialized.contains(&child_turn) && serialized.contains(EXPLICIT_RESPONSE)
+                }).expect("child observation missing from the follow-up request");
+                assert!(observation > tool_result, "observation must follow the tool result: {request:?}");
+
+                assert!(matches!(parent.wait().await, TurnOutcome::Completed { .. }));
+                manager.shutdown(TIMEOUT).await;
+                assert!(request_rx.try_recv().is_err(), "parent made an extra provider request");
+                seen.extend(actor_events.try_iter());
+                let started: Vec<TurnId> = seen.iter().filter_map(|event| match event {
+                    ActorEvent::Start { turn_id, .. } => Some(*turn_id),
+                    _ => None,
+                }).collect();
+                assert_eq!(started, [parent.turn_id()]);
+                let executed: Vec<TurnId> = seen.iter().filter_map(|event| match event {
+                    ActorEvent::Delivery(delivery) => match delivery.status {
+                        DeliveryStatus::Executed { parent_turn_id } => Some(parent_turn_id),
+                        _ => None,
+                    },
+                    _ => None,
+                }).collect();
+                assert_eq!(executed, [parent.turn_id()]);
+            }, async {
+                smol::Timer::after(TIMEOUT).await;
+                panic!("child completion did not reach the parent's follow-up request");
+            }).await;
+        });
+    }
+
+    const TOOL_BATCH_CALL_ID: &str = "tool-batch-call";
+    const TOOL_BATCH_TOOL: &str = "absent_tool";
+
+    struct ToolBatchProvider {
+        release: flume::Receiver<()>,
+        requests: flume::Sender<Vec<Message>>,
+    }
+
+    impl maki_providers::provider::Provider for ToolBatchProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            Box::pin(async move {
+                self.requests.send(messages.to_vec()).unwrap();
+                let answered = messages.iter().any(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                });
+                let (content, stop_reason) = if answered {
+                    (
+                        ContentBlock::Text {
+                            text: EXPLICIT_RESPONSE.into(),
+                        },
+                        maki_providers::StopReason::EndTurn,
+                    )
+                } else {
+                    self.release.recv_async().await.unwrap();
+                    (
+                        ContentBlock::ToolUse {
+                            id: TOOL_BATCH_CALL_ID.into(),
+                            name: TOOL_BATCH_TOOL.into(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        },
+                        maki_providers::StopReason::ToolUse,
+                    )
+                };
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![content],
+                        ..Default::default()
+                    },
+                    usage: Default::default(),
+                    stop_reason: Some(stop_reason),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     struct CompletionProvider {
