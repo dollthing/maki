@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use maki_providers::Message;
 
-use super::{ActorInner, ActorLifecycle, TurnProvenance};
-use crate::{AgentInput, TurnId};
+use super::{ActorInner, ActorLifecycle, AgentActorHandle, TurnProvenance, TurnTicket};
+use crate::{AgentId, AgentInput, CurrentManagedTurn, TurnId};
 
 pub const MAX_PENDING_INSTRUCTIONS: usize = 64;
 pub const MAX_PENDING_INSTRUCTION_BYTES: usize = 256 * 1024;
@@ -26,6 +28,12 @@ pub trait TurnInbox: Send + Sync {
     /// leaving pending completions for a successor turn.
     fn finish_instructions(&self) -> bool;
     fn close(&self) {}
+    /// Resolves once no child that reports to this agent has unsettled work,
+    /// yielding the turn permit while it waits. Roots resolve immediately,
+    /// since their idle continuations already reach the user.
+    fn join_children(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
     /// Acknowledge only previously drained instructions, after request submission.
     fn instructions_submitted(&self);
     fn has_unsubmitted_instructions(&self) -> bool;
@@ -70,14 +78,39 @@ impl InstructionInbox {
 pub(super) struct ActorTurnInbox {
     pub inner: Weak<ActorInner>,
     pub turn_id: TurnId,
+    pub managed_turn: Option<CurrentManagedTurn>,
 }
 
 impl ActorTurnInbox {
-    pub fn source(inner: &Arc<ActorInner>, turn_id: TurnId) -> Arc<dyn TurnInbox> {
+    pub fn source(
+        inner: &Arc<ActorInner>,
+        turn_id: TurnId,
+        managed_turn: Option<CurrentManagedTurn>,
+    ) -> Arc<dyn TurnInbox> {
         Arc::new(Self {
             inner: Arc::downgrade(inner),
             turn_id,
+            managed_turn,
         })
+    }
+
+    fn unsettled_reporting_child(
+        current: &CurrentManagedTurn,
+    ) -> Option<(AgentId, AgentActorHandle, TurnTicket)> {
+        let manager = current.manager();
+        current
+            .node_snapshot()
+            .ok()?
+            .children
+            .into_iter()
+            .find_map(|child_id| {
+                let actor = manager.actor(child_id).ok()?;
+                if !actor.reports_to_parent() {
+                    return None;
+                }
+                let ticket = actor.latest_ticket()?;
+                ticket.peek().is_none().then_some((child_id, actor, ticket))
+            })
     }
 
     fn close_admission(&self, await_completions: bool) -> bool {
@@ -146,6 +179,34 @@ impl TurnInbox for ActorTurnInbox {
 
     fn finish_instructions(&self) -> bool {
         self.close_admission(false)
+    }
+
+    fn join_children(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(current) = &self.managed_turn else {
+                return;
+            };
+            let is_child = self.inner.upgrade().is_some_and(|inner| {
+                inner
+                    .managed_admission
+                    .as_ref()
+                    .is_some_and(|managed| managed.parent_delivery.is_some())
+            });
+            if !is_child {
+                return;
+            }
+            while let Some((child_id, actor, ticket)) = Self::unsettled_reporting_child(current) {
+                let Ok(wait) = current
+                    .lease()
+                    .observe_descendant(current, child_id, &actor, ticket, None)
+                else {
+                    return;
+                };
+                if wait.wait().await.is_err() {
+                    return;
+                }
+            }
+        })
     }
 
     fn close(&self) {

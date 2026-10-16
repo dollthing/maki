@@ -4128,7 +4128,7 @@ fn submit_races_finish_on_both_sides() {
         let first = actor
             .submit(input(FIRST), None, FIRST.into(), Default::default())
             .unwrap();
-        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id(), None);
         let joined = actor
             .submit(input(NEXT), None, NEXT.into(), Default::default())
             .unwrap();
@@ -4177,7 +4177,7 @@ fn existing_only_submit_rejects_successor_without_admitting_work() {
                 .turn_id(),
             first.turn_id()
         );
-        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id(), None);
         assert_eq!(source.drain_instructions().len(), 1);
         source.instructions_submitted();
         assert!(source.finish());
@@ -4250,7 +4250,7 @@ fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
             Err(ActorError::InstructionOverflow)
         ));
         assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
-        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id(), None);
         assert!(!source.drain_instructions().is_empty());
         source.instructions_submitted();
         assert_eq!(

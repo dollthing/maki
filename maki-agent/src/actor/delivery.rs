@@ -1230,7 +1230,7 @@ mod tests {
                 admit_delivery(&actor.inner, envelope).unwrap();
             }
             let source =
-                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id());
+                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id(), None);
             let events = actor.subscribe_events();
             let mut first = Vec::new();
             source.commit_completions(&mut |message| {
@@ -1299,7 +1299,7 @@ mod tests {
                 )
                 .unwrap();
             let source =
-                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id());
+                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id(), None);
             source.instructions_submitted();
             admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
             assert!(!source.finish());

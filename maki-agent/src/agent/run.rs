@@ -590,10 +590,14 @@ impl<'h> Agent<'h> {
                         self.history.push(Message::user(message));
                         continue;
                     }
-                    if let Some(inbox) = &self.turn_inbox
-                        && !inbox.finish()
-                    {
-                        continue;
+                    if let Some(inbox) = self.turn_inbox.clone() {
+                        self.cancel
+                            .race(inbox.join_children())
+                            .await
+                            .map_err(|_| AgentError::Cancelled)?;
+                        if !inbox.finish() {
+                            continue;
+                        }
                     }
                     return Ok(reason);
                 }

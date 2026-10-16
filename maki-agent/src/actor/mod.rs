@@ -1371,6 +1371,22 @@ impl AgentActorHandle {
         self.inner.agent_id
     }
 
+    /// Whether settled turns are published to the recorded parent's inbox.
+    pub(crate) fn reports_to_parent(&self) -> bool {
+        self.inner
+            .managed_admission
+            .as_ref()
+            .is_some_and(|managed| managed.parent_delivery.is_some())
+            && self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .parent_delivery_policy
+                .as_ref()
+                .is_some_and(|policy| policy.auto_deliver)
+    }
+
     pub(crate) fn lifecycle(&self) -> ActorLifecycle {
         self.inner
             .state

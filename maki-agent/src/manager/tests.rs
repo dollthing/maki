@@ -4517,3 +4517,196 @@ fn active_turns_never_exceed_manager_limit() {
         assert!(report.timed_out.is_empty());
     });
 }
+
+struct JoiningBackend {
+    current: flume::Sender<crate::CurrentManagedTurn>,
+    start: Option<Arc<Gate>>,
+    joined: flume::Sender<usize>,
+}
+
+impl ActorBackend for JoiningBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.current
+                .send(context.managed_turn.clone().unwrap())
+                .unwrap();
+            if let Some(start) = self.start.take() {
+                start.enter().await;
+            }
+            let inbox = context.inbox.as_ref().unwrap();
+            inbox.join_children().await;
+            let completions = inbox.drain_completions();
+            let _ = self.joined.send(completions.len());
+            for message in completions {
+                history.push(message);
+            }
+            inbox.instructions_submitted();
+            while !inbox.finish() {
+                for message in inbox.drain_completions() {
+                    history.push(message);
+                }
+            }
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JoinCase {
+    ReportingChildOfChild,
+    NonReportingChildOfChild,
+    ChildOfRoot,
+}
+
+/// A subagent's turn does not settle while a child that reports to it is still
+/// running, and it yields its permit so that child can run at capacity one.
+/// Roots and children without automatic delivery are never joined.
+#[test_case(JoinCase::ReportingChildOfChild; "subagent_joins_reporting_child")]
+#[test_case(JoinCase::NonReportingChildOfChild; "non_reporting_child_not_joined")]
+#[test_case(JoinCase::ChildOfRoot; "root_does_not_join")]
+fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
+    smol::block_on(async {
+        const ROOT: &str = "root";
+        const JOINER: &str = "joiner";
+        const CHILD: &str = "child";
+        const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (current_tx, current_rx) = flume::unbounded();
+        let (joined_tx, joined_rx) = flume::unbounded();
+        let start = Gate::new();
+        let joiner_backend = || {
+            Box::new(JoiningBackend {
+                current: current_tx.clone(),
+                start: Some(Arc::clone(&start)),
+                joined: joined_tx.clone(),
+            }) as Box<dyn ActorBackend>
+        };
+        let (joiner, joiner_ticket) = if matches!(case, JoinCase::ChildOfRoot) {
+            let root = manager
+                .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+                    Ok::<_, String>(joiner_backend())
+                })
+                .unwrap();
+            let ticket = root
+                .actor()
+                .unwrap()
+                .admit_turn(input(), None, JOINER.into())
+                .unwrap();
+            (root, ticket)
+        } else {
+            let (root_tx, root_rx) = flume::unbounded();
+            let root_gate = Gate::new();
+            let root = manager
+                .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        root_tx,
+                        Some(Arc::clone(&root_gate)),
+                    ))
+                })
+                .unwrap();
+            let root_ticket = root
+                .actor()
+                .unwrap()
+                .admit_turn(input(), None, ROOT.into())
+                .unwrap();
+            let root_turn = root_rx.recv_async().await.unwrap();
+            let joiner = manager
+                .spawn_child(
+                    &root_turn,
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    joiner_backend(),
+                )
+                .unwrap();
+            root_gate.release(1);
+            root_ticket.wait().await;
+            let ticket = joiner
+                .actor()
+                .unwrap()
+                .admit_turn(input(), None, JOINER.into())
+                .unwrap();
+            (joiner, ticket)
+        };
+        let joiner_turn = current_rx.recv_async().await.unwrap();
+        let (child_tx, child_rx) = flume::unbounded();
+        let child_gate = Gate::new();
+        let child = manager
+            .spawn_child(
+                &joiner_turn,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        child_actor
+            .configure_parent_delivery(!matches!(case, JoinCase::NonReportingChildOfChild), None)
+            .unwrap();
+        let child_ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
+        start.release(1);
+        if matches!(case, JoinCase::ReportingChildOfChild) {
+            child_rx.recv_async().await.unwrap();
+            assert!(joined_rx.is_empty());
+            assert!(joiner_ticket.peek().is_none());
+            child_gate.release(1);
+            assert_eq!(joined_rx.recv_async().await.unwrap(), 1);
+            assert!(child_ticket.peek().is_some());
+        } else {
+            assert_eq!(joined_rx.recv_async().await.unwrap(), 0);
+            assert!(child_ticket.peek().is_none());
+            child_gate.release(1);
+        }
+        assert!(matches!(
+            joiner_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            child_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        drop(joiner);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}

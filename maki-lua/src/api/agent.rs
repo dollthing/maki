@@ -1076,8 +1076,9 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///     set via a `local_tools` handler). Use for hidden one-shot classification.
 ///   `auto_deliver` (boolean?) - for managed children, queue a structured
 ///     lifecycle observation per settled turn to the recorded parent, independently
-///     of `prompt()` or ticket waits. Nested children notify their own parent.
-///     Silent children disable delivery. Rejection and discard are observable in
+///     of `prompt()` or ticket waits. Nested children notify their own parent,
+///     and a managed child's turn does not settle while a child reporting to it
+///     is still running. Silent children disable delivery. Rejection and discard are observable in
 ///     host logs; delivery is in-memory, without retry. Default: `true`.
 ///   `semaphore` (maki.async.Semaphore?) - concurrency limit acquired by the
 ///     driver immediately before each unmanaged turn and released when that turn

@@ -400,7 +400,11 @@ impl Runner {
                     admission.input.as_ref().and_then(crate::batch_key),
                     admission.ticket.provenance().clone(),
                 )) as Arc<dyn InterruptSource>),
-                inbox: Some(super::inbox::ActorTurnInbox::source(&self.inner, turn_id)),
+                inbox: Some(super::inbox::ActorTurnInbox::source(
+                    &self.inner,
+                    turn_id,
+                    managed_turn.clone(),
+                )),
                 managed_turn: managed_turn.clone(),
                 admission: admission.admission.clone(),
             },
