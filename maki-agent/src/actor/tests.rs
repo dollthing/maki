@@ -25,13 +25,16 @@ use super::queue::{ActorQueue, QueueProjection};
 use super::types::{
     ActorLifecycle, ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind,
 };
-use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, TurnAdmission};
+use super::{
+    ActorBackend, ActorError, ActorEvent, ActorWork, AgentActorHandle, ChildDelivery,
+    DeliveryStatus, TurnAdmission,
+};
 use crate::tools::DescriptionContext;
 use crate::tools::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience, ToolInvocation,
     ToolSource,
 };
-use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
+use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 use std::borrow::Cow;
 
@@ -4367,5 +4370,223 @@ fn cancel_active_compact_cancels_cleanly_without_panic() {
         handle.close();
         task.await;
         assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
+    });
+}
+
+fn delivery_statuses(events: &flume::Receiver<ActorEvent>) -> Vec<DeliveryStatus> {
+    events
+        .try_iter()
+        .filter_map(|event| match event {
+            ActorEvent::Delivery(event) => Some(event.status),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Claim {
+    WaitFirst,
+    AutomaticFirst,
+}
+
+#[test_case::test_case(Claim::WaitFirst; "wait_first")]
+#[test_case::test_case(Claim::AutomaticFirst; "automatic_first")]
+fn wait_and_automatic_delivery_claim_race(first: Claim) {
+    smol::block_on(async {
+        const CHILD: &str = "child work";
+        let backend = ScriptedBackend::new();
+        let scripted = Arc::clone(&backend.state);
+        let (parent_start, parent_rx) = flume::bounded(1);
+        let (parent, parent_task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(backend),
+            None,
+            None,
+            Some(parent_rx),
+        );
+        let mut managed = super::ManagedTurnAdmission::new(Weak::new(), AgentId::generate());
+        managed.parent_delivery = Some(super::delivery::ParentDelivery {
+            parent_id: parent.agent_id(),
+            parent: Arc::downgrade(&parent.inner),
+            metadata: Default::default(),
+        });
+        let (_child_start, child_rx) = flume::bounded(1);
+        let (child, child_task) = AgentActorHandle::spawn_inner(
+            managed.agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            Some(managed),
+            None,
+            Some(child_rx),
+        );
+        child.configure_parent_delivery(true, None).unwrap();
+        let events = parent.subscribe_events();
+        let child_turn = child
+            .admit_turn(input(CHILD), None, CHILD.into())
+            .unwrap()
+            .turn_id();
+        child.cancel_turn(child_turn).unwrap();
+        let continuation = {
+            let mut state = parent.inner.state.lock().unwrap();
+            super::delivery::schedule(&parent.inner, &mut state);
+            let (&continuation, batch) = state.delivery_runs.iter().next().unwrap();
+            assert_eq!(batch, &vec![child_turn]);
+            continuation
+        };
+        let claimed = match first {
+            Claim::WaitFirst => {
+                assert!(parent.withdraw_child_delivery(child_turn));
+                assert!(super::delivery::drain(&parent.inner, continuation).is_empty());
+                DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn)
+            }
+            Claim::AutomaticFirst => {
+                assert_eq!(super::delivery::drain(&parent.inner, continuation).len(), 1);
+                assert!(!parent.withdraw_child_delivery(child_turn));
+                assert!(super::delivery::drain(&parent.inner, continuation).is_empty());
+                DeliveryStatus::Executed {
+                    parent_turn_id: continuation,
+                }
+            }
+        };
+        assert_eq!(
+            delivery_statuses(&events),
+            vec![DeliveryStatus::Accepted, claimed]
+        );
+        let retained = child
+            .turn_ticket(child_turn)
+            .and_then(|ticket| ticket.peek_result())
+            .unwrap();
+        assert_eq!(retained.outcome.turn_id(), child_turn);
+        assert_eq!(child.outcome(child_turn), Some(retained.outcome));
+
+        parent_start.send(()).unwrap();
+        until(|| parent.inner.state.lock().unwrap().delivery_runs.is_empty()).await;
+        assert_eq!(scripted.entered.load(Ordering::SeqCst), 0);
+        assert!(parent.turn_ticket(continuation).is_none());
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, ActorEvent::Start { .. }))
+        );
+        parent.close();
+        child.close();
+        parent_task.await;
+        child_task.await;
+    });
+}
+
+#[test]
+fn delivery_arrival_during_finalization() {
+    smol::block_on(async {
+        const ACTIVE: &str = "finishing parent turn";
+        const LATER: &str = "later parent turn";
+        const CHILD: &str = "late child result";
+        let backend = ScriptedBackend::new();
+        let scripted = Arc::clone(&backend.state);
+        let (parent, task) = spawn(backend);
+        let events = parent.subscribe_events();
+        let (retired, release_retire) = parent.pause_after_next_finalization_retire();
+        let finished = parent
+            .admit_turn(input(ACTIVE), None, ACTIVE.into())
+            .unwrap();
+        retired.recv_async().await.unwrap();
+        assert!(finished.peek_result().is_none());
+        assert!(
+            !parent
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .instructions
+                .contains_key(&finished.turn_id())
+        );
+
+        let child_turn = TurnId::generate();
+        let envelope = Arc::new(ChildDelivery {
+            parent_id: parent.agent_id(),
+            compatibility_id: None,
+            label: None,
+            child_config: None,
+            correlation: CHILD.into(),
+            result: super::TurnResult {
+                outcome: TurnOutcome::cancelled(
+                    AgentId::generate(),
+                    child_turn,
+                    TokenUsage::default(),
+                    0,
+                    TurnCancellationReason::User,
+                ),
+                text: CHILD.into(),
+                output: Vec::new(),
+                provenance: super::TurnProvenance::default(),
+                duration_ms: 0,
+            },
+        });
+        super::delivery::admit_delivery(&parent.inner, envelope).unwrap();
+        {
+            let state = parent.inner.state.lock().unwrap();
+            assert!(state.deliveries.contains_key(&child_turn));
+            assert!(state.delivery_runs.is_empty());
+        }
+
+        let (popped, release_pop) = parent.pause_after_next_pop();
+        release_retire.send(()).unwrap();
+        assert!(matches!(
+            finished.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        until(|| !popped.is_empty()).await;
+        let continuation = {
+            let state = parent.inner.state.lock().unwrap();
+            assert_eq!(state.delivery_runs.len(), 1);
+            let (&continuation, batch) = state.delivery_runs.iter().next().unwrap();
+            assert_eq!(batch, &vec![child_turn]);
+            assert!(state.deliveries.contains_key(&child_turn));
+            continuation
+        };
+        assert_ne!(continuation, finished.turn_id());
+        release_pop.send(()).unwrap();
+        let continuation_ticket = parent.turn_ticket(continuation).unwrap();
+        until(|| continuation_ticket.peek().is_some()).await;
+        assert!(matches!(
+            continuation_ticket.peek(),
+            Some(TurnOutcome::Completed { .. })
+        ));
+
+        let later = parent.admit_turn(input(LATER), None, LATER.into()).unwrap();
+        until(|| later.peek().is_some()).await;
+        let mut started = Vec::new();
+        let mut statuses = Vec::new();
+        for event in events.try_iter() {
+            match event {
+                ActorEvent::Start { turn_id, .. } => started.push(turn_id),
+                ActorEvent::Delivery(event) => statuses.push(event.status),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            started,
+            vec![finished.turn_id(), continuation, later.turn_id()]
+        );
+        assert_eq!(
+            statuses,
+            vec![
+                DeliveryStatus::Accepted,
+                DeliveryStatus::Executed {
+                    parent_turn_id: continuation
+                },
+            ]
+        );
+        assert_eq!(scripted.entered.load(Ordering::SeqCst), 3);
+        {
+            let state = parent.inner.state.lock().unwrap();
+            assert!(state.deliveries.is_empty());
+            assert!(state.delivery_runs.is_empty());
+        }
+        parent.close();
+        task.await;
     });
 }
