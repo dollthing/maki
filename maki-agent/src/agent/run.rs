@@ -42,6 +42,7 @@ const INSTRUCTION_BUDGET_EXHAUSTED: &str =
     "The request budget was exhausted before all accepted instructions reached the provider.";
 const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
     "turn budget exhausted before required output was reported";
+const LATE_REPORTS_NOTE: &str = "[system: subagents you started finished after your last answer; their results follow. Reply with your complete final answer, updated with these results.]";
 type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
 type CompletionExhausted = Arc<dyn Fn() -> String + Send + Sync>;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
@@ -596,6 +597,18 @@ impl<'h> Agent<'h> {
                             .await
                             .map_err(|_| AgentError::Cancelled)?;
                         if !inbox.finish() {
+                            if self
+                                .config
+                                .max_turns
+                                .is_some_and(|max| self.num_turns >= max)
+                                && inbox.finish_instructions()
+                            {
+                                return Ok(reason);
+                            }
+                            if inbox.is_managed_child() && !inbox.has_unsubmitted_instructions() {
+                                self.invalidate_reports();
+                                self.history.push(Message::user(LATE_REPORTS_NOTE.into()));
+                            }
                             continue;
                         }
                     }
@@ -954,6 +967,10 @@ impl<'h> Agent<'h> {
 
     fn instruction_consumed(&mut self) {
         self.pending_instruction_request = true;
+        self.invalidate_reports();
+    }
+
+    fn invalidate_reports(&self) {
         if let Some(capture) = &self.local_tool_capture {
             *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
         }
@@ -1453,6 +1470,114 @@ mod tests {
                     ..
                 }
             ));
+        });
+    }
+
+    /// Reports that land after a final answer: once the first `finish` refuses,
+    /// one child observation becomes drainable.
+    struct LateReportInbox {
+        managed_child: bool,
+        refused: Mutex<bool>,
+        report: Mutex<Option<Message>>,
+    }
+
+    impl LateReportInbox {
+        fn new(managed_child: bool) -> Self {
+            Self {
+                managed_child,
+                refused: Mutex::new(false),
+                report: Mutex::new(Some(Message::observation(LATE_REPORT.into()))),
+            }
+        }
+    }
+
+    impl TurnInbox for LateReportInbox {
+        fn drain_instructions(&self) -> Vec<AgentInput> {
+            Vec::new()
+        }
+        fn drain_completions(&self) -> Vec<Message> {
+            if !*self.refused.lock().unwrap() {
+                return Vec::new();
+            }
+            self.report.lock().unwrap().take().into_iter().collect()
+        }
+        fn finish(&self) -> bool {
+            std::mem::replace(&mut *self.refused.lock().unwrap(), true)
+        }
+        fn finish_instructions(&self) -> bool {
+            true
+        }
+        fn is_managed_child(&self) -> bool {
+            self.managed_child
+        }
+        fn instructions_submitted(&self) {}
+        fn has_unsubmitted_instructions(&self) -> bool {
+            false
+        }
+    }
+
+    const LATE_REPORT: &str = "late child report";
+
+    /// A report that arrives after the final answer of the last allowed request
+    /// stays pending; the turn keeps its own reason instead of `MaxTurns`.
+    #[test]
+    fn late_report_at_turn_budget_keeps_done_reason() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let inbox = Arc::new(LateReportInbox::new(true));
+            let mut agent = agent.with_turn_inbox(Some(Arc::clone(&inbox) as Arc<dyn TurnInbox>));
+            agent.config.max_turns = Some(1);
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Completed {
+                    reason: DoneReason::EndTurn,
+                    ..
+                }
+            ));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(inbox.report.lock().unwrap().is_some());
+        });
+    }
+
+    /// A subagent's single report is its last answer, so late child reports
+    /// invalidate earlier captures and ask for the complete answer again.
+    /// Roots consume them without restating.
+    #[test_case(true; "managed_child_restates")]
+    #[test_case(false; "root_does_not_restate")]
+    fn late_reports_after_final_answer(managed_child: bool) {
+        smol::block_on(async {
+            let capture = Arc::new(Mutex::new(Some(serde_json::json!({"stale": true}))));
+            let invalidations = Arc::new(Mutex::new(0));
+            let called = Arc::clone(&invalidations);
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let mut agent = agent
+                .with_turn_inbox(Some(Arc::new(LateReportInbox::new(managed_child))))
+                .with_local_tool_capture(Arc::clone(&capture))
+                .with_instruction_consumed_callback(Arc::new(move || {
+                    *called.lock().unwrap() += 1;
+                }));
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let texts: Vec<_> = requests[1]
+                .iter()
+                .filter_map(Message::first_text_content)
+                .collect();
+            assert!(texts.contains(&LATE_REPORT));
+            assert_eq!(texts.contains(&LATE_REPORTS_NOTE), managed_child);
+            assert_eq!(*invalidations.lock().unwrap(), usize::from(managed_child));
+            assert_eq!(capture.lock().unwrap().is_none(), managed_child);
         });
     }
 

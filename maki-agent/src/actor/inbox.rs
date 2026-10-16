@@ -28,6 +28,10 @@ pub trait TurnInbox: Send + Sync {
     /// leaving pending completions for a successor turn.
     fn finish_instructions(&self) -> bool;
     fn close(&self) {}
+    /// Whether this turn's agent reports its results to a managed parent.
+    fn is_managed_child(&self) -> bool {
+        false
+    }
     /// Resolves once no child that reports to this agent has unsettled work,
     /// yielding the turn permit while it waits. Roots resolve immediately,
     /// since their idle continuations already reach the user.
@@ -181,18 +185,21 @@ impl TurnInbox for ActorTurnInbox {
         self.close_admission(false)
     }
 
+    fn is_managed_child(&self) -> bool {
+        self.inner.upgrade().is_some_and(|inner| {
+            inner
+                .managed_admission
+                .as_ref()
+                .is_some_and(|managed| managed.parent_delivery.is_some())
+        })
+    }
+
     fn join_children(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(current) = &self.managed_turn else {
                 return;
             };
-            let is_child = self.inner.upgrade().is_some_and(|inner| {
-                inner
-                    .managed_admission
-                    .as_ref()
-                    .is_some_and(|managed| managed.parent_delivery.is_some())
-            });
-            if !is_child {
+            if !self.is_managed_child() {
                 return;
             }
             while let Some((child_id, actor, ticket)) = Self::unsettled_reporting_child(current) {
