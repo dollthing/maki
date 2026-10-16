@@ -539,7 +539,7 @@ impl<'h> Agent<'h> {
             {
                 if self.pending_instruction_request
                     || self.turn_inbox.as_ref().is_some_and(|inbox| {
-                        !inbox.finish() || inbox.has_unsubmitted_instructions()
+                        !inbox.finish_instructions() || inbox.has_unsubmitted_instructions()
                     })
                 {
                     return Err(AgentError::Config {
@@ -1346,6 +1346,10 @@ mod tests {
                 self.pending.lock().unwrap().push(input);
                 return false;
             }
+            self.finish_instructions()
+        }
+
+        fn finish_instructions(&self) -> bool {
             self.pending.lock().unwrap().is_empty() && *self.submitted.lock().unwrap()
         }
 
@@ -1404,6 +1408,50 @@ mod tests {
         });
     }
 
+    /// A child report still waiting at the turn budget belongs to a successor
+    /// turn; it must not be mistaken for an unsubmitted instruction.
+    #[test]
+    fn pending_completion_at_turn_budget_is_not_instruction_failure() {
+        struct PendingCompletionInbox;
+
+        impl TurnInbox for PendingCompletionInbox {
+            fn drain_instructions(&self) -> Vec<AgentInput> {
+                Vec::new()
+            }
+            fn drain_completions(&self) -> Vec<Message> {
+                Vec::new()
+            }
+            fn finish(&self) -> bool {
+                false
+            }
+            fn finish_instructions(&self) -> bool {
+                true
+            }
+            fn instructions_submitted(&self) {}
+            fn has_unsubmitted_instructions(&self) -> bool {
+                false
+            }
+        }
+
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::MaxTokens)]),
+                &mut history,
+            );
+            let mut agent = agent.with_turn_inbox(Some(Arc::new(PendingCompletionInbox)));
+            agent.config.max_turns = Some(1);
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Completed {
+                    reason: DoneReason::MaxTurns,
+                    ..
+                }
+            ));
+        });
+    }
+
     #[test_case(false; "instructions_invalidate_local_capture")]
     #[test_case(true; "observations_preserve_local_capture")]
     fn steering_capture_freshness(observation_only: bool) {
@@ -1430,6 +1478,9 @@ mod tests {
                     .collect()
             }
             fn finish(&self) -> bool {
+                true
+            }
+            fn finish_instructions(&self) -> bool {
                 true
             }
             fn instructions_submitted(&self) {}

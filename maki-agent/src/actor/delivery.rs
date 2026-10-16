@@ -1272,6 +1272,45 @@ mod tests {
     }
 
     #[test]
+    fn pending_completion_blocks_finish_but_not_instruction_close() {
+        smol::block_on(async {
+            const INSTRUCTION: &str = "ordinary work";
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            let ticket = actor
+                .submit(
+                    AgentInput::from_defaults(
+                        INSTRUCTION.into(),
+                        crate::AgentMode::Build,
+                        Vec::new(),
+                        Default::default(),
+                    ),
+                    None,
+                    INSTRUCTION.into(),
+                    Default::default(),
+                )
+                .unwrap();
+            let source =
+                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id());
+            source.instructions_submitted();
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            assert!(!source.finish());
+            assert!(source.finish_instructions());
+            assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
     fn idle_child_batch_uses_one_continuation() {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);

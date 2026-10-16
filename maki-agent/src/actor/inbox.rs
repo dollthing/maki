@@ -19,8 +19,12 @@ pub trait TurnInbox: Send + Sync {
             commit(message);
         }
     }
-    /// Closes admission only when every accepted instruction reached a request.
+    /// Closes admission only when every accepted instruction reached a request
+    /// and no child completion is waiting to be consumed.
     fn finish(&self) -> bool;
+    /// Closes admission once every accepted instruction reached a request,
+    /// leaving pending completions for a successor turn.
+    fn finish_instructions(&self) -> bool;
     fn close(&self) {}
     /// Acknowledge only previously drained instructions, after request submission.
     fn instructions_submitted(&self);
@@ -75,6 +79,25 @@ impl ActorTurnInbox {
             turn_id,
         })
     }
+
+    fn close_admission(&self, await_completions: bool) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return true;
+        };
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pending_completions = await_completions && !state.deliveries.is_empty();
+        let Some(inbox) = state.instructions.get_mut(&self.turn_id) else {
+            return true;
+        };
+        if inbox.outstanding().0 != 0 || pending_completions {
+            return false;
+        }
+        inbox.open = false;
+        true
+    }
 }
 
 impl TurnInbox for ActorTurnInbox {
@@ -118,22 +141,11 @@ impl TurnInbox for ActorTurnInbox {
     }
 
     fn finish(&self) -> bool {
-        let Some(inner) = self.inner.upgrade() else {
-            return true;
-        };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let pending_completions = !state.deliveries.is_empty();
-        let Some(inbox) = state.instructions.get_mut(&self.turn_id) else {
-            return true;
-        };
-        if inbox.outstanding().0 != 0 || pending_completions {
-            return false;
-        }
-        inbox.open = false;
-        true
+        self.close_admission(true)
+    }
+
+    fn finish_instructions(&self) -> bool {
+        self.close_admission(false)
     }
 
     fn close(&self) {
