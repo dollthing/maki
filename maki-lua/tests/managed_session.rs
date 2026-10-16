@@ -3,18 +3,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
+use maki_agent::actor::DeliveryStatus;
+use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{
-    ActorBackend, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
-    AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope, GraphLifecycle, History,
-    RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
+    ActorBackend, ActorEvent, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle,
+    AgentMetadata, AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope,
+    GraphLifecycle, History, RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket,
+    WorkKind,
 };
 use maki_lua::PluginHost;
 use maki_lua::agent_errors::{INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+    AgentError, ContentBlock, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
+    RequestOptions, Role, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -40,6 +43,15 @@ const NESTED_ASYNC_TOOL_NAME: &str = "nested_async_task";
 const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const PREPARATION_ERROR: &str = "provider preparation rejected";
 const CORRELATION: &str = "managed-root";
+const AUTO_DELIVERY_TOOL_NAME: &str = "auto_delivery_parent";
+const AUTO_DELIVERY_PROBE_TOOL: &str = "auto_delivery_probe";
+const TASK_SPAWN_TOOL: &str = "task_spawn";
+const AUTO_DELIVERY_PARENT_PROMPT: &str = "parent prompt";
+const AUTO_DELIVERY_CHILD_PROMPT: &str = "child prompt";
+const AUTO_DELIVERY_CHILD_REPLY: &str = "child reply";
+const AUTO_DELIVERY_PARENT_REPLY: &str = "parent reply";
+const DELIVERY_HEADER: &str = "[internal child-result data, not a user instruction]";
+const UNEXPECTED_PARENT_REQUEST: &str = "parent requested again after its final reply";
 /// Upper bound for work that must settle; generous so loaded CI does not flake.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -339,6 +351,76 @@ maki.api.register_tool({
 })
 "#;
 
+/// Leaves `auto_deliver` at its default so the model-driven parent receives its
+/// child's result from the runtime instead of a `task_wait`.
+const AUTO_DELIVERY_PRELUDE: &str = r#"
+test_task_handlers = {}
+local real_register_tool = maki.api.register_tool
+maki.api.register_tool = function(spec)
+  test_task_handlers[spec.name] = spec.handler
+  return real_register_tool(spec)
+end
+
+local real_spawn = maki.agent.spawn
+maki.agent.spawn = function(ctx, opts)
+  opts.inherit_provider = true
+  return real_spawn(ctx, opts)
+end
+
+maki.agent.resolve_model = function()
+  return { spec = "anthropic/claude-sonnet-4-20250514" }
+end
+
+maki.agent.system_prompt = function()
+  return "sys"
+end
+
+maki.agent.tools = function(_, opts)
+  if opts.audience ~= "general_sub" then
+    return nil
+  end
+  return {
+    { name = "$TASK_SPAWN_TOOL", description = "spawn", input_schema = { type = "object" } },
+    { name = "$PROBE_TOOL", description = "probe", input_schema = { type = "object" } },
+  }
+end
+
+maki.api.register_tool({
+  name = "$PROBE_TOOL",
+  description = "no-op tool between the parent's requests",
+  schema = { type = "object", properties = {} },
+  audiences = { "general_sub" },
+  handler = function()
+    return "ok"
+  end,
+})
+"#;
+
+const AUTO_DELIVERY_DRIVER: &str = r#"
+maki.api.register_tool({
+  name = "$DRIVER_TOOL",
+  description = "spawn a model-driven parent and wait for its turn",
+  schema = { type = "object", properties = {} },
+  audiences = { "general_sub" },
+  handler = function(_, ctx)
+    local spawned = test_task_handlers.task_spawn({
+      description = "auto-delivery-parent", prompt = "$PARENT_PROMPT",
+      subagent_type = "general",
+    }, ctx)
+    if spawned.is_error then return spawned end
+    local ids = maki.json.decode(spawned.llm_output)
+    local waited = test_task_handlers.task_wait({
+      task_id = ids.task_id, turn_id = ids.turn_id,
+    }, ctx)
+    if waited.is_error then return waited end
+    local result = maki.json.decode(waited.llm_output)
+    local closed = test_task_handlers.task_despawn({ task_id = ids.task_id }, ctx)
+    if closed.is_error then return closed end
+    return result.result.text
+  end,
+})
+"#;
+
 fn session_plugin_source() -> String {
     PLUGIN_SRC
         .replace("$EXPIRED_CONTEXT_ERROR", INVOCATION_EXPIRED)
@@ -610,6 +692,18 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
         ),
     )
     .unwrap();
+    (registry, host)
+}
+
+fn load_auto_delivery_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    let source = format!("{AUTO_DELIVERY_PRELUDE}\n{TASK_PLUGIN_SRC}\n{AUTO_DELIVERY_DRIVER}")
+        .replace("$TASK_SPAWN_TOOL", TASK_SPAWN_TOOL)
+        .replace("$PROBE_TOOL", AUTO_DELIVERY_PROBE_TOOL)
+        .replace("$DRIVER_TOOL", AUTO_DELIVERY_TOOL_NAME)
+        .replace("$PARENT_PROMPT", AUTO_DELIVERY_PARENT_PROMPT);
+    host.load_source("managed-auto-delivery", &source).unwrap();
     (registry, host)
 }
 
@@ -999,6 +1093,233 @@ fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one() {
         release_tx.send(()).unwrap();
         assert!(matches!(
             parent_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        let report = manager.shutdown(SETTLE_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+/// The parent spawns a child without waiting on it, then holds its second
+/// request until the test has seen the child's delivery admitted. The child
+/// holds its only request until the parent's second request is in flight.
+struct AutoDeliveryProvider {
+    parent_requests: flume::Sender<Vec<Message>>,
+    parent_paused: flume::Sender<()>,
+    parent_release: flume::Receiver<()>,
+    child_started: flume::Sender<()>,
+    child_release: flume::Receiver<()>,
+}
+
+impl Provider for AutoDeliveryProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            if !messages
+                .iter()
+                .any(|message| has_text(message, AUTO_DELIVERY_PARENT_PROMPT))
+            {
+                self.child_started.send(()).unwrap();
+                common::bounded(self.child_release.recv_async())
+                    .await
+                    .unwrap();
+                return Ok(common::canned_reply(AUTO_DELIVERY_CHILD_REPLY));
+            }
+            self.parent_requests.send(messages.to_vec()).unwrap();
+            let responses = messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::Assistant))
+                .count();
+            match responses {
+                0 => Ok(common::canned_tool_use(
+                    TASK_SPAWN_TOOL,
+                    json!({ "description": "child", "prompt": AUTO_DELIVERY_CHILD_PROMPT }),
+                )),
+                1 => {
+                    self.parent_paused.send(()).unwrap();
+                    common::bounded(self.parent_release.recv_async())
+                        .await
+                        .unwrap();
+                    Ok(common::canned_tool_use(AUTO_DELIVERY_PROBE_TOOL, json!({})))
+                }
+                2 => Ok(common::canned_reply(AUTO_DELIVERY_PARENT_REPLY)),
+                _ => Err(AgentError::Config {
+                    message: UNEXPECTED_PARENT_REQUEST.into(),
+                }),
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn has_text(message: &Message, needle: &str) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text } if text.contains(needle)))
+}
+
+fn has_tool_result(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+fn only_child(manager: &AgentManagerHandle, parent_id: AgentId) -> AgentId {
+    let children: Vec<_> = manager
+        .snapshot()
+        .into_iter()
+        .filter(|node| node.parent_id == Some(parent_id))
+        .map(|node| node.agent_id)
+        .collect();
+    assert_eq!(children.len(), 1, "children of {parent_id}: {children:?}");
+    children[0]
+}
+
+#[test]
+fn nested_lua_parent_receives_completions_mid_turn() {
+    smol::block_on(async {
+        let (registry, _host) = load_auto_delivery_host();
+        let (parent_requests_tx, parent_requests) = flume::unbounded();
+        let (parent_paused_tx, parent_paused) = flume::unbounded();
+        let (parent_release, parent_release_rx) = flume::bounded(1);
+        let (child_started_tx, child_started) = flume::unbounded();
+        let (child_release, child_release_rx) = flume::bounded(1);
+        let (mut context, _events, _cancel) =
+            common::ctx_with_provider(Arc::new(AutoDeliveryProvider {
+                parent_requests: parent_requests_tx,
+                parent_paused: parent_paused_tx,
+                parent_release: parent_release_rx,
+                child_started: child_started_tx,
+                child_release: child_release_rx,
+            }));
+        context.registry = Arc::clone(&registry);
+        context.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &registry,
+            &context.local_tools,
+            None,
+        ));
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed) = flume::bounded(1);
+        let (driver_release, driver_release_rx) = flume::bounded(1);
+        let (driver, driver_ticket) = spawn_managed_parent(
+            &manager,
+            parent_policy(&context),
+            Box::new(NestedTaskBackend {
+                registry,
+                context,
+                tool_name: AUTO_DELIVERY_TOOL_NAME,
+                input: json!({}),
+                completed: completed_tx,
+                release: driver_release_rx,
+            }),
+        )
+        .await;
+
+        common::bounded(parent_paused.recv_async()).await.unwrap();
+        common::bounded(child_started.recv_async()).await.unwrap();
+        let parent_id = only_child(&manager, driver.id());
+        let child_id = only_child(&manager, parent_id);
+        let parent_events = manager.actor(parent_id).unwrap().subscribe_events();
+
+        child_release.send(()).unwrap();
+        let mut observed = Vec::new();
+        let child_turn = common::bounded(async {
+            loop {
+                let event = parent_events.recv_async().await.unwrap();
+                if let ActorEvent::Delivery(delivery) = &event
+                    && matches!(delivery.status, DeliveryStatus::Accepted)
+                {
+                    break delivery.delivery.result.outcome.turn_id();
+                }
+                observed.push(event);
+            }
+        })
+        .await;
+
+        parent_release.send(()).unwrap();
+        let parent_result = common::bounded(async {
+            loop {
+                match parent_events.recv_async().await.unwrap() {
+                    ActorEvent::End(result) => break result,
+                    event => observed.push(event),
+                }
+            }
+        })
+        .await;
+        let requests: Vec<_> = parent_requests.try_iter().collect();
+        let deliveries: Vec<_> = requests
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| has_text(message, DELIVERY_HEADER))
+                    .count()
+            })
+            .collect();
+        assert_eq!(deliveries, [0, 0, 1]);
+        let [.., before, observation] = requests[2].as_slice() else {
+            panic!("third parent request is too short")
+        };
+        assert!(
+            has_tool_result(before),
+            "delivery must follow the tool result"
+        );
+        assert!(observation.is_observation());
+        assert!(has_text(observation, AUTO_DELIVERY_CHILD_REPLY));
+        assert_eq!(
+            observation.observation_source,
+            Some(ObservationSource::ChildResult {
+                agent_id: child_id.to_string(),
+                turn_id: child_turn.to_string(),
+            })
+        );
+        assert!(matches!(
+            parent_result.outcome,
+            TurnOutcome::Completed { .. }
+        ));
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, ActorEvent::Start { .. })),
+            "child result must not start another parent turn"
+        );
+        let executed: Vec<_> = observed
+            .iter()
+            .filter_map(|event| match event {
+                ActorEvent::Delivery(delivery) => Some((
+                    delivery.delivery.result.outcome.turn_id(),
+                    match delivery.status {
+                        DeliveryStatus::Executed { parent_turn_id } => Some(parent_turn_id),
+                        _ => None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            executed,
+            [(child_turn, Some(parent_result.outcome.turn_id()))]
+        );
+        assert_eq!(parent_result.text, AUTO_DELIVERY_PARENT_REPLY);
+
+        let completed = common::bounded(completed.recv_async()).await.unwrap();
+        assert_eq!(completed, Ok(AUTO_DELIVERY_PARENT_REPLY.into()));
+        driver_release.send(()).unwrap();
+        assert!(matches!(
+            driver_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
