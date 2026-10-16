@@ -7,7 +7,6 @@ local plan_spec = require("maki.plan_spec")
 local MAX_RETAINED_TASKS = 128
 local MAX_RETAINED_TURNS = 64
 local TURN_UNAVAILABLE_ERR = "turn_result_unavailable"
-local TURN_LIMIT_ERR = "task turn ticket limit reached"
 local TASK_LIMIT_ERR = "task record limit reached; despawn unused tasks"
 local GENERAL_SEND_IN_PLAN_ERR =
   "general subagents cannot take new work in plan mode; despawn the task or switch to build mode"
@@ -253,16 +252,24 @@ local function create_session(ctx, options)
         i = i + 1
       end
     end
-    if #order >= MAX_RETAINED_TURNS then
-      return nil, TURN_LIMIT_ERR, true
-    end
-    local ticket, send_err = agent:enqueue(call_ctx, message)
+    local ticket, send_err = agent:submit(call_ctx, message, { existing_only = #order >= MAX_RETAINED_TURNS })
     if not ticket then
-      return nil, send_err
+      return nil, send_err, true
     end
     latest = ticket:id()
-    tickets[latest] = ticket
-    order[#order + 1] = latest
+    if not tickets[latest] and #order >= MAX_RETAINED_TURNS then
+      for index, id in ipairs(order) do
+        if tickets[id]:result(call_ctx) then
+          tickets[id] = nil
+          table.remove(order, index)
+          break
+        end
+      end
+    end
+    if not tickets[latest] then
+      tickets[latest] = ticket
+      order[#order + 1] = latest
+    end
     return latest
   end
   function adapter:wait(call_ctx, turn_id, timeout)
@@ -365,6 +372,7 @@ local function spawn(spec, input, ctx)
   task_order[#task_order + 1] = task_id
   local admitted, enqueue_err = enqueue(task, input.prompt, ctx)
   if not admitted then
+    fail_task(task, enqueue_err, ctx)
     tasks[task_id] = nil
     table.remove(task_order)
     return nil, enqueue_err
@@ -410,7 +418,7 @@ local send_schema = {
     task_id = { type = "string", description = "Task id returned by task_spawn." },
     message = {
       type = "string",
-      description = "Message to queue to the subagent. A done subagent restarts on the next turn.",
+      description = "Instructions for the subagent. Busy sends join its open work turn; idle sends start a new turn.",
     },
   },
 }
@@ -513,7 +521,7 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Queue follow-ups with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
+  description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Steer work with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
     .. description,
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
@@ -526,7 +534,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_wait",
-  description = "Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent should finish its work before ending a turn; follow-up turns it runs after its own subagents report are not delivered on their own. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved tickets, sends reject without cancelling accepted work. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.",
+  description = "Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. Later messages accepted into this same turn extend its work; a successor never retargets an existing wait. Child reports arrive at safe request boundaries for active shared-actor parents, or in a batched idle continuation. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved unique tickets, new turns reject without cancelling accepted work; further messages may reuse an open ticket. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = wait_schema,
@@ -539,7 +547,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_send",
-  description = "Queue a message to a background subagent in per-task FIFO order and return immediately. A done subagent processes it as a new turn, acquiring concurrency capacity when the turn starts. Returns { queued = true, turn_id }, or a session error if queueing fails. Also callable from a code_execution script as a Python async function.",
+  description = "Submit instructions to a background subagent and return immediately. Busy sends join open work and return the same turn_id; idle or admission-closed sends start a new turn with a fresh ID. Instructions reach the next safe model request, not an in-flight request or blocked tool. Acceptance is not proof of processing. The bounded inbox rejects overflow without cancelling the child or earlier instructions. Returns { queued = true, turn_id }, or an admission error. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},

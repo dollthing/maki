@@ -179,8 +179,8 @@ fn admit(
     agent: &LuaAgent,
     ctx: &LuaCtx,
     message: String,
-    idle: bool,
-    after_turn: Option<TurnId>,
+    options: TurnAdmissionOptions,
+    submit: bool,
 ) -> Result<LuaAgentTurn, String> {
     authorize(lua, ctx, agent)?;
     let actor = agent.manager.actor(agent.id)?;
@@ -216,18 +216,19 @@ fn admit(
         }
     };
     let options = TurnAdmissionOptions {
-        idle_only: idle,
-        after_turn,
         provenance,
-        ..Default::default()
+        ..options
     };
-    let ticket = actor
-        .admit_turn_with_options(input, None, String::new(), options)
-        .map_err(|error| match error {
-            ActorError::Busy => AGENT_BUSY.to_owned(),
-            ActorError::StaleTurn => STALE_TURN.to_owned(),
-            other => other.to_string(),
-        })?;
+    let ticket = if submit {
+        actor.submit(input, None, String::new(), options)
+    } else {
+        actor.admit_turn_with_options(input, None, String::new(), options)
+    }
+    .map_err(|error| match error {
+        ActorError::Busy => AGENT_BUSY.to_owned(),
+        ActorError::StaleTurn => STALE_TURN.to_owned(),
+        other => other.to_string(),
+    })?;
     Ok(LuaAgentTurn {
         agent: agent.clone(),
         ticket,
@@ -260,7 +261,53 @@ fn agent_send(
     opts: Option<Table>,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     let after_turn = try_pair!(after_turn(opts.as_ref())?);
-    let turn = try_pair!(admit(lua, this, &ctx, message, true, after_turn));
+    let turn = try_pair!(admit(
+        lua,
+        this,
+        &ctx,
+        message,
+        TurnAdmissionOptions {
+            idle_only: true,
+            after_turn,
+            ..Default::default()
+        },
+        false,
+    ));
+    Ok((Some(turn), None))
+}
+
+/// Submit instructions to open ordinary work, or start a successor when idle or admission is closed.
+/// Busy and compatible pending submissions return the existing ticket. Instructions reach the next
+/// safe model request without interrupting a provider request or tool. Bounded inbox rejection does
+/// not cancel accepted work. Exact enqueue operations remain separate FIFO turns.
+/// @param ctx LuaCtx Invocation context.
+/// @param message string User instructions (text only).
+/// @param opts table? existing_only joins compatible admitted work or returns busy without starting a new turn. Defaults to false.
+/// @return (AgentTurn?, string?) Ticket covering these instructions, or an admission error.
+#[lua_fn(name = "submit")]
+fn agent_submit(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    message: String,
+    opts: Option<Table>,
+) -> mlua::Result<Pair<LuaAgentTurn>> {
+    let existing_only = opts
+        .map(|opts| opts.get::<Option<bool>>("existing_only"))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
+    let turn = try_pair!(admit(
+        lua,
+        this,
+        &ctx,
+        message,
+        TurnAdmissionOptions {
+            existing_only,
+            ..Default::default()
+        },
+        true,
+    ));
     Ok((Some(turn), None))
 }
 
@@ -275,7 +322,7 @@ fn agent_enqueue(
     ctx: UserDataRef<LuaCtx>,
     message: String,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
-    let turn = try_pair!(admit(lua, this, &ctx, message, false, None));
+    let turn = try_pair!(admit(lua, this, &ctx, message, Default::default(), false));
     Ok((Some(turn), None))
 }
 
@@ -296,8 +343,20 @@ async fn agent_prompt(
     if let Some(opts) = &opts {
         opts.get::<Option<u64>>("timeout")?;
     }
-    let admitted = after_turn(opts.as_ref())?
-        .and_then(|after_turn| admit(&lua, &this, &ctx, message, true, after_turn));
+    let admitted = after_turn(opts.as_ref())?.and_then(|after_turn| {
+        admit(
+            &lua,
+            &this,
+            &ctx,
+            message,
+            TurnAdmissionOptions {
+                idle_only: true,
+                after_turn,
+                ..Default::default()
+            },
+            false,
+        )
+    });
     let turn = match admitted {
         Ok(turn) => turn,
         Err(error) => return Ok((None, Some(LuaValue::String(lua.create_string(error)?)))),
@@ -620,7 +679,7 @@ lua_class! {
     /// these underscore-prefixed adapters are not a stable public API.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_latest_turn, agent_status, agent_mode, agent_model, agent_available_models,
-        agent_transcript, agent_ref, agent_send, agent_enqueue, agent_prompt, agent_set_model,
+        agent_transcript, agent_ref, agent_send, agent_submit, agent_enqueue, agent_prompt, agent_set_model,
         agent_set_mode, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]

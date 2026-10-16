@@ -20,7 +20,10 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, RootWork};
+use maki_agent::actor::{
+    ActorError, AgentActorHandle, QueueProjection, RootWork, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance,
+};
 use maki_agent::{AgentInput, ImageSource, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
 use tracing::warn;
@@ -295,7 +298,18 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
         } => {
             let images = input.images.clone();
             if displayed {
-                let _ticket = actor.admit_turn(input, None, correlation(run_id))?;
+                let _ticket = actor.admit_turn_with_options(
+                    input,
+                    None,
+                    correlation(run_id),
+                    TurnAdmissionOptions {
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::User,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )?;
                 Ok(())
             } else {
                 actor.rush(RootWork::new(

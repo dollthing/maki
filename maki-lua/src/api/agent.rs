@@ -32,6 +32,7 @@ use maki_agent::agent::{
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
@@ -43,7 +44,8 @@ use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History, McpSession,
     ModeDef, RunLedger, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
-    TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome, TurnResult,
+    TurnAdmissionOptions, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOrigin,
+    TurnOutcome, TurnProvenance, TurnResult,
 };
 use maki_config::{ModelPolicy, ToolKey};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -310,11 +312,15 @@ impl LuaActorState {
 /// shared [`LuaActorState`] so the boxed `run_turn` future stays `Send`.
 struct LuaActorBackend {
     state: Arc<LuaActorState>,
+    offload: Option<Arc<OffloadStore>>,
 }
 
 impl LuaActorBackend {
     fn new(state: Arc<LuaActorState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            offload: None,
+        }
     }
 }
 
@@ -325,6 +331,15 @@ impl Drop for LuaActorBackend {
 }
 
 impl ActorBackend for LuaActorBackend {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
+        self.offload.clone().or_else(|| {
+            self.state
+                .params
+                .get()
+                .and_then(|params| params.offload.clone())
+        })
+    }
+
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
         let state = Arc::clone(&self.state);
         Some(Arc::new(move |_input, mode, config| {
@@ -487,11 +502,23 @@ impl ActorBackend for LuaActorBackend {
             )
             .with_user_response_rx(Arc::clone(&state.answer_rx))
             .with_cancel(context.cancel.clone())
+            .with_turn_inbox(context.inbox)
             .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
             .with_local_tool_capture(Arc::clone(&state.commit))
             .with_admission(context.admission.clone());
+            if let Some(interrupt) = context.interrupt {
+                agent = agent.with_interrupt_source(interrupt);
+            }
+            let commit = Arc::clone(&state.commit);
+            let structured = state.structured.clone();
+            agent = agent.with_instruction_consumed_callback(Arc::new(move || {
+                commit.lock().unwrap().take();
+                if let Some(structured) = &structured {
+                    structured.invalidate();
+                }
+            }));
             if let Some(structured) = &state.structured {
                 let check = Arc::clone(structured);
                 let exhausted = Arc::clone(structured);
@@ -503,6 +530,9 @@ impl ActorBackend for LuaActorBackend {
             drop(agent);
             state.turn_permit.lock().unwrap().take();
 
+            if let Some(structured) = &state.structured {
+                structured.finish_turn();
+            }
             let captured = state.commit.lock().unwrap().take();
             if state.structured.is_none()
                 && let Some(value) = &captured
@@ -1044,7 +1074,7 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///     usage into the parent session's UI or event stream. The session still
 ///     completes and `:prompt()` still returns its result (including a commit
 ///     set via a `local_tools` handler). Use for hidden one-shot classification.
-///   `auto_deliver` (boolean?) - for managed children, queue one structured
+///   `auto_deliver` (boolean?) - for managed children, queue a structured
 ///     lifecycle observation per settled turn to the recorded parent, independently
 ///     of `prompt()` or ticket waits. Nested children notify their own parent.
 ///     Silent children disable delivery. Rejection and discard are observable in
@@ -1650,7 +1680,11 @@ fn spawn_session_actor(
     params: impl FnOnce(AgentId) -> AgentParams,
     child_trigger: CancelTrigger,
 ) -> Result<(AgentActorHandle, SessionControl), String> {
-    let backend = || -> Box<dyn ActorBackend> { Box::new(LuaActorBackend::new(Arc::clone(state))) };
+    let backend = || -> Box<dyn ActorBackend> {
+        let mut backend = LuaActorBackend::new(Arc::clone(state));
+        backend.offload = parent.context.offload.clone();
+        Box::new(backend)
+    };
     let init_params = |agent_id| {
         assert!(
             state.params.set(params(agent_id)).is_ok(),
@@ -1751,8 +1785,7 @@ fn spawn_close_relay(
 }
 
 /// UI input relay: tab submits from the parent dispatch into this session.
-/// Each message is admitted to the actor as its own turn, exactly like `send`
-/// (no second FIFO; the actor's queue is the FIFO).
+/// Instructions steer open ordinary work through the same admission path as Lua submit.
 fn spawn_ui_input_relay(
     actor: &AgentActorHandle,
     state: &LuaActorState,
@@ -1763,7 +1796,7 @@ fn spawn_ui_input_relay(
     let opts = state.opts;
     smol::spawn(async move {
         while let Ok(message) = ui_input_rx.recv_async().await {
-            let _ = actor.admit_turn(
+            let _ = actor.submit(
                 AgentInput {
                     message,
                     mode: mode.clone(),
@@ -1778,6 +1811,13 @@ fn spawn_ui_input_relay(
                 },
                 None,
                 String::new(),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             );
         }
     })

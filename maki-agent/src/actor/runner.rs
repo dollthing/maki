@@ -126,6 +126,7 @@ impl Runner {
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                super::delivery::schedule(&self.inner, &mut state);
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
                     state.idle_pending = true;
@@ -140,6 +141,9 @@ impl Runner {
                         .with_provenance(root.provenance.clone());
                     let turn_id = ticket.turn_id();
                     self.inner.admit_ticket(turn_id, ticket.clone());
+                    let mut inbox = super::inbox::InstructionInbox::new(ticket.clone());
+                    inbox.policy = root.policy.clone();
+                    state.instructions.insert(turn_id, inbox);
                     if let Some(processing) = &mut state.processing {
                         processing.turn_id = Some(turn_id);
                     }
@@ -247,6 +251,20 @@ impl Runner {
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .delivery_runs
+                .get(&turn_id)
+                .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
+            {
+                state.delivery_runs.remove(&turn_id);
+                self.inner
+                    .tickets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&turn_id);
+                state.settle_runner();
+                return;
+            }
             // A reusable cancellation cut may have landed after this work was
             // popped but before active installation. It owns that popped work.
             if state.cancellation_generation != popped_generation {
@@ -336,8 +354,20 @@ impl Runner {
                 );
                 return;
             }
-            if let Some(delivery) = state.deliveries.get_mut(&turn_id) {
-                delivery.started = true;
+
+            if state
+                .delivery_runs
+                .get(&turn_id)
+                .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
+            {
+                state.delivery_runs.remove(&turn_id);
+                self.inner
+                    .tickets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&turn_id);
+                state.settle_runner();
+                return;
             }
             admission.ticket.mark_started();
             state.emit(super::ActorEvent::Start {
@@ -370,6 +400,7 @@ impl Runner {
                     admission.input.as_ref().and_then(crate::batch_key),
                     admission.ticket.provenance().clone(),
                 )) as Arc<dyn InterruptSource>),
+                inbox: Some(super::inbox::ActorTurnInbox::source(&self.inner, turn_id)),
                 managed_turn: managed_turn.clone(),
                 admission: admission.admission.clone(),
             },
@@ -493,6 +524,7 @@ impl Runner {
                     generation: 0,
                     policy: None,
                     interrupt: None,
+                    inbox: None,
                     managed_turn: None,
                     admission: None,
                 },
@@ -555,6 +587,7 @@ impl Runner {
                     generation: policy_generation,
                     policy,
                     interrupt: None,
+                    inbox: None,
                     managed_turn: None,
                     admission: None,
                 },

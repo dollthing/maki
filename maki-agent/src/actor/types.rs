@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
+use crate::tools::offload::OffloadStore;
 use crate::types::{AgentId, TurnId, TurnOutcome};
 use crate::{AgentMode, InterruptSource, RunSettings};
 
@@ -113,6 +114,7 @@ pub struct TurnContext {
     /// Extracts root/compact work out of the actor's queue while the run is
     /// active, so it can fold them instead of waiting for the turn to end.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
+    pub inbox: Option<Arc<dyn super::TurnInbox>>,
     pub managed_turn: Option<CurrentManagedTurn>,
     pub admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
@@ -269,6 +271,10 @@ pub type PreparedReadiness = Arc<
 >;
 
 pub trait ActorBackend: Send {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
+        None
+    }
+
     fn on_work_settled(&mut self) {}
 
     fn prepared_readiness(&self) -> Option<PreparedReadiness> {

@@ -919,6 +919,85 @@ fn submit_during_streaming_queues_message() {
 }
 
 #[test]
+fn typed_completion_notices_render_once_and_skip_withdrawn() {
+    use maki_agent::actor::{ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult};
+    const LABEL: &str = "research child";
+    const TEXT: &str = "bounded child result";
+    let mut app = test_app();
+    let delivery = Arc::new(ChildDelivery {
+        parent_id: AgentId::generate(),
+        compatibility_id: None,
+        label: Some(LABEL.into()),
+        result: TurnResult {
+            outcome: TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ),
+            text: TEXT.repeat(COMPLETION_PREVIEW_CHARS),
+            output: Vec::new(),
+            provenance: Default::default(),
+            duration_ms: 0,
+        },
+        child_config: None,
+        correlation: String::new(),
+    });
+    app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+        delivery: Arc::clone(&delivery),
+        status: DeliveryStatus::Discarded(maki_agent::TurnCancellationReason::User),
+    }));
+    assert_eq!(app.main_chat().message_count(), 0);
+    app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+        delivery,
+        status: DeliveryStatus::Executed {
+            parent_turn_id: TurnId::generate(),
+        },
+    }));
+    let chat = app.main_chat();
+    assert_eq!(chat.message_count(), 1);
+    let notice = chat.message_at(0).unwrap();
+    assert_eq!(notice.role, DisplayRole::Done);
+    assert!(notice.text.contains(LABEL));
+    assert!(notice.text.chars().count() <= COMPLETION_LABEL_CHARS + COMPLETION_PREVIEW_CHARS + 20);
+}
+
+#[test_case(false; "deferred_input_drawn_on_consumption")]
+#[test_case(true; "displayed_input_not_drawn_twice")]
+fn folded_tui_inputs_render_once_with_images(displayed: bool) {
+    const TEXT: &str = "folded input with image";
+    const IMAGE: &str = "dGVzdA==";
+    let mut app = test_app();
+    type_and_submit(&mut app, "initial");
+    let images = vec![ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE))];
+    if displayed {
+        app.main_chat()
+            .show_user_message_with_notice(TEXT, images.clone(), None);
+    }
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: TEXT.into(),
+            images,
+            mcp_startup_notice: Some(2),
+            already_displayed: displayed,
+        },
+        app.run_id,
+    ));
+    let chat = app.main_chat();
+    assert_eq!(chat.message_count(), 2);
+    let message = chat.message_at(1).unwrap();
+    assert_eq!(message.role, DisplayRole::User);
+    assert_eq!(message.text, TEXT);
+    assert_eq!(message.images.len(), 1);
+    assert_eq!(message.images[0].data.as_ref(), IMAGE);
+    assert_eq!(
+        message.annotation.as_deref(),
+        Some("2 MCP servers are not ready; no MCP tools exposed")
+    );
+}
+
+#[test]
 fn queue_item_consumed_pushes_deferred_user_message() {
     let mut app = test_app();
     type_and_submit(&mut app, "first");

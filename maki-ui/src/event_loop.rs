@@ -1976,6 +1976,7 @@ enum Wake {
     InputGone,
     Ui(UiAction),
     Agent(usize, Box<maki_agent::Envelope>),
+    Actor(usize, maki_agent::actor::ActorEvent),
     Shell(usize, ShellEvent),
     Warn(String),
     Command(CommandEvent),
@@ -2463,6 +2464,11 @@ impl<'t> EventLoop<'t> {
                     res.ok().map(|env| Wake::Agent(i, Box::new(env)))
                 });
             }
+            if !rt.handles.actor_rx.is_disconnected() {
+                sel = sel.recv(&rt.handles.actor_rx, move |res| {
+                    res.ok().map(|event| Wake::Actor(i, event))
+                });
+            }
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
@@ -2476,6 +2482,7 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
+            Wake::Actor(i, event) => self.sessions[i].app.handle_actor_event(event),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Command(command) => self.handle_command(command),

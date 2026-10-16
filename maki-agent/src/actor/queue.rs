@@ -6,6 +6,8 @@
 //! with a concurrent push, matching the TUI's expectation.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::types::EarlierRoot;
@@ -322,7 +324,14 @@ impl ActorQueue {
             ActorWork::Root(first) => {
                 let key = crate::batch_key(&first.input);
                 let provenance = first.provenance;
-                let mut inputs = vec![first.input];
+                let mut inputs = vec![crate::PresentedInput {
+                    already_displayed: first.displayed,
+                    mcp_startup_notice: first
+                        .admission
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.mcp_startup_notice),
+                    input: first.input,
+                }];
                 while key.is_some()
                     && items.front().is_some_and(|work| {
                         matches!(work,
@@ -335,9 +344,16 @@ impl ActorQueue {
                     let Some(ActorWork::Root(next)) = items.pop_front() else {
                         break;
                     };
-                    inputs.push(next.input);
+                    inputs.push(crate::PresentedInput {
+                        already_displayed: next.displayed,
+                        mcp_startup_notice: next
+                            .admission
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.mcp_startup_notice),
+                        input: next.input,
+                    });
                 }
-                Some(ExtractedCommand::Interrupt(inputs))
+                Some(ExtractedCommand::PresentedInterrupt(inputs))
             }
             ActorWork::Compact { instructions, .. } => {
                 Some(ExtractedCommand::Compact(instructions))
@@ -384,6 +400,26 @@ impl InterruptQueue {
 }
 
 impl crate::InterruptSource for InterruptQueue {
+    fn poll_ready(&self) -> Pin<Box<dyn Future<Output = Option<ExtractedCommand>> + Send + '_>> {
+        Box::pin(async {
+            loop {
+                let listener = self.inner.policy_changed.listen();
+                let preparing = {
+                    let state = lock(&self.inner.state);
+                    state.cancellation_generation == self.cancellation_generation
+                        && matches!(
+                            state.operations.front(),
+                            Some(super::ActorOperation::Root { .. })
+                        )
+                };
+                if !preparing {
+                    return self.poll();
+                }
+                listener.await;
+            }
+        })
+    }
+
     fn poll(&self) -> Option<ExtractedCommand> {
         let state = lock(&self.inner.state);
         (state.cancellation_generation == self.cancellation_generation)
@@ -501,7 +537,7 @@ mod tests {
         queue.push(ActorWork::Root(
             test_root("second", 2, Vec::new()).with_provenance(next),
         ));
-        let Some(ExtractedCommand::Interrupt(inputs)) =
+        let Some(ExtractedCommand::PresentedInterrupt(inputs)) =
             queue.pop_interrupt(0, &crate::batch_key(&test_input("active")), &provenance)
         else {
             panic!("expected interrupt")
@@ -586,7 +622,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(queue.len(), 2);
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(
+        let Some(ExtractedCommand::PresentedInterrupt(inputs)) = queue.pop_interrupt(
             1,
             &crate::batch_key(&test_input("old")),
             &super::super::TurnProvenance {
@@ -597,8 +633,8 @@ mod tests {
             panic!("expected interrupt");
         };
         assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].message, "old");
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(
+        assert_eq!(inputs[0].input.message, "old");
+        let Some(ExtractedCommand::PresentedInterrupt(inputs)) = queue.pop_interrupt(
             2,
             &crate::batch_key(&test_input("old")),
             &super::super::TurnProvenance {
@@ -609,7 +645,7 @@ mod tests {
             panic!("expected next interrupt");
         };
         assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].message, "new");
+        assert_eq!(inputs[0].input.message, "new");
     }
 
     #[test]

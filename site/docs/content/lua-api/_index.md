@@ -1558,7 +1558,7 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
-  - `auto_deliver` (`boolean?`) for managed children, queue one structured
+  - `auto_deliver` (`boolean?`) for managed children, queue a structured
     lifecycle observation per settled turn to the recorded parent, independently
     of `prompt()` or ticket waits. Nested children notify their own parent.
     Silent children disable delivery. Rejection and discard are observable in
@@ -1991,6 +1991,27 @@ Admit a turn only when this agent has no active, preparing, or queued work.
 - `{opts?}` (`table?`) Optional after_turn ID required to match the latest terminal turn, including failure or cancellation.
 
 **Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
+
+---
+
+### `Agent:submit()` {#Agent-submit}
+
+```lua
+Agent:submit({ctx}, {message}, {opts?})
+```
+
+Submit instructions to open ordinary work, or start a successor when idle or admission is closed.
+Busy and compatible pending submissions return the existing ticket. Instructions reach the next
+safe model request without interrupting a provider request or tool. Bounded inbox rejection does
+not cancel accepted work. Exact enqueue operations remain separate FIFO turns.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{message}` (`string`) User instructions (text only).
+- `{opts?}` (`table?`) existing_only joins compatible admitted work or returns busy without starting a new turn. Defaults to false.
+
+**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Ticket covering these instructions, or an admission error.
 
 ---
 

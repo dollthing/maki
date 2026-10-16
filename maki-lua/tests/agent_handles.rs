@@ -250,18 +250,31 @@ struct LuaInvocationBackend {
 impl ActorBackend for LuaInvocationBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        history: &'a mut History,
         context: TurnContext,
-        input: AgentInput,
+        mut input: AgentInput,
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(inbox) = &context.inbox {
+                for instruction in inbox.drain_instructions() {
+                    history.push(Message::user(instruction.message));
+                }
+                inbox.commit_completions(&mut |message| {
+                    history.push(message.clone());
+                    input.preamble.push(message);
+                });
+                inbox.instructions_submitted();
+            }
             if input.preamble.iter().any(|message| {
                 matches!(
                     message.observation_source,
                     Some(ObservationSource::ChildResult { .. })
                 )
             }) {
+                if let Some(inbox) = &context.inbox {
+                    assert!(inbox.finish());
+                }
                 self.observations
                     .send((context.turn_id.unwrap(), context.provenance, input.preamble))
                     .unwrap();
@@ -293,6 +306,31 @@ impl ActorBackend for LuaInvocationBackend {
                 .unwrap();
             let result = invocation.execute(&self.context).await.output.map(|_| ());
             let _ = self.completed.send(result.clone());
+            if let Some(inbox) = &context.inbox {
+                loop {
+                    for instruction in inbox.drain_instructions() {
+                        history.push(Message::user(instruction.message));
+                    }
+                    let mut observations = Vec::new();
+                    inbox.commit_completions(&mut |message| {
+                        history.push(message.clone());
+                        observations.push(message);
+                    });
+                    if !observations.is_empty() {
+                        self.observations
+                            .send((
+                                context.turn_id.unwrap(),
+                                context.provenance.clone(),
+                                observations,
+                            ))
+                            .unwrap();
+                    }
+                    inbox.instructions_submitted();
+                    if inbox.finish() {
+                        break;
+                    }
+                }
+            }
             if result.is_err() {
                 return BackendResult::SetupFailed {
                     agent_id: context.agent_id,
@@ -4367,7 +4405,7 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             assert!(matches!(
                 statuses[..],
                 [
-                    DeliveryStatus::Accepted { .. },
+                    DeliveryStatus::Accepted,
                     DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn)
                 ]
             ));
@@ -4408,7 +4446,7 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
                 .map(|event| event.status.clone())
                 .collect::<Vec<_>>(),
             vec![
-                DeliveryStatus::Accepted { parent_turn_id },
+                DeliveryStatus::Accepted,
                 DeliveryStatus::Executed { parent_turn_id },
             ]
         );
@@ -4441,11 +4479,8 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             AgentMode::Build
         );
         assert_eq!(provenance.origin, TurnOrigin::Internal);
-        assert_eq!(provenance.source_agent, Some(child.agent_id));
-        assert_eq!(
-            provenance.source_turn,
-            Some(envelope.result.outcome.turn_id())
-        );
+        assert_eq!(provenance.source_agent, None);
+        assert_eq!(provenance.source_turn, None);
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_observation());
         assert_eq!(
@@ -4458,11 +4493,14 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
         let starts: Vec<_> = lifecycle
             .iter()
             .filter_map(|event| match event {
-                ActorEvent::Start { turn_id, .. } if *turn_id == parent_turn_id => Some(*turn_id),
+                ActorEvent::Start { turn_id, .. } if *turn_id != fixture.root_ticket.turn_id() => {
+                    Some(*turn_id)
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(starts, vec![parent_turn_id]);
+        assert_ne!(parent_turn_id, fixture.root_ticket.turn_id());
         assert!(fixture.observations.is_empty());
         fixture.finish().await;
     });
@@ -4591,7 +4629,7 @@ fn statuses_for(statuses: &[(String, DeliveryStatus)], text: &str) -> Vec<Delive
 fn settled_deliveries(statuses: &[(String, DeliveryStatus)]) -> usize {
     statuses
         .iter()
-        .filter(|(_, status)| !matches!(status, DeliveryStatus::Accepted { .. }))
+        .filter(|(_, status)| !matches!(status, DeliveryStatus::Accepted))
         .count()
 }
 
@@ -4599,7 +4637,7 @@ fn is_withdrawn(statuses: &[DeliveryStatus]) -> bool {
     matches!(
         statuses,
         [
-            DeliveryStatus::Accepted { .. },
+            DeliveryStatus::Accepted,
             DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn)
         ]
     )
@@ -4626,13 +4664,8 @@ fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
         "#
             ),
         );
-        let events = fixture
-            .manager
-            .root()
-            .unwrap()
-            .actor()
-            .unwrap()
-            .subscribe_events();
+        let root = fixture.manager.root().unwrap().actor().unwrap();
+        let events = root.subscribe_events();
         let request_a = fixture.request().await;
         let request_b = fixture.request().await;
         let (first, second) = if serde_json::to_string(&request_a.messages)
@@ -4652,6 +4685,15 @@ fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
             "first child delivery acceptance",
         )
         .await;
+        assert_eq!(
+            statuses_for(&statuses, FIRST_REPLY),
+            vec![DeliveryStatus::Accepted]
+        );
+        assert_eq!(
+            root.latest_ticket().unwrap().turn_id(),
+            fixture.root_ticket.turn_id()
+        );
+        assert!(fixture.observations.is_empty());
         second
             .reply
             .send(common::canned_reply(SECOND_REPLY))
@@ -4678,7 +4720,7 @@ fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
             assert_eq!(
                 first_statuses,
                 vec![
-                    DeliveryStatus::Accepted { parent_turn_id },
+                    DeliveryStatus::Accepted,
                     DeliveryStatus::Executed { parent_turn_id },
                 ]
             );
@@ -4762,7 +4804,7 @@ fn trusted_command_wait_keeps_child_delivery() {
         assert_eq!(
             statuses_for(&statuses, FIRST_REPLY),
             vec![
-                DeliveryStatus::Accepted { parent_turn_id },
+                DeliveryStatus::Accepted,
                 DeliveryStatus::Executed { parent_turn_id },
             ]
         );

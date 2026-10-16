@@ -2,7 +2,10 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
@@ -44,7 +47,9 @@ const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 /// Mirrors the task plugin's per-task turn ticket cap.
 const RETAINED_TURN_LIMIT: usize = 64;
 const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
-const TURN_LIMIT_ERR: &str = "task turn ticket limit reached";
+const TICKET_LIMIT_BUSY_ERR: &str = "stub admission busy";
+const SCENARIO_UNRESOLVED: &str = "unresolved";
+const JOIN_PENDING_MESSAGE: &str = "join pending";
 
 const NESTED_CHILD_PROMPT: &str = "child prompt";
 const NESTED_CHILD_REPLY: &str = "child finished";
@@ -112,7 +117,22 @@ maki.agent.spawn = function(ctx, opts)
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
   local sess = { opts = opts }
-  function sess:enqueue(call_ctx, msg)
+  function sess:submit(call_ctx, msg, submit_opts)
+    if opts.name == "unresolved" then
+      assert(submit_opts.existing_only == (#recorder.prompts >= @TURN_LIMIT@))
+      local turn_id = tostring(#recorder.prompts)
+      if submit_opts.existing_only then
+        if msg ~= "@JOIN_PENDING_MESSAGE@" then return nil, "@TICKET_LIMIT_BUSY_ERR@" end
+      else
+        recorder.prompts[#recorder.prompts + 1] = msg
+        turn_id = tostring(#recorder.prompts)
+      end
+      return {
+        id = function() return turn_id end,
+        result = function() return nil end,
+        wait = function() return nil, "agent turn wait timed out" end,
+      }
+    end
     recorder.prompts[#recorder.prompts + 1] = msg
     local res, err = behaviors[opts.name](self, msg)
     if not res then return nil, err end
@@ -211,7 +231,10 @@ fn load_task_host_with_opts(
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG)
         .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
-        .replace("@CANCELLED_ERR@", CANCELLED_ERR);
+        .replace("@CANCELLED_ERR@", CANCELLED_ERR)
+        .replace("@TURN_LIMIT@", &RETAINED_TURN_LIMIT.to_string())
+        .replace("@JOIN_PENDING_MESSAGE@", JOIN_PENDING_MESSAGE)
+        .replace("@TICKET_LIMIT_BUSY_ERR@", TICKET_LIMIT_BUSY_ERR);
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
@@ -227,7 +250,10 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
-        .replace("@RAISE_MSG@", RAISE_MSG);
+        .replace("@RAISE_MSG@", RAISE_MSG)
+        .replace("@TURN_LIMIT@", &RETAINED_TURN_LIMIT.to_string())
+        .replace("@JOIN_PENDING_MESSAGE@", JOIN_PENDING_MESSAGE)
+        .replace("@TICKET_LIMIT_BUSY_ERR@", TICKET_LIMIT_BUSY_ERR);
     let mode_stub = format!(
         r#"
         local register_tool = maki.api.register_tool
@@ -543,6 +569,46 @@ fn task_ticket_cache_evicts_oldest_settled_turn() {
 }
 
 #[test]
+fn task_ticket_limit_atomically_rejects_successors_but_joins_pending_work() {
+    let (reg, _host) = load_task_host();
+    let first = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_UNRESOLVED, None));
+    let task_id = first["task_id"].as_str().unwrap();
+    let mut latest = first["turn_id"].clone();
+    for _ in 1..RETAINED_TURN_LIMIT {
+        latest = exec_tool_json(
+            &reg,
+            "task_send",
+            json!({"task_id": task_id, "message": TASK_PROMPT}),
+        )["turn_id"]
+            .clone();
+    }
+    assert_eq!(
+        exec_tool(
+            &reg,
+            "task_send",
+            json!({"task_id": task_id, "message": TASK_PROMPT}),
+        )
+        .unwrap_err(),
+        TICKET_LIMIT_BUSY_ERR
+    );
+    let joined = exec_tool_json(
+        &reg,
+        "task_send",
+        json!({"task_id": task_id, "message": JOIN_PENDING_MESSAGE}),
+    );
+    assert_eq!(joined["turn_id"], latest);
+    assert_eq!(probe(&reg)["prompt_count"], RETAINED_TURN_LIMIT);
+    assert_eq!(probe(&reg)["closed"], 0);
+    let first_pending = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({"task_id": task_id, "turn_id": first["turn_id"], "timeout": 0}),
+    );
+    assert_eq!(first_pending["status"], "running");
+    exec_tool_json(&reg, "task_despawn", json!({"task_id": task_id}));
+}
+
+#[test]
 fn unmanaged_nested_task_lifecycle_remains_compatible() {
     let (reg, _host) = load_task_host();
     let mut ctx = stub_ctx(&AgentMode::Build);
@@ -628,7 +694,7 @@ fn failed_initial_admission_closes_new_session() {
 }
 
 #[test]
-fn failed_later_admission_closes_existing_session() {
+fn failed_later_admission_preserves_existing_session() {
     let (reg, _host) = load_task_host();
     let spawned = exec_tool_json(
         &reg,
@@ -645,7 +711,14 @@ fn failed_later_admission_closes_existing_session() {
         .unwrap_err(),
         PROMPT_ERR_MSG
     );
-    assert_eq!(probe(&reg)["closed"], json!(1));
+    assert_eq!(probe(&reg)["closed"], json!(0));
+    let retained = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": task_id, "turn_id": spawned["turn_id"] }),
+    );
+    assert_eq!(retained["status"], json!("done"));
+    assert_eq!(retained["result"]["text"], json!("started"));
     let despawned = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
     assert_eq!(despawned["ok"], json!(true));
     assert_eq!(probe(&reg)["closed"], json!(1));
@@ -827,6 +900,113 @@ impl Provider for GatedProvider {
     }
 }
 
+struct SteeringReportProvider {
+    request: AtomicUsize,
+    started: flume::Sender<()>,
+    release: flume::Receiver<()>,
+    fresh_report: bool,
+}
+
+impl Provider for SteeringReportProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        messages: &'a [Message],
+        _system: &'a str,
+        _tools: &'a Value,
+        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            match self.request.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(common::canned_tool_use(
+                    STRUCTURED_OUTPUT_TOOL,
+                    json!({"answer": "old"}),
+                )),
+                1 => {
+                    self.started.send(()).unwrap();
+                    common::bounded(self.release.recv_async()).await.unwrap();
+                    Ok(common::canned_reply(PLAIN_TEXT))
+                }
+                2 => {
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|message| matches!(message.role, Role::User)
+                                && message.content.iter().any(|block| matches!(block,
+                            ContentBlock::Text { text } if text.contains(NESTED_CHILD_PROMPT))))
+                    );
+                    if self.fresh_report {
+                        Ok(common::canned_tool_use(
+                            STRUCTURED_OUTPUT_TOOL,
+                            json!({"answer": "fresh"}),
+                        ))
+                    } else {
+                        Ok(common::canned_reply(PLAIN_TEXT))
+                    }
+                }
+                _ => Ok(common::canned_reply(PLAIN_TEXT)),
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+#[test_case::test_case(true ; "fresh_report")]
+#[test_case::test_case(false ; "stale_report_rejected")]
+fn steering_requires_fresh_structured_report(fresh_report: bool) {
+    smol::block_on(async {
+        let (started, started_rx) = flume::unbounded();
+        let (release_tx, release) = flume::unbounded();
+        let provider = Arc::new(SteeringReportProvider {
+            request: AtomicUsize::new(0),
+            started,
+            release,
+            fresh_report,
+        });
+        let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+        let (reg, _host) = load_real_driver_host();
+        let spawned = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_SPAWN_TOOL,
+            task_input(SCENARIO_HAPPY, Some(answer_schema())),
+        );
+        common::bounded(started_rx.recv_async()).await.unwrap();
+        let sent = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_send",
+            json!({"task_id": spawned["task_id"], "message": NESTED_CHILD_PROMPT}),
+        );
+        assert_eq!(sent["turn_id"], spawned["turn_id"]);
+        release_tx.send(()).unwrap();
+        let settled = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_WAIT_TOOL,
+            json!({"task_id": spawned["task_id"], "turn_id": spawned["turn_id"]}),
+        );
+        if fresh_report {
+            assert_eq!(settled["result"]["captured"], json!({"answer": "fresh"}));
+            assert_eq!(settled["result"]["status"], "completed");
+        } else {
+            assert!(settled["result"]["captured"].is_null());
+            assert_eq!(settled["result"]["status"], "failed");
+        }
+        exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_despawn",
+            json!({"task_id": spawned["task_id"]}),
+        );
+    });
+}
+
 fn probe_real(reg: &ToolRegistry, ctx: &ToolContext) -> Value {
     common::exec_tool(reg, ctx, "probe", json!({})).expect("probe failed")
 }
@@ -889,7 +1069,23 @@ fn task_policy_spawn_honors_mode_gating_real() {
 }
 
 #[test]
-fn pending_ticket_backpressure_preserves_accepted_turns() {
+fn task_docs_describe_same_turn_submission() {
+    for contract in [
+        "Busy sends join open work and return the same turn_id",
+        "next safe model request",
+        "without cancelling the child",
+        "a successor never retargets an existing wait",
+        "batched idle continuation",
+    ] {
+        assert!(
+            TASK_PLUGIN_SRC.contains(contract),
+            "missing contract: {contract}"
+        );
+    }
+}
+
+#[test]
+fn repeated_busy_sends_retain_one_ticket() {
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
@@ -906,44 +1102,56 @@ fn pending_ticket_backpressure_preserves_accepted_turns() {
             common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT
         );
-        let mut turns = vec![spawned["turn_id"].clone()];
-        for _ in 1..RETAINED_TURN_LIMIT {
+        for _ in 0..RETAINED_TURN_LIMIT {
             let admitted = exec_tool_json_with_ctx(
                 &reg,
                 &ctx,
                 "task_send",
                 json!({"task_id": task_id, "message": TASK_PROMPT}),
             );
-            turns.push(admitted["turn_id"].clone());
+            assert_eq!(admitted["turn_id"], spawned["turn_id"]);
         }
+        let error = common::exec_tool_text(
+            &reg,
+            &ctx,
+            "task_send",
+            json!({"task_id": task_id, "message": TASK_PROMPT}),
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        release_tx.send(()).unwrap();
         assert_eq!(
-            common::exec_tool_text(
-                &reg,
-                &ctx,
-                "task_send",
-                json!({"task_id": task_id, "message": TASK_PROMPT})
-            )
-            .unwrap_err(),
-            TURN_LIMIT_ERR
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
         );
-        for (index, turn_id) in turns.iter().enumerate() {
-            release_tx.send(()).unwrap();
-            let settled = exec_tool_json_with_ctx(
-                &reg,
-                &ctx,
-                TASK_WAIT_TOOL,
-                json!({"task_id": task_id, "turn_id": turn_id}),
-            );
-            assert_eq!(settled["result"]["turn_id"], *turn_id);
-            assert_eq!(settled["result"]["status"], "completed");
-            assert_eq!(settled["result"]["text"], "done");
-            if index + 1 < RETAINED_TURN_LIMIT {
-                assert_eq!(
-                    common::bounded(started_rx.recv_async()).await.unwrap(),
-                    TASK_PROMPT
-                );
-            }
-        }
+        release_tx.send(()).unwrap();
+        let settled = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": spawned["turn_id"]}),
+        );
+        assert_eq!(settled["result"]["turn_id"], spawned["turn_id"]);
+        assert_eq!(settled["result"]["status"], "completed");
+        let successor = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            "task_send",
+            json!({"task_id": task_id, "message": TASK_PROMPT}),
+        );
+        assert_ne!(successor["turn_id"], spawned["turn_id"]);
+        assert_eq!(
+            common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT
+        );
+        release_tx.send(()).unwrap();
+        let settled = exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": successor["turn_id"]}),
+        );
+        assert_eq!(settled["result"]["status"], "completed");
         exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({"task_id": task_id}));
     });
 }
@@ -989,7 +1197,7 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
 
 #[test_case::test_case(false ; "snapshots_latest_once")]
 #[test_case::test_case(true ; "explicit_exact_ticket")]
-fn task_wait_pins_exact_turn(explicit_turn: bool) {
+fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
     smol::block_on(async {
         let (started_tx, started_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
@@ -1036,13 +1244,15 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
         );
         assert_eq!(second["queued"], json!(true));
         assert!(second["turn_id"].is_string());
-        assert_ne!(first["turn_id"], second["turn_id"]);
+        assert_eq!(first["turn_id"], second["turn_id"]);
         release_tx.send(()).unwrap();
         assert_eq!(
             common::bounded(started_rx.recv_async()).await.unwrap(),
             "second turn"
         );
 
+        assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
+        release_tx.send(()).unwrap();
         let completed = common::bounded(wait).await.output.unwrap();
         let (ToolOutput::Plain(completed) | ToolOutput::Markdown(completed)) = completed else {
             panic!("unexpected task_wait output");
@@ -1051,7 +1261,6 @@ fn task_wait_pins_exact_turn(explicit_turn: bool) {
         assert_eq!(result["status"], json!("done"));
         assert_eq!(result["result"]["turn_id"], first["turn_id"]);
         assert_eq!(result["result"]["text"], json!("done"));
-        release_tx.send(()).unwrap();
         let closed =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": task_id }));
         assert_eq!(closed["ok"], json!(true));

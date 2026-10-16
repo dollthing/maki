@@ -272,15 +272,29 @@ impl ActorBackend for ScriptedBackend {
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
-            if let Some(ExtractedCommand::Interrupt(folded)) =
+            if let Some(ExtractedCommand::PresentedInterrupt(folded)) =
                 context.interrupt.as_ref().and_then(|source| source.poll())
             {
                 for msg in folded {
-                    self.state.folds.lock().unwrap().push(msg.message.clone());
-                    history.push(Message::user(msg.message));
+                    self.state
+                        .folds
+                        .lock()
+                        .unwrap()
+                        .push(msg.input.message.clone());
+                    history.push(Message::user(msg.input.message));
                 }
             }
 
+            if let Some(inbox) = &context.inbox {
+                for input in inbox.drain_instructions() {
+                    history.push(Message::user(input.message));
+                }
+                for message in inbox.drain_completions() {
+                    history.push(message);
+                }
+                inbox.instructions_submitted();
+                assert!(inbox.finish());
+            }
             self.outcomes
                 .lock()
                 .unwrap()
@@ -1244,7 +1258,7 @@ fn transcript_exact_boundary_pending_unknown_and_rewrite() {
 }
 
 #[test]
-fn busy_parent_delivery_runs_after_queued_user_and_config_fifo() {
+fn busy_parent_consumes_delivery_without_reordering_config_fifo() {
     smol::block_on(async {
         const ACTIVE: &str = "active parent";
         const BEFORE: &str = "queued before config";
@@ -1291,28 +1305,23 @@ fn busy_parent_delivery_runs_after_queued_user_and_config_fifo() {
                 duration_ms: 0,
             },
         });
-        let delivered = super::delivery::admit_delivery(&parent.inner, envelope).unwrap();
+        super::delivery::admit_delivery(&parent.inner, envelope).unwrap();
         let after = parent.admit_turn(input(AFTER), None, AFTER.into()).unwrap();
         config.resolve(Ok(fast_change(true))).unwrap();
-        assert!(delivered.peek().is_none());
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
         gate.open();
         active.wait().await;
         before.wait().await;
         config.wait().await.unwrap();
-        delivered.wait().await;
         after.wait().await;
         assert_eq!(
             *state.policies.lock().unwrap(),
             vec![
                 (ACTIVE.into(), Some(false), 0),
                 (BEFORE.into(), Some(false), 0),
-                (String::new(), Some(true), 1),
                 (AFTER.into(), Some(true), 1),
             ]
         );
-        assert_eq!(delivered.provenance().source_agent, Some(source_agent));
-        assert_eq!(delivered.provenance().source_turn, Some(source_turn));
         let history = parent.inner.history.load_full();
         let observation = history
             .messages
@@ -1339,11 +1348,9 @@ fn busy_parent_delivery_runs_after_queued_user_and_config_fifo() {
         assert_eq!(
             statuses,
             vec![
-                super::DeliveryStatus::Accepted {
-                    parent_turn_id: delivered.turn_id()
-                },
+                super::DeliveryStatus::Accepted,
                 super::DeliveryStatus::Executed {
-                    parent_turn_id: delivered.turn_id()
+                    parent_turn_id: active.turn_id()
                 },
             ]
         );
@@ -4047,6 +4054,260 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
             TurnOutcome::Completed { .. }
         ));
         handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn task_submit_busy_and_idle_turn_ids() {
+    smol::block_on(async {
+        const FIRST: &str = "initial task";
+        const NEXT: &str = "steering instruction";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let provenance = super::TurnProvenance {
+            source_turn: Some(crate::TurnId::generate()),
+            ..Default::default()
+        };
+        let joined = actor
+            .submit(
+                input(NEXT),
+                None,
+                NEXT.into(),
+                super::TurnAdmissionOptions {
+                    provenance: provenance.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first.turn_id(), joined.turn_id());
+        assert_ne!(joined.provenance(), &provenance);
+        let exact = actor.admit_turn(input(NEXT), None, NEXT.into()).unwrap();
+        assert_ne!(exact.turn_id(), first.turn_id());
+        gate.open();
+        first.wait().await;
+        exact.wait().await;
+        let history = actor.inner.history.load_full();
+        let messages: Vec<_> = history
+            .messages
+            .iter()
+            .filter_map(Message::first_text_content)
+            .collect();
+        assert_eq!(messages, vec![FIRST, NEXT, NEXT]);
+        let successor = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), successor.turn_id());
+        successor.wait().await;
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn submit_races_finish_on_both_sides() {
+    smol::block_on(async {
+        const FIRST: &str = "first instruction";
+        const NEXT: &str = "next instruction";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        let joined = actor
+            .submit(input(NEXT), None, NEXT.into(), Default::default())
+            .unwrap();
+        assert_eq!(first.turn_id(), joined.turn_id());
+        assert!(!source.finish());
+        assert_eq!(source.drain_instructions()[0].message, NEXT);
+        assert!(!source.finish());
+        assert!(source.has_unsubmitted_instructions());
+        source.instructions_submitted();
+        assert!(source.finish());
+        let successor = actor
+            .submit(input(NEXT), None, NEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), successor.turn_id());
+        assert!(!source.has_unsubmitted_instructions());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn existing_only_submit_rejects_successor_without_admitting_work() {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        let existing_only = || super::TurnAdmissionOptions {
+            existing_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            actor
+                .submit(input(TEXT), None, TEXT.into(), existing_only())
+                .unwrap()
+                .turn_id(),
+            first.turn_id()
+        );
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        assert_eq!(source.drain_instructions().len(), 1);
+        source.instructions_submitted();
+        assert!(source.finish());
+        let admission_state = || {
+            let state = actor.inner.state.lock().unwrap();
+            (
+                state.next_operation_id,
+                state.instructions.len(),
+                state.operations.len(),
+                actor.inner.tickets.lock().unwrap().len(),
+            )
+        };
+        let before = admission_state();
+        assert!(matches!(
+            actor.submit(input(TEXT), None, TEXT.into(), existing_only()),
+            Err(ActorError::Busy)
+        ));
+        assert_eq!(admission_state(), before);
+        assert_eq!(actor.latest_ticket().unwrap().turn_id(), first.turn_id());
+        assert!(source.drain_instructions().is_empty());
+        let successor = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), successor.turn_id());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "count")]
+#[test_case::test_case(true; "utf8_bytes")]
+fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        if bytes {
+            let text = "é".repeat((super::MAX_PENDING_INSTRUCTION_BYTES - TEXT.len()) / "é".len());
+            assert_eq!(
+                actor
+                    .submit(input(&text), None, TEXT.into(), Default::default())
+                    .unwrap()
+                    .turn_id(),
+                first.turn_id()
+            );
+        } else {
+            for _ in 1..super::MAX_PENDING_INSTRUCTIONS {
+                assert_eq!(
+                    actor
+                        .submit(input(TEXT), None, TEXT.into(), Default::default())
+                        .unwrap()
+                        .turn_id(),
+                    first.turn_id()
+                );
+            }
+        }
+        assert!(matches!(
+            actor.submit(input(TEXT), None, TEXT.into(), Default::default()),
+            Err(ActorError::InstructionOverflow)
+        ));
+        assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id());
+        assert!(!source.drain_instructions().is_empty());
+        source.instructions_submitted();
+        assert_eq!(
+            actor
+                .submit(input(TEXT), None, TEXT.into(), Default::default())
+                .unwrap()
+                .turn_id(),
+            first.turn_id()
+        );
+        actor.cancel_turn(first.turn_id()).unwrap();
+        assert!(source.drain_instructions().is_empty());
+        let successor = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), successor.turn_id());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn submit_pending_work_and_configuration_boundaries() {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        let exact = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
+        let next = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), next.turn_id());
+        assert_ne!(exact.turn_id(), next.turn_id());
+        assert_eq!(
+            next.turn_id(),
+            actor
+                .submit(input(TEXT), None, TEXT.into(), Default::default())
+                .unwrap()
+                .turn_id()
+        );
+        let config = actor.reserve_config_update().unwrap();
+        let after = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(next.turn_id(), after.turn_id());
+        drop(config);
+        actor.close();
         task.await;
     });
 }

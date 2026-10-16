@@ -30,6 +30,10 @@ pub enum ActorError {
     CompactedTurn(TurnId),
     #[error("could not serialize transcript: {0}")]
     TranscriptSerialization(String),
+    #[error("instruction inbox capacity exceeded (64 messages or 256 KiB)")]
+    InstructionOverflow,
+    #[error("submit accepts text-only instructions")]
+    InvalidInstruction,
     #[error("the actor has pending work")]
     Busy,
     #[error("the after_turn boundary is not the latest settled turn")]

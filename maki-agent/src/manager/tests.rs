@@ -1709,7 +1709,7 @@ impl ActorBackend for SuspendDuringPollBackend {
 impl ActorBackend for TestBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        history: &'a mut History,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1720,6 +1720,16 @@ impl ActorBackend for TestBackend {
             }
             if let Some(gate) = &self.gate {
                 gate.enter().await;
+            }
+            if let Some(inbox) = &context.inbox {
+                for input in inbox.drain_instructions() {
+                    history.push(maki_providers::Message::user(input.message));
+                }
+                for message in inbox.drain_completions() {
+                    history.push(message);
+                }
+                inbox.instructions_submitted();
+                assert!(inbox.finish());
             }
             BackendResult::EnteredRun(TurnOutcome::completed(
                 context.agent_id,
@@ -3669,15 +3679,10 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
                 }
             };
             assert_eq!(event.delivery.parent_id, parent.id());
-            let crate::actor::DeliveryStatus::Accepted { parent_turn_id } = event.status else {
+            let crate::actor::DeliveryStatus::Accepted = event.status else {
                 panic!("delivery was not admitted")
             };
             parent_actor.clear();
-            parent_actor
-                .turn_ticket(parent_turn_id)
-                .unwrap()
-                .wait()
-                .await;
             let event = loop {
                 if let crate::ActorEvent::Delivery(event) =
                     parent_events.recv_async().await.unwrap()
@@ -3735,6 +3740,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
             .configure_parent_delivery(true, Some(CHILD.into()))
             .unwrap();
         let child_events = actor.subscribe_events();
+        let mut pending_turns = Vec::new();
         for _ in 0..crate::actor::delivery::MAX_PENDING_DELIVERIES {
             let ticket = actor.admit_turn(input(), None, CHILD.into()).unwrap();
             ticket.wait().await;
@@ -3747,9 +3753,12 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
             };
             assert!(matches!(
                 event.status,
-                crate::actor::DeliveryStatus::Accepted { .. }
+                crate::actor::DeliveryStatus::Accepted
             ));
             assert_eq!(event.delivery.result.outcome.turn_id(), ticket.turn_id());
+            pending_turns.push(ticket.turn_id());
+            assert_eq!(parent.snapshot().queued, 0);
+            assert!(parent.latest_ticket().is_none());
         }
         let rejected = actor.admit_turn(input(), None, CHILD.into()).unwrap();
         rejected.wait().await;
@@ -3763,12 +3772,40 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
             crate::actor::DeliveryStatus::Rejected(crate::actor::DeliveryRejection::Overflow)
         );
         assert_eq!(event.delivery.result.outcome.turn_id(), rejected.turn_id());
-        assert_eq!(
-            parent.snapshot().queued,
-            crate::actor::delivery::MAX_PENDING_DELIVERIES
+        assert_eq!(parent.snapshot().queued, 0);
+        assert!(parent.latest_ticket().is_none());
+        assert!(
+            parent_events
+                .try_iter()
+                .all(|event| !matches!(event, crate::ActorEvent::Delivery(_)))
         );
         parent.clear();
+        let discarded: Vec<_> = parent_events
+            .try_iter()
+            .filter_map(|event| match event {
+                crate::ActorEvent::Delivery(event) => {
+                    assert_eq!(
+                        event.status,
+                        crate::actor::DeliveryStatus::Discarded(
+                            crate::TurnCancellationReason::User
+                        )
+                    );
+                    Some(event.delivery.result.outcome.turn_id())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            discarded.len(),
+            crate::actor::delivery::MAX_PENDING_DELIVERIES
+        );
+        for turn_id in pending_turns {
+            assert!(discarded.contains(&turn_id));
+            assert!(!parent.withdraw_child_delivery(turn_id));
+        }
+        assert!(!discarded.contains(&rejected.turn_id()));
         assert_eq!(parent.snapshot().queued, 0);
+        assert!(parent.latest_ticket().is_none());
         drop(barrier);
         assert!(
             manager
@@ -3781,7 +3818,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
 }
 
 #[test]
-fn managed_delivery_wait_capacity_one_follows_parent_fifo_once() {
+fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
     smol::block_on(async {
         const CHILD: &str = "delivery child";
         const USER: &str = "queued user";
@@ -3802,7 +3839,7 @@ fn managed_delivery_wait_capacity_one_follows_parent_fifo_once() {
             })
             .unwrap();
         let parent = root.actor().unwrap();
-        parent.admit_turn(input(), None, "root".into()).unwrap();
+        let root_ticket = parent.admit_turn(input(), None, "root".into()).unwrap();
         let current = root_rx.recv_async().await.unwrap();
         let events = parent.subscribe_events();
         let child_gate = Gate::new();
@@ -3838,25 +3875,37 @@ fn managed_delivery_wait_capacity_one_follows_parent_fifo_once() {
         assert_eq!(delivery.delivery.parent_id, root.id());
         assert_eq!(delivery.delivery.result.outcome, result.outcome);
         assert_eq!(delivery.delivery.compatibility_id.as_deref(), Some(CHILD));
-        let crate::actor::DeliveryStatus::Accepted { parent_turn_id } = delivery.status else {
+        let crate::actor::DeliveryStatus::Accepted = delivery.status else {
             panic!("delivery was not admitted")
         };
-        let delivered = parent.turn_ticket(parent_turn_id).unwrap();
-        assert!(delivered.peek().is_none());
-        root_gate.release(3);
+        assert_eq!(parent.latest_ticket().unwrap().turn_id(), user.turn_id());
+        root_gate.release(2);
         user.wait().await;
-        delivered.wait().await;
         let mut end_ids = Vec::new();
+        let mut executed = Vec::new();
         loop {
-            if let crate::ActorEvent::End(result) = events.recv_async().await.unwrap() {
-                let turn_id = result.outcome.turn_id();
-                end_ids.push(turn_id);
-                if turn_id == delivered.turn_id() {
-                    break;
+            match events.recv_async().await.unwrap() {
+                crate::ActorEvent::Delivery(event) => {
+                    assert_eq!(
+                        event.status,
+                        crate::actor::DeliveryStatus::Executed {
+                            parent_turn_id: root_ticket.turn_id(),
+                        }
+                    );
+                    executed.push(event.delivery.result.outcome.turn_id());
                 }
+                crate::ActorEvent::End(result) => {
+                    let turn_id = result.outcome.turn_id();
+                    end_ids.push(turn_id);
+                    if turn_id == user.turn_id() {
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
-        assert!(end_ids.ends_with(&[user.turn_id(), delivered.turn_id()]));
+        assert_eq!(executed, vec![ticket.turn_id()]);
+        assert_eq!(end_ids, vec![root_ticket.turn_id(), user.turn_id()]);
         assert!(
             manager
                 .shutdown(COMPLETION_TIMEOUT)

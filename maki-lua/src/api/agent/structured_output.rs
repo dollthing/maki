@@ -18,6 +18,7 @@ const NUDGE: &str = "You did not call the structured_output tool. Call it now wi
 struct ReportState {
     output: Option<TurnOutput>,
     reports: Vec<Value>,
+    fresh_from: usize,
     last_errors: Option<String>,
 }
 
@@ -60,6 +61,21 @@ impl StructuredOutput {
         };
     }
 
+    pub(super) fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.fresh_from = state.reports.len();
+        state.last_errors = None;
+    }
+
+    pub(super) fn finish_turn(&self) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(output) = &state.output {
+            for report in &state.reports[state.fresh_from..] {
+                output.append_output(report.clone());
+            }
+        }
+    }
+
     fn record(&self, value: Value) -> Result<String, String> {
         let errors = self
             .validator
@@ -80,11 +96,9 @@ impl StructuredOutput {
                 "Input does not match the required schema. Fix the errors and call structured_output again:\n{errors}"
             ));
         }
-        let output = state
-            .output
-            .as_ref()
-            .ok_or("structured_output has no active turn")?;
-        output.append_output(value.clone());
+        if state.output.is_none() {
+            return Err("structured_output has no active turn".into());
+        }
         state.reports.push(value);
         state.last_errors = None;
         Ok(ACK.into())
@@ -101,7 +115,7 @@ impl StructuredOutput {
 
     pub(super) fn completion_check(&self) -> Result<Option<String>, String> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        Ok(state.reports.is_empty().then(|| NUDGE.into()))
+        Ok((state.reports.len() == state.fresh_from).then(|| NUDGE.into()))
     }
 
     pub(super) fn completion_exhausted(&self) -> String {
@@ -209,12 +223,25 @@ mod tests {
         let reports = StructuredOutput::compile(json!({"type":"object"})).unwrap();
         reports.begin_turn(ticket.output());
         reports.record(json!({"answer":"before close"})).unwrap();
+        reports.finish_turn();
         actor.close();
         let result = smol::block_on(ticket.wait_result());
         reports.record(json!({"answer":"late"})).unwrap();
         assert_eq!(result.output, vec![json!({"answer":"before close"})]);
         assert_eq!(ticket.peek_result().unwrap().output, result.output);
         smol::block_on(task);
+    }
+
+    #[test]
+    fn consumed_instructions_require_fresh_report() {
+        let reports = StructuredOutput::compile(json!({"type":"object"})).unwrap();
+        reports.begin_turn(TurnOutput::default());
+        reports.record(json!({"answer":"old"})).unwrap();
+        reports.invalidate();
+        assert_eq!(reports.completion_check().unwrap(), Some(NUDGE.into()));
+        reports.record(json!({"answer":"new"})).unwrap();
+        assert_eq!(reports.completion_check().unwrap(), None);
+        assert_eq!(reports.reports().len(), 2);
     }
 
     #[test]

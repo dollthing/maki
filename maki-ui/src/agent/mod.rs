@@ -305,6 +305,7 @@ impl Drop for PreparedAgentHandles {
 pub(crate) struct AgentHandles {
     pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
+    pub(crate) actor_rx: flume::Receiver<maki_agent::actor::ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
@@ -723,6 +724,7 @@ fn spawn_agent_internal(
         handles: Some(AgentHandles {
             cmd_tx,
             agent_rx,
+            actor_rx: actor.subscribe_events(),
             agent_tx,
             answer_tx,
             history: shared_history,

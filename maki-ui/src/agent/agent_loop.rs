@@ -417,6 +417,9 @@ impl TuiActorBackend {
     }
 
     fn cancel_setup(&self, context: &TurnContext, turn_id: TurnId, run_id: u64) -> TurnOutcome {
+        if let Some(inbox) = &context.inbox {
+            inbox.close();
+        }
         let outcome = TurnOutcome::cancelled(
             context.agent_id,
             turn_id,
@@ -530,6 +533,7 @@ impl TuiActorBackend {
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(context.interrupt.clone().unwrap_or_else(noop_interrupt))
+        .with_turn_inbox(context.inbox.clone())
         .with_cancel(context.cancel.clone())
         .with_cancel_reason_source(context.cancel_reason.clone())
         .with_mcp(self.mcp.clone())
@@ -638,6 +642,10 @@ async fn prepare_prompt_inputs(
 }
 
 impl ActorBackend for TuiActorBackend {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
+        self.offload.clone()
+    }
+
     fn on_work_settled(&mut self) {
         let _ = self.drain_tx.try_send(self.current_run_id());
     }
@@ -830,11 +838,10 @@ impl ActorBackend for TuiActorBackend {
                 }
                 context.correlation = format!("{ROOT_CORRELATION_PREFIX}{run_id}");
             }
-            if explicit {
+            if explicit && (!input.message.is_empty() || !input.images.is_empty()) {
                 EventSender::new(self.agent_tx.clone(), run_id).try_send(
                     AgentEvent::QueueItemConsumed {
-                        text: maki_agent::actor::delivery_summary(&input)
-                            .unwrap_or_else(|| input.message.clone()),
+                        text: input.message.clone(),
                         images: input.images.clone(),
                         mcp_startup_notice: context
                             .admission
@@ -850,10 +857,11 @@ impl ActorBackend for TuiActorBackend {
             // by `start_from_queue`, and folded roots never reach here (the
             // active run consumes them through its interrupt source).
             if let WorkKind::Root {
-                displayed,
                 text,
                 images,
                 earlier,
+                mcp_startup_notice,
+                already_displayed,
                 ..
             } = &work
             {
@@ -870,16 +878,25 @@ impl ActorBackend for TuiActorBackend {
                         );
                     }
                 }
-                let notice = context
-                    .admission
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.mcp_startup_notice);
+                let notice = mcp_startup_notice.or_else(|| {
+                    context
+                        .admission
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.mcp_startup_notice)
+                });
                 let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
                     AgentEvent::QueueItemConsumed {
                         text: text.clone(),
                         images: images.clone(),
                         mcp_startup_notice: notice,
-                        already_displayed: *displayed,
+                        already_displayed: *already_displayed,
+                    },
+                );
+            }
+            if standalone_presentation && let Some(policy) = &context.policy {
+                EventSender::new(self.agent_tx.clone(), run_id).try_send(
+                    AgentEvent::ModelSwitched {
+                        spec: policy.settings.model.spec(),
                     },
                 );
             }
@@ -920,6 +937,9 @@ impl ActorBackend for TuiActorBackend {
                 }
             };
             if standalone_presentation && matches!(result, BackendResult::SetupFailed { .. }) {
+                if let Some(inbox) = &context.inbox {
+                    inbox.close();
+                }
                 let outcome = TurnOutcome::failed(
                     context.agent_id,
                     turn_id,
@@ -1715,6 +1735,189 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn tui_queue_adapter_folds_into_initial_user_turn() {
+        smol::block_on(futures_lite::future::or(
+            async {
+                use crate::agent::shared_queue::{QueueItem, actor_queue};
+                const INITIAL: &str = "initial user instruction";
+                const FOLLOWUPS: [&str; 2] =
+                    ["first deferred instruction", "second deferred instruction"];
+                let (mut backend, _, events) = failing_backend();
+                let (requests_tx, requests) = flume::unbounded();
+                let (release, released) = flume::bounded(1);
+                let run_id = Arc::clone(&backend.run_id);
+                let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+                let root = manager
+                    .create_root_with_config(
+                        Some(
+                            maki_agent::EffectiveAgentConfig::new(
+                                maki_agent::RunSettings {
+                                    provider: Arc::new(QueueProvider {
+                                        requests: requests_tx,
+                                        release: released,
+                                    }),
+                                    model: crate::components::test_model(),
+                                    fast: false,
+                                    workflow: false,
+                                    thinking: Default::default(),
+                                },
+                                AgentMode::Build,
+                            )
+                            .with_mode_def(
+                                maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build),
+                            ),
+                        ),
+                        Vec::new(),
+                        None,
+                        |agent_id| {
+                            backend.agent_id = agent_id;
+                            Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                        },
+                    )
+                    .unwrap();
+                let actor = root.actor().unwrap();
+                let queue = actor_queue(Arc::new(actor.clone()), run_id);
+                let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
+                app.update(crate::app::Msg::Paste(INITIAL.into()));
+                let actions = app.update(crate::app::Msg::Key(crate::components::key(
+                    crossterm::event::KeyCode::Enter,
+                )));
+                let Some(crate::components::Action::SendMessage(mut input)) =
+                    actions.into_iter().next()
+                else {
+                    panic!("expected initial user submission");
+                };
+                input.prompt = None;
+                let submitted_run = app.run_id;
+                queue.push(QueueItem::Message {
+                    text: INITIAL.into(),
+                    image_count: 0,
+                    input: *input,
+                    run_id: submitted_run,
+                    displayed: true,
+                });
+                let first = requests.recv_async().await.unwrap();
+                assert!(serde_json::to_string(&first).unwrap().contains(INITIAL));
+                let ticket = actor
+                    .turn_ticket(actor.snapshot().active_turn.unwrap())
+                    .unwrap();
+                assert_eq!(
+                    ticket.provenance().origin,
+                    maki_agent::actor::TurnOrigin::User
+                );
+                for text in FOLLOWUPS {
+                    let images = vec![maki_agent::ImageSource::new(
+                        maki_agent::ImageMediaType::Png,
+                        Arc::from(
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+                        ),
+                    )];
+                    queue.push(QueueItem::Message {
+                        text: text.into(),
+                        image_count: images.len(),
+                        input: AgentInput::from_defaults(
+                            text.into(),
+                            AgentMode::Build,
+                            images,
+                            Default::default(),
+                        ),
+                        run_id: submitted_run,
+                        displayed: false,
+                    });
+                }
+                assert_eq!(queue.panel_len(), FOLLOWUPS.len());
+                release.send(()).unwrap();
+                let next = requests.recv_async().await.unwrap();
+                let serialized = serde_json::to_string(&next).unwrap();
+                for text in FOLLOWUPS {
+                    assert!(
+                        serialized.contains(text),
+                        "missing {text} from next request"
+                    );
+                }
+                assert!(serialized.contains("image/png"));
+                assert_eq!(actor.snapshot().active_turn, Some(ticket.turn_id()));
+                assert!(queue.is_empty());
+                release.send(()).unwrap();
+                assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+                for envelope in events.drain() {
+                    assert_eq!(envelope.run_id, submitted_run);
+                    app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                }
+                let chat = app.main_chat();
+                for text in [INITIAL, FOLLOWUPS[0], FOLLOWUPS[1]] {
+                    assert_eq!(
+                        (0..chat.message_count())
+                            .filter(|&i| chat
+                                .message_at(i)
+                                .is_some_and(|message| message.text == text))
+                            .count(),
+                        1
+                    );
+                }
+                actor.close();
+                assert!(
+                    manager
+                        .shutdown(std::time::Duration::from_secs(1))
+                        .await
+                        .timed_out
+                        .is_empty()
+                );
+            },
+            async {
+                smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                panic!("production queue folding timed out");
+            },
+        ));
+    }
+
+    struct QueueProvider {
+        requests: flume::Sender<Vec<Message>>,
+        release: flume::Receiver<()>,
+    }
+
+    impl maki_providers::provider::Provider for QueueProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            Box::pin(async move {
+                self.requests.send(messages.to_vec()).unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: "request completed".into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: Default::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     #[test_case(false; "production_immediate_admitted_turn")]
     #[test_case(true; "displayed_root_current_presentation")]
     fn ui_submission_fires_one_turn_start(root_work: bool) {
@@ -1913,6 +2116,7 @@ mod tests {
                 policy: None,
                 admission: None,
                 interrupt: None,
+                inbox: None,
                 managed_turn: None,
             };
             let work = WorkKind::Root {
@@ -2200,6 +2404,153 @@ mod tests {
             Result<Vec<maki_providers::ModelInfo>, AgentError>,
         > {
             Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(false; "idle_continuation")]
+    #[test_case(true; "active_parent_boundary")]
+    fn child_completion_reaches_production_tui_presentation(active: bool) {
+        smol::block_on(async {
+            const RUN_ID: u64 = 7;
+            const CHILD_INPUT: &str = "child work";
+            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            futures_lite::future::or(async {
+                let (mut backend, mut input, events) = failing_backend();
+                input.prompt = None;
+                backend.run_id.store(RUN_ID - 1, Ordering::Relaxed);
+                let run_id = Arc::clone(&backend.run_id);
+                let (release, released) = flume::unbounded();
+                let (requests, request_rx) = flume::unbounded();
+                let config = maki_agent::EffectiveAgentConfig::new(
+                    maki_agent::RunSettings {
+                        provider: Arc::new(CompletionProvider {
+                            inner: ExplicitProvider { release: released }, requests,
+                        }),
+                        model: crate::components::test_model(),
+                        fast: false, workflow: false, thinking: Default::default(),
+                    }, AgentMode::Build,
+                ).with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
+                let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+                let root = manager.create_root_with_config(
+                    Some(config.clone()), Vec::new(), None, |agent_id| {
+                        backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    },
+                ).unwrap();
+                let actor = root.actor().unwrap();
+                let mut app = crate::app::tests::actor_presentation_app(
+                    crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()), run_id),
+                    RUN_ID - 1,
+                );
+                let actor_events = actor.subscribe_events();
+                let parent = active.then(|| actor.admit_turn(input, None, String::new()).unwrap());
+                if active {
+                    request_rx.recv_async().await.unwrap();
+                    loop {
+                        let envelope = events.recv_async().await.unwrap();
+                        let streamed = matches!(envelope.event, AgentEvent::TextDelta { .. });
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                        if streamed { break; }
+                    }
+                }
+                let (mut child_backend, mut child_input, _child_events) = failing_backend();
+                child_input.prompt = None;
+                child_input.message = CHILD_INPUT.into();
+                let (child_release, child_released) = flume::unbounded();
+                child_release.send(()).unwrap();
+                let mut child_config = config;
+                child_config.settings.provider = Arc::new(ExplicitProvider { release: child_released });
+                let child = manager.spawn_child_trusted_with_config(
+                    &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
+                        child_backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend))
+                    },
+                ).unwrap();
+                let child_actor = child.actor().unwrap();
+                child_actor.configure_parent_delivery(true, None).unwrap();
+                let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
+                assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
+                if active { release.send(()).unwrap(); }
+                let request = serde_json::to_string(&request_rx.recv_async().await.unwrap()).unwrap();
+                assert!(request.contains(EXPLICIT_RESPONSE), "missing child observation: {request}");
+                assert!(request.contains(&child_ticket.turn_id().to_string()), "missing child identity: {request}");
+                assert!(!request.contains(CHILD_INPUT));
+                let mut bubbles = 0;
+                loop {
+                    let envelope = events.recv_async().await.unwrap();
+                    assert_eq!(envelope.run_id, RUN_ID);
+                    bubbles += usize::from(matches!(envelope.event, AgentEvent::QueueItemConsumed { .. }));
+                    let streamed = matches!(envelope.event, AgentEvent::TextDelta { .. });
+                    app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    if streamed { break; }
+                }
+                assert_eq!(bubbles, 0);
+                assert_eq!(app.run_id, RUN_ID);
+                assert_eq!(app.status, crate::components::Status::Streaming);
+                release.send(()).unwrap();
+                loop {
+                    let envelope = events.recv_async().await.unwrap();
+                    let terminal = matches!(envelope.event, AgentEvent::TurnOutcome(_));
+                    app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    if terminal { break; }
+                }
+                let expected = if active {
+                    EXPLICIT_RESPONSE.repeat(2)
+                } else {
+                    EXPLICIT_RESPONSE.into()
+                };
+                crate::app::tests::assert_actor_response(&mut app, &expected);
+                if let Some(parent) = parent {
+                    assert!(matches!(parent.wait().await, TurnOutcome::Completed { .. }));
+                }
+                let mut consumed = 0;
+                for event in actor_events.try_iter() {
+                    if matches!(&event, maki_agent::actor::ActorEvent::Delivery(delivery)
+                        if matches!(delivery.status, maki_agent::actor::DeliveryStatus::Executed { .. })) {
+                        consumed += 1;
+                    }
+                    app.handle_actor_event(event);
+                }
+                assert_eq!(consumed, 1);
+                manager.shutdown(TIMEOUT).await;
+            }, async {
+                smol::Timer::after(TIMEOUT).await;
+                panic!("child completion did not reach the production TUI path");
+            }).await;
+        });
+    }
+
+    struct CompletionProvider {
+        inner: ExplicitProvider,
+        requests: flume::Sender<Vec<Message>>,
+    }
+
+    impl maki_providers::provider::Provider for CompletionProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a serde_json::Value,
+            events: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: maki_providers::RequestOptions,
+            session: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            self.requests.send(messages.to_vec()).unwrap();
+            self.inner
+                .stream_message(model, messages, system, tools, events, options, session)
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            self.inner.list_models()
         }
     }
 
@@ -2504,6 +2855,7 @@ mod tests {
             policy: policy.map(Arc::new),
             admission: None,
             interrupt: None,
+            inbox: None,
             managed_turn: None,
         };
         let mut history = History::new(Vec::new());
@@ -2589,6 +2941,7 @@ mod tests {
                 policy: Some(Arc::clone(&policy)),
                 admission: Some(admission),
                 interrupt: None,
+                inbox: None,
                 managed_turn: None,
             };
             let mut successor_input = AgentInput::from_defaults(
@@ -2633,6 +2986,7 @@ mod tests {
                 policy: Some(policy),
                 admission: None,
                 interrupt: None,
+                inbox: None,
                 managed_turn: None,
             };
             let result = backend

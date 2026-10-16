@@ -188,13 +188,15 @@ impl PreparedOperationTicket {
             generation: state.policy_generation,
             config,
         };
+        state.delivery_suspended = false;
+        self.inner.queue.notify();
         let ticket = pending.turn.take().map(|turn| {
             let turn_id = TurnId::generate();
             let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
             self.inner.admit_ticket(turn_id, ticket.clone());
             materialize(
                 &self.inner,
-                &state,
+                &mut state,
                 ActorOperation::Turn {
                     id: pending.id,
                     input: turn.input,

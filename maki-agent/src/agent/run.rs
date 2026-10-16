@@ -17,6 +17,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::{StreamError, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
+use crate::actor::TurnInbox;
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -37,6 +38,8 @@ const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const MAX_COMPLETION_RECOVERY_ATTEMPTS: u32 = 2;
 const COMPLETION_RECOVERY_EXHAUSTED: &str =
     "required output recovery exhausted before output was reported";
+const INSTRUCTION_BUDGET_EXHAUSTED: &str =
+    "The request budget was exhausted before all accepted instructions reached the provider.";
 const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
     "turn budget exhausted before required output was reported";
 type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
@@ -204,6 +207,9 @@ pub struct Agent<'h> {
     mode_def: Option<Arc<crate::ModeDef>>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
+    turn_inbox: Option<Arc<dyn TurnInbox>>,
+    instruction_consumed_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    pending_instruction_request: bool,
     cancel: CancelToken,
     cancel_reason_source: Option<ReasonedCancelToken>,
     ledger: Arc<RunLedger>,
@@ -260,6 +266,9 @@ impl<'h> Agent<'h> {
             mode_def: None,
             user_response_rx: None,
             interrupt_source: None,
+            turn_inbox: None,
+            instruction_consumed_callback: None,
+            pending_instruction_request: false,
             cancel: CancelToken::none(),
             cancel_reason_source: None,
             ledger: params.ledger,
@@ -310,6 +319,19 @@ impl<'h> Agent<'h> {
 
     pub fn with_interrupt_source(mut self, source: Arc<dyn InterruptSource>) -> Self {
         self.interrupt_source = Some(source);
+        self
+    }
+
+    pub fn with_turn_inbox(mut self, inbox: Option<Arc<dyn TurnInbox>>) -> Self {
+        self.turn_inbox = inbox;
+        self
+    }
+
+    pub fn with_instruction_consumed_callback(
+        mut self,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.instruction_consumed_callback = Some(callback);
         self
     }
 
@@ -441,6 +463,9 @@ impl<'h> Agent<'h> {
         );
 
         let loop_result = self.run_loop().await;
+        if let Some(inbox) = &self.turn_inbox {
+            inbox.close();
+        }
         let totals = self.ledger.totals();
         let context_size = self.context_size;
         let context_window = self.model.context_window;
@@ -512,6 +537,15 @@ impl<'h> Agent<'h> {
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
+                if self.pending_instruction_request
+                    || self.turn_inbox.as_ref().is_some_and(|inbox| {
+                        !inbox.finish() || inbox.has_unsubmitted_instructions()
+                    })
+                {
+                    return Err(AgentError::Config {
+                        message: INSTRUCTION_BUDGET_EXHAUSTED.into(),
+                    });
+                }
                 if let Some(check) = &self.completion_check {
                     match check().map_err(|message| AgentError::Config { message })? {
                         None => {}
@@ -530,6 +564,14 @@ impl<'h> Agent<'h> {
                     if self.cancel.is_cancelled() {
                         return Err(AgentError::Cancelled);
                     }
+                    if self.consume_instruction_inbox() {
+                        continue;
+                    }
+                    if let Some(inbox) = &self.turn_inbox
+                        && inbox.has_unsubmitted_instructions()
+                    {
+                        continue;
+                    }
                     if let Some(check) = &self.completion_check
                         && let Some(message) =
                             check().map_err(|message| AgentError::Config { message })?
@@ -546,6 +588,11 @@ impl<'h> Agent<'h> {
                         }
                         completion_recovery_attempts += 1;
                         self.history.push(Message::user(message));
+                        continue;
+                    }
+                    if let Some(inbox) = &self.turn_inbox
+                        && !inbox.finish()
+                    {
                         continue;
                     }
                     return Ok(reason);
@@ -585,7 +632,12 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        self.consume_turn_inbox()?;
+        self.pending_instruction_request = false;
         let tools = self.request_tools()?;
+        if let Some(inbox) = &self.turn_inbox {
+            inbox.instructions_submitted();
+        }
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
@@ -896,44 +948,114 @@ impl<'h> Agent<'h> {
         Ok(())
     }
 
+    fn instruction_consumed(&mut self) {
+        self.pending_instruction_request = true;
+        if let Some(capture) = &self.local_tool_capture {
+            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        }
+        if let Some(callback) = &self.instruction_consumed_callback {
+            callback();
+        }
+    }
+
+    fn consume_instruction_inbox(&mut self) -> bool {
+        let Some(inbox) = self.turn_inbox.clone() else {
+            return false;
+        };
+        let instructions = inbox.drain_instructions();
+        let consumed = !instructions.is_empty();
+        if !instructions.is_empty() {
+            self.instruction_consumed();
+        }
+        for input in instructions {
+            self.push_input_context(input.preamble);
+            self.history
+                .push(Message::user_with_images(input.message, input.images));
+        }
+        consumed
+    }
+
+    fn consume_turn_inbox(&mut self) -> Result<(), AgentError> {
+        self.consume_instruction_inbox();
+        if let Some(inbox) = self.turn_inbox.clone() {
+            inbox.commit_completions(&mut |message| self.history.push(message));
+        }
+        Ok(())
+    }
+
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
         let Some(ref source) = self.interrupt_source else {
             return Ok(false);
         };
-        let Some(cmd) = source.poll() else {
+        let Some(cmd) = self
+            .cancel
+            .race(source.poll_ready())
+            .await
+            .map_err(|_| AgentError::Cancelled)?
+        else {
             return Ok(false);
         };
         match cmd {
             ExtractedCommand::Interrupt(inputs) => {
-                for input in inputs {
-                    self.event_tx.send(AgentEvent::QueueItemConsumed {
-                        text: input.message.clone(),
-                        images: input.images.clone(),
-                        mcp_startup_notice: None,
+                self.consume_presented_inputs(inputs.into_iter().map(|input| {
+                    crate::PresentedInput {
+                        input,
                         already_displayed: true,
-                    })?;
-                    self.push_input_context(input.preamble);
-                    let wrapped = format!(
-                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
-                        input.message
-                    );
-                    self.history.push(Message {
-                        display_text: Some(
-                            if input.message.is_empty() && !input.images.is_empty() {
-                                IMAGE_PLACEHOLDER.into()
-                            } else {
-                                input.message
-                            },
-                        ),
-                        ..Message::user_with_images(wrapped, input.images)
-                    });
-                }
+                        mcp_startup_notice: None,
+                    }
+                }))?;
+            }
+            ExtractedCommand::PresentedInterrupt(inputs) => {
+                self.consume_presented_inputs(inputs)?;
             }
             ExtractedCommand::Compact(instructions) => {
                 self.do_compact(instructions.as_deref()).await?;
             }
         }
         Ok(true)
+    }
+
+    fn consume_presented_inputs(
+        &mut self,
+        inputs: impl IntoIterator<Item = crate::PresentedInput>,
+    ) -> Result<(), AgentError> {
+        for presented in inputs {
+            let input = presented.input;
+            self.instruction_consumed();
+            self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: input.message.clone(),
+                images: input.images.clone(),
+                mcp_startup_notice: presented.mcp_startup_notice,
+                already_displayed: presented.already_displayed,
+            })?;
+            self.push_input_context(input.preamble);
+            let wrapped = format!(
+                "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+                input.message
+            );
+            let mut message = Message {
+                display_text: Some(if input.message.is_empty() && !input.images.is_empty() {
+                    IMAGE_PLACEHOLDER.into()
+                } else {
+                    input.message
+                }),
+                ..Message::user_with_images(wrapped, input.images)
+            };
+            if let Some(count) = presented.mcp_startup_notice {
+                let notice = format!(
+                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
+                );
+                message.content.push(ContentBlock::Text {
+                    text: notice.clone(),
+                });
+                if let Some(display) = &mut message.display_text {
+                    display.push('\n');
+                    display.push_str(&notice);
+                }
+            }
+            self.history.push(message);
+        }
+        Ok(())
     }
 }
 
@@ -1196,6 +1318,161 @@ mod tests {
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         make_agent_with_sender(provider, history, raw_tx, event_rx)
+    }
+
+    struct FinishRaceInbox {
+        pending: Mutex<Vec<AgentInput>>,
+        inject_on_finish: Mutex<bool>,
+        submitted: Mutex<bool>,
+    }
+
+    impl TurnInbox for FinishRaceInbox {
+        fn drain_instructions(&self) -> Vec<AgentInput> {
+            let inputs = std::mem::take(&mut *self.pending.lock().unwrap());
+            if !inputs.is_empty() {
+                *self.submitted.lock().unwrap() = false;
+            }
+            inputs
+        }
+
+        fn drain_completions(&self) -> Vec<Message> {
+            Vec::new()
+        }
+
+        fn finish(&self) -> bool {
+            if std::mem::take(&mut *self.inject_on_finish.lock().unwrap()) {
+                let mut input = default_input();
+                input.message = STEERING_MESSAGE.into();
+                self.pending.lock().unwrap().push(input);
+                return false;
+            }
+            self.pending.lock().unwrap().is_empty() && *self.submitted.lock().unwrap()
+        }
+
+        fn instructions_submitted(&self) {
+            *self.submitted.lock().unwrap() = true;
+        }
+
+        fn has_unsubmitted_instructions(&self) -> bool {
+            !self.pending.lock().unwrap().is_empty() || !*self.submitted.lock().unwrap()
+        }
+    }
+
+    const STEERING_MESSAGE: &str = "revise the task before finishing";
+
+    #[test_case(None; "accepted_instruction_reaches_next_request")]
+    #[test_case(Some(1); "budget_failure_is_not_success")]
+    fn accepted_instruction_request_coverage(max_turns: Option<u32>) {
+        smol::block_on(async {
+            let inbox = Arc::new(FinishRaceInbox {
+                pending: Mutex::new(Vec::new()),
+                inject_on_finish: Mutex::new(true),
+                submitted: Mutex::new(true),
+            });
+            let provider = MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            let mut agent = agent.with_turn_inbox(Some(inbox));
+            agent.config.max_turns = max_turns;
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            if max_turns.is_some() {
+                assert!(matches!(outcome, TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(INSTRUCTION_BUDGET_EXHAUSTED)));
+                assert_eq!(requests.lock().unwrap().len(), 1);
+            } else {
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].iter().any(|message| {
+                    matches!(message.role, Role::User)
+                        && message.first_text_content() == Some(STEERING_MESSAGE)
+                }));
+            }
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| { matches!(event.event, AgentEvent::TurnOutcome(_)) })
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test_case(false; "instructions_invalidate_local_capture")]
+    #[test_case(true; "observations_preserve_local_capture")]
+    fn steering_capture_freshness(observation_only: bool) {
+        struct FreshnessInbox {
+            instruction: Mutex<Option<AgentInput>>,
+            observation: Mutex<Option<Message>>,
+        }
+
+        impl TurnInbox for FreshnessInbox {
+            fn drain_instructions(&self) -> Vec<AgentInput> {
+                self.instruction
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .into_iter()
+                    .collect()
+            }
+            fn drain_completions(&self) -> Vec<Message> {
+                self.observation
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .into_iter()
+                    .collect()
+            }
+            fn finish(&self) -> bool {
+                true
+            }
+            fn instructions_submitted(&self) {}
+            fn has_unsubmitted_instructions(&self) -> bool {
+                false
+            }
+        }
+
+        smol::block_on(async {
+            let mut input = default_input();
+            input.message = STEERING_MESSAGE.into();
+            let inbox = Arc::new(FreshnessInbox {
+                instruction: Mutex::new((!observation_only).then_some(input)),
+                observation: Mutex::new(
+                    observation_only.then(|| Message::observation(STEERING_MESSAGE.into())),
+                ),
+            });
+            let capture = Arc::new(Mutex::new(Some(serde_json::json!({"old": true}))));
+            let invalidations = Arc::new(Mutex::new(0));
+            let called = Arc::clone(&invalidations);
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, _events) = make_agent(provider, &mut history);
+            let mut agent = agent
+                .with_turn_inbox(Some(inbox))
+                .with_local_tool_capture(Arc::clone(&capture))
+                .with_instruction_consumed_callback(Arc::new(move || {
+                    *called.lock().unwrap() += 1;
+                }));
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(capture.lock().unwrap().is_some(), observation_only);
+            assert_eq!(
+                *invalidations.lock().unwrap(),
+                usize::from(!observation_only)
+            );
+            assert!(
+                requests.lock().unwrap()[0]
+                    .iter()
+                    .any(|message| { message.first_text_content() == Some(STEERING_MESSAGE) })
+            );
+        });
     }
 
     #[test_case(false; "report_after_recovery")]

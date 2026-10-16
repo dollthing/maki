@@ -89,6 +89,8 @@ use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
+const COMPLETION_LABEL_CHARS: usize = 80;
+const COMPLETION_PREVIEW_CHARS: usize = 512;
 
 pub(crate) use crate::agent::QueuedMessage;
 
@@ -453,6 +455,34 @@ impl PreparedApp {
 }
 
 impl App {
+    pub(crate) fn handle_actor_event(&mut self, event: maki_agent::actor::ActorEvent) {
+        let maki_agent::actor::ActorEvent::Delivery(event) = event else {
+            return;
+        };
+        if !matches!(
+            event.status,
+            maki_agent::actor::DeliveryStatus::Executed { .. }
+        ) {
+            return;
+        }
+        let delivery = event.delivery;
+        let source = delivery.label.as_deref().map_or_else(
+            || delivery.result.outcome.agent_id().to_string(),
+            str::to_owned,
+        );
+        let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
+        let text: String = delivery
+            .result
+            .text
+            .chars()
+            .take(COMPLETION_PREVIEW_CHARS)
+            .collect();
+        self.chats[0].push(DisplayMessage::new(
+            DisplayRole::Done,
+            format!("[Result from {source}] {text}"),
+        ));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         model: &Model,
@@ -1869,7 +1899,10 @@ impl App {
 
     pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
         if envelope.subagent.is_none()
-            && matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })
+            && matches!(
+                envelope.event,
+                AgentEvent::QueueItemConsumed { .. } | AgentEvent::ModelSwitched { .. }
+            )
             && envelope.run_id > self.run_id
             && self.queue.accepts_actor_presentation(envelope.run_id)
         {

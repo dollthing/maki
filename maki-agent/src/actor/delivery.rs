@@ -5,11 +5,18 @@ use serde_json::{Value, json};
 
 use super::{
     ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, ConfigCommit,
-    TurnOrigin, TurnProvenance, TurnResult, TurnTicket, drive_operations,
+    TurnOrigin, TurnResult, TurnTicket, drive_operations,
 };
+use crate::tools::offload::OffloadStore;
 use crate::{AgentId, AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
 
 pub const MAX_PENDING_DELIVERIES: usize = 64;
+pub const MAX_DELIVERY_PREVIEW_BYTES: usize = 16 * 1024;
+pub const MAX_PENDING_PREVIEW_BYTES: usize = 256 * 1024;
+pub const MAX_DELIVERY_BATCH: usize = 8;
+pub const MAX_DELIVERY_BATCH_BYTES: usize = 32 * 1024;
+const PREVIEW_TEXT_BYTES: usize = 256;
+const PREVIEW_METADATA_BYTES: usize = 128;
 const DELIVERY_HEADER: &str = "[internal child-result data, not a user instruction]";
 
 #[derive(Clone)]
@@ -69,7 +76,85 @@ impl ChildDelivery {
         })
     }
 
+    fn preview(&self, store: Option<&OffloadStore>) -> Self {
+        let serialized = self.to_json().to_string();
+        if serialized.len() + DELIVERY_HEADER.len() < MAX_DELIVERY_PREVIEW_BYTES {
+            return self.clone();
+        }
+        let mut preview = self.clone();
+        {
+            preview.result.text = bounded(&self.result.text, PREVIEW_TEXT_BYTES);
+            let mut reference = json!({
+                "truncated": true,
+                "full_result": {
+                    "agent_id": self.result.outcome.agent_id(),
+                    "turn_id": self.result.outcome.turn_id(),
+                    "lookup": "retained turn result",
+                },
+            });
+            if let Some(store) = store {
+                match store.put(&serialized) {
+                    Ok(saved) => {
+                        let path = store.path_of(&saved);
+                        if path.as_os_str().len() <= PREVIEW_TEXT_BYTES {
+                            reference["offload"] = json!({
+                                "path": path,
+                                "original_bytes": saved.original_bytes,
+                                "saved_bytes": saved.saved_bytes,
+                                "complete": saved.original_bytes == saved.saved_bytes,
+                                "lookup": "read or grep",
+                            });
+                            if saved.saved_bytes < saved.original_bytes {
+                                reference["diagnostic"] = json!(
+                                    "offload file capped; use retained result lookup for the full result"
+                                );
+                            }
+                        } else {
+                            reference["diagnostic"] = json!(
+                                "offload path exceeds preview budget; use retained result lookup"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        reference["diagnostic"] = json!(format!(
+                            "file offload failed: {}; use retained result lookup",
+                            bounded(&error.to_string(), PREVIEW_METADATA_BYTES),
+                        ));
+                    }
+                }
+            } else {
+                reference["diagnostic"] = json!(
+                    "file offload unavailable: no session offload store; use retained result lookup"
+                );
+            }
+            preview.result.output = vec![reference];
+            if let TurnOutcome::Failed { failure, .. } = &mut preview.result.outcome {
+                failure.diagnostic = bounded(&failure.diagnostic, PREVIEW_TEXT_BYTES);
+                failure.user_message = bounded(&failure.user_message, PREVIEW_TEXT_BYTES);
+            }
+        }
+        preview.label = preview
+            .label
+            .map(|text| bounded(&text, PREVIEW_METADATA_BYTES));
+        preview.compatibility_id = preview
+            .compatibility_id
+            .map(|text| bounded(&text, PREVIEW_METADATA_BYTES));
+        preview.correlation = bounded(&preview.correlation, PREVIEW_METADATA_BYTES);
+        preview.result.provenance.plugin = preview
+            .result
+            .provenance
+            .plugin
+            .map(|text| bounded(&text, PREVIEW_METADATA_BYTES));
+        preview
+    }
+
     fn input(&self) -> AgentInput {
+        let mut envelope = self.to_json();
+        if envelope.to_string().len() + DELIVERY_HEADER.len() + 1 > MAX_DELIVERY_PREVIEW_BYTES
+            && let Some(configuration) = envelope.get_mut("configuration")
+        {
+            bound_json_strings(configuration);
+        }
         AgentInput {
             message: String::new(),
             mode: AgentMode::Build,
@@ -79,10 +164,7 @@ impl ChildDelivery {
                     agent_id: self.result.outcome.agent_id().to_string(),
                     turn_id: self.result.outcome.turn_id().to_string(),
                 }),
-                ..Message::observation(format!(
-                    "{DELIVERY_HEADER}\n{}",
-                    without_nulls(self.to_json())
-                ))
+                ..Message::observation(format!("{DELIVERY_HEADER}\n{}", without_nulls(envelope)))
             }],
             thinking: Default::default(),
             fast: false,
@@ -91,6 +173,22 @@ impl ChildDelivery {
             cancel: None,
             lease_committer: None,
         }
+    }
+}
+
+fn bounded(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn bound_json_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = bounded(text, PREVIEW_METADATA_BYTES),
+        Value::Object(fields) => fields.values_mut().for_each(bound_json_strings),
+        _ => {}
     }
 }
 
@@ -139,7 +237,7 @@ pub enum DeliveryRejection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryStatus {
-    Accepted { parent_turn_id: TurnId },
+    Accepted,
     Rejected(DeliveryRejection),
     Discarded(TurnCancellationReason),
     Executed { parent_turn_id: TurnId },
@@ -153,13 +251,17 @@ pub struct DeliveryEvent {
 
 pub(crate) struct PendingDelivery {
     pub delivery: Arc<ChildDelivery>,
-    pub started: bool,
+    pub message: Message,
+    pub bytes: usize,
 }
 
 pub(super) fn admit_delivery(
     inner: &Arc<ActorInner>,
     delivery: Arc<ChildDelivery>,
-) -> Result<TurnTicket, DeliveryRejection> {
+) -> Result<(), DeliveryRejection> {
+    let delivery = Arc::new(delivery.preview(inner.offload.as_deref()));
+    let message = delivery.input().preamble.remove(0);
+    let bytes = message.first_text_content().map_or(0, str::len);
     let mut state = inner
         .state
         .lock()
@@ -167,43 +269,41 @@ pub(super) fn admit_delivery(
     if state.lifecycle != ActorLifecycle::Open {
         return Err(DeliveryRejection::ParentClosed);
     }
-    if state.deliveries.len() >= MAX_PENDING_DELIVERIES {
+    let id = delivery.result.outcome.turn_id();
+    if state.deliveries.contains_key(&id) || state.delivery_seen.contains(&id) {
+        return Ok(());
+    }
+    if bytes > MAX_DELIVERY_PREVIEW_BYTES
+        || state.deliveries.len() >= MAX_PENDING_DELIVERIES
+        || state
+            .deliveries
+            .values()
+            .map(|pending| pending.bytes)
+            .sum::<usize>()
+            + bytes
+            > MAX_PENDING_PREVIEW_BYTES
+    {
         return Err(DeliveryRejection::Overflow);
     }
-    let turn_id = TurnId::generate();
-    let ticket =
-        TurnTicket::new(turn_id, Arc::clone(&inner.identity)).with_provenance(TurnProvenance {
-            origin: TurnOrigin::Internal,
-            source_agent: Some(delivery.result.outcome.agent_id()),
-            source_turn: Some(delivery.result.outcome.turn_id()),
-            ..TurnProvenance::default()
-        });
-    inner.admit_ticket(turn_id, ticket.clone());
+    state.delivery_seen.push_back(id);
+    if state.delivery_seen.len() > super::MAX_RETAINED_TURN_RESULTS {
+        state.delivery_seen.pop_front();
+    }
+    state.delivery_order.push_back(id);
     state.deliveries.insert(
-        turn_id,
+        id,
         PendingDelivery {
             delivery: Arc::clone(&delivery),
-            started: false,
+            message,
+            bytes,
         },
     );
-    state.next_operation_id = state.next_operation_id.wrapping_add(1);
-    let id = state.next_operation_id;
-    state.operations.push_back(ActorOperation::Turn {
-        id,
-        input: delivery.input(),
-        event_sender: None,
-        correlation: delivery.correlation.clone(),
-        ticket: ticket.clone(),
-        policy_constraint: None,
-    });
     state.emit(ActorEvent::Delivery(DeliveryEvent {
         delivery,
-        status: DeliveryStatus::Accepted {
-            parent_turn_id: turn_id,
-        },
+        status: DeliveryStatus::Accepted,
     }));
-    drive_operations(inner, &mut state);
-    Ok(ticket)
+    inner.queue.notify();
+    Ok(())
 }
 
 pub(super) fn record(
@@ -264,7 +364,7 @@ pub(super) fn publish(
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.deliveries.contains_key(&ticket.turn_id()) {
+        if state.delivery_runs.contains_key(&ticket.turn_id()) {
             return;
         }
         state.parent_delivery_policy.clone()
@@ -290,14 +390,17 @@ pub(super) fn publish(
     let Some(result) = ticket.peek_result() else {
         return;
     };
-    let delivery = Arc::new(ChildDelivery {
-        parent_id: target.parent_id,
-        compatibility_id: policy.compatibility_id,
-        label: target.metadata.label.clone(),
-        result,
-        child_config,
-        correlation,
-    });
+    let delivery = Arc::new(
+        ChildDelivery {
+            parent_id: target.parent_id,
+            compatibility_id: policy.compatibility_id,
+            label: target.metadata.label.clone(),
+            result,
+            child_config,
+            correlation,
+        }
+        .preview(inner.offload.as_deref()),
+    );
     let result = target
         .parent
         .upgrade()
@@ -316,28 +419,36 @@ pub(super) fn publish(
 }
 
 impl AgentActorHandle {
-    /// Withdraws the queued delivery of `child_turn` once an exact wait in
-    /// this agent's own turn has returned that result to the model.
     pub fn withdraw_child_delivery(&self, child_turn: TurnId) -> bool {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(delivery_turn) = state.deliveries.iter().find_map(|(turn_id, pending)| {
-            (!pending.started && pending.delivery.result.outcome.turn_id() == child_turn)
-                .then_some(*turn_id)
-        }) else {
+        let Some(pending) = state.deliveries.remove(&child_turn) else {
             return false;
         };
-        let Ok(cut) =
-            self.capture_turn_cancel(&mut state, delivery_turn, TurnCancellationReason::Withdrawn)
-        else {
-            return false;
-        };
-        drop(state);
-        self.settle_turn_cancel(cut, TurnCancellationReason::Withdrawn);
+        state.delivery_order.retain(|id| *id != child_turn);
+        state.emit(ActorEvent::Delivery(DeliveryEvent {
+            delivery: pending.delivery,
+            status: DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn),
+        }));
         true
+    }
+}
+
+pub(super) fn discard(state: &mut super::ActorState, reason: TurnCancellationReason) {
+    state.delivery_order.clear();
+    let pending: Vec<_> = state
+        .deliveries
+        .drain()
+        .map(|(_, pending)| pending.delivery)
+        .collect();
+    for delivery in pending {
+        state.emit(ActorEvent::Delivery(DeliveryEvent {
+            delivery,
+            status: DeliveryStatus::Discarded(reason),
+        }));
     }
 }
 
@@ -346,19 +457,121 @@ pub(super) fn settle(inner: &ActorInner, turn_id: TurnId, reason: Option<TurnCan
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if let Some(pending) = state.deliveries.remove(&turn_id) {
-        let status = if pending.started {
-            DeliveryStatus::Executed {
-                parent_turn_id: turn_id,
-            }
-        } else {
-            DeliveryStatus::Discarded(reason.unwrap_or(TurnCancellationReason::Closed))
+    if let Some(batch) = state.delivery_runs.remove(&turn_id)
+        && batch.iter().any(|id| state.deliveries.contains_key(id))
+    {
+        state.delivery_suspended = true;
+        state.emit(ActorEvent::DeliveryContinuationFailed {
+            parent_turn_id: turn_id,
+            reason,
+        });
+    }
+}
+
+pub(super) fn drain(inner: &Arc<ActorInner>, turn_id: TurnId) -> Vec<Message> {
+    let mut messages = Vec::new();
+    commit(inner, turn_id, &mut |message| messages.push(message));
+    messages
+}
+
+pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn FnMut(Message)) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state.lifecycle != ActorLifecycle::Open
+        || state
+            .processing
+            .as_ref()
+            .is_some_and(|work| work.cancellation_reason.is_some())
+    {
+        return;
+    }
+    let eligible = state.delivery_runs.get(&turn_id).cloned();
+    if eligible.is_none()
+        && state
+            .instructions
+            .get(&turn_id)
+            .is_none_or(|inbox| !inbox.open)
+    {
+        return;
+    }
+    let mut committed = 0;
+    let mut bytes = 0;
+    while let Some(id) = state.delivery_order.front().copied() {
+        if committed == MAX_DELIVERY_BATCH {
+            break;
+        }
+        if eligible.as_ref().is_some_and(|batch| !batch.contains(&id)) {
+            break;
+        }
+        let Some(pending) = state.deliveries.get(&id) else {
+            state.delivery_order.pop_front();
+            continue;
         };
+        if bytes + pending.bytes > MAX_DELIVERY_BATCH_BYTES {
+            break;
+        }
+        let pending = state
+            .deliveries
+            .remove(&id)
+            .expect("head checked under actor lock");
+        state.delivery_order.pop_front();
+        bytes += pending.bytes;
+        commit(pending.message);
+        committed += 1;
         state.emit(ActorEvent::Delivery(DeliveryEvent {
             delivery: pending.delivery,
-            status,
+            status: DeliveryStatus::Executed {
+                parent_turn_id: turn_id,
+            },
         }));
     }
+}
+
+/// Reserve only after explicit FIFO work has drained. Records are not claimed
+/// until the model loop inserts them into history at a safe request boundary.
+pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
+    if state.lifecycle != ActorLifecycle::Open
+        || state.delivery_suspended
+        || state.deliveries.is_empty()
+        || !state.delivery_runs.is_empty()
+        || state.has_pending_work(&inner.queue)
+        || !state.operations.is_empty()
+    {
+        return;
+    }
+    let turn_id = TurnId::generate();
+    let ticket = TurnTicket::new(turn_id, Arc::clone(&inner.identity));
+    inner.admit_ticket(turn_id, ticket.clone());
+    let mut bytes = 0;
+    let batch: Vec<_> = state
+        .delivery_order
+        .iter()
+        .copied()
+        .take(MAX_DELIVERY_BATCH)
+        .take_while(|id| {
+            bytes += state.deliveries.get(id).map_or(0, |pending| pending.bytes);
+            bytes <= MAX_DELIVERY_BATCH_BYTES
+        })
+        .collect();
+    state.delivery_runs.insert(turn_id, batch);
+    state.next_operation_id = state.next_operation_id.wrapping_add(1);
+    let id = state.next_operation_id;
+    state.operations.push_back(ActorOperation::Turn {
+        id,
+        input: AgentInput::from_defaults(
+            String::new(),
+            AgentMode::Build,
+            Vec::new(),
+            Default::default(),
+        ),
+        event_sender: None,
+        correlation: "child-results".into(),
+        ticket,
+        policy_constraint: None,
+    });
+    drive_operations(inner, state);
 }
 
 #[cfg(test)]
@@ -438,6 +651,59 @@ mod tests {
         })
     }
 
+    #[test_case(false; "saved")]
+    #[test_case(true; "closed_store")]
+    fn oversized_completion_offload_preserves_envelope(closed: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::tools::offload::OffloadStore::on_disk(directory.path().to_path_buf());
+        if closed {
+            store.request_close();
+        }
+        let mut envelope = (*delivery(AgentId::generate())).clone();
+        envelope.result.text = "\u{0001}".repeat(super::MAX_DELIVERY_PREVIEW_BYTES);
+        envelope.result.provenance.plugin = Some(LABEL.into());
+        envelope.label = Some(LABEL.into());
+        envelope.child_config = Some(super::ConfigCommit {
+            identity: Arc::new(()),
+            generation: 3,
+            config: Arc::new(crate::EffectiveAgentConfig::new(
+                super::super::tests::policy(false),
+                crate::AgentMode::Build,
+            )),
+        });
+        let canonical = envelope.to_json();
+        let preview = envelope.preview(Some(&store));
+        let rendered = preview.input().preamble.remove(0);
+        assert!(rendered.first_text_content().unwrap().len() <= super::MAX_DELIVERY_PREVIEW_BYTES);
+        let value = preview.to_json();
+        for field in [
+            "configuration",
+            "provenance",
+            "outcome",
+            "correlation",
+            "label",
+        ] {
+            assert_eq!(value[field], canonical[field]);
+        }
+        let reference = &value["output"][0];
+        assert_eq!(reference["truncated"], true);
+        assert_eq!(reference["full_result"]["turn_id"], canonical["turn_id"]);
+        if closed {
+            const DIAGNOSTIC: &str = "file offload failed: the session's offload store is closed; use retained result lookup";
+            assert_eq!(reference["diagnostic"], DIAGNOSTIC);
+            assert!(reference.get("offload").is_none());
+        } else {
+            let body =
+                std::fs::read_to_string(reference["offload"]["path"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                canonical
+            );
+            assert_eq!(reference["offload"]["complete"], true);
+            assert_eq!(preview.preview(Some(&store)).to_json(), value);
+        }
+    }
+
     #[test]
     fn delivery_summary_names_source_status_and_text() {
         let mut envelope = (*delivery(AgentId::generate())).clone();
@@ -508,10 +774,9 @@ mod tests {
                     CORRELATION.into(),
                 )
                 .unwrap();
-            let delivered = admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
             actor.clear_user_work();
             assert!(matches!(user.wait().await, TurnOutcome::Cancelled { .. }));
-            assert!(delivered.peek().is_none());
             assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
             actor.close();
             task.await;
@@ -519,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_ticket_includes_runtime_admitted_deliveries() {
+    fn completion_admission_does_not_allocate_ticket() {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);
             let (actor, task) = AgentActorHandle::spawn_inner(
@@ -545,11 +810,8 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(actor.latest_ticket().unwrap().turn_id(), user.turn_id());
-            let delivered = admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
-            assert_eq!(
-                actor.latest_ticket().unwrap().turn_id(),
-                delivered.turn_id()
-            );
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            assert_eq!(actor.latest_ticket().unwrap().turn_id(), user.turn_id());
             actor.close();
             task.await;
         });
@@ -570,12 +832,11 @@ mod tests {
             );
             let events = actor.subscribe_events();
             let envelope = delivery(actor.agent_id());
-            let ticket = admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
+            admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
             let child_turn = envelope.result.outcome.turn_id();
             assert!(!actor.withdraw_child_delivery(TurnId::generate()));
             assert!(actor.withdraw_child_delivery(child_turn));
             assert!(!actor.withdraw_child_delivery(child_turn));
-            assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
             let statuses: Vec<_> = events
                 .try_iter()
                 .filter_map(|event| match event {
@@ -586,9 +847,7 @@ mod tests {
             assert_eq!(
                 statuses,
                 vec![
-                    DeliveryStatus::Accepted {
-                        parent_turn_id: ticket.turn_id()
-                    },
+                    DeliveryStatus::Accepted,
                     DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn),
                 ]
             );
@@ -614,17 +873,12 @@ mod tests {
             );
             let events = actor.subscribe_events();
             let envelope = delivery(actor.agent_id());
-            let ticket = admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
-            assert_eq!(
-                ticket.provenance().source_agent,
-                Some(envelope.result.outcome.agent_id())
-            );
+            admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
             if close {
                 actor.close();
             } else {
                 actor.clear();
             }
-            ticket.wait().await;
             let statuses: Vec<_> = events
                 .try_iter()
                 .filter_map(|event| match event {
@@ -635,9 +889,7 @@ mod tests {
             assert_eq!(
                 statuses,
                 vec![
-                    DeliveryStatus::Accepted {
-                        parent_turn_id: ticket.turn_id()
-                    },
+                    DeliveryStatus::Accepted,
                     DeliveryStatus::Discarded(if close {
                         TurnCancellationReason::Closed
                     } else {
@@ -695,7 +947,7 @@ mod tests {
             parent.configure_parent_delivery(true, None).unwrap();
             let ancestor_events = ancestor.subscribe_events();
             let envelope = delivery(parent.agent_id());
-            let ticket = admit_delivery(&parent.inner, Arc::clone(&envelope)).unwrap();
+            admit_delivery(&parent.inner, Arc::clone(&envelope)).unwrap();
             match discard {
                 Discard::Clear => {
                     parent.clear();
@@ -705,7 +957,6 @@ mod tests {
                     assert!(parent.withdraw_child_delivery(envelope.result.outcome.turn_id()));
                 }
             }
-            ticket.wait().await;
             assert!(
                 ancestor_events
                     .try_iter()
@@ -768,7 +1019,6 @@ mod tests {
                 )
                 .unwrap();
             child.cancel_turn(ticket.turn_id()).unwrap();
-            ticket.wait().await;
             let event = events
                 .try_iter()
                 .find_map(|event| match event {
@@ -879,6 +1129,274 @@ mod tests {
     }
 
     #[test]
+    fn completion_identity_deduplicates_only_same_turn() {
+        smol::block_on(async {
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            let envelope = delivery(actor.agent_id());
+            admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
+            admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 2);
+            assert!(actor.withdraw_child_delivery(envelope.result.outcome.turn_id()));
+            admit_delivery(&actor.inner, envelope).unwrap();
+            assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+            assert!(actor.latest_ticket().is_none());
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn completion_preview_and_pending_byte_bounds() {
+        smol::block_on(async {
+            const LARGE_TEXT: &str = "\u{0001}";
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            let mut envelope = (*delivery(actor.agent_id())).clone();
+            envelope.result.text = LARGE_TEXT.repeat(super::MAX_DELIVERY_PREVIEW_BYTES);
+            envelope
+                .result
+                .output
+                .push(serde_json::json!({ "large": envelope.result.text }));
+            let canonical_text = envelope.result.text.clone();
+            admit_delivery(&actor.inner, Arc::new(envelope)).unwrap();
+            {
+                let state = actor.inner.state.lock().unwrap();
+                let pending = state.deliveries.values().next().unwrap();
+                assert!(pending.bytes <= super::MAX_DELIVERY_PREVIEW_BYTES);
+                assert_ne!(pending.delivery.result.text, canonical_text);
+                assert_eq!(pending.delivery.to_json()["output"][0]["truncated"], true);
+                let text = pending
+                    .message
+                    .first_text_content()
+                    .unwrap()
+                    .strip_prefix(super::DELIVERY_HEADER)
+                    .unwrap();
+                assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
+            }
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn delivery_budget_preserves_fifo_and_explicit_work() {
+        smol::block_on(async {
+            const INSTRUCTION: &str = "ordinary work";
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            let ticket = actor
+                .submit(
+                    AgentInput::from_defaults(
+                        INSTRUCTION.into(),
+                        crate::AgentMode::Build,
+                        Vec::new(),
+                        Default::default(),
+                    ),
+                    None,
+                    INSTRUCTION.into(),
+                    Default::default(),
+                )
+                .unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..super::MAX_DELIVERY_BATCH + 1 {
+                let envelope = delivery(actor.agent_id());
+                ids.push(envelope.result.outcome.turn_id());
+                admit_delivery(&actor.inner, envelope).unwrap();
+            }
+            let source =
+                super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id());
+            let events = actor.subscribe_events();
+            let mut first = Vec::new();
+            source.commit_completions(&mut |message| {
+                assert!(actor.inner.state.try_lock().is_err());
+                let executed = events
+                    .try_iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            ActorEvent::Delivery(super::DeliveryEvent {
+                                status: DeliveryStatus::Executed { .. },
+                                ..
+                            })
+                        )
+                    })
+                    .count();
+                assert_eq!(executed, usize::from(!first.is_empty()));
+                first.push(message);
+            });
+            assert_eq!(first.len(), super::MAX_DELIVERY_BATCH);
+            assert!(events.try_iter().any(|event| matches!(
+                event,
+                ActorEvent::Delivery(super::DeliveryEvent {
+                    status: DeliveryStatus::Executed { .. },
+                    ..
+                })
+            )));
+            assert_eq!(
+                actor.inner.state.lock().unwrap().delivery_order.front(),
+                ids.last()
+            );
+            assert_eq!(source.drain_completions().len(), 1);
+            assert!(source.drain_completions().is_empty());
+            assert!(!actor.withdraw_child_delivery(ids[0]));
+            assert_eq!(actor.latest_ticket().unwrap().turn_id(), ticket.turn_id());
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn idle_child_batch_uses_one_continuation() {
+        smol::block_on(async {
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            for _ in 0..super::MAX_DELIVERY_BATCH + 1 {
+                admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            }
+            let id = {
+                let mut state = actor.inner.state.lock().unwrap();
+                super::schedule(&actor.inner, &mut state);
+                super::schedule(&actor.inner, &mut state);
+                assert_eq!(state.delivery_runs.len(), 1);
+                assert_eq!(state.deliveries.len(), super::MAX_DELIVERY_BATCH + 1);
+                *state.delivery_runs.keys().next().unwrap()
+            };
+            assert_eq!(actor.inner.tickets.lock().unwrap().len(), 1);
+            assert_eq!(
+                super::drain(&actor.inner, id).len(),
+                super::MAX_DELIVERY_BATCH
+            );
+            assert!(super::drain(&actor.inner, id).is_empty());
+            assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn submit_during_delivery_continuation_starts_work() {
+        smol::block_on(async {
+            const INSTRUCTION: &str = "ordinary instruction";
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            let continuation = {
+                let mut state = actor.inner.state.lock().unwrap();
+                super::schedule(&actor.inner, &mut state);
+                *state.delivery_runs.keys().next().unwrap()
+            };
+            let ticket = actor
+                .submit(
+                    AgentInput::from_defaults(
+                        INSTRUCTION.into(),
+                        crate::AgentMode::Build,
+                        Vec::new(),
+                        Default::default(),
+                    ),
+                    None,
+                    INSTRUCTION.into(),
+                    Default::default(),
+                )
+                .unwrap();
+            assert_ne!(ticket.turn_id(), continuation);
+            assert_eq!(
+                actor
+                    .submit(
+                        AgentInput::from_defaults(
+                            INSTRUCTION.into(),
+                            crate::AgentMode::Build,
+                            Vec::new(),
+                            Default::default()
+                        ),
+                        None,
+                        INSTRUCTION.into(),
+                        Default::default()
+                    )
+                    .unwrap()
+                    .turn_id(),
+                ticket.turn_id()
+            );
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn failed_delivery_continuation_waits_for_recovery_trigger() {
+        smol::block_on(async {
+            let (_start, rx) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            let id = {
+                let mut state = actor.inner.state.lock().unwrap();
+                super::schedule(&actor.inner, &mut state);
+                *state.delivery_runs.keys().next().unwrap()
+            };
+            actor.cancel_turn(id).unwrap();
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            {
+                let mut state = actor.inner.state.lock().unwrap();
+                assert!(state.delivery_suspended);
+                super::schedule(&actor.inner, &mut state);
+                assert!(state.delivery_runs.is_empty());
+                assert_eq!(state.deliveries.len(), 2);
+            }
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
     fn bounded_admission_and_internal_observation() {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);
@@ -897,10 +1415,10 @@ mod tests {
             assert!(input.preamble[0].is_observation());
             assert_eq!(envelope.to_json()["text"], CHILD_TEXT);
             for _ in 0..MAX_PENDING_DELIVERIES {
-                admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
+                admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
             }
             assert!(matches!(
-                admit_delivery(&actor.inner, Arc::clone(&envelope)),
+                admit_delivery(&actor.inner, delivery(actor.agent_id())),
                 Err(DeliveryRejection::Overflow)
             ));
             actor.close();

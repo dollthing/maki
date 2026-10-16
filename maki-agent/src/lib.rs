@@ -52,7 +52,9 @@ pub use tools::ToolFilter;
 pub mod types;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
@@ -91,12 +93,19 @@ impl AgentMode {
     }
 }
 
+pub struct PresentedInput {
+    pub input: AgentInput,
+    pub already_displayed: bool,
+    pub mcp_startup_notice: Option<usize>,
+}
+
 pub enum ExtractedCommand {
     /// Every message the user queued back to back, so one turn answers them
     /// all. A source must stop there and hand anything else over on its own,
     /// since a command like `/compact` rewrites the history the later messages
     /// land in.
     Interrupt(Vec<AgentInput>),
+    PresentedInterrupt(Vec<PresentedInput>),
     /// Carries the guidance typed as `/compact <instructions>`, for this one
     /// summary.
     Compact(Option<String>),
@@ -104,6 +113,10 @@ pub enum ExtractedCommand {
 
 pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
+
+    fn poll_ready(&self) -> Pin<Box<dyn Future<Output = Option<ExtractedCommand>> + Send + '_>> {
+        Box::pin(async { self.poll() })
+    }
 }
 
 /// What a message must agree on with its neighbours to share their turn.
