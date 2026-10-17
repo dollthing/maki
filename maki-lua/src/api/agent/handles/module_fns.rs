@@ -266,6 +266,10 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 ///   output_schema (table): validated before creation; requires a valid final
 ///     report each turn through the Rust structured-output reporting tool.
 ///   silent (boolean): defaults to false; suppresses parent relay and delivery.
+///   show (boolean|string): post a row for the child in its parent's chat;
+///     a string adds a description. Defaults to true for trusted parents and
+///     false otherwise. Silent children and children spawned by a tool call,
+///     which already have its row, cannot be shown.
 ///   auto_deliver (boolean): defaults to true; managed children notify their
 ///     recorded parent once per settled turn. A wait in the
 ///     parent's own turn returns the result directly and withdraws the

@@ -1558,6 +1558,10 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
+  - `show` (`boolean|string?`) post a row for the session in its parent's
+    chat; a string adds a description. Default: `true` for trusted parents,
+    `false` otherwise. Silent sessions and sessions opened by a tool call,
+    which already have its row, cannot be shown.
   - `auto_deliver` (`boolean?`) for managed children, queue a structured
     lifecycle observation per settled turn to the recorded parent, independently
     of `prompt()` or ticket waits. Nested children notify their own parent,
@@ -1702,6 +1706,10 @@ Unmanaged children use the current host task's authority, not a managed graph.
   - `output_schema` (`table`) validated before creation; requires a valid final
     report each turn through the Rust structured-output reporting tool.
   - `silent` (`boolean`) defaults to false; suppresses parent relay and delivery.
+  - `show` (`boolean|string`) post a row for the child in its parent's chat;
+    a string adds a description. Defaults to true for trusted parents and
+    false otherwise. Silent children and children spawned by a tool call,
+    which already have its row, cannot be shown.
   - `auto_deliver` (`boolean`) defaults to true; managed children notify their
     recorded parent once per settled turn. A wait in the
     parent's own turn returns the result directly and withdraws the
@@ -6587,6 +6595,45 @@ if focused then
   local agent = assert(maki.agent.get(ctx, focused))
   local selection = assert(agent:model(ctx))
 end
+```
+
+---
+
+### `maki.ui.post()` {#maki-ui-post}
+
+```lua
+maki.ui.post({ctx}, {text}, {opts?})
+```
+
+Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
+is for the user only: it never reaches the model, and later focus changes
+do not move it. It is saved with the session and comes back on restore.
+Trusted commands, keymaps and callbacks can post; delegated tool handlers
+cannot, since their tool row already speaks for them.
+
+`maki.agent.spawn` posts a row for each child it shows; see its `show`
+option.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
+- `{text}` (`string`) Row text. Must not be blank.
+- `{opts?}` (`table?`) Optional fields:
+  - `level` (`string?`) "info" (default), "warn" or "error".
+  - `agent` (`Agent?`) a child spawned from Lua that the post is about.
+
+  Any other option key is an error.
+
+
+**Returns:** (`boolean?`, `string?`) True once sent, or nil and an error.
+
+**Example:**
+
+```lua
+local ok, err = maki.ui.post(ctx, "review found 3 issues", {
+  level = "warn",
+  agent = reviewer,
+})
 ```
 
 ---

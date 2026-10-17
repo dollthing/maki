@@ -39,3 +39,12 @@ pub const ORCHESTRATION_CONTEXT_EXPIRED: &str = "orchestration context expired";
 pub const OUTPUT_SCHEMA_NOT_OBJECT: &str = "output_schema must have type object";
 pub const STRUCTURED_OUTPUT_CONFLICT: &str =
     "output_schema conflicts with existing structured_output tool";
+pub const SHOW_SILENT_AGENT: &str = "silent agents cannot be shown";
+pub const SHOW_TOOL_AGENT: &str = "agents spawned by a tool call are shown by that call";
+pub const SHOW_UNTRUSTED_PARENT: &str = "showing an agent requires a trusted parent";
+pub const BLANK_POST: &str = "post text must not be blank";
+pub const UNKNOWN_POST_OPTION: &str = "unknown post option";
+pub const UNKNOWN_POST_LEVEL: &str = "unknown post level";
+pub const UNLINKABLE_POST_AGENT: &str = "only agents spawned from Lua can be linked from a post";
+pub const POST_TARGET_SILENT: &str = "silent agents have no chat to post to";
+pub const POST_TARGET_NOT_STARTED: &str = "agent has no chat before its first turn";

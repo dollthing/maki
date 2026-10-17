@@ -154,6 +154,11 @@ pub(crate) struct LuaAgent {
 }
 
 impl LuaAgent {
+    /// The id the UI keys this agent's transcript by; `None` for host roots.
+    pub(crate) fn transcript_id(&self) -> Option<&str> {
+        self.state.as_ref().map(|state| state.ui_id.as_str())
+    }
+
     /// A handle without managed graph identity: host roots and unmanaged children.
     fn without_graph(
         manager: AgentRuntime,
@@ -248,7 +253,7 @@ fn session_settled_closed(session: &LuaSession) -> bool {
     snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
 }
 
-fn session_state(lua: &Lua, id: AgentId) -> Option<Arc<LuaActorState>> {
+pub(super) fn session_state(lua: &Lua, id: AgentId) -> Option<Arc<LuaActorState>> {
     lua.app_data_ref::<AgentSessions>()
         .and_then(|sessions| {
             sessions
@@ -284,9 +289,12 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::race;
-    use maki_agent::tools::test_support::stub_ctx;
+    use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with};
     use maki_agent::tools::{DescriptionContext, RequestTools, ToolContext, TurnToolBindings};
-    use maki_agent::{AgentLimits, AgentMode, EffectiveAgentConfig, RunSettings};
+    use maki_agent::{
+        AgentEvent, AgentLimits, AgentMode, EffectiveAgentConfig, EventSender, Post, PostLevel,
+        RunSettings,
+    };
     use maki_config::ModelPolicy;
     use maki_providers::{RequestOptions, TokenUsage};
     use mlua::{AnyUserData, Table};
@@ -693,6 +701,188 @@ mod tests {
                 "#).exec_async().await.unwrap();
             }).await;
         });
+    }
+
+    const CHILD_NAME: &str = "reviewer";
+    const POST_TEXT: &str = "review found issues";
+
+    /// Runs {chunk} with `ctx` pinned to a trusted root and `agent_api` and
+    /// `ui` in scope. Returns the chunk's string result and the posts the
+    /// root's chat received.
+    fn run_trusted(chunk: &str) -> (String, Vec<Post>) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let (event_tx, event_rx) = flume::unbounded();
+            let context = stub_ctx_with(
+                &AgentMode::Build,
+                Some(&EventSender::new(event_tx, 0)),
+                None,
+            );
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let mut root_fixture = None;
+            let root = manager
+                .create_root_with_config(None, Vec::new(), None, |id| {
+                    let (_, state, session, _) =
+                        session_with_provider_for_agent(Arc::clone(&context.provider), id);
+                    root_fixture = Some(session);
+                    Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                })
+                .unwrap();
+            let trusted_target = TrustedTarget {
+                target: root,
+                template: context,
+            };
+            lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
+                trusted_target.clone(),
+            )))));
+            let ctx = LuaCtx::trusted_context(&lua, trusted_target, Arc::from(PLUGIN));
+            lua.globals().set("ctx", ctx).unwrap();
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            lua.globals()
+                .set(
+                    "ui",
+                    crate::api::ui::create_ui_table(&lua, None, Arc::from(PLUGIN), None).unwrap(),
+                )
+                .unwrap();
+            let result: String = scope
+                .scope_future(lua.load(chunk).eval_async())
+                .await
+                .unwrap();
+            let posts = event_rx
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Post(post) => Some(post),
+                    _ => None,
+                })
+                .collect();
+            manager.shutdown(RETIRE_TIMEOUT).await;
+            drop(root_fixture);
+            (result, posts)
+        })
+    }
+
+    #[test_case::test_case("nil", Some(CHILD_NAME) ; "shown_by_default")]
+    #[test_case::test_case("'the pending diff'", Some("reviewer: the pending diff") ; "with_description")]
+    #[test_case::test_case("false", None ; "hidden")]
+    fn spawn_posts_a_row_for_shown_children(show: &str, expected: Option<&str>) {
+        let (transcript, posts) = run_trusted(&format!(
+            r#"
+            local child = assert(agent_api.spawn(ctx, {{
+                inherit_provider = true, tools = {{}}, name = "{CHILD_NAME}", show = {show},
+            }}))
+            local id = child:_maki_session_id()
+            assert(child:close(ctx))
+            return id
+        "#
+        ));
+        let expected: Vec<_> = expected
+            .map(|text| Post {
+                text: text.into(),
+                level: PostLevel::Info,
+                agent: Some(transcript),
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(posts, expected);
+    }
+
+    #[test]
+    fn showing_a_silent_child_is_an_error() {
+        let (error, posts) = run_trusted(
+            r#"
+            local child, err = agent_api.spawn(ctx, {
+                inherit_provider = true, tools = {}, silent = true, show = true,
+            })
+            assert(child == nil)
+            return err
+        "#,
+        );
+        assert_eq!(error, crate::agent_errors::SHOW_SILENT_AGENT);
+        assert!(posts.is_empty());
+    }
+
+    #[test_case::test_case("nil", None ; "hidden_by_default")]
+    #[test_case::test_case("true", Some(crate::agent_errors::SHOW_TOOL_AGENT) ; "explicit_show_refused")]
+    fn tool_spawned_children_keep_their_tool_row(show: &str, expected: Option<&str>) {
+        const TOOL_USE_ID: &str = "call_review";
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let (event_tx, event_rx) = flume::unbounded();
+            let context = stub_ctx_with(
+                &AgentMode::Build,
+                Some(&EventSender::new(event_tx, 0)),
+                Some(TOOL_USE_ID),
+            );
+            let mut ctx = LuaCtx::handler(&context);
+            ctx.bind_origin(scope.handle());
+            lua.globals().set("ctx", ctx).unwrap();
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            let error: Option<String> = scope
+                .scope_future(
+                    lua.load(format!(
+                        r#"
+                local child, err = agent_api.spawn(ctx, {{
+                    inherit_provider = true, tools = {{}}, show = {show},
+                }})
+                if child then assert(child:close(ctx)) end
+                return err
+            "#
+                    ))
+                    .eval_async(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(error.as_deref(), expected);
+            assert!(
+                !event_rx
+                    .drain()
+                    .any(|envelope| matches!(envelope.event, AgentEvent::Post(_)))
+            );
+        });
+    }
+
+    #[test]
+    fn post_links_a_child_at_the_requested_level() {
+        let (transcript, posts) = run_trusted(&format!(
+            r#"
+            local child = assert(agent_api.spawn(ctx, {{
+                inherit_provider = true, tools = {{}}, show = false,
+            }}))
+            assert(ui.post(ctx, "{POST_TEXT}", {{ level = "error", agent = child }}))
+            local id = child:_maki_session_id()
+            assert(child:close(ctx))
+            return id
+        "#
+        ));
+        assert_eq!(
+            posts,
+            [Post {
+                text: POST_TEXT.into(),
+                level: PostLevel::Error,
+                agent: Some(transcript),
+            }]
+        );
+    }
+
+    #[test_case::test_case("'  '", "nil", crate::agent_errors::BLANK_POST ; "blank_text")]
+    #[test_case::test_case("'text'", "{ level = 'fatal' }", crate::agent_errors::UNKNOWN_POST_LEVEL ; "unknown_level")]
+    #[test_case::test_case("'text'", "{ colour = 'red' }", crate::agent_errors::UNKNOWN_POST_OPTION ; "unknown_option")]
+    fn invalid_posts_return_errors(text: &str, opts: &str, expected: &str) {
+        let (error, posts) = run_trusted(&format!(
+            r#"
+            local ok, err = ui.post(ctx, {text}, {opts})
+            assert(ok == nil)
+            return err
+        "#
+        ));
+        assert!(error.starts_with(expected), "{error}");
+        assert!(posts.is_empty());
     }
 
     #[test]

@@ -43,7 +43,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History, McpSession,
-    ModeDef, RunLedger, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
+    ModeDef, Post, RunLedger, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
     TurnAdmissionOptions, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOrigin,
     TurnOutcome, TurnProvenance, TurnResult,
 };
@@ -60,15 +60,16 @@ use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
 use crate::agent_errors::{
-    INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_PLUGIN_AUTHORITY, NO_TASK_AUTHORITY,
-    ORCHESTRATION_SERVICES_EXPIRED, STRUCTURED_OUTPUT_CONFLICT,
+    BLANK_POST, INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_PLUGIN_AUTHORITY,
+    NO_TASK_AUTHORITY, ORCHESTRATION_SERVICES_EXPIRED, POST_TARGET_NOT_STARTED, POST_TARGET_SILENT,
+    SHOW_SILENT_AGENT, SHOW_TOOL_AGENT, SHOW_UNTRUSTED_PARENT, STRUCTURED_OUTPUT_CONFLICT,
 };
 use crate::api::r#async::LuaSemaphore;
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
-use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::host_root::HostRootServices;
 use crate::orchestration::TrustedContext;
 use crate::runtime::CANCELLED_MSG;
@@ -77,6 +78,7 @@ const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admi
 const SESSION_CLOSED_ERR: &str = "session closed";
 const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const UNNAMED_AGENT_LABEL: &str = "agent";
 const SPAWN_OPTIONS: &[&str] = &[
     "audience",
     "auto_deliver",
@@ -87,6 +89,7 @@ const SPAWN_OPTIONS: &[&str] = &[
     "name",
     "output_schema",
     "semaphore",
+    "show",
     "silent",
     "system",
     "tools",
@@ -1104,6 +1107,10 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///     usage into the parent session's UI or event stream. The session still
 ///     completes and `:prompt()` still returns its result (including a commit
 ///     set via a `local_tools` handler). Use for hidden one-shot classification.
+///   `show` (boolean|string?) - post a row for the session in its parent's
+///     chat; a string adds a description. Default: `true` for trusted parents,
+///     `false` otherwise. Silent sessions and sessions opened by a tool call,
+///     which already have its row, cannot be shown.
 ///   `auto_deliver` (boolean?) - for managed children, queue a structured
 ///     lifecycle observation per settled turn to the recorded parent, independently
 ///     of `prompt()` or ticket waits. Nested children notify their own parent,
@@ -1271,6 +1278,9 @@ struct SessionOptions {
     silent: bool,
     auto_deliver: bool,
     semaphore: Option<Arc<async_lock::Semaphore>>,
+    /// `Some` posts a row for the child in its parent's chat, with an
+    /// optional description.
+    show: Option<Option<String>>,
 }
 
 impl SessionOptions {
@@ -1318,6 +1328,39 @@ impl SessionOptions {
         let mcp = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !parent.restricts_writes();
         let silent = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
         let auto_deliver = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
+        let showable = if silent {
+            Err(SHOW_SILENT_AGENT)
+        } else if parent.context.tool_use_id.is_some() {
+            Err(SHOW_TOOL_AGENT)
+        } else if parent.trusted.is_none() {
+            Err(SHOW_UNTRUSTED_PARENT)
+        } else {
+            Ok(())
+        };
+        let show = match opts.get::<LuaValue>("show")? {
+            LuaValue::Nil => showable.is_ok().then_some(None),
+            LuaValue::Boolean(false) => None,
+            LuaValue::Boolean(true) => match showable {
+                Ok(()) => Some(None),
+                Err(error) => return Ok(Err(error.into())),
+            },
+            LuaValue::String(description) => {
+                if let Err(error) = showable {
+                    return Ok(Err(error.into()));
+                }
+                let description = description.to_str()?.to_owned();
+                if description.trim().is_empty() {
+                    return Ok(Err(BLANK_POST.into()));
+                }
+                Some(Some(description))
+            }
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "show must be a boolean or string, got {}",
+                    other.type_name()
+                )));
+            }
+        };
         let semaphore = if parent.managed_turn.is_some() {
             None
         } else {
@@ -1343,6 +1386,7 @@ impl SessionOptions {
             silent,
             auto_deliver,
             semaphore,
+            show,
         }))
     }
 
@@ -2104,12 +2148,53 @@ async fn build_session(
         relay_stop_tx,
         authority: parent.authority,
     };
-    Ok(pair(register_session(
+    let session = try_pair!(register_session(
         &lua,
         sess,
         child_template,
-        inherit_defaults,
-    )))
+        inherit_defaults
+    ));
+    if let (Some(description), Some(trusted)) = (options.show, &parent.trusted) {
+        let label = if options.name.is_empty() {
+            UNNAMED_AGENT_LABEL
+        } else {
+            &options.name
+        };
+        let post = Post {
+            text: description.map_or_else(|| label.to_owned(), |text| format!("{label}: {text}")),
+            level: Default::default(),
+            agent: Some(session.id.clone()),
+        };
+        if let Err(error) = send_post(&lua, trusted, post) {
+            warn!(name = %options.name, %error, "could not show spawned agent");
+        }
+    }
+    Ok((Some(session), None))
+}
+
+/// Puts {post} in the chat of {target}. A Lua child shares its parent's event
+/// stream, so its posts carry its identity to land in its own chat.
+pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Result<(), String> {
+    let event = AgentEvent::Post(post);
+    let Some(state) = handles::session_state(lua, target.target.id()) else {
+        return target
+            .template
+            .event_tx
+            .send(event)
+            .map_err(|error| error.to_string());
+    };
+    if state.silent {
+        return Err(POST_TARGET_SILENT.into());
+    }
+    let subagent = state.subagent_info.get().ok_or(POST_TARGET_NOT_STARTED)?;
+    state
+        .parent_event_tx
+        .send_envelope(Envelope {
+            event,
+            subagent: Some(subagent.clone()),
+            run_id: state.parent_event_tx.run_id(),
+        })
+        .map_err(|error| error.to_string())
 }
 
 lua_table! {
