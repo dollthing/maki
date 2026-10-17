@@ -167,6 +167,14 @@ impl CommandRuntime {
             .unwrap_or_else(|error| error.into_inner()) = targets;
     }
 
+    pub(crate) fn target_agent(&self, target: &TargetHandle) -> Option<maki_agent::AgentRef> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&target.id())
+            .map(|admission| admission.target.clone())
+    }
+
     pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),

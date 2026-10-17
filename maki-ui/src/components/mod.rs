@@ -225,6 +225,10 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    ChangePinnedModel {
+        target: maki_agent::AgentRef,
+        spec: String,
+    },
     SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {

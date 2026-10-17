@@ -125,6 +125,17 @@ async fn build_session_provider(
     }
 }
 
+#[derive(Default)]
+struct StandaloneChildren {
+    closed: bool,
+    actors: Vec<(Weak<AgentActorHandle>, Weak<LuaActorState>)>,
+}
+
+type StandaloneOwner = (Weak<CancelMap<String>>, Arc<Mutex<StandaloneChildren>>);
+
+#[derive(Default)]
+struct StandaloneActors(Vec<StandaloneOwner>);
+
 /// Shared backend state, owned by the adapter and cloned into the actor's
 /// backend. Runs are transient: the [`actor::Runner`](maki_agent::actor) owns
 /// the [`History`], while every per-session capability that must outlive a
@@ -135,6 +146,7 @@ async fn build_session_provider(
 /// a `Mutex`/`Sender`/`OnceLock` the borrowed shell can touch. `prompt` and
 /// `status` never read through this struct; they speak to the actor handle.
 struct LuaActorState {
+    children: Arc<Mutex<StandaloneChildren>>,
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
     custom_system: String,
@@ -294,11 +306,29 @@ impl LuaActorState {
         }
     }
 
+    fn cancel_subtree(&self, actor: &AgentActorHandle) {
+        let children = self.children.lock().unwrap();
+        actor.cancel_existing();
+        for (actor, state) in &children.actors {
+            if let (Some(actor), Some(state)) = (actor.upgrade(), state.upgrade()) {
+                state.cancel_subtree(&actor);
+            }
+        }
+    }
+
     /// Idempotent cancellation close: notify the UI immediately, retire the
-    /// actor, and resolve queued/parked waiters as Closed.
+    /// subtree, and resolve queued/parked waiters as Closed.
     fn close_with(&self, actor: &AgentActorHandle) {
         self.notify_closed_direct();
+        let mut children = self.children.lock().unwrap();
+        children.closed = true;
         actor.close();
+        for (actor, state) in children.actors.drain(..) {
+            if let (Some(actor), Some(state)) = (actor.upgrade(), state.upgrade()) {
+                state.close_with(&actor);
+            }
+        }
+        drop(children);
         if !self
             .execution_started
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1779,7 +1809,7 @@ fn spawn_close_relay(
         if let Some(agent) = managed_agent {
             let _ = agent.close_subtree();
         } else {
-            actor.close();
+            close_state.close_with(&actor);
         }
     })
     .detach();
@@ -1836,6 +1866,36 @@ fn register_session(
     inherit_defaults: bool,
 ) -> Result<LuaSession, String> {
     let _ = sess.state.template.set(child_template.clone());
+    if let SessionControl::Unmanaged { parent_cancels, .. } = &sess.control {
+        if lua.app_data_ref::<StandaloneActors>().is_none() {
+            lua.set_app_data(StandaloneActors::default());
+        }
+        let mut actors = lua.app_data_mut::<StandaloneActors>().unwrap();
+        actors.0.retain(|(map, _)| map.strong_count() > 0);
+        let parent = actors
+            .0
+            .iter()
+            .find(|(map, _)| map.ptr_eq(&Arc::downgrade(parent_cancels)));
+        if let Some((_, parent)) = parent {
+            let mut children = parent.lock().unwrap();
+            children
+                .actors
+                .retain(|(actor, _)| actor.strong_count() > 0);
+            if children.closed {
+                sess.state.close_with(&sess.actor);
+            } else {
+                children
+                    .actors
+                    .push((Arc::downgrade(&sess.actor), Arc::downgrade(&sess.state)));
+            }
+        }
+        if let Some(params) = sess.state.params.get() {
+            actors.0.push((
+                Arc::downgrade(&params.subagent_cancels),
+                Arc::clone(&sess.state.children),
+            ));
+        }
+    }
     if let SessionControl::Managed { agent, .. } = &sess.control
         && let Some(service) = crate::orchestration::services(lua)
         && let Err(error) = service.register_target(crate::orchestration::TrustedTarget {
@@ -1955,6 +2015,7 @@ async fn build_session(
     });
     let state = Arc::new(LuaActorState {
         template: OnceLock::new(),
+        children: Arc::default(),
         params: OnceLock::new(),
         custom_system: options.system.take().unwrap_or_default(),
         tools: tools.request,
@@ -3342,6 +3403,7 @@ mod tests {
         };
         let state = Arc::new(LuaActorState {
             template: OnceLock::new(),
+            children: Arc::default(),
             params: OnceLock::from(params),
             custom_system: String::new(),
             tools: RequestTools::default(),

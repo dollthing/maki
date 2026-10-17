@@ -6525,6 +6525,27 @@ fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
 }
 
+#[test_case(false ; "session_root_fallback")]
+#[test_case(true ; "plan_root_fallback")]
+fn model_picker_without_target_initializes_from_root(plan: bool) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let models = install_model_slot(&mut app);
+    let root_model = app.state.model.spec();
+    models.store(Some(Arc::new(vec![
+        MODEL_SPEC_GLM4.into(),
+        root_model.clone(),
+    ])));
+    app.open_model_picker(if plan {
+        ModelPickerPurpose::PlanImplementation
+    } else {
+        ModelPickerPurpose::Session
+    });
+    assert!(matches!(
+        app.model_picker.handle_key(key(KeyCode::Enter)),
+        ModelPickerAction::Select(spec) if spec == root_model
+    ));
+}
+
 #[test]
 fn normal_model_picker_still_requests_model_change() {
     const MODEL: &str = "zai/glm-5";

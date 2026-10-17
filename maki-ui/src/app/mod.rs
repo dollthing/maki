@@ -346,6 +346,7 @@ pub struct App {
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     model_picker_purpose: ModelPickerPurpose,
+    pub(crate) model_picker_target: Option<maki_agent::AgentRef>,
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -543,6 +544,7 @@ impl App {
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
             model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
             model_picker_purpose: ModelPickerPurpose::Session,
+            model_picker_target: None,
             plan_approval_pending: false,
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
@@ -1274,7 +1276,41 @@ impl App {
         self.pending_dirty |= self.model_picker.refresh();
     }
 
+    pub(crate) fn open_pinned_model_picker(
+        &mut self,
+        target: maki_agent::AgentRef,
+    ) -> Result<(), CommandError> {
+        target
+            .validate_live()
+            .map_err(|_| CommandError::StaleTarget)?;
+        let config = target
+            .effective_config()
+            .map_err(|_| CommandError::StaleTarget)?
+            .ok_or(CommandError::StaleTarget)?;
+        self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = Some(target);
+        self.model_picker.open(&config.model.spec());
+        Ok(())
+    }
+
     fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
+        if purpose == ModelPickerPurpose::Session
+            && let Some(target) = self.command_runtime.target_agent(&self.command_target)
+        {
+            if let Err(error) = self.open_pinned_model_picker(target) {
+                self.close_model_picker();
+                self.flash(error.to_string());
+            }
+            return;
+        }
+        if purpose == ModelPickerPurpose::Session
+            && (self.selected_agent_id().is_some() || self.coordinator.is_some())
+        {
+            self.close_model_picker();
+            self.flash(CommandError::StaleTarget.to_string());
+            return;
+        }
+        self.model_picker_target = None;
         let spec = match purpose {
             ModelPickerPurpose::PlanImplementation => self
                 .plan_form
@@ -1292,6 +1328,7 @@ impl App {
     fn close_model_picker(&mut self) {
         self.model_picker.close();
         self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = None;
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1303,6 +1340,8 @@ impl App {
                     self.plan_form
                         .set_implementation_model(spec, &self.state.model.spec());
                     vec![]
+                } else if let Some(target) = self.model_picker_target.take() {
+                    vec![Action::ChangePinnedModel { target, spec }]
                 } else {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -2557,7 +2596,7 @@ impl App {
                 vec![]
             }
             BuiltinOperation::OpenModelPicker => {
-                self.model_picker.open(&self.state.model.spec());
+                self.open_model_picker(ModelPickerPurpose::Session);
                 vec![Action::RefreshModels]
             }
             BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],

@@ -256,6 +256,11 @@ impl Runner {
                 .get(&turn_id)
                 .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
             {
+                admission.ticket.resolve(cancelled_outcome(
+                    agent_id,
+                    turn_id,
+                    TurnCancellationReason::Withdrawn,
+                ));
                 state.delivery_runs.remove(&turn_id);
                 self.inner
                     .tickets
@@ -360,6 +365,11 @@ impl Runner {
                 .get(&turn_id)
                 .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
             {
+                admission.ticket.resolve(cancelled_outcome(
+                    agent_id,
+                    turn_id,
+                    TurnCancellationReason::Withdrawn,
+                ));
                 state.delivery_runs.remove(&turn_id);
                 self.inner
                     .tickets

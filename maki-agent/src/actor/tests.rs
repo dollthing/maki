@@ -4436,6 +4436,11 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
             assert_eq!(batch, &vec![child_turn]);
             continuation
         };
+        let continuation_ticket = parent.latest_ticket().unwrap();
+        assert_eq!(continuation_ticket.turn_id(), continuation);
+        assert!(continuation_ticket.peek_result().is_none());
+        let waiter_ticket = continuation_ticket.clone();
+        let continuation_waiter = smol::spawn(async move { waiter_ticket.wait_result().await });
         let claimed = match first {
             Claim::WaitFirst => {
                 assert!(parent.withdraw_child_delivery(child_turn));
@@ -4463,7 +4468,21 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
         assert_eq!(child.outcome(child_turn), Some(retained.outcome));
 
         parent_start.send(()).unwrap();
-        until(|| parent.inner.state.lock().unwrap().delivery_runs.is_empty()).await;
+        let result = futures_lite::future::or(continuation_waiter, async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("{CONDITION_TIMEOUT}");
+        })
+        .await;
+        assert_eq!(
+            result.outcome,
+            super::cancelled_outcome(
+                parent.agent_id(),
+                continuation,
+                TurnCancellationReason::Withdrawn,
+            )
+        );
+        assert_eq!(result.duration_ms, 0);
+        assert!(parent.inner.state.lock().unwrap().delivery_runs.is_empty());
         assert_eq!(scripted.entered.load(Ordering::SeqCst), 0);
         assert!(parent.turn_ticket(continuation).is_none());
         assert!(
@@ -4475,6 +4494,9 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
         child.close();
         parent_task.await;
         child_task.await;
+        let retained_result = continuation_ticket.wait_result().await;
+        assert_eq!(retained_result.outcome, result.outcome);
+        assert_eq!(retained_result.duration_ms, result.duration_ms);
     });
 }
 

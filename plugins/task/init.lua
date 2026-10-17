@@ -236,40 +236,44 @@ local function create_session(ctx, options)
   function adapter:close(call_ctx)
     return agent:close(call_ctx)
   end
+  local function make_ticket_room(call_ctx)
+    for index, id in ipairs(order) do
+      if #order < MAX_RETAINED_TURNS then
+        break
+      end
+      if tickets[id]:result(call_ctx) then
+        tickets[id] = nil
+        table.remove(order, index)
+        break
+      end
+    end
+  end
+  local function retain_ticket(ticket, call_ctx)
+    local id = ticket:id()
+    if not tickets[id] then
+      make_ticket_room(call_ctx)
+      if #order >= MAX_RETAINED_TURNS then
+        return nil
+      end
+      tickets[id] = ticket
+      order[#order + 1] = id
+    end
+    return ticket
+  end
   function adapter:send(message, call_ctx)
     local authorized, auth_err = agent:status(call_ctx)
     if not authorized then
       return nil, auth_err, true
     end
-    local i = 1
-    while #order >= MAX_RETAINED_TURNS and i <= #order do
-      local id = order[i]
-      local result = tickets[id]:result(call_ctx)
-      if result then
-        tickets[id] = nil
-        table.remove(order, i)
-      else
-        i = i + 1
-      end
-    end
+    make_ticket_room(call_ctx)
     local ticket, send_err = agent:submit(call_ctx, message, { existing_only = #order >= MAX_RETAINED_TURNS })
     if not ticket then
       return nil, send_err, true
     end
+    if not retain_ticket(ticket, call_ctx) then
+      return nil, TURN_UNAVAILABLE_ERR, true
+    end
     latest = ticket:id()
-    if not tickets[latest] and #order >= MAX_RETAINED_TURNS then
-      for index, id in ipairs(order) do
-        if tickets[id]:result(call_ctx) then
-          tickets[id] = nil
-          table.remove(order, index)
-          break
-        end
-      end
-    end
-    if not tickets[latest] then
-      tickets[latest] = ticket
-      order[#order + 1] = latest
-    end
     return latest
   end
   function adapter:wait(call_ctx, turn_id, timeout)
@@ -280,6 +284,9 @@ local function create_session(ctx, options)
       ticket = tickets[turn_id]
     else
       ticket = agent:latest_turn(call_ctx) or tickets[latest]
+      if ticket then
+        ticket = retain_ticket(ticket, call_ctx)
+      end
     end
     if not ticket then
       return nil, TURN_UNAVAILABLE_ERR

@@ -54,6 +54,7 @@ pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<
         let runtime = AgentRuntime::unmanaged(
             lua,
             actor,
+            state.clone(),
             context.subagent_cancels.clone(),
             plugin,
             generation,
@@ -196,6 +197,7 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
                 let runtime = AgentRuntime::unmanaged(
                     lua,
                     session.actor.clone(),
+                    session.state.clone(),
                     parent_cancels.clone(),
                     plugin,
                     generation,
@@ -330,6 +332,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
             let runtime = AgentRuntime::unmanaged(
                 &lua,
                 Arc::clone(&session.actor),
+                Arc::clone(&state),
                 Arc::clone(parent_cancels),
                 plugin,
                 generation,

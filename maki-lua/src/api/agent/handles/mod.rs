@@ -38,6 +38,7 @@ enum AgentRuntime {
     Managed(AgentManagerHandle),
     Unmanaged {
         actor: Arc<AgentActorHandle>,
+        state: Arc<LuaActorState>,
         parent: Arc<CancelMap<String>>,
         plugin: Arc<str>,
         generation: u64,
@@ -56,12 +57,14 @@ impl AgentRuntime {
     fn unmanaged(
         lua: &Lua,
         actor: Arc<AgentActorHandle>,
+        state: Arc<LuaActorState>,
         parent: Arc<CancelMap<String>>,
         plugin: Arc<str>,
         generation: u64,
     ) -> Self {
         Self::Unmanaged {
             actor,
+            state,
             parent,
             owner: plugin_authority(lua, plugin.clone()),
             plugin,
@@ -106,8 +109,8 @@ impl AgentRuntime {
         match self {
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
             Self::Managed(manager) => manager.close_subtree(id).map_err(|error| error.to_string()),
-            Self::Unmanaged { actor, .. } => {
-                actor.close();
+            Self::Unmanaged { actor, state, .. } => {
+                state.close_with(actor);
                 Ok(())
             }
         }
@@ -132,7 +135,10 @@ impl AgentRuntime {
                 .cancel_subtree(id)
                 .map_err(|error| error.to_string()),
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Unmanaged { .. } => self.cancel_agent(Some(id)),
+            Self::Unmanaged { actor, state, .. } => {
+                state.cancel_subtree(actor);
+                Ok(())
+            }
         }
     }
 }
@@ -583,6 +589,109 @@ mod tests {
                 .await
                 .unwrap();
             assert!(closed);
+        });
+    }
+
+    #[test_case::test_case(false; "cancel_keeps_descendants_open")]
+    #[test_case::test_case(true; "close_permanently_closes_descendants")]
+    fn standalone_nested_subtree_lifecycle(close: bool) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let mut context = stub_ctx(&AgentMode::Build);
+            context.provider = Arc::new(StreamOnceProvider::new_replies(vec![
+                canned_reply_with_usage(REPLY, TokenUsage::default()),
+                canned_reply_with_usage(REPLY, TokenUsage::default()),
+            ]));
+            context.request_tools = Some(RequestTools::default());
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            let bind = |name: &str, context: &ToolContext| {
+                let mut ctx = LuaCtx::handler(context);
+                ctx.bind_origin(scope.handle());
+                lua.globals().set(name, ctx).unwrap();
+            };
+            bind("ctx", &context);
+            scope.scope_future(async {
+                lua.load(r#"
+                    parent = assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
+                    sibling = assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
+                "#).exec_async().await.unwrap();
+                let parent: AnyUserData = lua.globals().get("parent").unwrap();
+                let parent = parent.borrow::<LuaAgent>().unwrap().clone();
+                let mut child_context = context.clone();
+                let params = parent.state.as_ref().unwrap().params.get().unwrap();
+                child_context.subagent_cancels = params.subagent_cancels.clone();
+                child_context.ledger = params.ledger.clone();
+                bind("child_ctx", &child_context);
+                lua.load(r#"
+                    child = assert(agent_api.spawn(child_ctx, { inherit_provider = true, silent = true }))
+                "#).exec_async().await.unwrap();
+                let child: AnyUserData = lua.globals().get("child").unwrap();
+                let child = child.borrow::<LuaAgent>().unwrap().clone();
+                let mut leaf_context = child_context.clone();
+                let params = child.state.as_ref().unwrap().params.get().unwrap();
+                leaf_context.subagent_cancels = params.subagent_cancels.clone();
+                leaf_context.ledger = params.ledger.clone();
+                bind("leaf_ctx", &leaf_context);
+                let semaphore = Arc::new(async_lock::Semaphore::new(1));
+                let permit = semaphore.acquire().await;
+                lua.globals().set("gate", crate::api::r#async::LuaSemaphore { sem: semaphore.clone() }).unwrap();
+                lua.load(r#"
+                    leaf = assert(agent_api.spawn(leaf_ctx, {
+                        inherit_provider = true, silent = true, semaphore = gate,
+                    }))
+                    active = assert(leaf:send(leaf_ctx, "active"))
+                    queued = assert(leaf:enqueue(leaf_ctx, "queued"))
+                "#).exec_async().await.unwrap();
+                let leaf: AnyUserData = lua.globals().get("leaf").unwrap();
+                let leaf = leaf.borrow::<LuaAgent>().unwrap().clone();
+                let state = leaf.state.as_ref().unwrap();
+                race(async {
+                    while !state.execution_started.load(std::sync::atomic::Ordering::Acquire) {
+                        smol::future::yield_now().await;
+                    }
+                }, async {
+                    Timer::after(RETIRE_TIMEOUT).await;
+                    panic!("leaf did not enter its turn");
+                }).await;
+                lua.globals().set("close_subtree", close).unwrap();
+                lua.load(r#"
+                    assert(parent:status(ctx).status == "idle")
+                    assert(parent:cancel(ctx))
+                    assert(leaf:status(leaf_ctx).status == "running")
+                    if close_subtree then
+                        assert(parent:close(ctx))
+                    else
+                        assert(parent:cancel_subtree(ctx))
+                    end
+                    assert(assert(active:wait(leaf_ctx, { timeout = 5 })).status == "cancelled")
+                    assert(assert(queued:wait(leaf_ctx, { timeout = 5 })).status == "cancelled")
+                    assert(sibling:status(ctx).status == "idle")
+                "#).exec_async().await.unwrap();
+                for agent in [&parent, &child, &leaf] {
+                    assert_eq!(agent.manager.actor(agent.id).unwrap().snapshot().lifecycle,
+                        if close { ActorLifecycle::Closed } else { ActorLifecycle::Open });
+                }
+                if !close {
+                    drop(permit);
+                    let text: String = lua.load(r#"
+                        return assert(leaf:prompt(leaf_ctx, "after cancellation", { timeout = 5 })).text
+                    "#).eval_async().await.unwrap();
+                    assert_eq!(text, REPLY);
+                }
+                lua.load("assert(parent:close(ctx)); assert(sibling:close(ctx))")
+                    .exec_async().await.unwrap();
+                lua.globals().set("parent", mlua::Value::Nil).unwrap();
+                drop(parent);
+                lua.gc_collect().unwrap();
+                // A retained parent-local map must still reject late child registration.
+                lua.load(r#"
+                    late = assert(agent_api.spawn(child_ctx, { inherit_provider = true, silent = true }))
+                    assert(late:status(child_ctx).status == "closed")
+                "#).exec_async().await.unwrap();
+            }).await;
         });
     }
 

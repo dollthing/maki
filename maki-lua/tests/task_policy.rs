@@ -173,8 +173,67 @@ maki.agent.spawn = function(ctx, opts)
   function sess:close()
     recorder.closed = recorder.closed + 1
   end
+  if opts.name == "runtime" then
+    local serial = 0
+    local latest
+    local settled = {}
+    local function admit(done)
+      serial = serial + 1
+      local id = "runtime-" .. tostring(serial)
+      settled[id] = done
+      local function result()
+        if settled[id] then
+          return { turn_id = id, text = id, status = "completed" }
+        end
+      end
+      latest = {
+        id = function() return id end,
+        result = result,
+        wait = function()
+          local selected = result()
+          if recorder.advance_during_wait then
+            recorder.advance_during_wait = false
+            admit(true)
+          end
+          if selected then return selected end
+          return nil, "agent turn wait timed out"
+        end,
+      }
+      return latest
+    end
+    function sess:submit(call_ctx, msg, submit_opts)
+      assert(not submit_opts.existing_only)
+      return admit(false)
+    end
+    function sess:latest_turn()
+      return latest
+    end
+    recorder.advance = function(input)
+      if input.settle then settled[input.settle] = true end
+      if input.admit then admit(input.done == true) end
+      recorder.advance_during_wait = input.advance_during_wait
+      return latest:id()
+    end
+  end
   return sess
 end
+
+maki.api.register_tool({
+  name = "advance_runtime_turn",
+  description = "control runtime-created tickets",
+  schema = {
+    type = "object",
+    properties = {
+      admit = { type = "boolean" },
+      done = { type = "boolean" },
+      settle = { type = "string" },
+      advance_during_wait = { type = "boolean" },
+    },
+  },
+  handler = function(input)
+    return recorder.advance(input)
+  end,
+})
 
 maki.api.register_tool({
   name = "set_task_access",
@@ -566,6 +625,113 @@ fn task_ticket_cache_evicts_oldest_settled_turn() {
     assert_eq!(result["result"]["text"], PLAIN_TEXT);
     exec_tool_json(&reg, "task_despawn", json!({"task_id": task_id}));
     assert_eq!(probe(&reg)["closed"], json!(1));
+}
+
+#[test]
+fn implicit_runtime_ticket_is_retained_without_following_successors() {
+    let (reg, _host) = load_task_host();
+    let spawned = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input("runtime", None));
+    let task_id = &spawned["task_id"];
+    let selected = exec_tool(
+        &reg,
+        "advance_runtime_turn",
+        json!({"admit": true, "done": true, "advance_during_wait": true}),
+    )
+    .unwrap();
+    let implicit = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({"task_id": task_id}));
+    assert_eq!(implicit["result"]["turn_id"], selected);
+    let explicit = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({"task_id": task_id, "turn_id": selected}),
+    );
+    assert_eq!(explicit, implicit);
+    let successor = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({"task_id": task_id}));
+    assert_ne!(
+        successor["result"]["turn_id"],
+        implicit["result"]["turn_id"]
+    );
+}
+
+#[test]
+fn implicit_runtime_tickets_respect_bounds_and_preserve_unresolved_work() {
+    let (reg, _host) = load_task_host();
+    let spawned = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input("runtime", None));
+    let task_id = &spawned["task_id"];
+    let mut retained = vec![spawned["turn_id"].as_str().unwrap().to_owned()];
+    for _ in 1..RETAINED_TURN_LIMIT {
+        let id = exec_tool(&reg, "advance_runtime_turn", json!({"admit": true})).unwrap();
+        let pending = exec_tool_json(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "timeout": 0}),
+        );
+        assert_eq!(pending["status"], "running");
+        retained.push(id);
+    }
+    let overflow = exec_tool(&reg, "advance_runtime_turn", json!({"admit": true})).unwrap();
+    assert_eq!(
+        exec_tool(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "timeout": 0})
+        )
+        .unwrap_err(),
+        TURN_UNAVAILABLE_ERR
+    );
+    assert_eq!(
+        exec_tool(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": overflow, "timeout": 0})
+        )
+        .unwrap_err(),
+        TURN_UNAVAILABLE_ERR
+    );
+    for id in &retained {
+        let pending = exec_tool_json(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": id, "timeout": 0}),
+        );
+        assert_eq!(pending["status"], "running");
+    }
+    // Free a settled slot behind unresolved work, then retain the same snapshot.
+    exec_tool(&reg, "advance_runtime_turn", json!({"settle": retained[1]})).unwrap();
+    let pending = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({"task_id": task_id, "timeout": 0}),
+    );
+    assert_eq!(pending["status"], "running");
+    exec_tool(&reg, "advance_runtime_turn", json!({"settle": overflow})).unwrap();
+    let completed = exec_tool_json(
+        &reg,
+        TASK_WAIT_TOOL,
+        json!({"task_id": task_id, "turn_id": overflow}),
+    );
+    assert_eq!(completed["result"]["turn_id"], overflow);
+    assert_eq!(
+        exec_tool(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": retained[1]})
+        )
+        .unwrap_err(),
+        TURN_UNAVAILABLE_ERR
+    );
+    for id in retained
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| (index != 1).then_some(id))
+    {
+        let pending = exec_tool_json(
+            &reg,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task_id, "turn_id": id, "timeout": 0}),
+        );
+        assert_eq!(pending["status"], "running");
+    }
 }
 
 #[test]
