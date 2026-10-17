@@ -1923,6 +1923,7 @@ impl EventPump {
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentClosed
+            | AgentEvent::Post(_)
             | AgentEvent::Question { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

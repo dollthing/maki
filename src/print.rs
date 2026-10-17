@@ -497,6 +497,7 @@ pub fn run(
                     | AgentEvent::Question { .. }
                     | AgentEvent::SubagentHistory { .. }
                     | AgentEvent::SubagentClosed
+                    | AgentEvent::Post(_)
                     | AgentEvent::ToolSnapshot { .. }
                     | AgentEvent::ToolHeaderSnapshot { .. }
                     | AgentEvent::LiveToolBuf { .. }

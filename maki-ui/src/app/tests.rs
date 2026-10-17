@@ -15,15 +15,15 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::TASK_SPAWN_TOOL_NAME;
 use maki_agent::{
     AgentId, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_commands::ModelSelection;
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, ThinkingConfig, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
+use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -634,6 +634,70 @@ fn subagent_info_for_agent(
         input_tx,
         cancel: None,
     }
+}
+
+const POST_TEXT: &str = "review found issues";
+/// No run uses it, so a post must get past the stale-run filter.
+const UNRELATED_RUN_ID: u64 = 99;
+
+fn post_msg(subagent: Option<SubagentInfo>) -> (Msg, Post) {
+    let post = Post {
+        text: POST_TEXT.into(),
+        level: PostLevel::Error,
+        agent: None,
+    };
+    let msg = Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::Post(post.clone()),
+        subagent,
+        run_id: UNRELATED_RUN_ID,
+    }));
+    (msg, post)
+}
+
+fn assert_last_is_post(chat: &Chat) {
+    assert_eq!(chat.last_message_text(), POST_TEXT);
+    assert_eq!(
+        chat.last_message_role(),
+        Some(&DisplayRole::Post(PostLevel::Error))
+    );
+}
+
+#[test]
+fn main_chat_post_is_recorded_and_restored() {
+    let mut app = test_app();
+    let (msg, post) = post_msg(None);
+    app.update(msg);
+    assert_last_is_post(&app.chats[0]);
+    assert_eq!(
+        app.state.session.posts(),
+        [StoredPost {
+            chat: None,
+            after_message: 0,
+            post,
+        }]
+    );
+
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_last_is_post(&app.chats[0]);
+}
+
+#[test]
+fn subagent_post_lands_in_the_child_chat() {
+    let mut app = test_app();
+    let (msg, post) = post_msg(Some(subagent_info(TASK_ID, "reviewer")));
+    app.update(msg);
+    let chat_idx = app.chat_index[TASK_ID];
+    assert_ne!(chat_idx, 0);
+    assert_last_is_post(&app.chats[chat_idx]);
+    assert_eq!(
+        app.state.session.posts(),
+        [StoredPost {
+            chat: Some(TASK_ID.into()),
+            after_message: 0,
+            post,
+        }]
+    );
 }
 
 fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {

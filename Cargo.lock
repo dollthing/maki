@@ -2795,6 +2795,7 @@ dependencies = [
  "libc",
  "maki-commands",
  "maki-config",
+ "maki-domain",
  "maki-match",
  "maki-providers",
  "maki-storage",

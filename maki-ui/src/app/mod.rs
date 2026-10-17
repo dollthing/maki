@@ -65,8 +65,8 @@ pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
-    SharedMessages, SubagentInfo, TurnCompleteEvent, TurnId,
+    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, Post,
+    SharedBuf, SharedMessages, SubagentInfo, TurnCompleteEvent, TurnId,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -83,6 +83,7 @@ use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
+use maki_storage::sessions::StoredPost;
 
 use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
@@ -1973,6 +1974,11 @@ impl App {
             }
             return vec![];
         }
+        // Posts belong to no run, so the stale-run filter below must not see them.
+        if let AgentEvent::Post(post) = envelope.event {
+            self.push_post(envelope.subagent.as_ref(), post);
+            return vec![];
+        }
         self.adopt_actor_presentation(&envelope);
         if envelope.subagent.is_none() && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
@@ -2331,6 +2337,30 @@ impl App {
             }
         }
         !defer
+    }
+
+    fn push_post(&mut self, subagent: Option<&SubagentInfo>, post: Post) {
+        let (chat_idx, chat) = match subagent {
+            Some(subagent) => (
+                self.resolve_or_create_chat(subagent),
+                Some(subagent.parent_tool_use_id.clone()),
+            ),
+            None => (0, None),
+        };
+        self.chats[chat_idx].push_post(&post.text, post.level);
+        let session = &self.state.session;
+        let after_message = match &chat {
+            Some(id) => session
+                .subagent_messages()
+                .get(id)
+                .map_or(0, |messages| messages.len()),
+            None => session.messages().len(),
+        };
+        self.state.session_mut().push_post(StoredPost {
+            chat,
+            after_message,
+            post,
+        });
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {

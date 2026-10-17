@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
+use maki_domain::Post;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
 };
@@ -974,6 +975,7 @@ pub enum AgentEvent {
     },
     /// A live child was permanently closed and no longer accepts input.
     SubagentClosed,
+    Post(Post),
     ToolSnapshot {
         id: String,
         snapshot: BufferSnapshot,

@@ -19,7 +19,7 @@ use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
 use maki_agent::{
-    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BufferSnapshot, InstructionBlock, PostLevel, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -102,6 +102,22 @@ pub fn error_style() -> RoleStyle {
         prefix: "",
         text_style: theme::current().error,
         prefix_style: theme::current().tool_error,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
+pub fn post_style(level: PostLevel) -> RoleStyle {
+    let theme = theme::current();
+    let (text_style, prefix_style) = match level {
+        PostLevel::Info => (theme.tool, theme.tool_dim),
+        PostLevel::Warn => (theme.status_notice, theme.status_notice),
+        PostLevel::Error => (theme.error, theme.tool_error),
+    };
+    RoleStyle {
+        prefix: TOOL_INDICATOR,
+        text_style,
+        prefix_style,
         use_markdown: false,
         max_line_bytes: None,
     }
