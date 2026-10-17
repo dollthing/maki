@@ -1,6 +1,13 @@
-//! Queue for messages typed while the agent is busy.
+//! Focused actor pending-message presentation.
 
+use crate::theme;
+use maki_agent::actor::{
+    AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance,
+};
 use maki_agent::{AgentInput, TurnId};
+use maki_commands::COMPACT_COMMAND_NAME;
+use std::borrow::Cow;
 
 use super::{Action, App, Status};
 
@@ -11,7 +18,6 @@ pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
-const NO_SUBAGENT_IMAGE_ERR: &str = "images cannot be sent to a subagent";
 pub(crate) const NO_SUBAGENT_ERR: &str = "subagent is no longer accepting messages";
 
 pub(crate) enum SubmitOutcome {
@@ -23,11 +29,52 @@ pub(crate) enum SubmitOutcome {
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
+    target: Option<AgentActorHandle>,
+    target_id: Option<maki_agent::AgentId>,
+    child_selected: bool,
+    focused_submission: Option<PendingIdentity>,
     focus: Option<usize>,
     cancelled_through: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingIdentity {
+    Message(SubmissionId),
+    Compact(u64),
+}
+
+fn pending_identity(entry: &PendingQueueEntry) -> PendingIdentity {
+    match entry {
+        PendingQueueEntry::Message(entry) => PendingIdentity::Message(entry.id),
+        PendingQueueEntry::Compact { run_id, .. } => PendingIdentity::Compact(*run_id),
+    }
+}
+
+fn visible_pending(actor: &AgentActorHandle) -> Vec<PendingQueueEntry> {
+    actor
+        .pending_queue()
+        .into_iter()
+        .filter(|entry| match entry {
+            PendingQueueEntry::Message(entry) => !entry.already_displayed,
+            PendingQueueEntry::Compact { .. } => true,
+        })
+        .collect()
+}
+
 impl MessageQueue {
+    pub(crate) fn select(
+        &mut self,
+        id: Option<maki_agent::AgentId>,
+        child: bool,
+        actor: Option<AgentActorHandle>,
+    ) {
+        if self.target_id != id || self.child_selected != child {
+            self.unfocus();
+        }
+        self.target_id = id;
+        self.child_selected = child;
+        self.target = actor;
+    }
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
     }
@@ -69,14 +116,40 @@ impl MessageQueue {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.shared.as_ref().is_none_or(|s| s.is_empty())
+        self.len() == 0
     }
 
     pub(crate) fn len(&self) -> usize {
+        if self.target.is_some() || self.child_selected {
+            return self
+                .target
+                .as_ref()
+                .map_or(0, |actor| visible_pending(actor).len());
+        }
         self.shared.as_ref().map_or(0, |s| s.len())
     }
 
     pub(crate) fn remove(&mut self, index: usize) {
+        if self.target.is_some() || self.child_selected {
+            if let Some(actor) = &self.target {
+                let id = if self.focus() == Some(index) {
+                    self.focused_submission
+                } else {
+                    visible_pending(actor).get(index).map(pending_identity)
+                };
+                match id {
+                    Some(PendingIdentity::Message(id)) => {
+                        actor.remove_submission(id);
+                    }
+                    Some(PendingIdentity::Compact(run_id)) => {
+                        actor.remove_pending_compact(run_id);
+                    }
+                    None => {}
+                }
+            }
+            self.unfocus();
+            return;
+        }
         // Removal success (or absence) only affects whether focus clamps;
         // the panel must never point past the (possibly unchanged) list.
         if let Some(ref shared) = self.shared {
@@ -93,15 +166,29 @@ impl MessageQueue {
         self.focus = None;
     }
 
-    pub(crate) fn clear_user_work(&mut self) {
+    pub(crate) fn clear_root_user_work(&mut self) {
         if let Some(ref shared) = self.shared {
             shared.clear_user_work();
         }
-        self.focus = None;
+        if !self.child_selected {
+            self.unfocus();
+        }
+    }
+
+    pub(crate) fn root_text_messages(&self) -> Vec<String> {
+        self.shared
+            .as_ref()
+            .map_or(Vec::new(), QueueSender::text_messages)
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        self.focus
+        if let Some(actor) = &self.target {
+            let identity = self.focused_submission?;
+            return visible_pending(actor)
+                .iter()
+                .position(|entry| pending_identity(entry) == identity);
+        }
+        self.focus.filter(|&index| index < self.len())
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -110,27 +197,39 @@ impl MessageQueue {
 
     pub(crate) fn unfocus(&mut self) {
         self.focus = None;
+        self.focused_submission = None;
     }
 
     pub(crate) fn move_focus_up(&mut self) {
-        if let Some(sel) = self.focus
+        if let Some(sel) = self.focus()
             && sel > 0
         {
-            self.focus = Some(sel - 1);
+            self.set_focus_at(sel - 1);
         }
     }
 
     pub(crate) fn move_focus_down(&mut self) {
-        if let Some(sel) = self.focus {
+        if let Some(sel) = self.focus() {
             let len = self.len();
             if sel + 1 < len {
-                self.focus = Some(sel + 1);
+                self.set_focus_at(sel + 1);
             }
         }
     }
 
     pub(crate) fn remove_focused(&mut self) {
-        if let Some(sel) = self.focus {
+        if let Some(actor) = &self.target {
+            match self.focused_submission {
+                Some(PendingIdentity::Message(id)) => {
+                    actor.remove_submission(id);
+                }
+                Some(PendingIdentity::Compact(run_id)) => {
+                    actor.remove_pending_compact(run_id);
+                }
+                None => {}
+            }
+            self.unfocus();
+        } else if let Some(sel) = self.focus() {
             self.remove(sel);
         }
     }
@@ -142,14 +241,52 @@ impl MessageQueue {
     }
 
     pub(crate) fn panel_len(&self) -> usize {
+        if self.target.is_some() || self.child_selected {
+            return self.len();
+        }
         self.shared.as_ref().map_or(0, |s| s.panel_len())
     }
 
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
+        if self.target.is_some() || self.child_selected {
+            return self.target.as_ref().map_or(Vec::new(), |actor| {
+                visible_pending(actor)
+                    .into_iter()
+                    .map(|entry| match entry {
+                        PendingQueueEntry::Message(entry) => QueueEntry {
+                            text: Cow::Owned(entry.text),
+                            color: theme::current().foreground,
+                        },
+                        PendingQueueEntry::Compact { instructions, .. } => QueueEntry {
+                            text: instructions
+                                .map_or(Cow::Borrowed(COMPACT_COMMAND_NAME), |extra| {
+                                    Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}"))
+                                }),
+                            color: theme::current()
+                                .queue
+                                .fg
+                                .unwrap_or(theme::current().foreground),
+                        },
+                    })
+                    .collect()
+            });
+        }
         self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
+        if self.target.is_some() || self.child_selected {
+            return self.target.as_ref().map_or(Vec::new(), |actor| {
+                visible_pending(actor)
+                    .into_iter()
+                    .filter_map(|entry| match entry {
+                        PendingQueueEntry::Message(entry) => Some(entry.text),
+                        PendingQueueEntry::Compact { .. } => None,
+                    })
+                    .collect()
+            });
+        }
         self.shared.as_ref().map_or(vec![], |s| s.text_messages())
     }
 
@@ -165,6 +302,10 @@ impl MessageQueue {
     pub(crate) fn set_focus_at(&mut self, index: usize) {
         if index < self.len() {
             self.focus = Some(index);
+            self.focused_submission = self
+                .target
+                .as_ref()
+                .and_then(|actor| visible_pending(actor).get(index).map(pending_identity));
         }
     }
 }
@@ -177,12 +318,6 @@ impl App {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR.into());
         }
-        // Submitting text in a subagent tab routes to that subagent's driver
-        // input queue instead of the main agent. `@`-reference expansion is a
-        // main-agent concern, so subagent tabs pass text through verbatim.
-        if self.is_subagent_focused() {
-            return self.submit_to_subagent(msg);
-        }
         // Expand `@prefix:value` tokens once, here, via the registered Lua
         // expanders. A rejected expander flashes and aborts the run. The
         // expanded text is stored so `build_agent_input` reuses it without
@@ -193,6 +328,9 @@ impl App {
         };
         let mut msg = msg;
         msg.text = expanded;
+        if self.is_subagent_focused() || self.selected_agent_id().is_some() {
+            return self.submit_to_focused_actor(msg);
+        }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
                 SubmitOutcome::Queued
@@ -226,33 +364,66 @@ impl App {
         chat.subagent_id.is_some()
     }
 
-    /// Queue a message into the focused subagent's driver queue, showing it in
-    /// that subagent's chat. Images cannot ride the text-only driver queue.
-    fn submit_to_subagent(&mut self, msg: QueuedMessage) -> SubmitOutcome {
-        if !msg.images.is_empty() {
-            return SubmitOutcome::Rejected(NO_SUBAGENT_IMAGE_ERR.into());
-        }
-        let Some(_) = self.chats[self.active_chat].subagent_id else {
-            return SubmitOutcome::Started(self.start_from_queue(&msg));
-        };
-        let Some(agent_id) = self.chats[self.active_chat].agent_id else {
+    fn submit_to_focused_actor(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if self.active_subagent_closed() {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
-        };
-        let Some(input_tx) = self
-            .subagent_channels
-            .get(&agent_id)
-            .filter(|channels| !channels.closed)
-            .and_then(|channels| channels.input_tx.as_ref())
+        }
+        let Some(target) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
         else {
-            // Live-channel gone (subagent finished); never silently reroute to
-            // the main agent. Surface the rejection via the caller's flash.
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
-        self.chats[self.active_chat].show_user_message(msg.text.clone(), msg.images.clone());
-        if input_tx.try_send(msg.text).is_err() {
-            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
+        let actor = match target.validate_live().and_then(|()| target.actor()) {
+            Ok(actor) => actor,
+            Err(error) => return SubmitOutcome::Rejected(error.to_string()),
+        };
+        let mut input = self.build_agent_input(&msg);
+        if let Ok(Some(config)) = target.effective_config() {
+            input.mode = config.mode.clone();
+            input.thinking = config.settings.thinking;
+            input.fast = config.settings.fast;
+            input.workflow = config.settings.workflow;
         }
-        SubmitOutcome::Queued
+        input.preamble = self.shell.drain_results_for(Some(target.id()));
+        if self.is_main_chat() {
+            input.preamble.extend(self.shell.drain_results());
+        }
+        let root = self.is_main_chat();
+        let starting = root && !self.focused_streaming();
+        let run_id = if starting {
+            actor.reserve_presentation(self.run_id)
+        } else if root {
+            actor.presentation_id()
+        } else {
+            0
+        };
+        let correlation = if root {
+            crate::agent::shared_queue::correlation(run_id)
+        } else {
+            String::new()
+        };
+        match actor.submit(
+            input,
+            None,
+            correlation,
+            TurnAdmissionOptions {
+                provenance: TurnProvenance {
+                    origin: TurnOrigin::User,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => {
+                if starting {
+                    self.record_run_start(run_id);
+                }
+                SubmitOutcome::Queued
+            }
+            Err(error) => SubmitOutcome::Rejected(error.to_string()),
+        }
     }
 
     /// Deferred path: the agent is busy, so park the message and let
@@ -263,14 +434,15 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        shared.push(QueueItem::Message {
-            text: msg.text,
-            image_count: msg.images.len(),
-            input,
-            run_id: self.run_id,
-            displayed: false,
-        });
-        true
+        shared
+            .try_push(QueueItem::Message {
+                text: msg.text,
+                image_count: msg.images.len(),
+                input,
+                run_id: self.run_id,
+                displayed: false,
+            })
+            .is_ok()
     }
 
     /// Push restored queue items only here, never in `restore_display`: on

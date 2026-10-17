@@ -142,6 +142,7 @@ impl OrchestrationServices for AgentOrchestration {
             .map_err(|error| error.to_string())?
             .ok_or("agent configuration is unavailable")?;
         template.apply_effective_config(&config);
+        template.cwd = config.context.cwd().to_path_buf();
         template.managed_turn = None;
         template.tool_use_id = None;
         template.live_sink = None;

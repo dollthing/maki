@@ -8,10 +8,10 @@ use maki_providers::TokenUsage;
 use tracing::{debug, info, warn};
 
 use super::queue::{ActorQueue, InterruptQueue};
-use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
+use super::types::{ActorStatus, BackendResult, ControlWork, TurnContext, WorkKind};
 use super::{
-    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, TurnTicket,
-    cancelled_outcome, settle_and_finalize_turn,
+    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
+    settle_and_finalize_turn,
 };
 use crate::types::{TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -23,11 +23,6 @@ fn take_after_pop_hook(inner: &ActorInner) -> Option<(flume::Sender<()>, flume::
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take()
-}
-
-enum PoppedWork {
-    Work(ActorWork),
-    Root(RootWork, TurnTicket),
 }
 
 enum Step {
@@ -132,22 +127,17 @@ impl Runner {
                     state.idle_pending = true;
                     state.retire_superseded_precancels(work);
                 }
-                state.processing = work.as_ref().map(ProcessingWork::new);
-                let work = work.map(|work| {
-                    let ActorWork::Root(root) = work else {
-                        return PoppedWork::Work(work);
-                    };
-                    let ticket = TurnTicket::new_anonymous(Arc::clone(&self.inner.identity))
-                        .with_provenance(root.provenance.clone());
-                    let turn_id = ticket.turn_id();
-                    self.inner.admit_ticket(turn_id, ticket.clone());
-                    let mut inbox = super::inbox::InstructionInbox::new(ticket.clone());
-                    inbox.policy = root.policy.clone();
-                    state.instructions.insert(turn_id, inbox);
-                    if let Some(processing) = &mut state.processing {
-                        processing.turn_id = Some(turn_id);
+                state.processing = work.as_ref().map(|work| {
+                    let mut processing = ProcessingWork::new(work);
+                    if let Some(inbox) = processing
+                        .turn_id
+                        .and_then(|turn_id| state.instructions.get(&turn_id))
+                    {
+                        processing
+                            .correlations
+                            .extend(inbox.correlations.iter().cloned());
                     }
-                    PoppedWork::Root(root, ticket)
+                    processing
                 });
                 work.map(|work| (work, state.cancellation_generation))
             };
@@ -170,6 +160,39 @@ impl Runner {
             state.publish_idle(&self.inner);
             drop(state);
             self.backend.on_work_settled();
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let probe = super::ActorRuntimeProbe {
+                operations: state.operations.len(),
+                queued: self.queue.len(),
+                deliveries: state.deliveries.len(),
+                pending_publications: state.pending_publications,
+                pending_callbacks: *self
+                    .inner
+                    .callback_drain
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+                retained_results: state.retained_order.len(),
+                processing: state.processing.is_some()
+                    || state.active.is_some()
+                    || state.preparing.is_some(),
+            };
+            for observer in self
+                .inner
+                .runtime_probes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .drain(..)
+            {
+                let _ = observer.send(probe.clone());
+            }
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
         if self
@@ -203,35 +226,25 @@ impl Runner {
         }
     }
 
-    async fn process(&mut self, work: PoppedWork, cancellation_generation: u64) {
-        let work = match work {
-            PoppedWork::Root(root, ticket) => {
-                self.run_root(root, ticket, cancellation_generation).await;
-                return;
-            }
-            PoppedWork::Work(work) => work,
-        };
+    async fn process(&mut self, work: ActorWork, cancellation_generation: u64) {
         match work {
-            ActorWork::Turn(admission) => {
-                self.run_turn(admission, WorkKind::Turn, cancellation_generation)
-                    .await
+            ActorWork::Turn(admission) => self.run_turn(*admission, cancellation_generation).await,
+            ActorWork::Control(control) => self.run_control(control).await,
+            ActorWork::HistoryEdit(edit) => {
+                let actor = super::AgentActorHandle {
+                    inner: Arc::clone(&self.inner),
+                    wake: Arc::clone(&self.wake),
+                };
+                edit.execute(&actor, &mut self.history).await;
             }
-            ActorWork::Root(_) => unreachable!("standalone roots are materialized at pop"),
-            ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
             ActorWork::Compact {
                 run_id,
                 instructions,
                 generation,
                 policy,
             } => {
-                self.run_compact(
-                    run_id,
-                    instructions.as_deref(),
-                    generation,
-                    policy,
-                    cancellation_generation,
-                )
-                .await
+                self.run_compact(run_id, instructions.as_deref(), generation, policy)
+                    .await
             }
         }
     }
@@ -239,12 +252,7 @@ impl Runner {
     /// Runs one admitted turn. Strictly serial: the runner never starts the
     /// next turn until this one settles, so only one active cancellation
     /// wiring exists at a time.
-    async fn run_turn(
-        &mut self,
-        mut admission: TurnAdmission,
-        work: WorkKind,
-        popped_generation: u64,
-    ) {
+    async fn run_turn(&mut self, mut admission: TurnAdmission, popped_generation: u64) {
         let turn_id = admission.turn_id;
         let agent_id = self.inner.agent_id;
         let correlation = admission.correlation.clone();
@@ -407,8 +415,6 @@ impl Runner {
                     Arc::clone(&self.inner),
                     popped_generation,
                     admission.generation,
-                    admission.input.as_ref().and_then(crate::batch_key),
-                    admission.ticket.provenance().clone(),
                 )) as Arc<dyn InterruptSource>),
                 inbox: Some(super::inbox::ActorTurnInbox::source(
                     &self.inner,
@@ -419,7 +425,7 @@ impl Runner {
                 admission: admission.admission.clone(),
             },
             admission.input.take().expect("turn input taken once"),
-            work,
+            WorkKind::Turn,
         );
         let result = match (managed_guard, managed_turn) {
             (Some(guard), Some(current)) => {
@@ -431,9 +437,7 @@ impl Runner {
         };
         let history_ready = matches!(&result, BackendResult::EnteredRun(_));
         let (outcome, deliver) = match result {
-            // EnteredRun is the authoritative outcome `Agent::run` already
-            // emitted exactly once; retain it but never deliver again.
-            BackendResult::EnteredRun(outcome) => (outcome, false),
+            BackendResult::EnteredRun(outcome) => (outcome, true),
             // A setup failure never entered a run: synthesize one Failed
             // outcome and attempt its single delivery.
             BackendResult::SetupFailed { .. } => (
@@ -461,44 +465,9 @@ impl Runner {
         self.wake.wake();
     }
 
-    /// Runs a root input. The runner only ever sees a root when the actor is
-    /// idle: a root popped during an active turn is folded by the interrupt
-    /// source into the active run, so no orphan [`crate::TurnId`] exists here.
-    async fn run_root(&mut self, root: RootWork, ticket: TurnTicket, cancellation_generation: u64) {
-        let mcp_startup_notice = root
-            .admission
-            .as_ref()
-            .and_then(|admission| admission.mcp_startup_notice);
-        let turn_id = ticket.turn_id();
-        let admission = TurnAdmission {
-            turn_id,
-            input: Some(root.input),
-            event_sender: None,
-            correlation: root.correlation,
-            generation: root.generation,
-            policy: root.policy,
-            admission: root.admission,
-            ticket,
-        };
-        self.run_turn(
-            admission,
-            WorkKind::Root {
-                run_id: root.run_id,
-                displayed: root.displayed,
-                text: root.text,
-                images: root.images,
-                earlier: root.earlier,
-                mcp_startup_notice,
-                already_displayed: root.displayed,
-            },
-            cancellation_generation,
-        )
-        .await
-    }
-
     /// Runs a standalone control. Never carries a [`crate::TurnId`] and never
     /// produces a [`TurnOutcome`].
-    async fn run_control(&mut self, control: ControlWork, popped_generation: u64) {
+    async fn run_control(&mut self, control: ControlWork) {
         let correlation = control.correlation.clone();
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
@@ -507,8 +476,7 @@ impl Runner {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.cancellation_generation != popped_generation
-                || state.lifecycle != ActorLifecycle::Open
+            if state.lifecycle != ActorLifecycle::Open
                 || state
                     .processing
                     .as_ref()
@@ -564,14 +532,12 @@ impl Runner {
         instructions: Option<&str>,
         policy_generation: u64,
         policy: Option<Arc<super::EffectiveAgentConfig>>,
-        popped_generation: u64,
     ) {
         let correlation = super::run_correlation(run_id);
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.cancellation_generation != popped_generation
-                || state.lifecycle != ActorLifecycle::Open
+            if state.lifecycle != ActorLifecycle::Open
                 || state
                     .processing
                     .as_ref()

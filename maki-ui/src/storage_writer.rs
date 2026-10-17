@@ -18,7 +18,9 @@ use maki_storage::checkpoint::{
 };
 use maki_storage::id::MakiId;
 use maki_storage::session_lock::SessionPublicationGuard;
-use maki_storage::sessions::{HistoryIdentity, SESSIONS_DIR, SessionError, SessionLog};
+use maki_storage::sessions::{
+    HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError, SessionLog,
+};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -32,6 +34,7 @@ use maki_agent::{AgentMode, ThinkingConfig};
 use maki_storage::sessions::StoredMode;
 
 use crate::AppSession;
+use maki_providers::Message;
 
 pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
@@ -337,6 +340,11 @@ impl StorageWriter {
         let id = session.id;
         let incoming_history = session.history_identity();
         let mut state = lock(&self.pending);
+        let mut incoming = session.as_ref().clone();
+        if let Some(latest) = state.latest.get(&id) {
+            preserve_newer_child_histories(&mut incoming, latest);
+        }
+        let session = Arc::new(incoming);
         if state.closed {
             return;
         }
@@ -402,6 +410,86 @@ impl StorageWriter {
         );
         drop(state);
         wake_checkpoint(&self.pending, &self.wake, id);
+    }
+
+    pub fn checkpoint_child_history(
+        &self,
+        session_id: MakiId,
+        child_key: String,
+        history: HistorySnapshot<Message>,
+    ) -> CheckpointFuture {
+        let mut state = lock(&self.pending);
+        if state.closed {
+            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
+        }
+        let Some(base) = state
+            .coordinator_pending
+            .get(&session_id)
+            .map(|pending| Arc::clone(&pending.session))
+            .or_else(|| state.latest.get(&session_id).cloned())
+        else {
+            return Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from("session snapshot is unavailable"),
+                })
+            });
+        };
+        let mut candidate = base.as_ref().clone();
+        if !candidate.adopt_subagent_history(child_key, &history) {
+            return Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from(CHECKPOINT_REPLACED),
+                })
+            });
+        }
+        let candidate = Arc::new(candidate);
+        let generation = next_generation(&mut state);
+        let history_base = state
+            .coordinator_pending
+            .get(&session_id)
+            .and_then(|pending| pending.history_base);
+        state.coordinator_pending.insert(
+            session_id,
+            CoordinatorPending {
+                generation,
+                session: Arc::clone(&candidate),
+                history_base,
+            },
+        );
+        state.latest_generations.insert(session_id, generation);
+        let version = CheckpointVersion {
+            revision: generation,
+            epoch: candidate.history_snapshot().epoch,
+        };
+        let config_version = state.config_versions.get(&session_id).copied();
+        let (reply, response) = flume::bounded(1);
+        enqueue_locked(
+            &mut state.entries,
+            PendingSave {
+                session: candidate,
+                waiters: vec![CheckpointWaiter {
+                    version,
+                    config_version: None,
+                    reply,
+                }],
+                generation,
+                coordinator_generation: Some(generation),
+                config_version,
+                coordinator_history_base: history_base,
+                retry_attempt: 0,
+                retry_at: None,
+            },
+        );
+        drop(state);
+        wake_checkpoint(&self.pending, &self.wake, session_id);
+        Box::pin(async move {
+            response
+                .recv_async()
+                .await
+                .map_err(|_| CheckpointError::Closed(session_id))?
+        })
     }
 
     pub fn coordinator_checkpoint(&self) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
@@ -620,11 +708,13 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
         .latest
         .get(&id)
         .map(|latest| {
-            Arc::new(merge_tui_snapshot(
+            let mut merged = merge_tui_snapshot(
                 latest,
                 &save.session,
                 save.coordinator_history_base.is_some(),
-            ))
+            );
+            preserve_newer_child_histories(&mut merged, &save.session);
+            Arc::new(merged)
         })
         .unwrap_or_else(|| Arc::clone(&save.session));
     state.latest.insert(id, authoritative);
@@ -705,12 +795,27 @@ fn requeue_save(
     }
 }
 
+fn preserve_newer_child_histories(incoming: &mut AppSession, latest: &AppSession) {
+    for key in latest.subagent_messages().keys() {
+        let Some(history) = latest.subagent_history_snapshot(key) else {
+            continue;
+        };
+        if incoming
+            .subagent_history_snapshot(key)
+            .is_none_or(|incoming| incoming.epoch < history.epoch)
+        {
+            incoming.adopt_subagent_history(key.clone(), &history);
+        }
+    }
+}
+
 fn merge_tui_snapshot(
     incoming: &AppSession,
     latest: &AppSession,
     preserve_history: bool,
 ) -> AppSession {
     let mut session = incoming.clone();
+    preserve_newer_child_histories(&mut session, latest);
     if preserve_history && session.history_identity() != latest.history_identity() {
         session.adopt_history(&latest.history_snapshot());
     }
@@ -1982,6 +2087,164 @@ mod tests {
                 })
                 .await;
             assert!(ack.is_err(), "a deleted session must not be resurrected");
+        });
+    }
+
+    #[test]
+    fn child_history_checkpoint_preserves_root_sibling_and_rejects_stale_save() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(MODEL, CWD);
+            session.push_message(Message::user(BASE_MSG.into()));
+            session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+            session.set_subagent_messages("sibling".into(), vec![Message::user(BASE_MSG.into())]);
+            let id = session.id;
+            writer.send(Arc::new(session.clone()));
+            writer
+                .checkpoint_child_history(
+                    id,
+                    TOOL_ID.into(),
+                    HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
+                )
+                .await
+                .unwrap();
+            session.set_title(TITLE.into());
+            session
+                .set_subagent_messages("sibling".into(), vec![Message::user(RESUMED_MSG.into())]);
+            writer.send(Arc::new(session));
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(loaded.messages().len(), 1);
+            let child = serde_json::to_value(&loaded.subagent_messages()[TOOL_ID]).unwrap();
+            let expected = serde_json::to_value(vec![Message::user(REWOUND_MSG.into())]).unwrap();
+            assert_eq!(child, expected);
+            let sibling = serde_json::to_value(&loaded.subagent_messages()["sibling"]).unwrap();
+            assert_eq!(
+                sibling,
+                serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
+            );
+        });
+    }
+
+    #[test_case(false; "without_interleaved_save")]
+    #[test_case(true; "with_interleaved_save")]
+    fn failed_child_replacement_keeps_committed_history(interleaved: bool) {
+        let (_tmp, dir) = state_dir();
+        block_sessions_dir(&dir);
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        let id = session.id;
+        writer.seed(Arc::new(session.clone()));
+        let checkpoint = writer.checkpoint_child_history(
+            id,
+            TOOL_ID.into(),
+            HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
+        );
+        if interleaved {
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session.clone()));
+        }
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        for _ in 0..=CHECKPOINT_RETRY_BACKOFFS.len() {
+            if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
+                save.retry_at = None;
+            }
+            disk.flush(&writer.pending);
+        }
+        assert!(
+            matches!(smol::block_on(checkpoint), Err(CheckpointError::Save { session_id, .. }) if session_id == id)
+        );
+        assert!(lock(&writer.pending).coordinator_pending.is_empty());
+        let latest = writer.latest_snapshot(id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&latest.subagent_messages()[TOOL_ID]).unwrap(),
+            serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
+        );
+        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        let mut retry = latest.as_ref().clone();
+        retry.set_title(TITLE.into());
+        writer.send(Arc::new(retry));
+        disk.flush(&writer.pending);
+        let stored = AppSession::load(id, &dir).unwrap();
+        assert_eq!(stored.title, TITLE);
+        assert_eq!(
+            serde_json::to_value(&stored.subagent_messages()[TOOL_ID]).unwrap(),
+            serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
+        );
+    }
+
+    #[test]
+    fn successive_child_replacements_fence_stale_snapshots_and_reconstructed_events() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(MODEL, CWD);
+            session.push_message(Message::user(BASE_MSG.into()));
+            session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+            session.set_subagent_messages("sibling".into(), vec![Message::user(BASE_MSG.into())]);
+            let id = session.id;
+            let original = session.clone();
+            writer.send(Arc::new(session.clone()));
+            let earlier = HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]);
+            writer
+                .checkpoint_child_history(id, TOOL_ID.into(), earlier.clone())
+                .await
+                .unwrap();
+            assert!(session.adopt_subagent_history(TOOL_ID.into(), &earlier));
+            let replacement = HistorySnapshot::new(vec![Message::user(RESUMED_MSG.into())]);
+            writer
+                .checkpoint_child_history(id, TOOL_ID.into(), replacement.clone())
+                .await
+                .unwrap();
+            // A delayed save from B must not resurrect B after the B -> C replacement.
+            writer.send(Arc::new(session.clone()));
+            // Reallocation cannot turn an old producer epoch into a new one.
+            let reconstructed = HistorySnapshot {
+                messages: Arc::new(earlier.messages.as_ref().clone()),
+                ..earlier
+            };
+            session.adopt_subagent_history(TOOL_ID.into(), &reconstructed);
+            session.set_title(TITLE.into());
+            session
+                .set_subagent_messages("sibling".into(), vec![Message::user(REWOUND_MSG.into())]);
+            writer.send(Arc::new(session.clone()));
+            assert_eq!(
+                writer
+                    .latest_snapshot(id)
+                    .unwrap()
+                    .subagent_history_snapshot(TOOL_ID)
+                    .unwrap()
+                    .epoch,
+                replacement.epoch
+            );
+            assert!(session.adopt_subagent_history(TOOL_ID.into(), &replacement));
+            assert!(!session.adopt_subagent_history(TOOL_ID.into(), &reconstructed));
+            writer.send(Arc::new(original));
+            writer.send(Arc::new(session));
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(
+                serde_json::to_value(loaded.messages()).unwrap(),
+                serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&loaded.subagent_messages()[TOOL_ID]).unwrap(),
+                serde_json::to_value(&replacement.messages).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&loaded.subagent_messages()["sibling"]).unwrap(),
+                serde_json::to_value(vec![Message::user(REWOUND_MSG.into())]).unwrap()
+            );
         });
     }
 

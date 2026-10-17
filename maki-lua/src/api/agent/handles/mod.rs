@@ -703,6 +703,81 @@ mod tests {
         });
     }
 
+    #[test_case::test_case(false ; "focus_changes_after_dispatch")]
+    #[test_case::test_case(true ; "target_closes_after_dispatch")]
+    fn editor_request_retains_the_invocation_agent(close_target: bool) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let context = stub_ctx(&AgentMode::Build);
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let replacement_manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let mut fixtures = Vec::new();
+            let mut create = |manager: &AgentManagerHandle| {
+                manager
+                    .create_root_with_config(None, Vec::new(), None, |id| {
+                        let (_, state, session, _) =
+                            session_with_provider_for_agent(Arc::clone(&context.provider), id);
+                        fixtures.push(session);
+                        Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                    })
+                    .unwrap()
+            };
+            let original = create(&manager);
+            let replacement = create(&replacement_manager);
+            let pinned = TrustedTarget {
+                target: original.clone(),
+                template: context.clone(),
+            };
+            lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
+                pinned.clone(),
+            )))));
+            lock_cell(scope.handle()).pinned_target = Some(pinned);
+            let (tx, rx) = flume::unbounded();
+            lua.globals()
+                .set(
+                    "ui",
+                    crate::api::ui::create_ui_table(&lua, Some(tx), Arc::from(PLUGIN), None)
+                        .unwrap(),
+                )
+                .unwrap();
+            let request = scope.scope_future(
+                lua.load("return ui.open_editor('plan.md')")
+                    .eval_async::<i32>(),
+            );
+            let consume = async {
+                let crate::api::util::command::UiAction::OpenEditor {
+                    target,
+                    path,
+                    reply_tx,
+                } = rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected editor request");
+                };
+                lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
+                    TrustedTarget {
+                        target: replacement.clone(),
+                        template: context,
+                    },
+                )))));
+                if close_target {
+                    manager.close_subtree(original.id()).unwrap();
+                }
+                let target = target.unwrap();
+                assert_eq!(target.id(), original.id());
+                assert_ne!(target.id(), replacement.id());
+                assert_eq!(target.validate_live().is_err(), close_target);
+                assert_eq!(path, std::path::PathBuf::from("plan.md"));
+                reply_tx.send(if close_target { -1 } else { 0 }).unwrap();
+            };
+            let (code, ()) = futures_lite::future::zip(request, consume).await;
+            assert_eq!(code.unwrap(), if close_target { -1 } else { 0 });
+            manager.shutdown(RETIRE_TIMEOUT).await;
+            replacement_manager.shutdown(RETIRE_TIMEOUT).await;
+            drop(fixtures);
+        });
+    }
+
     const CHILD_NAME: &str = "reviewer";
     const POST_TEXT: &str = "review found issues";
 

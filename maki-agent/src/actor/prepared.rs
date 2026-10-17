@@ -26,6 +26,7 @@ pub struct PreparedCommit {
 pub(super) struct PreparedOperation {
     pub id: u64,
     pub turn: Option<PreparedTurn>,
+    turn_displayed: bool,
     change: Option<Option<ConfigChange>>,
     ready: Option<(Arc<EffectiveAgentConfig>, Option<TurnAdmissionSnapshot>)>,
     pub(super) failure: Arc<Mutex<Option<ActorError>>>,
@@ -64,6 +65,7 @@ impl AgentActorHandle {
             .push_back(ActorOperation::Prepared(Box::new(PreparedOperation {
                 id,
                 turn,
+                turn_displayed: false,
                 change: None,
                 ready: None,
                 failure: Arc::clone(&failure),
@@ -92,6 +94,24 @@ impl PreparedOperationTicket {
         Ok(())
     }
 
+    /// Sets whether the caller already displayed this turn, including after readiness.
+    /// Must be set before commit; config-only or cancelled operations reject it.
+    pub fn set_turn_displayed(&self, displayed: bool) -> Result<(), ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        let pending = state
+            .pending_prepared(self.id)
+            .filter(|pending| pending.turn.is_some())
+            .ok_or(ActorError::PolicyCancelled)?;
+        pending.turn_displayed = displayed;
+        Ok(())
+    }
+
     /// Resolves the configuration change the prepared operation commits.
     /// `None` keeps the actor's current configuration. Fails with
     /// [`ActorError::PolicyPending`] when the change or turn input was
@@ -101,6 +121,33 @@ impl PreparedOperationTicket {
         self.unresolved(&mut state)?.change = Some(change);
         drive_operations(&self.inner, &mut state);
         Ok(())
+    }
+
+    /// Waits for earlier operations to commit and returns their resulting config.
+    /// An active turn need not finish before this configuration boundary.
+    pub async fn wait_predecessor(&self) -> Result<Arc<EffectiveAgentConfig>, ActorError> {
+        loop {
+            let listener = self.inner.policy_changed.listen();
+            {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(error) = self.failure() {
+                    return Err(error);
+                }
+                if state.lifecycle != ActorLifecycle::Open {
+                    return Err(lifecycle_error(state.lifecycle));
+                }
+                if state
+                    .operations
+                    .front()
+                    .is_some_and(|entry| entry.id() == self.id)
+                {
+                    return state.policy.clone().ok_or_else(|| {
+                        ActorError::InvalidConfig("actor configuration is not initialized".into())
+                    });
+                }
+            }
+            listener.await;
+        }
     }
 
     pub async fn wait_ready(&self) -> Result<(), ActorError> {
@@ -163,16 +210,38 @@ impl PreparedOperationTicket {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
+        let pending = self.take_ready_locked(&mut state)?;
+        Ok(pending.commit_locked(&self.inner, &mut state))
+    }
+
+    pub(super) fn belongs_to(&self, actor: &AgentActorHandle) -> bool {
+        Arc::ptr_eq(&self.inner, &actor.inner)
+    }
+
+    pub(super) fn take_ready_locked(
+        &self,
+        state: &mut ActorState,
+    ) -> Result<PreparedOperation, ActorError> {
         if let Some(error) = self.failure() {
             return Err(error);
         }
         if !state.prepared_head_ready(self.id) {
             return Err(ActorError::PolicyPending);
         }
-        let Some(ActorOperation::Prepared(mut pending)) = state.operations.pop_front() else {
+        let Some(ActorOperation::Prepared(pending)) = state.operations.pop_front() else {
             unreachable!()
         };
-        let (config, snapshot) = pending.ready.take().unwrap();
+        Ok(*pending)
+    }
+}
+
+impl PreparedOperation {
+    pub(super) fn commit_locked(
+        mut self,
+        inner: &Arc<ActorInner>,
+        state: &mut ActorState,
+    ) -> PreparedCommit {
+        let (config, snapshot) = self.ready.take().unwrap();
         let (config, changed) = match state.policy.as_ref() {
             Some(current) if config::equivalent(current, &config) => (Arc::clone(current), false),
             // No current policy means the actor never initialized one; the
@@ -184,21 +253,21 @@ impl PreparedOperationTicket {
             state.policy = Some(Arc::clone(&config));
         }
         let commit = ConfigCommit {
-            identity: Arc::clone(&self.inner.identity),
+            identity: Arc::clone(&inner.identity),
             generation: state.policy_generation,
             config,
         };
         state.delivery_suspended = false;
-        self.inner.queue.notify();
-        let ticket = pending.turn.take().map(|turn| {
+        inner.queue.notify();
+        let ticket = self.turn.take().map(|turn| {
             let turn_id = TurnId::generate();
-            let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
-            self.inner.admit_ticket(turn_id, ticket.clone());
+            let ticket = TurnTicket::new(turn_id, Arc::clone(&inner.identity));
+            inner.admit_ticket(turn_id, ticket.clone());
             materialize(
-                &self.inner,
-                &mut state,
+                inner,
+                state,
                 ActorOperation::Turn {
-                    id: pending.id,
+                    id: self.id,
                     input: turn.input,
                     event_sender: turn.event_sender,
                     correlation: turn.correlation,
@@ -207,6 +276,13 @@ impl PreparedOperationTicket {
                 },
                 snapshot,
             );
+            if let Some(initial) = state
+                .instructions
+                .get_mut(&turn_id)
+                .and_then(|inbox| inbox.initial.as_mut())
+            {
+                initial.already_displayed = self.turn_displayed;
+            }
             ticket
         });
         let result = PreparedCommit {
@@ -219,10 +295,10 @@ impl PreparedOperationTicket {
                 .retain(|observer| observer.send(commit.clone()).is_ok());
             state.emit(super::ActorEvent::Config(commit.clone()));
         }
-        drive_operations(&self.inner, &mut state);
-        state.publish_idle(&self.inner);
-        self.inner.policy_changed.notify(usize::MAX);
-        Ok(result)
+        drive_operations(inner, state);
+        state.publish_idle(inner);
+        inner.policy_changed.notify(usize::MAX);
+        result
     }
 }
 
@@ -305,6 +381,10 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
                 || Ok(Arc::clone(current)),
                 |change| change.apply(current).map(Arc::new),
             )
+        })
+        .and_then(|config| {
+            inner.validate_mode_config(&config)?;
+            Ok(config)
         });
     let config = match config {
         Ok(config) => config,

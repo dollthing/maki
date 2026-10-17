@@ -733,6 +733,10 @@ impl Fixture {
             bounded(self.root_ticket.wait(), "root turn settlement").await,
             TurnOutcome::Completed { .. }
         ));
+        let drained = bounded(self.manager.drain_graph_for_test(), "graph quiescence")
+            .await
+            .unwrap();
+        assert!(drained.iter().all(|(_, probe)| probe.is_quiescent()));
         assert!(
             self.requests.is_empty(),
             "unexpected extra provider request"
@@ -4501,7 +4505,39 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             .collect();
         assert_eq!(starts, vec![parent_turn_id]);
         assert_ne!(parent_turn_id, fixture.root_ticket.turn_id());
+        let continuation = root.turn_ticket(parent_turn_id).unwrap();
+        let continuation_result =
+            bounded(continuation.wait_result(), "root continuation result").await;
+        let original_result = fixture.root_ticket.wait_result().await;
+        assert_eq!(continuation_result.outcome.turn_id(), parent_turn_id);
+        assert_eq!(
+            original_result.outcome.turn_id(),
+            fixture.root_ticket.turn_id()
+        );
+        assert!(matches!(
+            continuation_result.outcome,
+            TurnOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            original_result.outcome,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            fixture.root_ticket.wait_result().await.outcome,
+            original_result.outcome
+        );
+        let continuation_ends: Vec<_> = lifecycle
+            .iter()
+            .filter_map(|event| match event {
+                ActorEvent::End(result) if result.outcome.turn_id() == parent_turn_id => {
+                    Some(result.outcome.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(continuation_ends, [continuation_result.outcome]);
         assert!(fixture.observations.is_empty());
+        assert!(fixture.requests.is_empty());
         fixture.finish().await;
     });
 }

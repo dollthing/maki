@@ -106,6 +106,9 @@ impl StatusBar {
     }
 
     pub fn set_cwd(&mut self, cwd: PathBuf) {
+        if self.cwd == cwd {
+            return;
+        }
         self.cwd_branch = cwd_branch_label(&cwd);
         self.branch_update_rx = spawn_branch_watcher(&cwd);
         self.cwd = cwd;

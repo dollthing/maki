@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
-    ADMISSION_PREPARATION_FAILED, ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork,
-    EffectiveAgentConfig, QueueProjection,
+    ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
+    QueueProjection,
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
-
-const ROOT_RUN_ID: u64 = 17;
 
 #[test]
 fn admitted_prompt_dependencies_remain_pinned() {
@@ -63,7 +61,10 @@ fn admitted_prompt_dependencies_remain_pinned() {
         assert!(
             matches!(prompt.resolved.as_ref().unwrap().recv().unwrap(), Err(error) if error == "pinned dependency failure")
         );
-        actor.inner.queue.push(crate::actor::ActorWork::Turn(work));
+        actor
+            .inner
+            .queue
+            .push(crate::actor::ActorWork::Turn(Box::new(work)));
         gate.open();
         active.wait().await;
         queued.wait().await;
@@ -97,6 +98,142 @@ fn mode_change_without_definition_preserves_config(mode: AgentMode) {
         let after = actor.config_snapshot().unwrap();
         assert_eq!(after.generation, before.generation);
         assert!(Arc::ptr_eq(&after.config, &before.config));
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, false; "root_mode")]
+#[test_case::test_case(false, true; "root_patch_and_mode")]
+#[test_case::test_case(true, false; "child_mode")]
+#[test_case::test_case(true, true; "child_patch_and_mode")]
+fn mode_ceiling_is_captured_at_creation(child: bool, combined: bool) {
+    smol::block_on(async {
+        let mut narrow = crate::ModeDef::default_for(crate::modes::ModeId::Plan);
+        narrow.tools = Some(vec!["read".into()]);
+        let initial = EffectiveAgentConfig::new(policy(false), AgentMode::Plan("plan.md".into()))
+            .with_mode_def(Some(narrow.clone()))
+            .with_mode_authority(crate::actor::ModeCeiling::default());
+        let mut managed = crate::actor::ManagedTurnAdmission::new(
+            std::sync::Weak::new(),
+            crate::AgentId::generate(),
+        );
+        managed.is_child = child;
+        let (actor, task) = crate::AgentActorHandle::spawn_managed(
+            managed.agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            Some(initial),
+            None,
+        );
+        for (mode, mode_def) in [
+            (AgentMode::Plan("plan.md".into()), narrow),
+            (
+                AgentMode::Build,
+                crate::ModeDef::default_for(crate::modes::ModeId::Build),
+            ),
+        ] {
+            actor.validate_mode_change(&mode, &mode_def).unwrap();
+            let change = actor.reserve_config_update().unwrap();
+            let change_value = if combined {
+                ConfigChange::PatchAndMode {
+                    patch: ConfigPatch {
+                        workflow: Some(true),
+                        ..Default::default()
+                    },
+                    mode: mode.clone(),
+                    mode_def,
+                }
+            } else {
+                ConfigChange::Mode {
+                    mode: mode.clone(),
+                    mode_def: Some(mode_def),
+                }
+            };
+            change.resolve(Ok(change_value)).unwrap();
+            assert_eq!(change.wait().await.unwrap().config.mode, mode);
+        }
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, false, false; "write_mode")]
+#[test_case::test_case(false, true, false; "write_patch_and_mode")]
+#[test_case::test_case(true, false, false; "tools_mode")]
+#[test_case::test_case(true, true, false; "tools_patch_and_mode")]
+#[test_case::test_case(true, false, true; "inherit_tools_mode")]
+#[test_case::test_case(true, true, true; "inherit_tools_patch_and_mode")]
+fn child_mode_ceiling_rejects_widening(tools: bool, combined: bool, inherit: bool) {
+    smol::block_on(async {
+        let initial_mode = AgentMode::Plan("plan.md".into());
+        let mut initial_def = crate::ModeDef::default_for(crate::modes::ModeId::Plan);
+        initial_def.tools = Some(vec!["read".into()]);
+        let initial = EffectiveAgentConfig::new(policy(false), initial_mode.clone())
+            .with_mode_def(Some(initial_def.clone()))
+            .with_mode_authority(crate::actor::ModeCeiling::from_mode(
+                &initial_mode,
+                Some(&initial_def),
+            ));
+        let mut managed = crate::actor::ManagedTurnAdmission::new(
+            std::sync::Weak::new(),
+            crate::AgentId::generate(),
+        );
+        managed.is_child = true;
+        let (actor, task) = crate::AgentActorHandle::spawn_managed(
+            managed.agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            Some(initial),
+            None,
+        );
+        let mut mode_def = initial_def;
+        let mode = if tools {
+            mode_def.tools = if inherit {
+                None
+            } else {
+                Some(vec!["read".into(), "write".into()])
+            };
+            initial_mode
+        } else {
+            AgentMode::Build
+        };
+        const WRITE_CEILING: &str = "mode exceeds the child's initial write restriction";
+        const TOOL_CEILING: &str = "mode exceeds the child's initial tool permissions";
+        let expected =
+            ActorError::InvalidConfig(if tools { TOOL_CEILING } else { WRITE_CEILING }.into());
+        assert_eq!(
+            actor.validate_mode_change(&mode, &mode_def),
+            Err(expected.clone())
+        );
+        let before = actor.config_snapshot().unwrap();
+        let commits = actor.subscribe_config_commits();
+        let change = actor.reserve_config_update().unwrap();
+        let change_value = if combined {
+            ConfigChange::PatchAndMode {
+                patch: ConfigPatch {
+                    workflow: Some(true),
+                    ..Default::default()
+                },
+                mode,
+                mode_def,
+            }
+        } else {
+            ConfigChange::Mode {
+                mode,
+                mode_def: Some(mode_def),
+            }
+        };
+        change.resolve(Ok(change_value)).unwrap();
+        assert!(matches!(change.wait().await, Err(error) if error == expected));
+        let after = actor.config_snapshot().unwrap();
+        assert_eq!(after.generation, before.generation);
+        assert!(Arc::ptr_eq(&after.config, &before.config));
+        assert!(commits.is_empty());
         actor.close();
         task.await;
     });
@@ -194,8 +331,10 @@ fn cancel_during_preparation_terminalizes_once() {
     });
 }
 
-#[test]
-fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
+#[test_case::test_case(None; "child_defaults_undisplayed")]
+#[test_case::test_case(Some(true); "root_already_displayed")]
+#[test_case::test_case(Some(false); "explicitly_undisplayed")]
+fn prepared_turn_commit_pins_config_and_allocates_one_ticket(displayed: Option<bool>) {
     const WORK: &str = "prepared turn";
     smol::block_on(async {
         let gate = super::Gate::new();
@@ -215,6 +354,10 @@ fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
             .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         reservation.wait_ready().await.unwrap();
+        if let Some(displayed) = displayed {
+            reservation.set_turn_displayed(!displayed).unwrap();
+            reservation.set_turn_displayed(displayed).unwrap();
+        }
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         let (popped, release) = actor.pause_after_next_pop();
         let committed = reservation.commit().unwrap();
@@ -222,6 +365,15 @@ fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
         let ticket = committed.ticket.unwrap();
         assert_eq!(actor.inner.tickets.lock().unwrap().len(), 1);
         popped.recv_async().await.unwrap();
+        {
+            let state = actor.inner.state.lock().unwrap();
+            let initial = state.instructions[&ticket.turn_id()]
+                .initial
+                .as_ref()
+                .unwrap();
+            assert_eq!(initial.already_displayed, displayed.unwrap_or(false));
+            assert_eq!(initial.text, WORK);
+        }
         assert_eq!(
             actor.config_snapshot().unwrap().generation,
             committed.config.generation
@@ -333,9 +485,21 @@ fn prepared_turn_input_replacement_keeps_intent(action: &str) {
             reservation.replace_turn_input(input(PLACEHOLDER)),
             Err(ActorError::PolicyCancelled)
         );
+        assert_eq!(
+            reservation.set_turn_displayed(true),
+            Err(ActorError::PolicyCancelled)
+        );
+        assert!(matches!(
+            reservation.wait_predecessor().await,
+            Err(ActorError::PolicyCancelled)
+        ));
         let snapshot = actor.reserve_prepared_operation(None).unwrap();
         assert_eq!(
             snapshot.replace_turn_input(input(APPROVED)),
+            Err(ActorError::PolicyCancelled)
+        );
+        assert_eq!(
+            snapshot.set_turn_displayed(true),
             Err(ActorError::PolicyCancelled)
         );
         drop(snapshot);
@@ -402,11 +566,23 @@ fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
             .unwrap();
         let first = actor.reserve_config_update().unwrap();
         let prepared = actor.reserve_prepared_operation(None).unwrap();
+        let predecessor = {
+            let waiting = prepared.wait_predecessor();
+            futures_lite::pin!(waiting);
+            assert!(
+                futures_lite::future::poll_once(waiting.as_mut())
+                    .await
+                    .is_none()
+            );
+            first.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+            let predecessor = first.wait().await.unwrap();
+            let config = waiting.await.unwrap();
+            assert!(Arc::ptr_eq(&config, &predecessor.config));
+            predecessor
+        };
         prepared
             .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
-        first.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-        let predecessor = first.wait().await.unwrap();
         prepared.wait_ready().await.unwrap();
         assert_eq!(
             actor.config_snapshot().unwrap().generation,
@@ -914,14 +1090,12 @@ fn control_waits_for_earlier_preparation(root: bool) {
         let (actor, task) = spawn(backend);
         if root {
             actor
-                .rush(crate::RootWork::new(
+                .submit(
                     input(WORK),
-                    1,
-                    false,
+                    None,
                     WORK.into(),
-                    Vec::new(),
-                    WORK.into(),
-                ))
+                    crate::actor::TurnAdmissionOptions::default(),
+                )
                 .unwrap();
         } else {
             actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
@@ -1047,14 +1221,12 @@ fn acceptance_does_not_run_blocking_preparation_inline(root: bool) {
             .unwrap();
         let ticket = if root {
             actor
-                .rush(crate::RootWork::new(
+                .submit(
                     input("work"),
-                    1,
-                    false,
+                    None,
                     "work".into(),
-                    Vec::new(),
-                    "work".into(),
-                ))
+                    crate::actor::TurnAdmissionOptions::default(),
+                )
                 .unwrap();
             None
         } else {
@@ -1082,91 +1254,82 @@ fn acceptance_does_not_run_blocking_preparation_inline(root: bool) {
 }
 
 #[test]
-fn root_preparation_failure_is_visible_once_and_successors_progress() {
+fn submitted_preparation_failure_is_visible_once_and_successors_progress() {
     smol::block_on(async {
-        let (sender, events) = flume::unbounded();
+        const FAILED: &str = "panic";
+        const NEXT: &str = "next";
         let mut backend = ScriptedBackend::new();
-        backend.root_preparation_error = Some(Arc::new(move |run_id, message| {
-            EventSender::new(sender.clone(), run_id)
-                .send(crate::AgentEvent::ControlError { message })
-                .unwrap();
-        }));
         backend.preparation = Some(Arc::new(|input, _, _| {
-            assert_ne!(input.message, "panic");
+            assert_ne!(input.message, FAILED);
             empty_snapshot()
         }));
         let (actor, task) = spawn(backend);
-        actor
-            .rush(crate::RootWork::new(
-                input("panic"),
-                ROOT_RUN_ID,
-                false,
-                "panic".into(),
-                Vec::new(),
-                "root".into(),
-            ))
+        let events = actor.subscribe_events();
+        let failed = actor
+            .submit(
+                input(FAILED),
+                None,
+                FAILED.into(),
+                crate::actor::TurnAdmissionOptions::default(),
+            )
             .unwrap();
-        let next = actor
-            .admit_turn(input("next"), None, "next".into())
-            .unwrap();
-        let error = events.recv_async().await.unwrap();
-        assert_eq!(error.run_id, ROOT_RUN_ID);
-        assert!(
-            matches!(error.event, crate::AgentEvent::ControlError { message } if message == ADMISSION_PREPARATION_FAILED)
-        );
+        let next = actor.admit_turn(input(NEXT), None, NEXT.into()).unwrap();
+        assert!(matches!(failed.wait().await, TurnOutcome::Failed { .. }));
         assert!(matches!(next.wait().await, TurnOutcome::Completed { .. }));
-        assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 1);
+        let mut failed_ends = 0;
+        while let Ok(event) = events.try_recv() {
+            if let ActorEvent::End(result) = event
+                && result.outcome.turn_id() == failed.turn_id()
+            {
+                failed_ends += 1;
+            }
+        }
+        assert_eq!(failed_ends, 1);
+        assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 2);
         actor.close();
         task.await;
-        assert!(events.is_empty());
     });
 }
 
 #[test]
-fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
+fn final_submitted_preparation_panic_publishes_end_before_idle_once() {
     smol::block_on(async {
-        let (sender, errors) = flume::unbounded();
+        const FAILED: &str = "panic";
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
-        backend.root_preparation_error = Some(Arc::new(move |run_id, message| {
+        backend.preparation = Some(Arc::new(move |_, _, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            EventSender::new(sender.clone(), run_id)
-                .send(crate::AgentEvent::ControlError { message })
-                .unwrap();
+            panic!("preparation panic");
         }));
-        backend.preparation = Some(Arc::new(|_, _, _| panic!("preparation panic")));
         let (actor, task) = spawn(backend);
         let events = actor.subscribe_events();
-        actor
-            .rush(crate::RootWork::new(
-                input("panic"),
-                ROOT_RUN_ID,
-                false,
-                "panic".into(),
-                Vec::new(),
-                "root".into(),
-            ))
+        let failed = actor
+            .submit(
+                input(FAILED),
+                None,
+                FAILED.into(),
+                crate::actor::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         entered_rx.recv_async().await.unwrap();
-        assert!(errors.is_empty());
         assert!(events.is_empty());
-        assert_eq!(actor.clear(), 0);
-        assert!(events.is_empty());
+        assert!(failed.peek_result().is_none());
         release_tx.send(()).unwrap();
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
+            ActorEvent::End(result)
+                if result.outcome.turn_id() == failed.turn_id() && matches!(result.outcome, TurnOutcome::Failed { .. })
+        ));
         assert!(matches!(
             events.recv_async().await.unwrap(),
             ActorEvent::Idle { agent_id } if agent_id == actor.agent_id()
         ));
-        let error = errors.try_recv().unwrap();
-        assert_eq!(error.run_id, ROOT_RUN_ID);
-        assert!(
-            matches!(error.event, crate::AgentEvent::ControlError { message } if message == ADMISSION_PREPARATION_FAILED)
-        );
+        assert!(matches!(failed.wait().await, TurnOutcome::Failed { .. }));
         assert!(observed.runs.lock().unwrap().is_empty());
-        assert!(actor.inner.outcomes.lock().unwrap().is_empty());
+        assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 1);
         assert!(actor.snapshot().queue.is_empty());
         actor.cancel_all();
         assert_eq!(actor.clear(), 0);
@@ -1178,7 +1341,6 @@ fn final_root_preparation_panic_publishes_idle_after_recovery_once() {
             ActorEvent::Close { .. }
         ));
         assert!(events.is_empty());
-        assert!(errors.is_empty());
     });
 }
 

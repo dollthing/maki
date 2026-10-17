@@ -1,13 +1,17 @@
 use std::sync::Arc;
 
-use maki_agent::{AgentId, AgentManagerHandle, CancelMap, CancelTrigger, TurnCancellationReason};
+#[cfg(test)]
+use maki_agent::TurnCancellationReason;
+use maki_agent::{AgentId, AgentManagerHandle, CancelMap, CancelTrigger};
 
-use super::{AgentCommand, shared_queue::correlation};
+use super::AgentCommand;
+#[cfg(test)]
+use super::shared_queue::correlation;
 
 /// Routes commands from the UI to the actor's cancellation APIs.
 ///
-/// `AgentCommand::Cancel` permanently closes managed descendants and
-/// cancels only the matching root run, leaving the root actor reusable.
+/// `AgentCommand::Cancel` cancels only the captured root work. Descendants
+/// remain live; explicit subtree shutdown uses `CancelAll`.
 /// `CancelAll` cancels the manager's entire root subtree, compatibility
 /// subagents outside that graph, and startup so an early command aborts MCP
 /// readiness.
@@ -25,15 +29,17 @@ pub(super) fn spawn_command_router(
     smol::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
             match cmd {
+                #[cfg(test)]
                 AgentCommand::Cancel { turn_id, run_id } => {
-                    if let Some(turn_id) = turn_id {
-                        let _ = manager.cancel_turn(root_id, turn_id, TurnCancellationReason::User);
-                    } else {
-                        let _ = manager.cancel_correlation(
-                            root_id,
-                            &correlation(run_id),
-                            TurnCancellationReason::User,
-                        );
+                    if let Ok(actor) = manager.actor(root_id) {
+                        if let Some(turn_id) = turn_id {
+                            let _ = actor.cancel_turn(turn_id);
+                        } else {
+                            actor.cancel_correlation(
+                                &correlation(run_id),
+                                TurnCancellationReason::User,
+                            );
+                        }
                     }
                 }
                 AgentCommand::CancelAll => {
@@ -59,9 +65,9 @@ mod tests {
     use std::time::Duration;
 
     use maki_agent::{
-        ActorBackend, ActorError, ActorLifecycle, AgentEvent, AgentInput, AgentLimits,
-        AgentMetadata, AgentMode, BackendResult, ControlWork, DoneReason, EventSender,
-        GraphLifecycle, History, ManagerError, TurnContext, TurnOutcome, WorkKind,
+        ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentMetadata,
+        AgentMode, BackendResult, ControlWork, DoneReason, EventSender, History, TurnContext,
+        TurnOutcome, WorkKind,
     };
     use maki_providers::{
         AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -239,7 +245,7 @@ mod tests {
 
     #[test_case::test_case(true; "nominal_turn")]
     #[test_case::test_case(false; "pre_admit_correlation_fallback")]
-    fn cancel_closes_managed_descendants_and_preserves_root_reuse(nominal: bool) {
+    fn cancel_preserves_managed_descendants_and_root_reuse(nominal: bool) {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let (current_tx, current_rx) = flume::bounded(2);
@@ -302,34 +308,15 @@ mod tests {
                 .unwrap();
 
             assert!(matches!(
-                child_ticket.wait().await,
-                TurnOutcome::Cancelled {
-                    reason: TurnCancellationReason::Closed,
-                    ..
-                }
-            ));
-            while !manager.runner_finished(child.id()).unwrap() {
-                smol::future::yield_now().await;
-            }
-            assert_eq!(
-                child.snapshot().unwrap().graph_lifecycle,
-                GraphLifecycle::Closed
-            );
-            assert!(matches!(
-                manager.actor(child.id()),
-                Err(ManagerError::UnknownAgent(id)) if id == child.id()
-            ));
-            assert!(matches!(
-                child_actor.admit_turn(input(), None, "retained-task".into()),
-                Err(ActorError::Closed)
-            ));
-            assert!(matches!(
                 root_ticket.wait().await,
                 TurnOutcome::Cancelled {
                     reason: TurnCancellationReason::User,
                     ..
                 }
             ));
+            assert!(child_ticket.peek_result().is_none());
+            assert_eq!(child_actor.snapshot().lifecycle, ActorLifecycle::Open);
+            assert!(manager.actor(child.id()).is_ok());
             assert_eq!(root_actor.snapshot().lifecycle, ActorLifecycle::Open);
 
             let later = root_actor

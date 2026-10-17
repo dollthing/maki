@@ -311,7 +311,237 @@ fn rejects_active_managed_child_without_cancelling_it() {
             event_loop.sessions[index].app.status == Status::Idle
                 && child.snapshot().status == ActorStatus::Idle
         });
-        assert!(child.snapshot().latest.is_some());
+        assert!(matches!(
+            child.snapshot().latest,
+            Some(maki_agent::TurnOutcome::Completed { turn_id, .. })
+                if Some(turn_id) == child_before.active_turn
+        ));
+        shutdown_manager(&manager);
+    });
+}
+
+#[test_case(false; "keep_context")]
+#[test_case(true; "clear_context")]
+fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let config = actor.effective_config().unwrap();
+        let history = event_loop.sessions[index].coordinator.read().history();
+        let run_id = event_loop.sessions[index].app.run_id;
+        let app = &mut event_loop.sessions[index].app;
+        let mut child = crate::chat::Chat::new(
+            CHILD_PROMPT.into(),
+            app.ui_config.clone(),
+            app.lua_event_handle.clone(),
+            Arc::clone(&app.theme_provider),
+        );
+        child.agent_id = Some(maki_agent::AgentId::generate());
+        child.subagent_id = Some(CHILD_PROMPT.into());
+        app.chats.push(child);
+        app.active_chat = 1;
+        event_loop.prepare_plan_approval(index, clear_context, None, false, path.clone());
+        assert!(event_loop.sessions[index].pending_approval.is_none());
+        assert_eq!(event_loop.sessions[index].app.run_id, run_id);
+        assert_eq!(
+            event_loop.sessions[index].app.state.plan.path(),
+            Some(path.as_path())
+        );
+        assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
+        assert!(Arc::ptr_eq(
+            &history,
+            &event_loop.sessions[index].coordinator.read().history()
+        ));
+        assert!(requests.is_empty());
+        shutdown_manager(&manager);
+    });
+}
+
+#[test_case(false, false; "keep_context")]
+#[test_case(true, false; "clear_context")]
+#[test_case(true, true; "checkpoint_failure")]
+fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) {
+    const CHECKPOINT_FAILURE: &str = "child approval checkpoint failed";
+    const CHECKPOINT_FLASH: &str = "history checkpoint failed: child approval checkpoint failed";
+    with_event_loop(|event_loop| {
+        let (index, path, requests, host) =
+            setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
+        host.load_source(CHILD_PLUGIN, &child_tool()).unwrap();
+        event_loop.sessions[index]
+            .app
+            .permissions
+            .set_session_yolo(Some(true));
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        let root_actor = manager.actor(root).unwrap();
+        let mode = AgentMode::Build;
+        let ticket = root_actor.reserve_config_update().unwrap();
+        ticket
+            .resolve(Ok(ConfigChange::Mode {
+                mode: mode.clone(),
+                mode_def: Some(host.event_handle().mode_registry().current(&mode)),
+            }))
+            .unwrap();
+        smol::block_on(ticket.wait()).unwrap();
+        let (entered, entry) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        apply_patch(
+            &root_actor,
+            model_patch(
+                SOURCE_MODEL,
+                Arc::new(ChildProvider {
+                    entered,
+                    release: gate,
+                    root_requests: AtomicUsize::new(0),
+                }),
+            ),
+        );
+        event_loop.submit_text(index, HISTORY.into()).unwrap();
+        let entry_deadline = Instant::now() + WAIT;
+        pump_until(event_loop, |event_loop| {
+            if let Some(maki_agent::TurnOutcome::Failed { failure, .. }) =
+                root_actor.snapshot().latest
+            {
+                panic!(
+                    "root failed before pinned child start: {}",
+                    failure.diagnostic
+                );
+            }
+            let history = event_loop.sessions[index].coordinator.read().history();
+            for message in history.iter() {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    } = block
+                    {
+                        panic!("pinned child tool failed before provider start: {content:?}");
+                    }
+                }
+            }
+            assert!(
+                !entry.is_empty() || Instant::now() < entry_deadline,
+                "pinned child provider not entered: root={:?}, app={:?}, graph={:?}, history={history:?}",
+                root_actor.snapshot(),
+                event_loop.sessions[index].app.status,
+                manager.snapshot()
+            );
+            !entry.is_empty()
+        });
+        entry.recv_timeout(WAIT).unwrap();
+        let child_id = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root))
+            .unwrap()
+            .agent_id;
+        let child = manager.actor(child_id).unwrap();
+        release.send(()).unwrap();
+        let settled_deadline = Instant::now() + WAIT;
+        pump_until(event_loop, |event_loop| {
+            let settled = child.snapshot().status == ActorStatus::Idle
+                && root_actor.snapshot().status == ActorStatus::Idle
+                && event_loop.sessions[index].app.status == Status::Idle;
+            assert!(
+                settled || Instant::now() < settled_deadline,
+                "pinned child setup did not settle: root={:?}, child={:?}, app={:?}",
+                root_actor.snapshot(),
+                child.snapshot(),
+                event_loop.sessions[index].app.status
+            );
+            settled
+        });
+        let mode = AgentMode::Plan(path.clone());
+        let ticket = child.reserve_config_update().unwrap();
+        ticket
+            .resolve(Ok(ConfigChange::Mode {
+                mode: mode.clone(),
+                mode_def: Some(host.event_handle().mode_registry().current(&mode)),
+            }))
+            .unwrap();
+        smol::block_on(ticket.wait()).unwrap();
+        let config = child.effective_config().unwrap();
+        let child_epoch = child.history_boundaries().unwrap()[0].epoch;
+        let root_config = root_actor.effective_config().unwrap();
+        let root_history = event_loop.sessions[index].coordinator.read().history();
+        let session = event_loop.sessions[index].id();
+        let root_run = event_loop.sessions[index].app.run_id;
+        let child_chat = event_loop.sessions[index]
+            .app
+            .chats
+            .iter()
+            .position(|chat| chat.agent_id == Some(child_id))
+            .unwrap();
+        event_loop.sessions[index].app.active_chat = child_chat;
+        event_loop.sync_orchestration();
+        event_loop.prepare_plan_approval(
+            index,
+            clear_context,
+            Some(TARGET_MODEL.into()),
+            false,
+            path,
+        );
+        assert!(
+            event_loop.sessions[index].pending_approval.is_some(),
+            "child approval rejected before preparation: {:?}",
+            event_loop.sessions[index].app.status_bar.flash_text()
+        );
+        let mut ready = next_ready(event_loop);
+        if fail_checkpoint {
+            let InternalEvent::PlanApprovalReady {
+                result: Ok(ApprovalStep::Child(prepared)),
+                ..
+            } = &mut ready
+            else {
+                panic!("child preparation failed");
+            };
+            prepared.checkpoint = Arc::new(|_| Box::pin(async { Err(CHECKPOINT_FAILURE.into()) }));
+        }
+        event_loop.sessions[index].app.active_chat = 0;
+        event_loop.handle_internal(ready);
+        assert!(
+            event_loop.sessions[index]
+                .pending_approval
+                .as_ref()
+                .unwrap()
+                .committing
+        );
+        event_loop.sessions[index].end_plan_approval();
+        assert!(event_loop.sessions[index].pending_approval.is_some());
+        let committed = next_ready(event_loop);
+        event_loop.handle_internal(committed);
+        assert!(event_loop.sessions[index].pending_approval.is_none());
+        if fail_checkpoint {
+            assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
+            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert!(requests.is_empty());
+            assert_eq!(
+                event_loop.sessions[index].app.status_bar.flash_text(),
+                Some(CHECKPOINT_FLASH)
+            );
+        } else {
+            pump_until(event_loop, |_| !requests.is_empty());
+            let (model, _, messages, _) = requests.recv_timeout(WAIT).unwrap();
+            assert_eq!(model, TARGET_MODEL);
+            assert_eq!(
+                messages
+                    .iter()
+                    .any(|message| message.user_text() == Some(CHILD_PROMPT)),
+                !clear_context
+            );
+            assert_eq!(child.effective_config().unwrap().mode, AgentMode::Build);
+        }
+        assert!(Arc::ptr_eq(
+            &root_config,
+            &root_actor.effective_config().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &root_history,
+            &event_loop.sessions[index].coordinator.read().history()
+        ));
+        assert_eq!(event_loop.sessions[index].id(), session);
+        assert_eq!(event_loop.sessions[index].app.run_id, root_run);
         shutdown_manager(&manager);
     });
 }
@@ -332,6 +562,8 @@ fn setup_with_registry(
         false,
     )
     .unwrap();
+    host.event_handle()
+        .install_orchestration_services(event_loop.orchestration.clone());
     host.load_source(OBSERVER_PLUGIN, &observer()).unwrap();
     event_loop.ctx.lua_event_handle = host.event_handle();
     let path = PathBuf::from(&event_loop.session_cwd).join(PLAN_FILE);
@@ -426,7 +658,6 @@ fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_
         }
         for index in 0..event_loop.sessions.len() {
             while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
-                assert_eq!(envelope.run_id, event_loop.sessions[index].app.run_id);
                 event_loop
                     .handle_wake(Wake::Agent(index, Box::new(envelope)))
                     .unwrap();
@@ -541,7 +772,6 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let original_id = event_loop.sessions[index].id();
-        let original_run = event_loop.sessions[index].app.run_id;
         let prefs = serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap();
         let stored_model = read_model(&event_loop.ctx.storage);
         let recents = read_recents(&event_loop.ctx.storage);
@@ -563,10 +793,20 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
         assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
-            let app = &event_loop.sessions[index].app;
-            app.run_id == original_run.wrapping_add(1)
-                && app.status == Status::Idle
-                && !app.plan_approval_pending
+            let runtime = &event_loop.sessions[index];
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            runtime.app.status == Status::Idle
+                && !runtime.app.plan_approval_pending
+                && actor.snapshot().status == ActorStatus::Idle
+                && matches!(
+                    actor.snapshot().latest,
+                    Some(maki_agent::TurnOutcome::Completed { .. })
+                )
+                && actor.effective_config().is_some_and(|config| {
+                    config.mode == AgentMode::Build && config.model.spec() == TARGET_MODEL
+                })
+                && !requests.is_empty()
         });
         let starts: Vec<_> = observed(event_loop, index, START_COMMAND_PREFIX)
             .into_iter()
@@ -801,17 +1041,18 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         let id = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         assert_eq!(id != source_id, fresh);
-        let run = event_loop.sessions[index].app.run_id;
-        event_loop.dispatch(
-            index,
-            vec![Action::CancelAgent {
-                turn_id: None,
-                run_id: run,
-            }],
-        );
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let turn = actor.snapshot().active_turn.unwrap();
+        press(event_loop, key::QUIT.to_key_event());
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
+                && actor.snapshot().status == ActorStatus::Idle
         });
+        assert!(matches!(
+            actor.snapshot().latest,
+            Some(maki_agent::TurnOutcome::Cancelled { turn_id, .. }) if turn_id == turn
+        ));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(Arc::ptr_eq(
             &identity,
@@ -1168,11 +1409,18 @@ fn cancel_during_provider_preparation_ignores_late_result() {
         assert_preserved(event_loop, index, &path, run, None);
         release.send(()).unwrap();
         completion.recv_timeout(WAIT).unwrap();
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
         event_loop.submit_text(index, RESPONSE.into()).unwrap();
         let (model, _, _, _) = requests.recv_timeout(WAIT).unwrap();
         assert_eq!(model, SOURCE_MODEL);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
+                && actor.snapshot().status == ActorStatus::Idle
+                && matches!(
+                    actor.snapshot().latest,
+                    Some(maki_agent::TurnOutcome::Completed { .. })
+                )
         });
         assert!(requests.is_empty());
         assert!(late_requests.is_empty());
@@ -1246,6 +1494,14 @@ fn save_failure_retains_committed_selection(fresh: bool) {
 fn without_override_uses_actor_predecessor(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, _, requests, _host) = setup(event_loop);
+        choose_form_row(event_loop, index, USE_CURRENT_ROW, false);
+        assert_eq!(
+            event_loop.sessions[index]
+                .app
+                .plan_form
+                .implementation_model(),
+            None
+        );
         let (record, recorded) = flume::unbounded();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -1269,14 +1525,6 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
         );
         event_loop.ctx.prepare_provider =
             Arc::new(|_, _| panic!("no-override approval must reuse actor provider"));
-        choose_form_row(event_loop, index, USE_CURRENT_ROW, false);
-        assert_eq!(
-            event_loop.sessions[index]
-                .app
-                .plan_form
-                .implementation_model(),
-            None
-        );
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
@@ -1329,6 +1577,11 @@ fn busy_rejection_preserves_active_turn(fresh: bool) {
         );
         event_loop.submit_text(index, HISTORY.into()).unwrap();
         active_rx.recv_timeout(WAIT).unwrap();
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.status == Status::Streaming
+        });
+        let active = actor.snapshot();
+        assert!(matches!(active.status, ActorStatus::Running(_)));
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
@@ -1354,10 +1607,13 @@ fn busy_rejection_preserves_active_turn(fresh: bool) {
             Some(APPROVAL_BUSY)
         );
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
+        assert_eq!(actor.snapshot().status, active.status);
+        assert_eq!(actor.snapshot().active_turn, active.active_turn);
         assert!(requests.is_empty());
         release.send(()).unwrap();
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
+                && actor.snapshot().status == ActorStatus::Idle
         });
         assert!(active_rx.is_empty());
     });

@@ -32,10 +32,14 @@ pub enum ActorError {
     TranscriptSerialization(String),
     #[error("instruction inbox capacity exceeded (64 messages or 256 KiB)")]
     InstructionOverflow,
-    #[error("submit accepts text-only instructions")]
+    #[error("submission payload could not be serialized")]
     InvalidInstruction,
     #[error("the actor has pending work")]
     Busy,
+    #[error("history boundary no longer belongs to this actor history")]
+    StaleHistoryBoundary,
+    #[error("history checkpoint failed: {0}")]
+    HistoryCheckpoint(String),
     #[error("the after_turn boundary is not the latest settled turn")]
     StaleTurn,
     #[error("no such turn: {0}")]

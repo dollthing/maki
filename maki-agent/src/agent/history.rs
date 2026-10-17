@@ -44,6 +44,10 @@ impl History {
         self
     }
 
+    pub fn snapshot(&self) -> &HistorySnapshot {
+        &self.snapshot
+    }
+
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
     }
@@ -88,6 +92,11 @@ impl History {
 
     pub fn replace(&mut self, messages: Vec<Message>) {
         self.rewrite(|msgs| *msgs = messages);
+    }
+
+    pub(crate) fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
+        self.snapshot = snapshot;
+        self.publish();
     }
 
     pub fn replace_compacted(&mut self, messages: Vec<Message>) {

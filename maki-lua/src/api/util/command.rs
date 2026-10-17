@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
+use maki_agent::{AgentRef, SharedBuf};
 use maki_commands::{CommandArguments, PositionalArgument};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -610,6 +610,7 @@ pub enum UiAction {
     Flash(String),
     SetWindowTitle(String),
     OpenEditor {
+        target: Option<AgentRef>,
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },

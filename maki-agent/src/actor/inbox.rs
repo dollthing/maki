@@ -15,6 +15,25 @@ pub const MAX_PENDING_INSTRUCTION_BYTES: usize = 256 * 1024;
 /// and inserting them into history must be one no-await commit path.
 pub trait TurnInbox: Send + Sync {
     fn drain_instructions(&self) -> Vec<AgentInput>;
+    fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+        self.drain_instructions()
+            .into_iter()
+            .map(|input| {
+                let presentation = PendingSubmission {
+                    id: SubmissionId(0),
+                    turn_id: TurnId::generate(),
+                    text: input.message.clone(),
+                    images: input.images.clone(),
+                    already_displayed: true,
+                    mcp_startup_notice: None,
+                };
+                (presentation, input)
+            })
+            .collect()
+    }
+    fn take_initial_submission(&self) -> Option<PendingSubmission> {
+        None
+    }
     fn drain_completions(&self) -> Vec<Message>;
     fn commit_completions(&self, commit: &mut dyn FnMut(Message)) {
         for message in self.drain_completions() {
@@ -43,7 +62,30 @@ pub trait TurnInbox: Send + Sync {
     fn has_unsubmitted_instructions(&self) -> bool;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubmissionId(pub u64);
+
+#[derive(Clone)]
+pub enum PendingQueueEntry {
+    Message(PendingSubmission),
+    Compact {
+        run_id: u64,
+        instructions: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+pub struct PendingSubmission {
+    pub id: SubmissionId,
+    pub turn_id: TurnId,
+    pub text: String,
+    pub images: Vec<maki_providers::ImageSource>,
+    pub already_displayed: bool,
+    pub mcp_startup_notice: Option<usize>,
+}
+
 pub(super) struct InstructionEntry {
+    pub presentation: PendingSubmission,
     pub input: AgentInput,
     pub provenance: TurnProvenance,
     pub bytes: usize,
@@ -56,6 +98,11 @@ pub(super) struct InstructionInbox {
     pub drained: Vec<(TurnProvenance, usize)>,
     pub submit_operation: Option<u64>,
     pub policy: Option<Arc<super::EffectiveAgentConfig>>,
+    pub initial: Option<PendingSubmission>,
+    pub operation: u64,
+    pub mergeable: bool,
+    pub batch_key: Option<crate::BatchKey>,
+    pub correlations: Vec<String>,
 }
 
 impl InstructionInbox {
@@ -67,6 +114,11 @@ impl InstructionInbox {
             drained: Vec::new(),
             submit_operation: None,
             policy: None,
+            initial: None,
+            operation: 0,
+            mergeable: false,
+            batch_key: None,
+            correlations: Vec::new(),
         }
     }
 
@@ -140,6 +192,24 @@ impl ActorTurnInbox {
 
 impl TurnInbox for ActorTurnInbox {
     fn drain_instructions(&self) -> Vec<AgentInput> {
+        self.drain_presented_instructions()
+            .into_iter()
+            .map(|(_, input)| input)
+            .collect()
+    }
+
+    fn take_initial_submission(&self) -> Option<PendingSubmission> {
+        let inner = self.inner.upgrade()?;
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let submission = state.instructions.get_mut(&self.turn_id)?.initial.take()?;
+        state.emit(super::ActorEvent::SubmissionConsumed(submission.clone()));
+        Some(submission)
+    }
+
+    fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
         let Some(inner) = self.inner.upgrade() else {
             return Vec::new();
         };
@@ -159,7 +229,10 @@ impl TurnInbox for ActorTurnInbox {
         let mut inputs = Vec::with_capacity(inbox.pending.len());
         for entry in inbox.pending.drain(..) {
             inbox.drained.push((entry.provenance, entry.bytes));
-            inputs.push(entry.input);
+            inputs.push((entry.presentation, entry.input));
+        }
+        for (submission, _) in &inputs {
+            state.emit(super::ActorEvent::SubmissionConsumed(submission.clone()));
         }
         inputs
     }
@@ -188,10 +261,7 @@ impl TurnInbox for ActorTurnInbox {
 
     fn is_managed_child(&self) -> bool {
         self.inner.upgrade().is_some_and(|inner| {
-            inner
-                .managed_admission
-                .as_ref()
-                .is_some_and(|managed| managed.parent_delivery.is_some())
+            inner.completion_policy == super::types::CompletionPolicy::JoinReportingChildren
         })
     }
 

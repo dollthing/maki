@@ -3,6 +3,9 @@ name = "maki-agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 maki-domain = { workspace = true }
 maki-providers = { workspace = true }

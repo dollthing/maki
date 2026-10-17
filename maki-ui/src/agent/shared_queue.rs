@@ -2,8 +2,8 @@
 //!
 //! This is a thin presentation facade over the actor's single scheduling
 //! queue. Production uses the actor-backed variant only: `push` translates a
-//! TUI [`QueueItem`] into actor work (a queued root input, an admitted turn,
-//! or a compact command) and every read projects [`ActorSnapshot::queue`].
+//! TUI [`QueueItem`] into acknowledged ordinary submissions or compact work,
+//! and every read projects the selected actor's queue.
 //! There is no second scheduling deque in production.
 //!
 //! The `#[cfg(test)]` variant is a presentation-only deque used exclusively
@@ -21,8 +21,8 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use maki_agent::actor::{
-    ActorError, AgentActorHandle, QueueProjection, RootWork, TurnAdmissionOptions, TurnOrigin,
-    TurnProvenance,
+    ActorError, AgentActorHandle, PendingQueueEntry, QueueProjection, TurnAdmissionOptions,
+    TurnOrigin, TurnProvenance,
 };
 use maki_agent::{AgentInput, ImageSource, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
@@ -53,7 +53,7 @@ pub(crate) enum QueueItem {
         input: AgentInput,
         run_id: u64,
         /// `true` when the UI already drew the bubble (immediate dispatch).
-        /// The agent then skips `QueueItemConsumed` so we don't draw it twice.
+        /// Consumption retains this flag so the UI does not draw it twice.
         /// `false` when the user typed while the agent was busy: the UI waits
         /// for `QueueItemConsumed` before drawing.
         displayed: bool,
@@ -180,16 +180,20 @@ impl QueueSender {
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
-        self.set_run_id(entry.run_id());
+        if let Err(error) = self.try_push(entry) {
+            warn!(error = %error, "agent queue push failed");
+        }
+    }
+
+    pub(crate) fn try_push(&self, entry: QueueItem) -> Result<(), ActorError> {
+        let run_id = entry.run_id();
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).push_back(entry),
-            QueueBackend::Actor(actor) => {
-                if let Err(error) = push_to_actor(actor, entry) {
-                    warn!(error = %error, "agent queue push failed");
-                }
-            }
+            QueueBackend::Actor(actor) => push_to_actor(actor, entry)?,
         }
+        self.set_run_id(run_id);
+        Ok(())
     }
 
     /// Removes the panel-visible item at `index`, returning whether a row
@@ -208,7 +212,25 @@ impl QueueSender {
                     .map(|(index, _)| index);
                 raw_index.and_then(|index| items.remove(index)).is_some()
             }
-            QueueBackend::Actor(actor) => actor.remove_visible_at(index).is_some(),
+            QueueBackend::Actor(actor) => {
+                match actor
+                    .pending_queue()
+                    .into_iter()
+                    .filter(|entry| match entry {
+                        PendingQueueEntry::Message(entry) => !entry.already_displayed,
+                        PendingQueueEntry::Compact { .. } => true,
+                    })
+                    .nth(index)
+                {
+                    Some(PendingQueueEntry::Message(entry)) => {
+                        actor.remove_submission(entry.id).is_some()
+                    }
+                    Some(PendingQueueEntry::Compact { run_id, .. }) => {
+                        actor.remove_pending_compact(run_id).is_some()
+                    }
+                    None => false,
+                }
+            }
         }
     }
 
@@ -216,7 +238,7 @@ impl QueueSender {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).len(),
-            QueueBackend::Actor(actor) => actor.snapshot().queue.len(),
+            QueueBackend::Actor(_) => self.projections().len(),
         }
     }
 
@@ -278,49 +300,46 @@ impl QueueSender {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).iter().map(Into::into).collect(),
-            QueueBackend::Actor(actor) => actor.snapshot().queue,
+            QueueBackend::Actor(actor) => actor
+                .pending_queue()
+                .into_iter()
+                .map(|entry| match entry {
+                    PendingQueueEntry::Message(entry) => QueueProjection::Message {
+                        text: entry.text,
+                        image_count: entry.images.len(),
+                        displayed: entry.already_displayed,
+                    },
+                    PendingQueueEntry::Compact { instructions, .. } => {
+                        QueueProjection::Compact(instructions)
+                    }
+                })
+                .collect(),
         }
     }
 }
 
-/// Translates a TUI [`QueueItem`] into actor work. Deferred messages become
-/// root inputs with no `TurnId` until the scheduler starts or folds them;
-/// compacts become actor compact commands. Immediate-dispatch messages are
-/// admitted as real turns (the actor retains their outcome).
 fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), ActorError> {
     match entry {
         QueueItem::Message {
-            text,
-            image_count: _,
             input,
             run_id,
             displayed,
+            ..
         } => {
-            let images = input.images.clone();
-            if displayed {
-                let _ticket = actor.admit_turn_with_options(
-                    input,
-                    None,
-                    correlation(run_id),
-                    TurnAdmissionOptions {
-                        provenance: TurnProvenance {
-                            origin: TurnOrigin::User,
-                            ..Default::default()
-                        },
+            actor.submit(
+                input,
+                None,
+                correlation(run_id),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
                         ..Default::default()
                     },
-                )?;
-                Ok(())
-            } else {
-                actor.rush(RootWork::new(
-                    input,
-                    run_id,
-                    displayed,
-                    text,
-                    images,
-                    correlation(run_id),
-                ))
-            }
+                    already_displayed: displayed,
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
         }
         QueueItem::Compact {
             run_id,
@@ -417,6 +436,19 @@ mod tests {
         let expected = usize::from(visible);
         assert_eq!(tx.panel_len(), expected);
         assert_eq!(tx.panel_entries().len(), expected);
+    }
+
+    #[test]
+    fn acknowledged_submission_updates_shared_presentation() {
+        let tx = queue();
+        let mut item = msg(false);
+        if let QueueItem::Message { run_id, .. } = &mut item {
+            *run_id = 9;
+        }
+        tx.try_push(item).unwrap();
+        assert_eq!(tx.current_run_id(), 9);
+        assert_eq!(tx.text_messages(), ["t"]);
+        assert_eq!(tx.clone().panel_len(), 1);
     }
 
     #[test]

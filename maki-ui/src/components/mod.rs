@@ -196,7 +196,6 @@ pub enum SessionReplacementKind {
     },
     #[cfg(test)]
     Load,
-    Rewind,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +211,8 @@ pub enum Action {
     RunKeybind(u64),
     ManualExit,
     ShellCommand {
+        target: Option<maki_agent::AgentId>,
+        cwd: PathBuf,
         id: String,
         command: String,
         visible: bool,
@@ -224,6 +225,10 @@ pub enum Action {
         tool_use_id: String,
     },
     ReplaceSession(Box<SessionReplacementRequest>),
+    RewindAgent {
+        target: maki_agent::AgentRef,
+        boundary: maki_agent::actor::HistoryBoundary,
+    },
     ChangeModel(String),
     ChangePinnedModel {
         target: maki_agent::AgentRef,

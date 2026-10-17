@@ -27,7 +27,8 @@ use maki_agent::actor::{
     EffectiveAgentConfig, TurnContext, WorkKind,
 };
 use maki_agent::agent::{
-    Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
+    ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, load_instructions,
+    tool_dispatch,
 };
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::template::env_vars_for;
@@ -42,18 +43,16 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
-    AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History, McpSession,
-    ModeDef, Post, RunLedger, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
-    TurnAdmissionOptions, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOrigin,
-    TurnOutcome, TurnProvenance, TurnResult,
+    AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History,
+    HistorySnapshot, McpSession, ModeDef, Post, RunLedger, RunSettings, SubagentCancel,
+    SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId,
+    TurnOutcome, TurnResult,
 };
 use maki_config::{ModelPolicy, ToolKey};
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{
-    Message, Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost,
-};
+use maki_providers::{Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost};
 use maki_storage::id::MakiId;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
@@ -78,6 +77,7 @@ const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admi
 const SESSION_CLOSED_ERR: &str = "session closed";
 const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+const PROMPT_SLOTS_CLOSED: &str = "prompt slots channel closed";
 const UNNAMED_AGENT_LABEL: &str = "agent";
 const SPAWN_OPTIONS: &[&str] = &[
     "audience",
@@ -152,6 +152,7 @@ struct LuaActorState {
     children: Arc<Mutex<StandaloneChildren>>,
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
+    prompt_requests: Option<flume::Sender<crate::runtime::Request>>,
     custom_system: String,
     tools: RequestTools,
     opts: RequestOptions,
@@ -164,7 +165,6 @@ struct LuaActorState {
     answer_tx: Option<flume::Sender<String>>,
     ui_id: String,
     parent_event_tx: EventSender,
-    input_tx: flume::Sender<String>,
     cancel: SubagentCancel,
     parent_agent_id: Option<AgentId>,
     parent_is_root: bool,
@@ -187,7 +187,7 @@ struct LuaActorState {
     /// Prevents close/drop from duplicating the latest terminal relay.
     history_relayed: std::sync::atomic::AtomicBool,
     close_notified: std::sync::atomic::AtomicBool,
-    relay_snapshot: Mutex<Vec<Message>>,
+    relay_snapshot: Mutex<HistorySnapshot>,
 }
 
 impl LuaActorState {
@@ -234,7 +234,6 @@ impl LuaActorState {
                 ),
                 opts: Some(self.opts),
                 answer_tx: self.answer_tx.clone(),
-                input_tx: Some(self.input_tx.clone()),
                 cancel: Some(self.cancel.clone()),
             });
         }
@@ -245,7 +244,7 @@ impl LuaActorState {
             .store(true, std::sync::atomic::Ordering::Release);
         self.history_relayed
             .store(false, std::sync::atomic::Ordering::Release);
-        *self.relay_snapshot.lock().unwrap() = history.as_slice().to_vec();
+        *self.relay_snapshot.lock().unwrap() = history.snapshot().clone();
         self.relay_snapshot_if_pending();
     }
 
@@ -261,15 +260,16 @@ impl LuaActorState {
         {
             return;
         }
-        let messages = self.relay_snapshot.lock().unwrap().clone();
-        if messages.is_empty() {
+        let snapshot = self.relay_snapshot.lock().unwrap().clone();
+        if snapshot.messages.is_empty() {
             self.history_relayed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
         let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
-            messages,
+            history_epoch: snapshot.epoch,
+            messages: snapshot.messages.as_ref().clone(),
         };
         let _ = match self.subagent_info.get() {
             Some(subagent) => self.parent_event_tx.send_envelope(Envelope {
@@ -390,22 +390,47 @@ impl ActorBackend for LuaActorBackend {
             } else {
                 None
             };
-            maki_agent::agent::TurnAdmissionSnapshot {
-                mode_def,
-                prompt_inputs: Some(Arc::new(TurnPromptInputs {
-                    cwd: state
-                        .template
-                        .get()
-                        .map(|template| template.cwd.clone())
-                        .unwrap_or_else(|| ".".into()),
-                    instructions: Instructions::default(),
-                    mcp_prompt: None,
-                    resolved: None,
-                    ready: Some(ResolvedPromptInputs {
+            let cwd = config
+                .map(|config| config.context.cwd().to_path_buf())
+                .or_else(|| state.template.get().map(|template| template.cwd.clone()))
+                .unwrap_or_else(|| ".".into());
+            let instructions = load_instructions(&cwd.to_string_lossy());
+            let (resolved, ready) = if let Some(requests) = &state.prompt_requests {
+                let (slot_tx, slot_rx) = flume::bounded(1);
+                let _ =
+                    requests.send(crate::runtime::Request::CollectPromptSlots { reply: slot_tx });
+                let (tx, rx) = flume::bounded(1);
+                smol::spawn(async move {
+                    let (slots, slots_error) = match slot_rx.recv_async().await {
+                        Ok(slots) => (Arc::new(slots), None),
+                        Err(_) => (Arc::default(), Some(PROMPT_SLOTS_CLOSED.into())),
+                    };
+                    let _ = tx.send(Ok(ResolvedPromptInputs {
+                        slots,
+                        slots_error,
+                        mcp_messages: None,
+                    }));
+                })
+                .detach();
+                (Some(rx), None)
+            } else {
+                (
+                    None,
+                    Some(ResolvedPromptInputs {
                         slots: Arc::clone(&params.prompt_slots),
                         slots_error: None,
                         mcp_messages: None,
                     }),
+                )
+            };
+            maki_agent::agent::TurnAdmissionSnapshot {
+                mode_def,
+                prompt_inputs: Some(Arc::new(TurnPromptInputs {
+                    cwd,
+                    instructions,
+                    mcp_prompt: None,
+                    resolved,
+                    ready,
                 })),
                 bindings: Arc::new(TurnToolBindings::capture(
                     &params.registry,
@@ -429,12 +454,12 @@ impl ActorBackend for LuaActorBackend {
             state
                 .execution_started
                 .store(true, std::sync::atomic::Ordering::Release);
-            // The chip sender drives the parent relay: it is the only handle
-            // keeping `sub_tx` alive, and `Agent::run` emits through it.
+            // The finalizer uses the same relay sink after sealing the result.
             let event_tx = state
                 .chip_event_tx
                 .clone()
                 .with_output(context.output.clone());
+            context.output.set_terminal_sender(event_tx.clone());
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
             if context.managed_turn.is_some() && context.policy.is_none() {
                 return BackendResult::EnteredRun(TurnOutcome::failed(
@@ -505,15 +530,57 @@ impl ActorBackend for LuaActorBackend {
             }
             params.agent_id = context.agent_id;
             params.managed_turn = context.managed_turn.clone();
+            let prompt_inputs = context
+                .admission
+                .as_ref()
+                .and_then(|admission| admission.prompt_inputs.as_ref());
+            if let Some(inputs) = prompt_inputs {
+                let resolved = if let Some(ready) = &inputs.ready {
+                    Some(ready.clone())
+                } else if let Some(receiver) = &inputs.resolved {
+                    match context.cancel.race(receiver.recv_async()).await {
+                        Ok(Ok(Ok(resolved))) => Some(resolved),
+                        Ok(_) => {
+                            warn!("Lua actor prompt inputs unavailable");
+                            None
+                        }
+                        Err(_) => {
+                            state.release_turn_permit();
+                            return BackendResult::EnteredRun(TurnOutcome::cancelled(
+                                context.agent_id,
+                                turn_id,
+                                TokenUsage::default(),
+                                0,
+                                context
+                                    .cancel_reason
+                                    .reason()
+                                    .unwrap_or(TurnCancellationReason::User),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(resolved) = resolved {
+                    if let Some(error) = resolved.slots_error {
+                        warn!(%error, "Lua actor prompt slots unavailable");
+                    }
+                    params.prompt_slots = resolved.slots;
+                }
+            }
             let mut system = context
                 .admission
                 .as_ref()
                 .and_then(|admission| {
-                    let definition = admission.mode_def.as_deref()?;
-                    let inputs = admission.prompt_inputs.as_ref()?;
+                    let inputs = prompt_inputs?;
+                    let definition = admission
+                        .mode_def
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| ModeDef::default_for(maki_agent::ModeId::Build));
                     Some(build_mode_system_prompt(
                         &env_vars_for(&inputs.cwd),
-                        definition,
+                        &definition,
                         &input.mode,
                     ))
                 })
@@ -540,7 +607,11 @@ impl ActorBackend for LuaActorBackend {
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
             .with_local_tool_capture(Arc::clone(&state.commit))
-            .with_admission(context.admission.clone());
+            .with_admission(context.admission.clone())
+            .with_deferred_outcome();
+            if let Some(inputs) = prompt_inputs {
+                agent = agent.with_loaded_instructions(inputs.instructions.loaded.clone());
+            }
             if let Some(interrupt) = context.interrupt {
                 agent = agent.with_interrupt_source(interrupt);
             }
@@ -592,14 +663,59 @@ impl ActorBackend for LuaActorBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _history: &'a mut History,
-        _context: TurnContext,
-        _instructions: Option<&'a str>,
+        history: &'a mut History,
+        context: TurnContext,
+        instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
-        // Lua sessions admit turns only; compacts are a TUI-run concern.
         Box::pin(async move {
-            warn!("unexpected compact for Lua session backend");
-            BackendResult::CompactDone
+            let state = &*self.state;
+            let event_tx = state
+                .chip_event_tx
+                .clone()
+                .with_output(context.output.clone());
+            let Some(params) = state.params.get() else {
+                let _ = event_tx.send(AgentEvent::ControlError {
+                    message: "compaction requires initialized agent parameters".into(),
+                });
+                return BackendResult::ControlFailed;
+            };
+            let Some(settings) = context.policy.as_deref().map(|config| &config.settings) else {
+                let _ = event_tx.send(AgentEvent::ControlError {
+                    message: "compaction was admitted without an effective agent configuration"
+                        .into(),
+                });
+                return BackendResult::ControlFailed;
+            };
+            let (provider, model) = maki_agent::agent::resolve_compaction_model(
+                &settings.provider,
+                &settings.model,
+                params.timeouts,
+                &params.model_policy,
+            );
+            match maki_agent::agent::compact(
+                &*provider,
+                &model,
+                history,
+                &event_tx,
+                &context.cancel,
+                &params.config,
+                instructions,
+                params.session_id.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    state.relay_history(history);
+                    BackendResult::CompactDone
+                }
+                Err(error) => {
+                    warn!(error = %error, "Lua agent compaction failed");
+                    let _ = event_tx.send(AgentEvent::ControlError {
+                        message: error.user_message(),
+                    });
+                    BackendResult::ControlFailed
+                }
+            }
         })
     }
 }
@@ -1215,6 +1331,7 @@ impl SessionParent {
                 .map_err(|error| error.to_string())?
             {
                 template.apply_effective_config(&config);
+                template.cwd = config.context.cwd().to_path_buf();
             }
             return Ok(AgentContext::from(&template));
         }
@@ -1707,6 +1824,52 @@ impl ChildSettings {
             self.mode.clone(),
         )
         .with_mode_def(Some(self.mode_definition(parent)))
+        .with_mode_authority(if let Some(trusted) = &parent.trusted {
+            trusted
+                .target
+                .effective_config()
+                .ok()
+                .flatten()
+                .and_then(|config| config.mode_authority())
+                .or_else(|| {
+                    trusted
+                        .target
+                        .snapshot()
+                        .ok()
+                        .filter(|node| node.parent_id.is_none())
+                        .map(|_| maki_agent::actor::ModeCeiling::default())
+                })
+                .unwrap_or_else(|| {
+                    maki_agent::actor::ModeCeiling::from_mode(
+                        &parent.context.mode,
+                        parent.context.mode_def.as_deref(),
+                    )
+                })
+        } else {
+            maki_agent::actor::ModeCeiling::from_mode(
+                &self.mode,
+                Some(&self.mode_definition(parent)),
+            )
+        })
+        .with_context(
+            parent
+                .trusted
+                .as_ref()
+                .and_then(|trusted| trusted.target.effective_config().ok().flatten())
+                .or_else(|| {
+                    parent.managed_turn.as_ref().and_then(|current| {
+                        current
+                            .manager()
+                            .actor(current.agent_id())
+                            .ok()?
+                            .effective_config()
+                    })
+                })
+                .map(|config| config.context.clone())
+                .unwrap_or_else(|| {
+                    maki_agent::actor::AgentContextSnapshot::new(parent.context.cwd.clone())
+                }),
+        )
     }
 }
 
@@ -1860,46 +2023,6 @@ fn spawn_close_relay(
     relay_stop_tx
 }
 
-/// UI input relay: tab submits from the parent dispatch into this session.
-/// Instructions steer open ordinary work through the same admission path as Lua submit.
-fn spawn_ui_input_relay(
-    actor: &AgentActorHandle,
-    state: &LuaActorState,
-    ui_input_rx: flume::Receiver<String>,
-) {
-    let actor = actor.clone();
-    let mode = state.mode.clone();
-    let opts = state.opts;
-    smol::spawn(async move {
-        while let Ok(message) = ui_input_rx.recv_async().await {
-            let _ = actor.submit(
-                AgentInput {
-                    message,
-                    mode: mode.clone(),
-                    images: Vec::new(),
-                    preamble: Vec::new(),
-                    thinking: opts.thinking,
-                    fast: opts.fast,
-                    workflow: false,
-                    prompt: None,
-                    cancel: None,
-                    lease_committer: None,
-                },
-                None,
-                String::new(),
-                TurnAdmissionOptions {
-                    provenance: TurnProvenance {
-                        origin: TurnOrigin::User,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            );
-        }
-    })
-    .detach();
-}
-
 /// Publishes a managed child as a trusted target, ties a delegated unmanaged
 /// session to its invocation's lifetime, and records its owner. A failed step
 /// closes the session.
@@ -2030,7 +2153,6 @@ async fn build_session(
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     // Register a cancel trigger so the child token does not fire on drop
     // and kill the subagent at birth. The fallback key gets its own id:
@@ -2061,6 +2183,9 @@ async fn build_session(
         template: OnceLock::new(),
         children: Arc::default(),
         params: OnceLock::new(),
+        prompt_requests: lua
+            .app_data_ref::<crate::runtime::RequestTx>()
+            .map(|requests| requests.0.clone()),
         custom_system: options.system.take().unwrap_or_default(),
         tools: tools.request,
         opts: child.opts,
@@ -2081,7 +2206,6 @@ async fn build_session(
         answer_tx: Some(answer_tx),
         ui_id: ui_id.clone(),
         parent_event_tx: parent.context.event_tx.clone(),
-        input_tx: ui_input_tx,
         cancel,
         parent_agent_id: parent.agent_id,
         parent_is_root: parent.is_root,
@@ -2098,7 +2222,7 @@ async fn build_session(
         execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
         close_notified: std::sync::atomic::AtomicBool::new(false),
-        relay_snapshot: Mutex::new(Vec::new()),
+        relay_snapshot: Mutex::default(),
     });
     let (actor, control) = try_pair!(spawn_session_actor(
         &lua,
@@ -2134,7 +2258,6 @@ async fn build_session(
 
     *cancel_actor.lock().unwrap() = Some(actor.clone());
     let relay_stop_tx = spawn_close_relay(&actor, &control, &state);
-    spawn_ui_input_relay(&actor, &state, ui_input_rx);
 
     let sess = LuaSession {
         id: ui_id,
@@ -2575,31 +2698,13 @@ fn session_policy_constraint(
 }
 
 fn mode_policy_is_within(ceiling: &EffectiveAgentConfig, current: &EffectiveAgentConfig) -> bool {
-    let ceiling_path = ceiling
-        .mode_def
-        .as_ref()
-        .and_then(|definition| definition.restrict_write_to.as_deref())
-        .or_else(|| ceiling.mode.plan_path());
-    let current_path = current
-        .mode_def
-        .as_ref()
-        .and_then(|definition| definition.restrict_write_to.as_deref())
-        .or_else(|| current.mode.plan_path());
-    if ceiling_path.is_some() && ceiling_path != current_path {
-        return false;
-    }
-    match ceiling
-        .mode_def
-        .as_ref()
-        .and_then(|definition| definition.tools.as_ref())
-    {
-        Some(allowed) => current
-            .mode_def
-            .as_ref()
-            .and_then(|definition| definition.tools.as_ref())
-            .is_some_and(|tools| tools.iter().all(|tool| allowed.contains(tool))),
-        None => true,
-    }
+    ceiling
+        .mode_authority()
+        .unwrap_or_else(|| {
+            maki_agent::actor::ModeCeiling::from_mode(&ceiling.mode, ceiling.mode_def.as_ref())
+        })
+        .validate(&current.mode, current.mode_def.as_ref())
+        .is_ok()
 }
 
 impl LuaSession {
@@ -3309,6 +3414,70 @@ mod tests {
         }))
     }
 
+    #[test_case::test_case(false; "missing_policy_rejected")]
+    #[test_case::test_case(true; "child_history_compacted")]
+    fn lua_compaction_uses_common_backend(configured: bool) {
+        smol::block_on(async {
+            const SUMMARY: &str = "compacted child history";
+            let provider = Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(SUMMARY)]));
+            let (actor, state, session, events) = session_with_provider(provider, None, None);
+            let params = state.params.get().unwrap();
+            let policy = configured.then(|| {
+                Arc::new(EffectiveAgentConfig::new(
+                    RunSettings {
+                        provider: Arc::clone(&params.provider),
+                        model: params.model.clone(),
+                        fast: false,
+                        workflow: false,
+                        thinking: Default::default(),
+                    },
+                    AgentMode::Build,
+                ))
+            });
+            let (_, cancel_reason) = maki_agent::ReasonedCancelToken::new();
+            let context = TurnContext {
+                agent_id: params.agent_id,
+                turn_id: None,
+                output: Default::default(),
+                provenance: Default::default(),
+                cancel: CancelToken::none(),
+                cancel_reason,
+                correlation: String::new(),
+                generation: 0,
+                policy,
+                interrupt: None,
+                inbox: None,
+                managed_turn: None,
+                admission: None,
+            };
+            let mut history = History::new(vec![Message::user("original child prompt".into())]);
+            let original = serde_json::to_value(history.as_slice()).unwrap();
+            let result = LuaActorBackend::new(Arc::clone(&state))
+                .run_compact(&mut history, context, None)
+                .await;
+            if configured {
+                assert!(matches!(result, BackendResult::CompactDone));
+                assert!(history.as_slice().iter().any(|message| message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text.contains(SUMMARY)))));
+                assert!(
+                    events.drain().any(|envelope| matches!(
+                        envelope.event,
+                        AgentEvent::ControlComplete { .. }
+                    ))
+                );
+            } else {
+                assert!(matches!(result, BackendResult::ControlFailed));
+                assert_eq!(serde_json::to_value(history.as_slice()).unwrap(), original);
+                assert!(
+                    events
+                        .drain()
+                        .any(|envelope| matches!(envelope.event, AgentEvent::ControlError { .. }))
+                );
+            }
+            actor.close();
+            drop(session);
+        });
+    }
+
     /// A provider that never resolves, so a running turn parks until its
     /// cancel fires. Deterministic for close/cancel tests.
     struct HangingProvider;
@@ -3454,7 +3623,6 @@ mod tests {
             None => (parent_raw_tx.clone(), None),
         };
         let (answer_tx, answer_rx) = flume::unbounded();
-        let (input_tx, _input_rx) = flume::unbounded::<String>();
         let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
         let ui_id = "task-1".to_owned();
         let (child_trigger, child_cancel) = CancelToken::new();
@@ -3490,6 +3658,7 @@ mod tests {
             template: OnceLock::new(),
             children: Arc::default(),
             params: OnceLock::from(params),
+            prompt_requests: None,
             custom_system: String::new(),
             tools: RequestTools::default(),
             opts: maki_providers::RequestOptions {
@@ -3505,7 +3674,6 @@ mod tests {
             answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
             parent_event_tx: EventSender::new(parent_raw_tx.clone(), RUN_ID),
-            input_tx,
             cancel: SubagentCancel::new(|| {}),
             parent_agent_id: None,
             parent_is_root: false,
@@ -3522,7 +3690,7 @@ mod tests {
             execution_started: std::sync::atomic::AtomicBool::new(false),
             history_relayed: std::sync::atomic::AtomicBool::new(false),
             close_notified: std::sync::atomic::AtomicBool::new(false),
-            relay_snapshot: Mutex::new(Vec::new()),
+            relay_snapshot: Mutex::default(),
         });
         if let Some((sub_rx, gate)) = relay {
             smol::spawn(relay_session_events(
@@ -3980,7 +4148,8 @@ mod tests {
         smol::block_on(async {
             loop {
                 let envelope = parent_rx.recv_async().await.unwrap();
-                if matches!(envelope.event, AgentEvent::SubagentHistory { .. }) {
+                if let AgentEvent::SubagentHistory { history_epoch, .. } = envelope.event {
+                    assert_eq!(history_epoch, state.relay_snapshot.lock().unwrap().epoch);
                     break;
                 }
             }
@@ -4321,6 +4490,74 @@ mod tests {
     }
 
     #[test]
+    fn lua_admission_pins_cwd_instructions_and_tool_inheritance() {
+        const BEFORE: &str = "instructions before admission";
+        const AFTER: &str = "instructions after admission";
+        let directory = tempfile::tempdir().unwrap();
+        let instructions_path = directory.path().join("AGENTS.md");
+        std::fs::write(&instructions_path, BEFORE).unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
+        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let params = state.params.get().unwrap();
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: params.model.clone(),
+                thinking: ThinkingConfig::Off,
+                fast: false,
+                workflow: false,
+            },
+            AgentMode::Build,
+        )
+        .with_context(maki_agent::actor::AgentContextSnapshot::new(
+            directory.path().into(),
+        ));
+        let input = AgentInput::from_defaults(
+            "queued".into(),
+            AgentMode::Build,
+            Vec::new(),
+            Default::default(),
+        );
+        let prepare = LuaActorBackend::new(Arc::clone(&state))
+            .admission_preparation()
+            .unwrap();
+        let admitted = prepare(&input, &input.mode, Some(&config));
+        std::fs::write(&instructions_path, AFTER).unwrap();
+        let inputs = admitted.prompt_inputs.as_ref().unwrap();
+        assert_eq!(inputs.cwd, directory.path());
+        assert!(inputs.instructions.text.contains(BEFORE));
+        assert!(!inputs.instructions.text.contains(AFTER));
+        assert!(
+            prepare(&input, &input.mode, Some(&config))
+                .prompt_inputs
+                .as_ref()
+                .unwrap()
+                .instructions
+                .text
+                .contains(AFTER)
+        );
+        let mut history = History::new(Vec::new());
+        let agent = Agent::new(
+            params.clone(),
+            AgentRunParams {
+                history: &mut history,
+                system: String::new(),
+                event_tx: state.chip_event_tx.clone(),
+                tools: state.tools.clone(),
+            },
+        )
+        .with_admission(Some(admitted.clone()));
+        let inherited = AgentContext::from(&agent.tool_context());
+        assert_eq!(inherited.cwd, directory.path());
+        assert!(Arc::ptr_eq(
+            &inherited.prompt_slots,
+            &inputs.ready.as_ref().unwrap().slots
+        ));
+        drop(session);
+        actor.shutdown();
+    }
+
+    #[test]
     fn failed_turn_keeps_session_open_for_later_turn() {
         let fail = Arc::new(FailOnceProvider::default());
         let provider: Arc<dyn Provider> = fail.clone();
@@ -4519,7 +4756,6 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                input_tx: None,
                 cancel: None,
             })
             .unwrap();
@@ -4594,7 +4830,6 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                input_tx: None,
                 cancel: None,
             })
             .unwrap();
@@ -4610,13 +4845,13 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
-            input_tx: None,
             cancel: None,
         };
         sub_tx
             .send(Envelope {
                 event: AgentEvent::SubagentHistory {
                     tool_use_id: "grandchild".into(),
+                    history_epoch: 0,
                     messages: Vec::new(),
                 },
                 subagent: Some(grandchild_info),

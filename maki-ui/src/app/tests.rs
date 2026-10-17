@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::shared_queue;
-use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
@@ -14,9 +14,10 @@ use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::TASK_SPAWN_TOOL_NAME;
 use maki_agent::{
-    AgentId, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    AgentId, AgentInput, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId,
+    TurnOutcome,
 };
 use maki_commands::ModelSelection;
 use maki_config::{PermissionsConfig, UiConfig};
@@ -462,27 +463,6 @@ pub(crate) fn actor_presentation_app(queue: shared_queue::QueueSender, run_id: u
     app
 }
 
-pub(crate) fn assert_displayed_root_adoption(envelope: Envelope, run_id: u64) {
-    let mut app = test_app();
-    app.run_id = run_id - 1;
-    app.queue.set_run_id(run_id);
-    app.main_chat().show_user_message("hello", Vec::new());
-    let before = app.main_chat().message_count();
-    app.update(Msg::Agent(Box::new(envelope)));
-    assert_eq!(app.run_id, run_id);
-    assert_eq!(app.main_chat().message_count(), before);
-    const RESPONSE: &str = "displayed root response";
-    app.update(agent_msg_with_run_id(
-        AgentEvent::TextDelta {
-            text: RESPONSE.into(),
-        },
-        run_id,
-    ));
-    assert!(!app.main_chat().streaming_text_is_empty());
-    app.update(agent_msg_with_run_id(done(), run_id));
-    assert_eq!(app.main_chat().last_message_text(), RESPONSE);
-}
-
 pub(crate) fn assert_actor_response(app: &mut App, response: &str) {
     assert_eq!(app.main_chat().last_message_text(), response);
 }
@@ -618,7 +598,7 @@ fn subagent_info_for_agent(
     parent_id: &str,
     name: &str,
     answer_tx: Option<flume::Sender<String>>,
-    input_tx: Option<flume::Sender<String>>,
+    _input_tx: Option<flume::Sender<String>>,
 ) -> SubagentInfo {
     SubagentInfo {
         agent_id,
@@ -631,7 +611,6 @@ fn subagent_info_for_agent(
         model: None,
         opts: None,
         answer_tx,
-        input_tx,
         cancel: None,
     }
 }
@@ -2352,7 +2331,7 @@ fn turn_complete_accumulates_usage_by_model() {
 }
 
 #[test]
-fn cancel_resets_all_chats_and_indices() {
+fn cancel_preserves_descendant_chats_and_indices() {
     let mut app = app_with_subagent();
     open_tasks_picker(&mut app);
     app.update(subagent_msg(
@@ -2383,10 +2362,17 @@ fn cancel_resets_all_chats_and_indices() {
     assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
     assert!(!app.task_picker.is_open());
     assert_eq!(app.chats[0].in_progress_count(), 0);
-    assert_eq!(app.chats[1].in_progress_count(), 0);
-    assert!(app.chats[1].is_finished());
-    assert!(app.chat_index.is_empty());
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    assert!(!app.chats[1].is_finished());
+    assert_eq!(app.chat_index.get(TASK_ID), Some(&1));
+    app.update(subagent_msg(
+        AgentEvent::TextDelta {
+            text: "still running".into(),
+        },
+        TASK_ID,
+        None,
+    ));
+    assert!(!app.chats[1].streaming_text_is_empty());
 }
 
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
@@ -2413,8 +2399,6 @@ fn subagent_done_only_in_subagent_chat() {
 
 #[test_case(|app: &mut App| finish_subagent_task(app, false), DONE_TEXT,      &DisplayRole::Done  ; "task_success")]
 #[test_case(|app: &mut App| finish_subagent_task(app, true),  "result",       &DisplayRole::Error ; "task_failure")]
-#[test_case(cancel_app as fn(&mut App),                       CANCELLED_TEXT, &DisplayRole::Error ; "cancel")]
-#[test_case(error_app  as fn(&mut App),                       ERROR_TEXT,     &DisplayRole::Error ; "main_error")]
 fn subagent_terminal_marker(
     terminate: fn(&mut App),
     expected_text: &str,
@@ -2960,6 +2944,7 @@ fn open_task_picker_refreshes_after_subagent_history() {
     open_tasks_picker(&mut app);
 
     app.update(agent_msg(AgentEvent::SubagentHistory {
+        history_epoch: 0,
         tool_use_id: "session-abc".into(),
         messages: vec![],
     }));
@@ -3239,12 +3224,7 @@ fn double_esc_cancels_flushes_and_fails_tools() {
 #[test]
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();
-    type_and_submit(&mut app, "hello");
-    app.status = Status::Idle;
-    app.run_id = 1;
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
+    bind_history_actor(&mut app, vec![Message::user("hello".into())]);
 
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -4625,7 +4605,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "streaming"
 )]
 #[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
+    |app: &mut App| { app.state.mode = Mode::Plan; app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
     &[KeybindContext::FormInput],
     &[KeybindContext::Editing]
     ; "plan_form"
@@ -4644,7 +4624,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
 )]
 #[test_case(
     |app: &mut App| {
-        app.state.session_mut().push_message(Message::user("test".into()));
+        bind_history_actor(app, vec![Message::user("test".into())]);
         app.open_rewind_picker();
     },
     &[KeybindContext::RewindPicker],
@@ -5278,6 +5258,10 @@ fn direct_custom_command_renders_args_and_starts_run() {
         argument_hint: None,
     }]);
 
+    let (target, rx) = spawn_input_child(&mut app, TASK_ID, "reviewer");
+    app.active_chat = 1;
+    bind_actor_target(&app, target);
+    let before = app.chats[1].message_count();
     let actions = app.execute_command(
         ParsedCommand {
             name: "/project:review".into(),
@@ -5286,10 +5270,11 @@ fn direct_custom_command_renders_args_and_starts_run() {
         0,
     );
 
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::SendMessage(input)] if input.message == "Review src/lib.rs"
-    ));
+    assert!(actions.is_empty());
+    let input = received_input(&rx);
+    assert_eq!(input.message, "Review src/lib.rs");
+    assert_eq!(app.chats[1].message_count(), before);
+    assert!(app.queue.root_text_messages().is_empty());
 }
 
 #[test]
@@ -5303,12 +5288,17 @@ fn run_cmdline_dispatches_custom_command() {
         argument_hint: None,
     }]);
 
+    let (target, rx) = spawn_input_child(&mut app, TASK_ID, "reviewer");
+    app.active_chat = 1;
+    bind_actor_target(&app, target);
+    let before = app.chats[1].message_count();
     let actions = app.run_cmdline("/project:review src/lib.rs", 0).unwrap();
 
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::SendMessage(input)] if input.message == "Review src/lib.rs"
-    ));
+    assert!(actions.is_empty());
+    let input = received_input(&rx);
+    assert_eq!(input.message, "Review src/lib.rs");
+    assert_eq!(app.chats[1].message_count(), before);
+    assert!(app.queue.root_text_messages().is_empty());
 }
 
 /// Only the typed path clears the input, so a keybind or autocmd reaching for
@@ -5424,6 +5414,197 @@ fn slash_escape_sends_literal_input(text: &str, expected: &str) {
     ));
 }
 
+fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> maki_agent::AgentRef {
+    let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+    let (tx, _) = flume::unbounded();
+    let shared = Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::new(
+        messages.clone(),
+    )));
+    let target = manager
+        .create_root_with_config(None, messages.clone(), Some(Arc::clone(&shared)), |_| {
+            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn maki_agent::ActorBackend>)
+        })
+        .unwrap();
+    app.chats[0].agent_id = Some(target.id());
+    app.shared_history = Some(shared);
+    app.state.session_mut().replace_messages(messages);
+    bind_actor_target(app, target.clone());
+    target
+}
+
+#[test_case(false ; "main")]
+#[test_case(true ; "child")]
+fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
+    let mut app = streaming_app();
+    let target = if child {
+        let (target, _) = spawn_input_child(&mut app, TASK_ID, "research");
+        app.active_chat = 1;
+        bind_actor_target(&app, target.clone());
+        Some(target)
+    } else {
+        None
+    };
+    let info = target
+        .as_ref()
+        .map(|target| subagent_info_for_agent(target.id(), TASK_ID, "research", None, None));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::Retry {
+            attempt: 1,
+            message: RETRY_MESSAGE.into(),
+            delay_ms: RETRY_DELAY.as_millis() as u64,
+        },
+        subagent: info.clone(),
+        run_id: app.run_id,
+    })));
+    assert_eq!(app.focused_retry().unwrap().message, RETRY_MESSAGE);
+    if child {
+        assert!(app.retry_info.is_none());
+    }
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "request resumed".into(),
+        },
+        subagent: info,
+        run_id: app.run_id,
+    })));
+    assert!(app.focused_retry().is_none());
+}
+
+#[test]
+fn focused_plan_state_is_isolated() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting("root-plan.md".into());
+    app.plan_form.on_plan_ready();
+    let (target, _) = spawn_input_child_with_mode(
+        &mut app,
+        TASK_ID,
+        "planner",
+        maki_agent::AgentMode::Plan("child-plan.md".into()),
+    );
+    app.active_chat = 1;
+    bind_actor_target(&app, target);
+    app.sync_focused_queue();
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.focused_plan_path(),
+        Some(PathBuf::from("child-plan.md"))
+    );
+    app.plan_form.on_plan_ready();
+    app.plan_approval_pending = true;
+    app.update(Msg::Paste("not a draft".into()));
+    assert!(app.input_box.buffer.value().is_empty());
+    app.active_chat = 0;
+    app.sync_focused_queue();
+    assert!(app.plan_form.is_visible());
+    assert!(!app.plan_approval_pending);
+    assert_eq!(app.focused_plan_path(), Some(PathBuf::from("root-plan.md")));
+    app.active_chat = 1;
+    app.sync_focused_queue();
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_approval_pending);
+    app.plan_approval_pending = false;
+    let child_id = app.selected_agent_id().unwrap();
+    let actions = app.implement_plan(false);
+    assert!(matches!(actions.as_slice(), [Action::ApprovePlan {
+        clear_context: false,
+        model: None,
+        parallel: _,
+        path,
+    }] if path == Path::new("child-plan.md")));
+    assert_eq!(
+        app.command_runtime
+            .target_agent(&app.command_target)
+            .unwrap()
+            .id(),
+        child_id
+    );
+    assert!(app.plan_approval_pending);
+    assert_eq!(app.state.plan.path(), Some(Path::new("root-plan.md")));
+    app.active_chat = 0;
+    app.sync_focused_queue();
+    assert!(app.plan_form.is_visible());
+    assert!(!app.plan_approval_pending);
+    app.active_chat = 1;
+    app.sync_focused_queue();
+    assert!(app.plan_approval_pending);
+    assert_eq!(app.focused_mode(), Mode::Plan);
+    assert_eq!(
+        app.focused_model_spec(),
+        app.focused_config().unwrap().model.spec()
+    );
+}
+
+#[test]
+fn root_error_recovery_does_not_follow_child_queue_focus() {
+    let (mut app, rx) = app_with_subagent_actor(TASK_ID);
+    app.queue_and_notify(queued_msg("root pending"));
+    type_and_submit(&mut app, "child active");
+    received_input(&rx);
+    type_and_submit(&mut app, "child pending");
+    app.queue.set_focus_at(0);
+    assert_eq!(app.queue.focus(), Some(0));
+    assert_eq!(app.build_meta().queued_messages, ["root pending"]);
+    app.update(agent_msg(AgentEvent::ControlError {
+        message: "root failure".into(),
+    }));
+    assert_eq!(app.recoverable_queue, ["root pending"]);
+    assert_eq!(app.queue.text_messages(), ["child pending"]);
+    assert_eq!(app.queue.focus(), Some(0));
+    assert_eq!(app.build_meta().queued_messages, ["root pending"]);
+}
+
+#[test]
+fn focused_queue_preserves_compact_and_stale_removal_identity() {
+    let (mut app, rx) = app_with_subagent_actor(TASK_ID);
+    type_and_submit(&mut app, "active");
+    received_input(&rx);
+    type_and_submit(&mut app, "first queued");
+    let actor = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap()
+        .actor()
+        .unwrap();
+    actor
+        .push_compact(1, Some(COMPACT_GUIDANCE.into()))
+        .unwrap();
+    type_and_submit(&mut app, "after compact");
+    app.sync_focused_queue();
+    assert_eq!(app.queue.panel_len(), 3);
+    assert_eq!(app.queue.panel_entries()[1].text, COMPACT_WITH_GUIDANCE);
+    app.queue.set_focus_at(0);
+    let first = actor
+        .pending_submissions()
+        .into_iter()
+        .find(|entry| entry.text == "first queued")
+        .unwrap();
+    actor.remove_submission(first.id).unwrap();
+    assert_eq!(app.queue.focus(), None);
+    app.queue.remove_focused();
+    assert_eq!(app.queue.panel_len(), 2);
+    assert_eq!(app.queue.panel_entries()[0].text, COMPACT_WITH_GUIDANCE);
+    app.queue.set_focus_at(0);
+    app.queue.remove_focused();
+    assert_eq!(app.queue.panel_len(), 1);
+    assert_eq!(app.queue.panel_entries()[0].text, "after compact");
+}
+
+fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
+    let mut actions = actions.into_iter();
+    let Action::RewindAgent { target, boundary } = actions.next().expect("rewind action") else {
+        panic!("expected actor rewind");
+    };
+    assert!(actions.next().is_none());
+    let actor = target.actor().unwrap();
+    let checkpoint: maki_agent::actor::HistoryEditCheckpoint =
+        Arc::new(|_| Box::pin(async { Ok(()) }));
+    let change =
+        smol::block_on(actor.prepare_idle().unwrap().rewind(boundary, checkpoint)).unwrap();
+    assert_eq!(change.agent_id, target.id());
+    app.apply_history_change(change);
+}
+
 fn build_rewind_app() -> App {
     let mut app = test_app();
 
@@ -5431,12 +5612,9 @@ fn build_rewind_app() -> App {
         Message::user("first prompt".into()),
         Message {
             role: Role::Assistant,
-            content: vec![
-                ContentBlock::Text {
-                    text: "response 1".into(),
-                },
-                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({})),
-            ],
+            content: vec![ContentBlock::Text {
+                text: "response 1".into(),
+            }],
             ..Default::default()
         },
         Message::user("second prompt".into()),
@@ -5452,6 +5630,9 @@ fn build_rewind_app() -> App {
     app.state
         .session_mut()
         .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
+    let messages = app.state.session.messages().to_vec();
+    bind_history_actor(&mut app, messages);
+    app.open_rewind_picker();
     app
 }
 
@@ -5470,18 +5651,12 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert!(app.input_box.buffer.value().is_empty());
     assert_eq!(app.run_id, old_run_id);
-    let Action::ReplaceSession(ref request) = actions[0] else {
-        panic!("expected replacement request");
-    };
-    assert_eq!(
-        request.kind,
-        crate::components::SessionReplacementKind::Rewind
-    );
-    assert_eq!(request.session.messages().len(), 2);
-    assert_eq!(
-        request.session.meta.input_draft.as_deref(),
-        Some("second prompt")
-    );
+    let agent_id = app.selected_agent_id();
+    apply_rewind_action(&mut app, actions);
+    assert_eq!(app.selected_agent_id(), agent_id);
+    assert_eq!(app.state.session.messages().len(), 2);
+    assert_eq!(app.input_box.buffer.value(), "second prompt");
+    assert_eq!(app.run_id, old_run_id);
 }
 
 #[test]
@@ -5502,12 +5677,12 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 100_000);
-    let Action::ReplaceSession(request) = &actions[0] else {
-        panic!("expected replacement request");
-    };
-    assert!(request.session.messages().is_empty());
-    assert!(!request.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(request.session.meta.context_size, 0);
+    apply_rewind_action(&mut app, actions);
+    assert!(app.state.session.messages().is_empty());
+    assert_eq!(app.state.context_size, 0);
+    assert_eq!(app.input_box.buffer.value(), "first prompt");
+    assert_eq!(app.state.token_usage.input, 500);
+    assert_eq!(app.state.token_usage.output, 200);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -5807,7 +5982,7 @@ fn mcp_toggle_dispatches_action() {
 }
 
 #[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
+    |app: &mut App| { app.state.mode = Mode::Plan; app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
     ""
     ; "consumed_by_plan_form"
 )]
@@ -5973,7 +6148,7 @@ fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
 }
 
 #[test]
-fn parent_done_reconciles_unresolved_children_and_tools() {
+fn parent_done_preserves_unresolved_children_and_reconciles_own_tools() {
     let mut app = streaming_app_with_history();
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
@@ -6011,23 +6186,23 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
 
     app.update(done_event());
 
-    assert!(app.chats[1].is_finished());
+    assert!(!app.chats[1].is_finished());
     assert_eq!(app.chats[0].in_progress_count(), 0);
-    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert_eq!(app.chats[1].in_progress_count(), 1);
     assert!(
         app.chats[0]
             .last_message_text()
             .contains(MISSING_TOOL_COMPLETION)
     );
     app.checkpoint();
-    assert!(app.state.session.subagents().is_empty());
+    assert_eq!(app.state.session.subagents().len(), 1);
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
-    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.chat_index.get("task1"), Some(&1));
 }
 
 #[test]
-fn parent_error_refreshes_picker_and_persists_only_completed_children() {
+fn parent_error_preserves_running_and_completed_children() {
     let mut app = streaming_app_with_history();
     app.update(subagent_msg_with_model(
         AgentEvent::TextDelta { text: "one".into() },
@@ -6058,7 +6233,14 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
     }));
 
     assert!(app.task_picker.is_open());
-    assert_eq!(app.task_picker.item(2).unwrap().finished, Some(true));
+    let running = app
+        .task_picker
+        .items()
+        .unwrap()
+        .iter()
+        .find(|entry| entry.chat_index == 2)
+        .unwrap();
+    assert_eq!(running.finished, Some(false));
     app.checkpoint();
     let saved: Vec<_> = app
         .state
@@ -6077,6 +6259,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
         saved,
         vec![
             ("task1", "first", Some("model-a")),
+            ("task2", "second", Some("model-b")),
             ("task3", "third", Some("model-c")),
         ]
     );
@@ -6107,7 +6290,7 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
 }
 
 #[test]
-fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
+fn agent_error_preserves_shell_and_child_tools() {
     let mut app = streaming_app_with_history();
     let shell_id = app.shell.reserve_id();
     app.handle_shell_event(shell::ShellEvent::Start {
@@ -6144,8 +6327,8 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     }));
 
     assert_eq!(app.chats[0].in_progress_count(), 1);
-    assert_eq!(app.chats[1].in_progress_count(), 0);
-    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    assert!(!app.chats[1].is_finished());
 
     app.handle_shell_event(shell::ShellEvent::Done {
         id: shell_id.clone(),
@@ -6159,7 +6342,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
 }
 
 #[test]
-fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
+fn parent_done_preserves_shell_and_same_id_child_tool() {
     let mut app = streaming_app_with_history();
     let id = app.shell.reserve_id();
     app.handle_shell_event(shell::ShellEvent::Start {
@@ -6184,8 +6367,8 @@ fn main_shell_exclusion_does_not_protect_same_id_in_child_chat() {
     app.update(done_event());
 
     assert_eq!(app.chats[0].in_progress_count(), 1);
-    assert_eq!(app.chats[1].in_progress_count(), 0);
-    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    assert!(!app.chats[1].is_finished());
 }
 
 #[test]
@@ -7186,6 +7369,7 @@ fn subagent_history_finishes_workflow_chat() {
 
     app.update(agent_msg_with_run_id(
         AgentEvent::SubagentHistory {
+            history_epoch: 0,
             tool_use_id: "session-abc".into(),
             messages: vec![],
         },
@@ -7291,9 +7475,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (input_tx, input_rx) = flume::unbounded();
-    let mut info = subagent_info(TASK_ID, "worker");
-    info.input_tx = Some(input_tx);
+    let info = subagent_info(TASK_ID, "worker");
     let envelope = |outcome| {
         Msg::Agent(Box::new(Envelope {
             event: AgentEvent::TurnOutcome(outcome),
@@ -7328,6 +7510,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     assert!(app.task_entries()[1].is_spinning());
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
+            history_epoch: 0,
             tool_use_id: TASK_ID.into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -7356,42 +7539,17 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
 
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
-    assert!(input_rx.try_recv().is_err());
 }
 
 #[test]
 fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
     const FOLLOW_UP: &str = "follow up";
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    let (input_tx, input_rx) = flume::unbounded();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let mut info = subagent_info(TASK_ID, "worker");
-    info.input_tx = Some(input_tx);
-    info.cancel = Some(maki_agent::SubagentCancel::new({
-        let cancelled = Arc::clone(&cancelled);
-        move || cancelled.store(true, Ordering::SeqCst)
-    }));
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TextDelta {
-            text: "working".into(),
-        },
-        subagent: Some(info),
-        run_id: 1,
-    })));
-
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     app.update(done_event());
-    app.active_chat = 1;
     assert!(!app.chats[1].is_finished());
-
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(actions.is_empty());
-    assert!(cancelled.load(Ordering::SeqCst));
-
+    app.handle_cancel();
     type_and_submit(&mut app, FOLLOW_UP);
-    assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);
+    assert_eq!(received_input(&input_rx).message, FOLLOW_UP);
 }
 
 #[test]
@@ -7406,6 +7564,7 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     ));
     app.update(subagent_msg_with_run_id(
         AgentEvent::SubagentHistory {
+            history_epoch: 0,
             tool_use_id: TASK_ID.into(),
             messages: vec![],
         },
@@ -7770,6 +7929,277 @@ fn app_with_active_subagent() -> App {
     app
 }
 
+#[test_case(false; "main")]
+#[test_case(true; "child")]
+fn main_child_input_interaction_parity(child: bool) {
+    let mut app = app_with_subagent();
+    app.active_chat = usize::from(child);
+    app.update(Msg::Paste("shared draft".into()));
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    assert_eq!(app.input_box.buffer.value(), "shared draf!t");
+    assert!(app.run_builtin(BuiltinAction::Search).is_empty());
+    assert!(app.search_modal.is_open());
+}
+
+#[test]
+fn shared_draft_survives_focus_switch() {
+    let mut app = app_with_subagent();
+    app.update(Msg::Paste("shared draft".into()));
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.input_box.buffer.value(), "shared draft");
+    app.run_builtin(BuiltinAction::PrevChat);
+    assert_eq!(app.input_box.buffer.value(), "shared draft");
+}
+
+#[test_case(false; "idle_root")]
+#[test_case(true; "busy_root")]
+fn focused_agent_status_independent_of_root(root_busy: bool) {
+    let mut app = app_with_active_subagent();
+    app.status = if root_busy {
+        Status::Streaming
+    } else {
+        Status::Idle
+    };
+    assert!(app.focused_streaming());
+    app.chats[1].mark_finished(DisplayRole::Done, DONE_TEXT);
+    assert!(!app.focused_streaming());
+}
+
+#[test_case(40, 12; "small")]
+#[test_case(100, 35; "large")]
+fn focused_agent_render_layout_matrix(width: u16, height: u16) {
+    let mut app = app_with_subagent();
+    app.input_box.set_input("shared\nmultiline".into());
+    let area = Rect::new(0, 0, width, height);
+    let main = app.layout_geometry(area);
+    app.active_chat = 1;
+    let child = app.layout_geometry(area);
+    assert_eq!(
+        (main.0, main.1, main.2, main.3),
+        (child.0, child.1, child.2, child.3)
+    );
+    let rows = rendered_rows(&mut app, width, height);
+    assert!(rows.iter().any(|row| row.contains("shared")));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RenderSurface {
+    Draft,
+    Panel,
+    Permission,
+    Question,
+    Plan,
+}
+
+#[test_case(80, 24 ; "compact")]
+#[test_case(140, 40 ; "large")]
+fn normalized_focused_render_matrix(width: u16, height: u16) {
+    for surface in [
+        RenderSurface::Draft,
+        RenderSurface::Panel,
+        RenderSurface::Permission,
+        RenderSurface::Question,
+        RenderSurface::Plan,
+    ] {
+        for root_busy in [false, true] {
+            for selected_busy in [false, true] {
+                for closed in [false, true] {
+                    if closed && selected_busy {
+                        continue;
+                    }
+                    let mut panels = Vec::new();
+                    for child in [false, true] {
+                        let mut app = test_app();
+                        let mode = if matches!(surface, RenderSurface::Plan) {
+                            maki_agent::AgentMode::Plan("matrix-plan.md".into())
+                        } else {
+                            maki_agent::AgentMode::Build
+                        };
+                        let (target, rx) =
+                            spawn_input_child_with_mode(&mut app, TASK_ID, "matrix-agent", mode);
+                        let config = target.effective_config().unwrap().unwrap();
+                        app.state.model = config.model.clone();
+                        app.state.session_mut().model = config.model.spec();
+                        if child {
+                            bind_actor_target(&app, target);
+                        }
+                        app.status = if if child { root_busy } else { selected_busy } {
+                            Status::Streaming
+                        } else {
+                            Status::Idle
+                        };
+                        app.active_chat = usize::from(child);
+                        if !selected_busy {
+                            app.chats[1].mark_finished(DisplayRole::Done, DONE_TEXT);
+                        }
+                        if closed {
+                            let id = app.chats[1].agent_id.unwrap();
+                            app.subagent_channels.get_mut(&id).unwrap().closed = true;
+                        }
+                        app.sync_focused_queue();
+                        if child && selected_busy {
+                            type_and_submit(&mut app, "active");
+                            received_input(&rx);
+                        }
+                        app.input_box.set_input("shared draft\nsecond line".into());
+                        with_image(&mut app);
+                        app.last_input = None;
+                        match surface {
+                            RenderSurface::Draft => {}
+                            RenderSurface::Panel => {
+                                let (tx, _rx) = flume::unbounded();
+                                let (_cmd_tx, cmd_rx) = flume::unbounded();
+                                app.float_mgr.open(
+                                    Arc::new(maki_agent::SharedBuf::new()),
+                                    maki_lua::FloatConfig {
+                                        split: maki_lua::Split::Panel,
+                                        height: maki_lua::Dimension::Abs(3),
+                                        ..Default::default()
+                                    },
+                                    false,
+                                    tx,
+                                    cmd_rx,
+                                );
+                            }
+                            RenderSurface::Permission => {
+                                let mut demand = bash_perm_demand("matrix-permission");
+                                demand.perm.as_mut().unwrap().agent_id = app.selected_agent_id();
+                                assert!(!app.begin_input_demand(demand));
+                                assert!(app.permission_active());
+                            }
+                            RenderSurface::Question => {
+                                let (active, _events, _commands) =
+                                    open_question_win(&mut app, true);
+                                assert!(active);
+                                assert!(app.question_active());
+                            }
+                            RenderSurface::Plan => {
+                                app.state.mode = Mode::Plan;
+                                app.state.plan = PlanState::Drafting("matrix-plan.md".into());
+                                app.plan_form.on_plan_ready();
+                                assert!(app.plan_form_active());
+                            }
+                        }
+                        let rows = rendered_rows(&mut app, width, height);
+                        let geometry = app.layout_geometry(Rect::new(0, 0, width, height));
+                        let bottom = geometry.1;
+                        let start = geometry
+                            .4
+                            .rect(maki_lua::Split::Below)
+                            .map_or(bottom.y, |below| bottom.y.min(below.y));
+                        let panel: Vec<_> = rows
+                            .into_iter()
+                            .skip(start as usize)
+                            .take(geometry.2.y.saturating_sub(start) as usize)
+                            .map(|row| {
+                                let row = if row.contains("[subtask] ") {
+                                    let mut normalized = row.replace("[subtask] ", "");
+                                    if let Some(border) = normalized.rfind('│') {
+                                        normalized.insert_str(border, "          ");
+                                    }
+                                    normalized
+                                } else { row };
+                                row.replace(
+                                    "DESPAWNED · sends to this subagent · TAB mode · ESC cancel",
+                                    &"─".repeat("DESPAWNED · sends to this subagent · TAB mode · ESC cancel".chars().count()),
+                                )
+                                .replace("sends to this subagent · TAB mode · ESC cancel", &"─".repeat("sends to this subagent · TAB mode · ESC cancel".chars().count()))
+                                .trim_end()
+                                .to_owned()
+                            })
+                            .collect();
+                        assert!(!panel.is_empty());
+                        panels.push(panel);
+                    }
+                    assert_eq!(
+                        panels[0], panels[1],
+                        "{surface:?}: root_busy={root_busy}, selected_busy={selected_busy}, closed={closed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test_case(false, false ; "both_idle")]
+#[test_case(false, true ; "child_busy")]
+#[test_case(true, false ; "root_busy")]
+#[test_case(true, true ; "both_busy")]
+fn focused_status_render_does_not_leak_root_state(root_busy: bool, child_busy: bool) {
+    const ROOT_ERROR: &str = "root-only error";
+    let mut app = app_with_subagent();
+    app.status = if root_busy {
+        Status::Streaming
+    } else {
+        Status::error(ROOT_ERROR.into())
+    };
+    app.run_model = Some("old-root-model".into());
+    app.chats[1].model_id = Some("child-model".into());
+    if !child_busy {
+        app.chats[1].mark_finished(DisplayRole::Done, DONE_TEXT);
+    }
+    let main = rendered_rows(&mut app, 160, 30).pop().unwrap();
+    assert_eq!(main.contains(ROOT_ERROR), !root_busy);
+    assert_eq!(main.contains("[switch queued]"), root_busy);
+    app.active_chat = 1;
+    let child = rendered_rows(&mut app, 160, 30).pop().unwrap();
+    assert!(!child.contains(ROOT_ERROR));
+    assert!(!child.contains("[switch queued]"));
+    assert!(child.contains("child-model"));
+    assert_eq!(app.focused_streaming(), child_busy);
+}
+
+#[test]
+fn viewed_agent_cancel_is_local() {
+    let mut app = app_with_subagent();
+    let child_count = app.chats[1].message_count();
+    let agent_id = app.chats[1].agent_id.unwrap();
+    app.handle_cancel();
+    assert_eq!(app.chats[1].message_count(), child_count);
+    assert!(!app.chats[1].is_finished());
+    assert!(app.subagent_channels.contains_key(&agent_id));
+}
+
+#[test]
+fn child_consumption_renders_user_bubble() {
+    let mut app = app_with_subagent();
+    app.update(subagent_msg(
+        AgentEvent::QueueItemConsumed {
+            text: "consumed child input".into(),
+            images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
+        },
+        TASK_ID,
+        Some("research"),
+    ));
+    assert_eq!(app.chats[1].last_message_text(), "consumed child input");
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
+}
+
+#[test]
+fn shell_results_stay_with_original_agent_after_focus_switch() {
+    let mut app = app_with_active_subagent();
+    let target = app.selected_agent_id();
+    let id = app.shell.reserve_for(target);
+    app.active_chat = 0;
+    app.handle_shell_event(shell::ShellEvent::Start {
+        id: id.clone(),
+        command: "true".into(),
+    });
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+    app.handle_shell_event(shell::ShellEvent::Done {
+        id,
+        command: "true".into(),
+        output: "output".into(),
+        is_error: false,
+        visible: true,
+    });
+    assert!(app.shell.drain_results().is_empty());
+    assert_eq!(app.shell.drain_results_for(target).len(), 1);
+}
+
 #[test]
 fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
@@ -7954,18 +8384,17 @@ fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
     assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
 }
 
-/// In the window between a rewind and the agent respawn, syncing from the
-/// mirror would bring back the messages that were just dropped.
 #[test]
 fn checkpoint_after_rewind_persists_the_truncated_history() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    let _live = attach_live_history(
+    let target = bind_history_actor(
         &mut app,
         vec![
             Message::user("first prompt".into()),
             Message::user("second prompt".into()),
         ],
     );
+    app.open_rewind_picker();
     app.checkpoint();
 
     let entry = crate::components::rewind_picker::RewindEntry {
@@ -7978,14 +8407,16 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
         app.shared_history.is_some(),
         "live mirror remains installed"
     );
-    let Action::ReplaceSession(request) = &actions[0] else {
-        panic!("expected replacement request");
-    };
-    assert_eq!(request.session.messages().len(), 1);
-
+    apply_rewind_action(&mut app, actions);
+    assert_eq!(app.selected_agent_id(), Some(target.id()));
+    assert_eq!(
+        app.shared_history.as_ref().unwrap().load().messages.len(),
+        1
+    );
+    app.checkpoint_now();
     let id = app.state.session.id;
     drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 2);
+    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
 }
 
 #[test]
@@ -8192,7 +8623,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
 /// rebuild the tabs later. Only the `sync_subagents` call inside
 /// `retain_resolved_subagents` carries the survivors over.
 #[test]
-fn turn_end_keeps_only_the_subagents_that_finished() {
+fn turn_end_keeps_running_and_finished_subagents() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -8210,7 +8641,8 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
     assert_eq!(app.state.session.subagents().len(), 2);
 
     app.update(done_event());
-    assert!(app.chat_index.is_empty());
+    assert_eq!(app.chat_index.len(), 2);
+    assert!(!app.chats[2].is_finished());
     app.checkpoint();
 
     let ids: Vec<_> = app
@@ -8220,7 +8652,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .iter()
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
-    assert_eq!(ids, [FINISHED_TASK_ID]);
+    assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID]);
 }
 
 #[test]
@@ -8854,6 +9286,40 @@ fn cd_completion_opens_after_command_name_tab_or_paste(paste: bool) {
 }
 
 #[test]
+fn cd_slash_completion_uses_child_cwd_before_argument_dispatch() {
+    let (root, mut app, _backend) = completion_app();
+    let child = TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("alpha-root")).unwrap();
+    std::fs::create_dir(child.path().join("alpha-child")).unwrap();
+    let (target, _) = spawn_input_child(&mut app, TASK_ID, "research");
+    let actor = target.actor().unwrap();
+    let update = actor.reserve_config_update().unwrap();
+    update
+        .resolve(Ok(maki_agent::actor::ConfigChange::WorkingDirectory(
+            child.path().to_path_buf(),
+        )))
+        .unwrap();
+    smol::block_on(update.wait()).unwrap();
+    app.active_chat = 1;
+    bind_actor_target(&app, target);
+    app.sync_focused_queue();
+    for character in "/cd ./al".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    let labels: Vec<_> = app
+        .command_palette
+        .argument_match_items()
+        .iter()
+        .map(|item| item.label.to_string())
+        .collect();
+    assert_eq!(labels, ["./alpha-child/"]);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "/cd ./alpha-child/");
+    assert_eq!(app.state.session.cwd, root.path().to_string_lossy());
+}
+
+#[test]
 fn cd_completion_does_not_hijack_plugin_override() {
     let (tmp, mut app, _backend) = completion_app();
     std::fs::create_dir(tmp.path().join("alpha")).unwrap();
@@ -9400,121 +9866,267 @@ fn queued_msg_with(text: &str, app: &App) -> QueuedMessage {
 
 // --- Async subagent routing (AC.8, AC.9, AC.10) ------------------------------
 
-/// A subagent tab whose `SubagentInfo` carries both an answer and an input
-/// channel, as an async session does.
-fn app_with_subagent_input_tx(id: &str) -> (App, flume::Receiver<String>) {
-    let (input_tx, input_rx) = flume::unbounded();
-    let mut app = streaming_app();
-    let info = subagent_info_full(id, "research", None, Some(input_tx));
+struct PromptTurnBehavior;
+
+impl maki_commands::CommandBehavior for PromptTurnBehavior {
+    fn execute(
+        &self,
+        invocation: maki_commands::CommandInvocation,
+    ) -> maki_commands::CommandFuture<
+        Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
+    > {
+        Box::pin(async move {
+            Ok(maki_commands::CommandOutcome::AgentTurn(
+                maki_commands::AgentTurn {
+                    content: invocation.content,
+                    prompt: Some(maki_commands::PromptReference {
+                        qualified_name: Arc::from("fixture/review"),
+                        arguments: Arc::from([(Arc::from("subject"), invocation.arguments)]),
+                    }),
+                },
+            ))
+        })
+    }
+}
+
+#[test]
+fn child_mcp_command_preserves_full_input_while_root_busy() {
+    let (mut app, rx) = app_with_subagent_actor(TASK_ID);
+    let child = app.selected_agent_id().unwrap();
+    app.queue_and_notify(queued_msg("root pending"));
+    let producer = app
+        .command_runtime
+        .registry
+        .create_producer(maki_commands::ProducerPrecedence::Plugin);
+    producer
+        .replace(vec![maki_commands::Registration {
+            spec: maki_commands::CommandSpec {
+                name: Arc::from("/fixture-review"),
+                aliases: Arc::from([]),
+                arguments: test_command_arguments(Some(1), false),
+                docs: maki_commands::CommandDocs {
+                    summary: Arc::from("MCP prompt fixture"),
+                    argument_hint: None,
+                },
+                required_capabilities: Default::default(),
+            },
+            behavior: Arc::new(PromptTurnBehavior),
+            argument_completions: vec![None],
+        }])
+        .unwrap();
+    app.handle_submit(Submission {
+        text: "/fixture-review subject".into(),
+        images: vec![ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(TEST_IMAGE_DATA),
+        )],
+    });
+    assert!(app.execute_pending_commands().is_empty());
+    let input = received_input(&rx);
+    assert_eq!(input.images.len(), 1);
+    assert_eq!(input.images[0].data.as_ref(), TEST_IMAGE_DATA);
+    assert_eq!(
+        input.prompt.as_ref().unwrap().qualified_name,
+        "fixture/review"
+    );
+    assert_eq!(
+        input
+            .prompt
+            .as_ref()
+            .unwrap()
+            .arguments
+            .get("subject")
+            .map(String::as_str),
+        Some("subject")
+    );
+    assert_eq!(app.selected_agent_id(), Some(child));
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.queue.root_text_messages(), ["root pending"]);
+}
+
+struct FocusedInputBackend(flume::Sender<AgentInput>);
+
+impl maki_agent::ActorBackend for FocusedInputBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut maki_agent::History,
+        context: maki_agent::TurnContext,
+        input: AgentInput,
+        _: maki_agent::WorkKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if let Some(inbox) = &context.inbox {
+                inbox.take_initial_submission();
+            }
+            self.0.send_async(input).await.unwrap();
+            std::future::pending().await
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut maki_agent::History,
+        _: maki_agent::TurnContext,
+        _: &'a maki_agent::ControlWork,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
+    {
+        Box::pin(async { maki_agent::BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut maki_agent::History,
+        _: maki_agent::TurnContext,
+        _: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
+    {
+        Box::pin(async { maki_agent::BackendResult::CompactDone })
+    }
+}
+
+fn bind_actor_target(app: &App, target: maki_agent::AgentRef) {
+    app.command_runtime.sync_admissions(HashMap::from([(
+        app.command_target.id(),
+        maki_lua::orchestration::TrustedTarget {
+            target,
+            template: maki_agent::tools::cli_tool_ctx(),
+        },
+    )]));
+}
+
+fn spawn_input_child(
+    app: &mut App,
+    id: &str,
+    name: &str,
+) -> (maki_agent::AgentRef, flume::Receiver<AgentInput>) {
+    spawn_input_child_with_mode(app, id, name, maki_agent::AgentMode::Build)
+}
+
+fn spawn_input_child_with_mode(
+    app: &mut App,
+    id: &str,
+    name: &str,
+    mode: maki_agent::AgentMode,
+) -> (maki_agent::AgentRef, flume::Receiver<AgentInput>) {
+    let template = maki_agent::tools::cli_tool_ctx();
+    let config = maki_agent::EffectiveAgentConfig::new(
+        maki_agent::RunSettings {
+            provider: template.provider,
+            model: (*template.model).clone(),
+            fast: false,
+            workflow: false,
+            thinking: Default::default(),
+        },
+        mode,
+    );
+    let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+    let (unused_tx, _) = flume::unbounded();
+    let root = manager
+        .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+            Ok::<_, String>(
+                Box::new(FocusedInputBackend(unused_tx)) as Box<dyn maki_agent::ActorBackend>
+            )
+        })
+        .unwrap();
+    let (tx, rx) = flume::unbounded();
+    let target = manager
+        .spawn_child_trusted_with_config(
+            &root,
+            config,
+            Default::default(),
+            Vec::new(),
+            None,
+            |_| {
+                Ok::<_, String>(
+                    Box::new(FocusedInputBackend(tx)) as Box<dyn maki_agent::ActorBackend>
+                )
+            },
+        )
+        .unwrap();
+    target
+        .actor()
+        .unwrap()
+        .configure_parent_delivery(false, Some(id.into()))
+        .unwrap();
+    let info = subagent_info_for_agent(target.id(), id, name, None, None);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(info),
         run_id: 1,
     })));
+    (target, rx)
+}
+
+fn app_with_subagent_actor(id: &str) -> (App, flume::Receiver<AgentInput>) {
+    let mut app = streaming_app();
+    let (target, rx) = spawn_input_child(&mut app, id, "research");
     app.active_chat = 1;
-    (app, input_rx)
+    bind_actor_target(&app, target);
+    (app, rx)
+}
+
+fn received_input(rx: &flume::Receiver<AgentInput>) -> AgentInput {
+    smol::block_on(async {
+        futures_lite::future::race(rx.recv_async(), async {
+            smol::Timer::after(SETTLE_TIMEOUT).await;
+            panic!("actor did not enter submitted input")
+        })
+        .await
+        .unwrap()
+    })
 }
 
 #[test]
 fn duplicate_compatibility_ids_route_by_agent_id() {
-    const COMPATIBILITY_ID: &str = "duplicate";
-    const FIRST_TEXT: &str = "first";
-    const SECOND_TEXT: &str = "second";
-
-    let first_id = AgentId::generate();
-    let second_id = AgentId::generate();
-    let (first_input_tx, first_input_rx) = flume::unbounded();
-    let (second_input_tx, second_input_rx) = flume::unbounded();
-    let first_cancelled = Arc::new(AtomicBool::new(false));
-    let second_cancelled = Arc::new(AtomicBool::new(false));
-    let mut first = subagent_info_for_agent(
-        first_id,
-        COMPATIBILITY_ID,
-        "first agent",
-        None,
-        Some(first_input_tx),
-    );
-    let mut second = subagent_info_for_agent(
-        second_id,
-        COMPATIBILITY_ID,
-        "second agent",
-        None,
-        Some(second_input_tx),
-    );
-    first.cancel = Some(maki_agent::SubagentCancel::new({
-        let cancelled = Arc::clone(&first_cancelled);
-        move || cancelled.store(true, Ordering::SeqCst)
-    }));
-    second.cancel = Some(maki_agent::SubagentCancel::new({
-        let cancelled = Arc::clone(&second_cancelled);
-        move || cancelled.store(true, Ordering::SeqCst)
-    }));
-
     let mut app = streaming_app();
-    for (info, text) in [(first, FIRST_TEXT), (second, SECOND_TEXT)] {
-        app.update(Msg::Agent(Box::new(Envelope {
-            event: AgentEvent::TextDelta { text: text.into() },
-            subagent: Some(info),
-            run_id: 1,
-        })));
-    }
-
-    assert_eq!(app.chats.len(), 3);
-    let first_index = app.live_chat_index[&first_id];
-    let second_index = app.live_chat_index[&second_id];
+    let (first, first_rx) = spawn_input_child(&mut app, "duplicate", "first");
+    let (second, second_rx) = spawn_input_child(&mut app, "duplicate", "second");
+    let first_index = app.live_chat_index[&first.id()];
+    let second_index = app.live_chat_index[&second.id()];
     assert_ne!(first_index, second_index);
-    app.chats[first_index].flush();
-    app.chats[second_index].flush();
-    assert_eq!(app.chats[first_index].last_message_text(), FIRST_TEXT);
-    assert_eq!(app.chats[second_index].last_message_text(), SECOND_TEXT);
-
-    app.update(done_event());
-    assert_eq!(app.live_chat_index[&first_id], first_index);
-    assert_eq!(app.live_chat_index[&second_id], second_index);
-
     app.active_chat = second_index;
+    bind_actor_target(&app, second.clone());
     assert!(matches!(
         app.submit_prompt(queued_msg("continue")),
         SubmitOutcome::Queued
     ));
-    assert_eq!(second_input_rx.try_recv().unwrap(), "continue");
-    assert!(first_input_rx.try_recv().is_err());
-
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(second_cancelled.load(Ordering::SeqCst));
-    assert!(!first_cancelled.load(Ordering::SeqCst));
+    assert_eq!(received_input(&second_rx).message, "continue");
+    assert!(first_rx.try_recv().is_err());
+    app.handle_cancel();
+    assert!(first.validate_live().is_ok());
+    assert!(second.validate_live().is_ok());
 }
 
 #[test]
 fn submit_in_subagent_chat_routes_to_subagent_queue() {
-    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     let outcome = app.submit_prompt(queued_msg("do more"));
     assert!(matches!(outcome, SubmitOutcome::Queued));
     assert_eq!(
-        input_rx.try_recv().unwrap(),
+        received_input(&input_rx).message,
         "do more",
         "message must go to the subagent queue"
     );
-    // The subagent's chat shows the message; the main queue is untouched.
-    assert_eq!(app.chats[1].last_message_text(), "do more");
+    assert_ne!(app.chats[1].last_message_text(), "do more");
     assert!(app.queue.text_messages().is_empty());
 }
 
 #[test]
-fn submit_in_subagent_chat_with_images_is_rejected() {
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+fn shared_submission_preserves_images() {
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     let mut msg = queued_msg("hi");
     msg.images
         .push(ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA==")));
-    assert!(matches!(app.submit_prompt(msg), SubmitOutcome::Rejected(_)));
+    assert!(matches!(app.submit_prompt(msg), SubmitOutcome::Queued));
+    assert_eq!(received_input(&input_rx).images.len(), 1);
 }
 
 #[test]
 fn submit_after_subagent_completion_routes_to_reusable_child() {
-    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let input_tx = app.subagent_channels[&agent_id].input_tx.clone();
+    let input_tx = None;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(TurnOutcome::completed(
             agent_id,
@@ -9534,23 +10146,17 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
         app.submit_prompt(queued_msg("continue")),
         SubmitOutcome::Queued
     ));
-    assert_eq!(input_rx.try_recv().unwrap(), "continue");
+    assert_eq!(received_input(&input_rx).message, "continue");
 }
 
 #[test]
 fn subagent_closed_marks_despawned_and_rejects_input() {
     const LATE_FAILURE: &str = "late failure";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     app.open_tasks();
     assert!(!app.active_subagent_closed());
     assert!(app.task_picker.item(chat_idx).unwrap().is_spinning());
@@ -9599,15 +10205,9 @@ fn subagent_closed_replaces_active_permission_with_live_root_request() {
     const CHILD_PERMISSION_ID: &str = "child-permission";
     const ROOT_PERMISSION_ID: &str = "root-permission";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     let permission = |id: &str| AgentEvent::PermissionRequest {
         id: id.into(),
         tool: maki_config::ToolKey::native(PERM_TOOL),
@@ -9643,15 +10243,9 @@ fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
     const CHILD_PERMISSION_ID: &str = "deferred-child-permission";
     const ROOT_PERMISSION_ID: &str = "deferred-root-permission";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     let permission = |id: &str| AgentEvent::PermissionRequest {
         id: id.into(),
         tool: maki_config::ToolKey::native(PERM_TOOL),
@@ -9686,16 +10280,10 @@ fn subagent_closed_preserves_terminal_status(
     expected_text: &str,
     expected_role: &DisplayRole,
 ) {
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     if failed {
         app.chats[chat_idx].mark_failed(expected_text);
     } else {
@@ -9717,17 +10305,11 @@ fn subagent_closed_preserves_terminal_status(
 fn final_history_after_subagent_closed_only_persists_messages() {
     const FINAL_REPLY: &str = "final reply";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let chat_count = app.chats.len();
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     let messages = vec![Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
@@ -9744,6 +10326,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
     })));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
+            history_epoch: 0,
             tool_use_id: TASK_ID.into(),
             messages: messages.clone(),
         },
@@ -9767,17 +10350,11 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
     const MODEL: &str = "delayed-model";
     const COST: f64 = 0.125;
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let chat_count = app.chats.len();
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     let usage = TokenUsage {
         input: 100,
         output: 25,
@@ -9814,20 +10391,14 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
 }
 
 #[test]
-fn turn_complete_after_root_cancel_accounts_without_restoring_child() {
+fn turn_complete_after_root_cancel_preserves_child() {
     const MODEL: &str = "cancelled-child-model";
     const COST: f64 = 0.25;
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     let usage = TokenUsage {
         input: 80,
         output: 20,
@@ -9835,8 +10406,9 @@ fn turn_complete_after_root_cancel_accounts_without_restoring_child() {
         cache_read: 2,
     };
 
+    app.active_chat = 0;
     app.handle_cancel();
-    assert!(app.live_chat_index.is_empty());
+    assert!(app.live_chat_index.contains_key(&agent_id));
     app.update(Msg::Agent(Box::new(Envelope {
         event: turn_complete(usage, MODEL, Some(COST)),
         subagent: Some(info),
@@ -9848,25 +10420,63 @@ fn turn_complete_after_root_cancel_accounts_without_restoring_child() {
         app.state.session.usage_by_model()[MODEL],
         usage.billed(Some(COST))
     );
-    assert!(app.live_chat_index.is_empty());
-    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.live_chat_index.contains_key(&agent_id));
+    assert!(!app.chats[chat_idx].is_finished());
     assert!(app.queue.text_messages().is_empty());
+}
+
+#[test_case::test_case(false; "live_child")]
+#[test_case::test_case(true; "closed_child")]
+fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool) {
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let earlier = maki_agent::HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
+    let latest = maki_agent::HistorySnapshot::new(Vec::new());
+    assert!(
+        app.state
+            .session_mut()
+            .adopt_subagent_history(TASK_ID.into(), &earlier)
+    );
+    app.apply_history_change(maki_agent::actor::HistoryChange {
+        agent_id,
+        epoch: latest.epoch,
+        messages: Arc::clone(&latest.messages),
+        draft: Message::user(String::new()),
+    });
+    if closed {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::SubagentClosed,
+            subagent: Some(info.clone()),
+            run_id: 1,
+        })));
+    }
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            history_epoch: earlier.epoch,
+            messages: earlier.messages.as_ref().clone(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    let projected = app
+        .state
+        .session
+        .subagent_history_snapshot(TASK_ID)
+        .unwrap();
+    assert_eq!(projected.epoch, latest.epoch);
+    assert!(projected.messages.is_empty());
 }
 
 #[test]
 fn progress_after_subagent_closed_does_not_reopen_chat() {
     const LATE_PROGRESS: &str = "late progress";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
 
     for event in [
@@ -9891,15 +10501,9 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
 fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     const IN_PROGRESS: &str = "in progress";
 
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
             text: IN_PROGRESS.into(),
@@ -9909,7 +10513,11 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     })));
     assert!(!app.chats[app.active_chat].is_finished());
 
+    let child_index = app.active_chat;
+    app.active_chat = 0;
     app.handle_cancel();
+    assert!(!app.chats[child_index].is_finished());
+    assert_eq!(app.live_chat_index.get(&agent_id), Some(&child_index));
     let chat_count = app.chats.len();
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
@@ -9918,12 +10526,14 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     })));
 
     assert_eq!(app.chats.len(), chat_count);
-    assert!(app.live_chat_index.is_empty());
+    assert_eq!(app.live_chat_index.get(&agent_id), Some(&child_index));
+    assert!(app.chats[child_index].is_finished());
+    assert!(app.subagent_channels.get(&agent_id).unwrap().closed);
 }
 
 #[test]
 fn subagent_closed_prunes_only_its_presentation_state() {
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     let other_agent_id = AgentId::generate();
     let turn_id = TurnId::generate();
@@ -9931,13 +10541,7 @@ fn subagent_closed_prunes_only_its_presentation_state() {
     app.stamped_subagent_outcomes.insert((agent_id, turn_id));
     app.stamped_subagent_outcomes
         .insert((other_agent_id, other_turn_id));
-    let info = subagent_info_for_agent(
-        agent_id,
-        TASK_ID,
-        "research",
-        None,
-        app.subagent_channels[&agent_id].input_tx.clone(),
-    );
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
@@ -9958,32 +10562,32 @@ fn subagent_closed_prunes_only_its_presentation_state() {
 
 #[test]
 fn typing_in_subagent_chat_edits_input_and_submits_to_subagent() {
-    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     // Typing reaches the shared input box on a focused subagent tab.
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
     assert_eq!(app.input_box.buffer.value(), "hi");
     // Enter submits to the subagent's driver queue, not the main agent.
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(input_rx.try_recv().unwrap(), "hi");
+    assert_eq!(received_input(&input_rx).message, "hi");
 }
 
 #[test]
 fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
     const PASTED: &str = "first\nsecond";
 
-    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     app.update(Msg::Paste("first\r\nsecond".into()));
     assert_eq!(app.input_box.buffer.value(), PASTED);
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(input_rx.try_recv().unwrap(), PASTED);
-    assert!(app.queue.text_messages().is_empty());
+    assert_eq!(received_input(&input_rx).message, PASTED);
+    assert!(app.chats[0].message_count() == 0);
 }
 
 #[test]
 fn subagent_history_updates_storage_without_queuing_parent_work() {
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let message = |text: &str| Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text { text: text.into() }],
@@ -9992,6 +10596,7 @@ fn subagent_history_updates_storage_without_queuing_parent_work() {
     let history_event = |messages| {
         subagent_msg(
             AgentEvent::SubagentHistory {
+                history_epoch: 0,
                 tool_use_id: TASK_ID.to_string(),
                 messages,
             },
@@ -10039,6 +10644,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
     grandchild.parent_is_root = false;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
+            history_epoch: 0,
             tool_use_id: "grandchild-task".into(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -10062,14 +10668,21 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
 
 #[test]
 fn task_picker_rows_show_snippet() {
-    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
-    app.update(subagent_msg(
-        AgentEvent::TextDelta {
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
+    let info = subagent_info_for_agent(
+        app.selected_agent_id().unwrap(),
+        TASK_ID,
+        "research",
+        None,
+        None,
+    );
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
             text: "progress line".into(),
         },
-        TASK_ID,
-        None,
-    ));
+        subagent: Some(info),
+        run_id: 1,
+    })));
     app.chats[1].flush();
     app.open_tasks();
     let entry = app.task_picker.item(1).expect("subagent row");

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::QueuedMessage;
-use crate::components::Status;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, ModeDef, ModeId, ModeRegistry};
 use maki_storage::StateDir;
@@ -145,7 +144,10 @@ impl App {
         if modes.is_empty() {
             return vec![];
         }
-        let current = self.state.mode.id_key();
+        let current = self.focused_config().map_or_else(
+            || self.state.mode.id_key(),
+            |config| config.mode.id().key().to_owned(),
+        );
         let idx = modes.iter().position(|d| d.id.key() == current);
         let next = match idx {
             Some(i) => &modes[(i + 1) % modes.len()],
@@ -221,6 +223,15 @@ impl App {
     pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
         let label: Cow<'static, str> = if self.is_bash_input() {
             "[BASH]".into()
+        } else if let Some(config) = self.focused_config() {
+            config
+                .mode_def
+                .as_ref()
+                .map_or_else(
+                    || config.mode.id().key().to_owned(),
+                    |mode| mode.label.to_string(),
+                )
+                .into()
         } else {
             self.state
                 .mode
@@ -249,7 +260,7 @@ impl App {
     }
 
     pub(super) fn separator_style(&self) -> Style {
-        if self.status == Status::Streaming {
+        if self.focused_streaming() {
             theme::current().input_border
         } else {
             Style::new().fg(self.effective_mode_color())

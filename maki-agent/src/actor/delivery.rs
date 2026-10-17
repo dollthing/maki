@@ -253,6 +253,8 @@ pub(crate) struct PendingDelivery {
     pub delivery: Arc<ChildDelivery>,
     pub message: Message,
     pub bytes: usize,
+    cancellation_retried: bool,
+    arrived_during_run: bool,
 }
 
 pub(super) fn admit_delivery(
@@ -285,6 +287,7 @@ pub(super) fn admit_delivery(
     {
         return Err(DeliveryRejection::Overflow);
     }
+    state.delivery_suspended = false;
     state.delivery_seen.push_back(id);
     if state.delivery_seen.len() > super::MAX_RETAINED_TURN_RESULTS {
         state.delivery_seen.pop_front();
@@ -296,6 +299,8 @@ pub(super) fn admit_delivery(
             delivery: Arc::clone(&delivery),
             message,
             bytes,
+            cancellation_retried: false,
+            arrived_during_run: true,
         },
     );
     state.emit(ActorEvent::Delivery(DeliveryEvent {
@@ -348,8 +353,6 @@ pub(super) fn publish(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .remove(&ticket.turn_id());
-    // Closing a child is the owner's own decision, so the turns it cuts short
-    // carry nothing the parent does not already know.
     if matches!(
         ticket.peek_result().map(|result| result.outcome),
         Some(TurnOutcome::Cancelled {
@@ -364,9 +367,6 @@ pub(super) fn publish(
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.delivery_runs.contains_key(&ticket.turn_id()) {
-            return;
-        }
         state.parent_delivery_policy.clone()
     };
     let Some(policy) = policy.filter(|policy| policy.auto_deliver) else {
@@ -460,7 +460,29 @@ pub(super) fn settle(inner: &ActorInner, turn_id: TurnId, reason: Option<TurnCan
     if let Some(batch) = state.delivery_runs.remove(&turn_id)
         && batch.iter().any(|id| state.deliveries.contains_key(id))
     {
-        state.delivery_suspended = true;
+        let new_completion = state
+            .deliveries
+            .values()
+            .any(|pending| pending.arrived_during_run);
+        let retry_cancellation = reason.is_some_and(|reason| {
+            !matches!(
+                reason,
+                TurnCancellationReason::Closed | TurnCancellationReason::Shutdown
+            )
+        }) && batch.iter().any(|id| {
+            state
+                .deliveries
+                .get(id)
+                .is_some_and(|pending| !pending.cancellation_retried)
+        });
+        if retry_cancellation {
+            for id in &batch {
+                if let Some(pending) = state.deliveries.get_mut(id) {
+                    pending.cancellation_retried = true;
+                }
+            }
+        }
+        state.delivery_suspended = !new_completion && !retry_cancellation;
         state.emit(ActorEvent::DeliveryContinuationFailed {
             parent_turn_id: turn_id,
             reason,
@@ -555,6 +577,9 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
             bytes <= MAX_DELIVERY_BATCH_BYTES
         })
         .collect();
+    for pending in state.deliveries.values_mut() {
+        pending.arrived_during_run = false;
+    }
     state.delivery_runs.insert(turn_id, batch);
     state.next_operation_id = state.next_operation_id.wrapping_add(1);
     let id = state.next_operation_id;
@@ -1402,8 +1427,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn failed_delivery_continuation_waits_for_recovery_trigger() {
+    #[test_case(false; "failure_without_new_report")]
+    #[test_case(true; "failure_with_new_report_during_finalization")]
+    fn failed_continuation_recovery_is_bounded(arrival_during_finalization: bool) {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);
             let (actor, task) = AgentActorHandle::spawn_inner(
@@ -1421,15 +1447,267 @@ mod tests {
                 super::schedule(&actor.inner, &mut state);
                 *state.delivery_runs.keys().next().unwrap()
             };
+            let later = delivery(actor.agent_id());
+            if arrival_during_finalization {
+                admit_delivery(&actor.inner, Arc::clone(&later)).unwrap();
+            }
+            super::settle(&actor.inner, id, None);
+            {
+                let state = actor.inner.state.lock().unwrap();
+                assert_eq!(state.delivery_suspended, !arrival_during_finalization);
+                assert!(state.delivery_runs.is_empty());
+            }
+            if !arrival_during_finalization {
+                let first = {
+                    let state = actor.inner.state.lock().unwrap();
+                    Arc::clone(&state.deliveries.values().next().unwrap().delivery)
+                };
+                admit_delivery(&actor.inner, first).unwrap();
+                assert!(actor.inner.state.lock().unwrap().delivery_suspended);
+                admit_delivery(&actor.inner, later).unwrap();
+            }
+            assert!(!actor.inner.state.lock().unwrap().delivery_suspended);
+            assert!(super::drain(&actor.inner, id).is_empty());
+            assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 2);
             actor.cancel_turn(id).unwrap();
+            let recovery = schedule_ticket(&actor);
+            assert_ne!(recovery.turn_id(), id);
+            assert_eq!(super::drain(&actor.inner, recovery.turn_id()).len(), 2);
+            super::settle(&actor.inner, recovery.turn_id(), None);
+            assert!(!actor.inner.state.lock().unwrap().delivery_suspended);
+            actor.close();
+            task.await;
+        });
+    }
+
+    fn deferred_actor(
+        parent: Option<&AgentActorHandle>,
+    ) -> (AgentActorHandle, smol::Task<()>, flume::Sender<()>) {
+        let managed = parent.map(|parent| {
+            let mut managed = crate::actor::types::ManagedTurnAdmission::new(
+                std::sync::Weak::new(),
+                AgentId::generate(),
+            );
+            managed.parent_delivery = Some(super::ParentDelivery {
+                parent_id: parent.agent_id(),
+                parent: Arc::downgrade(&parent.inner),
+                metadata: Default::default(),
+            });
+            managed
+        });
+        let id = managed
+            .as_ref()
+            .map_or_else(AgentId::generate, |managed| managed.agent_id);
+        let (start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            id,
+            Vec::new(),
+            None,
+            Box::new(UnusedBackend),
+            managed,
+            None,
+            Some(rx),
+        );
+        if parent.is_some() {
+            actor.configure_parent_delivery(true, None).unwrap();
+        }
+        (actor, task, start)
+    }
+
+    fn schedule_ticket(actor: &AgentActorHandle) -> crate::actor::TurnTicket {
+        let mut state = actor.inner.state.lock().unwrap();
+        super::schedule(&actor.inner, &mut state);
+        let turn_id = *state.delivery_runs.keys().next().unwrap();
+        actor.turn_ticket(turn_id).unwrap()
+    }
+
+    #[test]
+    fn nested_continuations_report_once_and_quiesce() {
+        smol::block_on(async {
+            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(None);
+            let (parent, parent_task, _parent_start) = deferred_actor(Some(&ancestor));
+            let (child, child_task, _child_start) = deferred_actor(Some(&parent));
+            let ancestor_events = ancestor.subscribe_events();
+            let parent_events = parent.subscribe_events();
+            let child_ticket = child
+                .admit_turn(
+                    delivery(parent.agent_id()).input(),
+                    None,
+                    CORRELATION.into(),
+                )
+                .unwrap();
+            child.cancel_turn(child_ticket.turn_id()).unwrap();
+            let parent_ticket = schedule_ticket(&parent);
+            assert_eq!(
+                super::drain(&parent.inner, parent_ticket.turn_id()).len(),
+                1
+            );
+            parent.cancel_turn(parent_ticket.turn_id()).unwrap();
+            super::publish(&parent.inner, &parent_ticket, None);
+            let ancestor_ticket = schedule_ticket(&ancestor);
+            assert_eq!(
+                super::drain(&ancestor.inner, ancestor_ticket.turn_id()).len(),
+                1
+            );
+            ancestor.cancel_turn(ancestor_ticket.turn_id()).unwrap();
+            for actor in [&ancestor, &parent, &child] {
+                let mut state = actor.inner.state.lock().unwrap();
+                super::schedule(&actor.inner, &mut state);
+                super::schedule(&actor.inner, &mut state);
+                assert!(state.deliveries.is_empty());
+                assert!(state.delivery_runs.is_empty());
+                assert!(!state.has_pending_work(&actor.inner.queue));
+                assert!(state.operations.is_empty());
+            }
+            for (events, turn_id) in [
+                (&parent_events, parent_ticket.turn_id()),
+                (&ancestor_events, ancestor_ticket.turn_id()),
+            ] {
+                let statuses: Vec<_> = events
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        ActorEvent::Delivery(event) => Some(event.status),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    statuses,
+                    [
+                        DeliveryStatus::Accepted,
+                        DeliveryStatus::Executed {
+                            parent_turn_id: turn_id
+                        }
+                    ]
+                );
+            }
+            child.close();
+            parent.close();
+            ancestor.close();
+            child_task.await;
+            parent_task.await;
+            ancestor_task.await;
+        });
+    }
+
+    #[test]
+    fn cancelled_parent_resumes_and_reports_upward() {
+        smol::block_on(async {
+            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(None);
+            let (parent, parent_task, _parent_start) = deferred_actor(Some(&ancestor));
+            let original = parent
+                .admit_turn(
+                    delivery(parent.agent_id()).input(),
+                    None,
+                    CORRELATION.into(),
+                )
+                .unwrap();
+            parent.cancel_turn(original.turn_id()).unwrap();
+            let original_result = original.wait_result().await;
+            assert!(ancestor.withdraw_child_delivery(original.turn_id()));
+            let child_report = delivery(parent.agent_id());
+            admit_delivery(&parent.inner, Arc::clone(&child_report)).unwrap();
+            let continuation = schedule_ticket(&parent);
+            assert_ne!(continuation.turn_id(), original.turn_id());
+            assert_eq!(super::drain(&parent.inner, continuation.turn_id()).len(), 1);
+            continuation.resolve(TurnOutcome::completed(
+                parent.agent_id(),
+                continuation.turn_id(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            ));
+            super::publish(&parent.inner, &continuation, None);
+            super::publish(&parent.inner, &continuation, None);
+            super::settle(&parent.inner, continuation.turn_id(), None);
+            admit_delivery(&parent.inner, child_report).unwrap();
+            assert!(parent.inner.state.lock().unwrap().deliveries.is_empty());
+            assert_eq!(
+                original.wait_result().await.outcome,
+                original_result.outcome
+            );
+            {
+                let state = ancestor.inner.state.lock().unwrap();
+                assert_eq!(state.deliveries.len(), 1);
+                assert!(matches!(
+                    state.deliveries[&continuation.turn_id()]
+                        .delivery
+                        .result
+                        .outcome,
+                    TurnOutcome::Completed { .. }
+                ));
+            }
+            parent.close();
+            ancestor.close();
+            parent_task.await;
+            ancestor_task.await;
+        });
+    }
+
+    #[test]
+    fn failed_batch_does_not_treat_existing_backlog_as_recovery() {
+        smol::block_on(async {
+            let (actor, task, _start) = deferred_actor(None);
+            for _ in 0..super::MAX_DELIVERY_BATCH + 1 {
+                admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            }
+            let ticket = schedule_ticket(&actor);
+            super::settle(&actor.inner, ticket.turn_id(), None);
+            {
+                let mut state = actor.inner.state.lock().unwrap();
+                assert!(state.delivery_suspended);
+                assert_eq!(state.deliveries.len(), super::MAX_DELIVERY_BATCH + 1);
+                super::schedule(&actor.inner, &mut state);
+                assert!(state.delivery_runs.is_empty());
+            }
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn consumed_report_is_acknowledged_after_provider_failure() {
+        smol::block_on(async {
+            let (actor, task, _start) = deferred_actor(None);
+            let report = delivery(actor.agent_id());
+            admit_delivery(&actor.inner, Arc::clone(&report)).unwrap();
+            let ticket = schedule_ticket(&actor);
+            assert_eq!(super::drain(&actor.inner, ticket.turn_id()).len(), 1);
+            super::settle(&actor.inner, ticket.turn_id(), None);
+            admit_delivery(&actor.inner, report).unwrap();
+            {
+                let state = actor.inner.state.lock().unwrap();
+                assert!(state.deliveries.is_empty());
+                assert!(state.delivery_runs.is_empty());
+                assert!(!state.delivery_suspended);
+            }
+            actor.close();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn cancellation_retries_each_unconsumed_report_once() {
+        smol::block_on(async {
+            let (actor, task, _start) = deferred_actor(None);
             admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            let first = schedule_ticket(&actor);
+            actor.cancel_turn(first.turn_id()).unwrap();
+            assert!(!actor.inner.state.lock().unwrap().delivery_suspended);
+            let retry = schedule_ticket(&actor);
+            assert_ne!(first.turn_id(), retry.turn_id());
+            actor.cancel_turn(retry.turn_id()).unwrap();
             {
                 let mut state = actor.inner.state.lock().unwrap();
                 assert!(state.delivery_suspended);
                 super::schedule(&actor.inner, &mut state);
                 assert!(state.delivery_runs.is_empty());
-                assert_eq!(state.deliveries.len(), 2);
+                assert_eq!(state.deliveries.len(), 1);
             }
+            admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
+            let recovered = schedule_ticket(&actor);
+            assert_eq!(super::drain(&actor.inner, recovered.turn_id()).len(), 2);
+            actor.cancel_turn(recovered.turn_id()).unwrap();
+            assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
             actor.close();
             task.await;
         });

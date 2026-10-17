@@ -537,7 +537,6 @@ impl MessagesPanel {
         true
     }
 
-    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }

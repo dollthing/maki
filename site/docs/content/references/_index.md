@@ -36,7 +36,7 @@ The opening and closing quote must match. Completion adds quotes when an inserti
 
 File references are the odd one out. They are never expanded or stripped. Makima does not inject file contents at submit time. The agent gets the path as text and decides when to read it. This keeps big files out of context until they are actually needed.
 
-Project-relative file completion uses the project index. A file value that starts with `~`, `/`, or `.` instead reads one directory at a time. For example, `@~/`, `@/var/`, `@./`, and `@../` list the immediate children of those directories. Selecting a directory keeps the popup open at the next level. Selecting a file completes the reference and closes the popup. Missing or unreadable directories produce no candidates and remain editable.
+File completion and reference expansion use the viewed agent's working directory and pinned invocation target. Changing tabs while submission is in progress does not retarget it. Project-relative file completion uses the project index for that directory. A file value that starts with `~`, `/`, or `.` instead reads one directory at a time. For example, `@~/`, `@/var/`, `@./`, and `@../` list the immediate children of those directories. Selecting a directory keeps the popup open at the next level. Selecting a file completes the reference and closes the popup. Missing or unreadable directories produce no candidates and remain editable.
 
 Project-index completion and the file picker use Nucleo for coarse retrieval and the shared matcher for final admission, highlighting, and ranking. Each surface materializes at most 640 coarse results for final matching. Additional coarse results are not ranked and are not guaranteed to appear.
 
@@ -60,7 +60,7 @@ More than one `@subagent:` token each expands in place, so a single message can 
 
 A `@model:spec` next to a subagent reference sets that subagent's model; the `<model:spec>` token sits beside the `<subagent:type>` token and the agent applies it when spawning the subagent. If the requested model is unavailable (the `task` plugin's `allow_model` option is off, so its schema has no `model` parameter), the agent asks you how to proceed via the `question` tool if it is loaded, or rejects the request and asks you to clarify. It does not silently pick another model.
 
-A `<model:spec>` reference without a subagent has no effect. Use the `/model` command to switch the session model.
+A `<model:spec>` reference without a subagent has no effect. The `/model` command switches the viewed agent's model.
 
 ## Skills
 

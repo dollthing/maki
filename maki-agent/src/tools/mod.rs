@@ -516,6 +516,7 @@ pub struct ToolContext {
 impl ToolContext {
     /// Overlays an agent's committed configuration onto this template.
     pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
+        self.cwd = config.context.cwd().to_path_buf();
         self.model = Arc::new(config.settings.model.clone());
         self.provider = Arc::clone(&config.settings.provider);
         self.opts = RequestOptions {

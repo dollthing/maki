@@ -971,6 +971,8 @@ pub enum AgentEvent {
     Nudge,
     SubagentHistory {
         tool_use_id: String,
+        #[serde(default)]
+        history_epoch: u64,
         messages: Vec<Message>,
     },
     /// A live child was permanently closed and no longer accepts input.
@@ -1324,12 +1326,20 @@ pub struct SubagentInfo {
     pub opts: Option<maki_providers::RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
-    /// Queue into the subagent's background driver (async sessions only).
-    #[serde(skip)]
-    pub input_tx: Option<flume::Sender<String>>,
     /// Cancel currently executing and queued work without closing the session.
     #[serde(skip)]
     pub cancel: Option<SubagentCancel>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct EventObserver(Arc<dyn Fn(&AgentEvent) + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for EventObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EventObserver")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1337,6 +1347,8 @@ pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
     output: Option<crate::TurnOutput>,
+    #[cfg(test)]
+    observer: Option<EventObserver>,
 }
 
 impl EventSender {
@@ -1345,7 +1357,18 @@ impl EventSender {
             tx,
             run_id,
             output: None,
+            #[cfg(test)]
+            observer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observer(
+        mut self,
+        observer: impl Fn(&AgentEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(EventObserver(Arc::new(observer)));
+        self
     }
 
     pub fn with_output(mut self, output: crate::TurnOutput) -> Self {
@@ -1358,6 +1381,8 @@ impl EventSender {
             tx: self.tx.clone(),
             run_id: self.run_id,
             output: None,
+            #[cfg(test)]
+            observer: self.observer.clone(),
         }
     }
 
@@ -1366,6 +1391,10 @@ impl EventSender {
     }
 
     fn capture(&self, event: &AgentEvent) {
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            (observer.0)(event);
+        }
         if let Some(output) = &self.output {
             match event {
                 AgentEvent::TextDelta { text } => output.append_text(text),
@@ -1416,6 +1445,8 @@ impl EventSender {
             tx: self.tx.clone(),
             run_id,
             output: self.output.clone(),
+            #[cfg(test)]
+            observer: self.observer.clone(),
         }
     }
 }

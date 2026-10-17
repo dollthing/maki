@@ -57,6 +57,7 @@ pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
     pub context_size: u32,
+    pub(crate) retry_info: Option<crate::components::RetryInfo>,
     pub model_id: Option<String>,
     /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
@@ -81,6 +82,7 @@ impl Chat {
             name,
             cost: None,
             context_size: 0,
+            retry_info: None,
             model_id: None,
             subagent_id: None,
             agent_id: None,
@@ -499,7 +501,6 @@ impl Chat {
         self.messages_panel.tool_done(event);
     }
 
-    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
     }

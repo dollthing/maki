@@ -6,6 +6,7 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
+use maki_agent::HistorySnapshot;
 use maki_agent::agent::estimate_message_tokens;
 #[cfg(test)]
 use maki_providers::Model;
@@ -133,7 +134,7 @@ impl App {
             context_size: state.context_size,
             input_draft: (!draft.is_empty()).then_some(draft),
             queued_messages: if self.recoverable_queue.is_empty() {
-                self.queue.text_messages()
+                self.queue.root_text_messages()
             } else {
                 self.recoverable_queue.clone()
             },
@@ -316,7 +317,13 @@ impl App {
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
-        match self.rewind_picker.open(self.state.session.messages()) {
+        let result = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .ok_or_else(|| "agent is no longer available".to_owned())
+            .and_then(|target| self.rewind_picker.open_actor(target));
+        match result {
             Ok(()) => vec![],
             Err(msg) => {
                 self.status_bar.flash(msg);
@@ -326,25 +333,52 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        self.checkpoint_now();
-        let baseline = self
-            .state
-            .context_size
-            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
-        let mut session = self.state.session.as_ref().clone();
-        session.truncate_messages(entry.turn_index);
-        session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
-        session.update_title_if_default();
-        let kept = estimate_message_tokens(session.messages());
-        session.meta.context_size = if kept == 0 { 0 } else { baseline + kept };
-        session.meta.input_draft = Some(entry.prompt_text);
-        session.meta.queued_messages.clear();
-        vec![Action::ReplaceSession(Box::new(
-            SessionReplacementRequest {
-                session,
-                kind: SessionReplacementKind::Rewind,
-            },
-        ))]
+        if let Some((target, boundary)) = self.rewind_picker.target_boundary(entry.turn_index) {
+            return vec![Action::RewindAgent { target, boundary }];
+        }
+        self.flash("rewind selection is no longer available".into());
+        vec![]
+    }
+
+    pub(crate) fn apply_history_change(&mut self, change: maki_agent::actor::HistoryChange) {
+        let Some(index) = self
+            .chats
+            .iter()
+            .position(|chat| chat.agent_id == Some(change.agent_id))
+        else {
+            return;
+        };
+        let draft = change.draft.user_text().unwrap_or("").to_owned();
+        if index == 0 {
+            self.state
+                .session_mut()
+                .replace_shared_messages(Arc::clone(&change.messages));
+            self.state.context_size = estimate_message_tokens(&change.messages);
+            self.state.session_mut().meta.input_draft = Some(draft.clone());
+        } else if let Some(key) = self.chats[index].subagent_id.clone()
+            && !self.state.session_mut().adopt_subagent_history(
+                key,
+                &HistorySnapshot {
+                    epoch: change.epoch,
+                    compacted: false,
+                    messages: Arc::clone(&change.messages),
+                },
+            )
+        {
+            return;
+        }
+        let (display, items) = history_to_display(
+            &change.messages,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &[],
+        );
+        self.chats[index].load_messages(display);
+        self.chats[index].context_size = estimate_message_tokens(&change.messages);
+        self.fire_restore_items(items);
+        self.refresh_at_ref_labels(&draft);
+        self.input_box.set_input(draft);
+        self.input_box.buffer.move_to_end();
     }
 
     #[cfg(test)]

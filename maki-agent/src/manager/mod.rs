@@ -902,6 +902,10 @@ impl AgentManagerHandle {
         let mut admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
         {
             let graph = self.lock_graph();
+            admission.is_child = graph
+                .nodes
+                .get(&agent_id)
+                .is_some_and(|node| node.parent_id.is_some());
             if let Some(node) = graph.nodes.get(&agent_id)
                 && let Some(parent_id) = node.parent_id
                 && let Some(parent) = graph
@@ -1128,6 +1132,75 @@ impl AgentManagerHandle {
             .collect::<Vec<_>>();
         nodes.sort_by_key(|node| (node.depth, node.agent_id.to_string()));
         nodes
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn drain_graph_for_test(
+        &self,
+    ) -> Result<Vec<(AgentId, crate::actor::ActorRuntimeProbe)>, crate::ActorError> {
+        let mut previous = None;
+        for _ in 0..crate::actor::MAX_RETAINED_TURN_RESULTS {
+            let actors: Vec<_> = self
+                .snapshot()
+                .into_iter()
+                .filter_map(|node| {
+                    let actor = self.actor(node.agent_id).ok()?;
+                    (actor.snapshot().lifecycle == crate::ActorLifecycle::Open)
+                        .then_some((node.agent_id, actor))
+                })
+                .collect();
+            let mut probes = Vec::with_capacity(actors.len());
+            for (id, actor) in actors {
+                probes.push((id, actor.runtime_barrier().await?));
+            }
+            if probes.iter().all(|(_, probe)| probe.is_quiescent())
+                && previous.as_ref() == Some(&probes)
+            {
+                return Ok(probes);
+            }
+            previous = Some(probes);
+            smol::future::yield_now().await;
+        }
+        Err(crate::ActorError::Busy)
+    }
+
+    /// Cuts local work and its managed authority without closing descendants.
+    pub fn local_cancel(
+        &self,
+        agent_id: AgentId,
+        displayed: u64,
+    ) -> Result<(Option<TurnId>, u64), ManagerError> {
+        let (actor, cut) = {
+            let mut graph = self.lock_graph();
+            let node = graph
+                .nodes
+                .get(&agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent_id))?;
+            if !node.lifecycle.consumes_capacity() {
+                return Err(ManagerError::NonLiveAgent(agent_id));
+            }
+            let actor = node
+                .actor
+                .clone()
+                .ok_or(ManagerError::NonLiveAgent(agent_id))?;
+            let mut state = actor
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(ManagerError::NonLiveAgent(agent_id));
+            }
+            let cut = actor.capture_local_cancel(&mut state, displayed);
+            if let Some(turn_id) = cut.turn_id {
+                graph.active_turns.remove(&(agent_id, turn_id));
+            }
+            drop(state);
+            (actor, cut)
+        };
+        let captured = (cut.turn_id, cut.fence);
+        actor.settle_local_cancel(cut);
+        Ok(captured)
     }
 
     pub fn cancel_agent(&self, agent_id: AgentId) -> Result<(), ManagerError> {

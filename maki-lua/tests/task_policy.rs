@@ -1030,7 +1030,7 @@ fn load_real_driver_host_with_prelude(
 }
 
 struct GatedProvider {
-    started_tx: flume::Sender<String>,
+    started_tx: flume::Sender<Message>,
     release_rx: flume::Receiver<()>,
 }
 
@@ -1046,15 +1046,7 @@ impl Provider for GatedProvider {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let message = messages
-                .last()
-                .and_then(|message| {
-                    message.content.iter().find_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                })
-                .unwrap_or_default();
+            let message = messages.last().expect("provider request has input").clone();
             self.started_tx.send(message).unwrap();
             common::bounded(self.release_rx.recv_async()).await.unwrap();
             Ok(common::canned_reply("done"))
@@ -1234,11 +1226,26 @@ fn task_policy_spawn_honors_mode_gating_real() {
     );
 }
 
+fn assert_task_input(message: &Message, original: &str, interrupted: bool) {
+    let text = message.first_text_content().expect("task input has text");
+    if interrupted {
+        assert!(text.starts_with("<user-interrupt>\n"), "{text}");
+        assert!(
+            text.ends_with(&format!("\n\n{original}\n</user-interrupt>")),
+            "{text}"
+        );
+        assert_eq!(message.display_text.as_deref(), Some(original));
+    } else {
+        assert_eq!(text, original);
+        assert_eq!(message.display_text, None);
+    }
+}
+
 #[test]
 fn task_docs_describe_same_turn_submission() {
     for contract in [
-        "Busy sends join open work and return the same turn_id",
-        "next safe model request",
+        "Compatible sends join eligible open work and return the same turn_id",
+        "Pending messages drain in order before the next eligible model request",
         "without cancelling the child",
         "a successor never retargets an existing wait",
         "batched idle continuation",
@@ -1264,9 +1271,10 @@ fn repeated_busy_sends_retain_one_ticket() {
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
         for _ in 0..RETAINED_TURN_LIMIT {
             let admitted = exec_tool_json_with_ctx(
@@ -1286,9 +1294,10 @@ fn repeated_busy_sends_retain_one_ticket() {
         .unwrap_err();
         assert!(!error.is_empty());
         release_tx.send(()).unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            true,
         );
         release_tx.send(()).unwrap();
         let settled = exec_tool_json_with_ctx(
@@ -1306,9 +1315,10 @@ fn repeated_busy_sends_retain_one_ticket() {
             json!({"task_id": task_id, "message": TASK_PROMPT}),
         );
         assert_ne!(successor["turn_id"], spawned["turn_id"]);
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
         release_tx.send(()).unwrap();
         let settled = exec_tool_json_with_ctx(
@@ -1337,9 +1347,10 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
         let pending = exec_tool_json_with_ctx(
             &reg,
@@ -1376,9 +1387,10 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = first["task_id"].as_str().unwrap();
         assert!(first["turn_id"].is_string());
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
 
         let mut wait_input = json!({ "task_id": task_id });
@@ -1412,9 +1424,10 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
         assert!(second["turn_id"].is_string());
         assert_eq!(first["turn_id"], second["turn_id"]);
         release_tx.send(()).unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            "second turn"
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            "second turn",
+            true,
         );
 
         assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
@@ -1449,9 +1462,10 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
 
         let queued = exec_tool_json_with_ctx(
@@ -1476,13 +1490,23 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
 
         release_tx.send(()).unwrap();
         let next = common::bounded(started_rx.recv_async()).await.unwrap();
-        assert!(matches!(next.as_str(), "second turn" | TASK_PROMPT));
+        let next_original = next
+            .display_text
+            .as_deref()
+            .unwrap_or_else(|| next.first_text_content().unwrap());
+        assert!(matches!(next_original, "second turn" | TASK_PROMPT));
+        assert_task_input(&next, next_original, next_original == "second turn");
         assert!(started_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
         let last = common::bounded(started_rx.recv_async()).await.unwrap();
-        assert_ne!(last, next);
-        assert!(matches!(last.as_str(), "second turn" | TASK_PROMPT));
+        let last_original = last
+            .display_text
+            .as_deref()
+            .unwrap_or_else(|| last.first_text_content().unwrap());
+        assert_ne!(last_original, next_original);
+        assert!(matches!(last_original, "second turn" | TASK_PROMPT));
+        assert_task_input(&last, last_original, last_original == "second turn");
         release_tx.send(()).unwrap();
 
         for task_id in [first_id, second_id] {
@@ -1509,9 +1533,10 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
 
         let mut waiting_input = task_input("waiting", None);
@@ -1528,9 +1553,10 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
         third_input["prompt"] = json!("third prompt");
         let third = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, third_input);
         let third_id = third["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            "third prompt"
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            "third prompt",
+            false,
         );
         release_tx.send(()).unwrap();
 
@@ -1558,9 +1584,10 @@ fn despawn_releases_capacity_from_an_active_turn() {
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
 
         let second =
@@ -1574,9 +1601,10 @@ fn despawn_releases_capacity_from_an_active_turn() {
         let error = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, json!({ "task_id": first_id }))
             .unwrap_err();
         assert!(error.contains(UNKNOWN_TASK_ERR), "got: {error}");
-        assert_eq!(
-            common::bounded(started_rx.recv_async()).await.unwrap(),
-            TASK_PROMPT
+        assert_task_input(
+            &common::bounded(started_rx.recv_async()).await.unwrap(),
+            TASK_PROMPT,
+            false,
         );
 
         let out =
@@ -1808,11 +1836,28 @@ fn unmanaged_blocking_wait_yields_the_only_permit_to_its_child() {
 
     let mut input = task_input("parent", None);
     input["subagent_type"] = json!("general");
-    let result = spawn_and_wait(&reg, &ctx, input).expect("general subagent failed");
+    let spawned = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, input);
+    let waited = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
+    );
+    assert_eq!(waited["status"], "done");
+    let result = &waited["result"];
+    assert_eq!(result["turn_id"], spawned["turn_id"]);
+    let repeated = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
+    );
+    assert_eq!(repeated["result"], *result);
 
     let echoed: Value = serde_json::from_str(result["text"].as_str().unwrap())
         .unwrap_or_else(|error| panic!("reply is not the task_wait result ({error}): {result}"));
     assert_eq!(echoed["status"], "done");
     assert_eq!(echoed["result"]["text"], NESTED_CHILD_REPLY);
+    assert_ne!(echoed["result"]["turn_id"], result["turn_id"]);
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(2));
 }

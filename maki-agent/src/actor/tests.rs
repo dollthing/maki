@@ -5,7 +5,8 @@
 #[path = "config_tests.rs"]
 mod config_tests;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::slice;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -23,11 +24,11 @@ fn test_image() -> ImageSource {
 
 use super::queue::{ActorQueue, QueueProjection};
 use super::types::{
-    ActorLifecycle, ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind,
+    ActorLifecycle, ActorStatus, BackendResult, ControlWork, TurnContext, WorkKind,
 };
 use super::{
     ActorBackend, ActorError, ActorEvent, ActorWork, AgentActorHandle, ChildDelivery,
-    DeliveryStatus, TurnAdmission,
+    DeliveryStatus,
 };
 use crate::tools::DescriptionContext;
 use crate::tools::{
@@ -35,7 +36,7 @@ use crate::tools::{
     ToolSource,
 };
 use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
-use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
+use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
 use std::borrow::Cow;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,7 +91,6 @@ pub(super) fn policy(fast: bool) -> crate::RunSettings {
 #[derive(Default)]
 struct ScriptedState {
     runs: Mutex<Vec<(WorkKind, String)>>,
-    root_metadata: Mutex<Vec<(u64, bool, String, usize)>>,
     folds: Mutex<Vec<String>>,
     controls: Mutex<Vec<String>>,
     compacts: AtomicU32,
@@ -112,7 +112,6 @@ struct ScriptedBackend {
     outcomes: Mutex<Vec<BackendResult>>,
     preparation: Option<super::AdmissionPreparation>,
     readiness: Option<super::PreparedReadiness>,
-    root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
 }
 
 struct Gate {
@@ -155,7 +154,6 @@ impl ScriptedBackend {
             outcomes: Mutex::new(Vec::new()),
             preparation: None,
             readiness: None,
-            root_preparation_error: None,
         }
     }
 
@@ -199,10 +197,6 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 }
 
 impl ActorBackend for ScriptedBackend {
-    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
-        self.root_preparation_error.clone()
-    }
-
     fn prepared_readiness(&self) -> Option<super::PreparedReadiness> {
         self.readiness.clone()
     }
@@ -224,21 +218,6 @@ impl ActorBackend for ScriptedBackend {
                 .lock()
                 .unwrap()
                 .push((work.clone(), input.message.clone()));
-            if let WorkKind::Root {
-                run_id,
-                displayed,
-                text,
-                images,
-                ..
-            } = work
-            {
-                self.state.root_metadata.lock().unwrap().push((
-                    run_id,
-                    displayed,
-                    text,
-                    images.len(),
-                ));
-            }
             self.state.policies.lock().unwrap().push((
                 input.message.clone(),
                 context.policy.as_ref().map(|policy| policy.fast),
@@ -268,28 +247,16 @@ impl ActorBackend for ScriptedBackend {
                 history.push(Message::user(input.message));
             }
 
-            // Poll the interrupt source exactly once per turn, after the
-            // gate, so a test can queue a root mid-run and the fold is
-            // deterministic. An extracted root folds into this turn (no new
-            // TurnId, no outcome of its own).
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
-            if let Some(ExtractedCommand::PresentedInterrupt(folded)) =
-                context.interrupt.as_ref().and_then(|source| source.poll())
-            {
-                for msg in folded {
-                    self.state
-                        .folds
-                        .lock()
-                        .unwrap()
-                        .push(msg.input.message.clone());
-                    history.push(Message::user(msg.input.message));
-                }
-            }
-
             if let Some(inbox) = &context.inbox {
+                inbox.take_initial_submission();
                 for input in inbox.drain_instructions() {
+                    self.state.folds.lock().unwrap().push(input.message.clone());
+                    for message in input.preamble {
+                        history.push(message);
+                    }
                     history.push(Message::user(input.message));
                 }
                 for message in inbox.drain_completions() {
@@ -410,9 +377,7 @@ impl ActorBackend for CancellableBackend {
                         *cost = Some(BILLED_COST);
                         *list_cost = Some(BILLED_LIST_COST);
                     }
-                    sender
-                        .send(AgentEvent::TurnOutcome(outcome.clone()))
-                        .unwrap();
+                    context.output.set_terminal_sender(sender.clone());
                 }
                 return BackendResult::EnteredRun(outcome);
             }
@@ -547,24 +512,22 @@ fn root_setup_failure_resolves_started_ticket_and_emits_end() {
         let (actor, task) = spawn(backend);
         let events = actor.subscribe_events();
         actor
-            .rush(RootWork::new(
+            .submit(
                 input("root"),
-                1,
-                false,
+                None,
                 "root".into(),
-                Vec::new(),
-                "root".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
-        let super::ActorEvent::Start { turn_id, .. } = events.recv_async().await.unwrap() else {
-            panic!("expected root start")
+        let turn_id = loop {
+            if let ActorEvent::Start { turn_id, .. } = events.recv_async().await.unwrap() {
+                break turn_id;
+            }
         };
         let ticket = actor.turn_ticket(turn_id).unwrap();
         gate.open();
         assert!(matches!(ticket.wait().await, TurnOutcome::Failed { .. }));
-        assert!(
-            matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == turn_id)
-        );
+        until(|| events.drain().any(|event| matches!(event, ActorEvent::End(result) if result.outcome.turn_id() == turn_id))).await;
         actor.close();
         task.await;
     });
@@ -608,6 +571,10 @@ fn typed_actor_events_are_ordered_future_only_and_broadcast() {
         gate.open();
         ticket.wait().await;
         for events in [&first, &second, &late] {
+            assert!(matches!(
+                events.recv_async().await.unwrap(),
+                super::ActorEvent::SubmissionConsumed(_)
+            ));
             assert!(
                 matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == ticket.turn_id())
             );
@@ -1609,6 +1576,10 @@ fn clearing_pending_work_waits_for_processing_before_idle() {
         assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
         assert!(matches!(
             events.recv_async().await.unwrap(),
+            super::ActorEvent::SubmissionConsumed(_)
+        ));
+        assert!(matches!(
+            events.recv_async().await.unwrap(),
             super::ActorEvent::End(_)
         ));
         assert!(matches!(
@@ -1880,14 +1851,12 @@ fn cancel_all_is_reusable() {
         until(|| state.entered.load(Ordering::SeqCst) == 1).await;
 
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("root"),
-                1,
-                false,
-                "root".into(),
-                Vec::new(),
+                None,
                 "r1".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         let t2 = handle
             .admit_turn(input("queued"), None, "t2".into())
@@ -2186,11 +2155,9 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool, close_bef
         }
         let (cancel_result, presentation, events) = cancel.join().unwrap();
         assert!(matches!(cancel_result, Err(ActorError::UnknownTurn(id)) if id == turn_id));
-        if setup_failure {
-            assert!(
-                matches!(presentation.recv_async().await.unwrap().event, AgentEvent::TurnOutcome(delivered) if delivered == outcome)
-            );
-        }
+        assert!(
+            matches!(presentation.recv_async().await.unwrap().event, AgentEvent::TurnOutcome(delivered) if delivered == outcome)
+        );
         assert!(presentation.is_empty());
         assert!(
             matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome == outcome)
@@ -2221,6 +2188,52 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool, close_bef
     });
 }
 
+#[test_case::test_case(false, false; "completed")]
+#[test_case::test_case(true, false; "setup_failure")]
+#[test_case::test_case(false, true; "queued_cancel")]
+fn ui_terminal_observes_sealed_immutable_result(setup_failure: bool, cancel: bool) {
+    smol::block_on(async {
+        let backend = if setup_failure {
+            ScriptedBackend::failing_setup()
+        } else {
+            ScriptedBackend::new()
+        };
+        let (handle, task) = spawn(backend);
+        let observed_ticket = Arc::new(Mutex::new(None::<super::TurnTicket>));
+        let ticket_slot = Arc::clone(&observed_ticket);
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_count = Arc::clone(&observed);
+        let (tx, rx) = flume::unbounded();
+        let sender = EventSender::new(tx, 0).with_observer(move |event| {
+            if let AgentEvent::TurnOutcome(outcome) = event {
+                let ticket = ticket_slot.lock().unwrap().clone().unwrap();
+                let sealed = ticket.peek_result().expect("UI terminal preceded sealing");
+                assert_eq!(&sealed.outcome, outcome);
+                ticket.output().append_text("late text");
+                ticket
+                    .output()
+                    .append_output(Value::String("late output".into()));
+                let unchanged = ticket.peek_result().unwrap();
+                assert_eq!(unchanged.text, sealed.text);
+                assert_eq!(unchanged.output, sealed.output);
+                observed_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let ticket = handle
+            .admit_turn(input("work"), Some(sender), "work".into())
+            .unwrap();
+        *observed_ticket.lock().unwrap() = Some(ticket.clone());
+        if cancel {
+            handle.cancel_turn(ticket.turn_id()).unwrap();
+        }
+        ticket.wait().await;
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(rx.drain().count(), 1);
+        handle.close();
+        task.await;
+    });
+}
+
 #[test]
 fn entered_run_is_never_emitted_twice() {
     smol::block_on(async {
@@ -2231,8 +2244,10 @@ fn entered_run_is_never_emitted_twice() {
             .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
             .unwrap();
         ticket.wait().await;
-        // Agent::run already emitted the authoritative outcome; the actor
-        // retains but never re-delivers it.
+        assert!(matches!(
+            rx.try_recv().unwrap().event,
+            AgentEvent::TurnOutcome(_)
+        ));
         assert!(rx.is_empty());
         assert!(handle.outcome(ticket.turn_id()).is_some());
 
@@ -2295,7 +2310,10 @@ fn event_sink_failure_still_retains() {
 #[test_case::test_case(false, false; "matching_plugin")]
 #[test_case::test_case(true, false; "different_origin")]
 #[test_case::test_case(false, true; "reloaded_plugin")]
-fn active_turn_interrupt_respects_provenance(origin_boundary: bool, generation_boundary: bool) {
+fn shared_submission_retains_execution_provenance(
+    origin_boundary: bool,
+    generation_boundary: bool,
+) {
     smol::block_on(async {
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
@@ -2308,7 +2326,7 @@ fn active_turn_interrupt_respects_provenance(origin_boundary: bool, generation_b
             ..Default::default()
         };
         let ticket = actor
-            .admit_turn_with_options(
+            .submit(
                 input("active"),
                 None,
                 "active".into(),
@@ -2319,7 +2337,7 @@ fn active_turn_interrupt_respects_provenance(origin_boundary: bool, generation_b
             )
             .unwrap();
         until(|| state.entered.load(Ordering::SeqCst) == 1).await;
-        let mut queued = provenance;
+        let mut queued = provenance.clone();
         if origin_boundary {
             queued.origin = super::TurnOrigin::User;
         }
@@ -2327,34 +2345,22 @@ fn active_turn_interrupt_respects_provenance(origin_boundary: bool, generation_b
             queued.plugin_generation = Some(2);
         }
         actor
-            .rush(
-                RootWork::new(
-                    input("queued"),
-                    1,
-                    false,
-                    "queued".into(),
-                    Vec::new(),
-                    "queued".into(),
-                )
-                .with_provenance(queued.clone()),
+            .submit(
+                input("queued"),
+                None,
+                "queued".into(),
+                super::TurnAdmissionOptions {
+                    provenance: queued.clone(),
+                    ..Default::default()
+                },
             )
             .unwrap();
         gate.open();
         ticket.wait().await;
         until(|| !actor.has_pending_work()).await;
-        let boundary = origin_boundary || generation_boundary;
-        assert_eq!(
-            state.runs.lock().unwrap().len(),
-            if boundary { 2 } else { 1 }
-        );
-        assert_eq!(state.folds.lock().unwrap().len(), usize::from(!boundary));
-        if boundary {
-            let latest = actor.snapshot().latest.unwrap();
-            assert_eq!(
-                actor.turn_ticket(latest.turn_id()).unwrap().provenance(),
-                &queued
-            );
-        }
+        assert_eq!(state.runs.lock().unwrap().len(), 1);
+        assert_eq!(state.folds.lock().unwrap().as_slice(), ["queued"]);
+        assert_eq!(ticket.provenance(), &provenance);
         actor.close();
         task.await;
     });
@@ -2368,7 +2374,7 @@ fn root_folds_into_active_turn_with_no_orphan() {
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let main = handle
-            .admit_turn_with_options(
+            .submit(
                 input("main"),
                 None,
                 "m".into(),
@@ -2381,19 +2387,15 @@ fn root_folds_into_active_turn_with_no_orphan() {
                 },
             )
             .unwrap();
-        // Wait until the main turn has entered the backend, then queue a
-        // root. The gated backend polls the interrupt source only after the
-        // gate opens, so ordering is deterministic.
+        // The backend drains accepted instructions only after the gate opens.
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("fold-me"),
-                1,
-                false,
-                "fold-me".into(),
-                Vec::new(),
+                None,
                 "r1".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         gate.open();
         main.wait().await;
@@ -2425,7 +2427,7 @@ fn permitted_idle_turn_folds_interrupts_like_any_turn() {
         let (handle, task) = spawn(backend);
         let guard = handle.prepare_idle().unwrap();
         let approved = handle
-            .admit_turn_with_options(
+            .submit(
                 input("approved"),
                 None,
                 "approved".into(),
@@ -2441,14 +2443,12 @@ fn permitted_idle_turn_folds_interrupts_like_any_turn() {
         guard.allow_turn(&approved).unwrap();
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("fold-me"),
-                1,
-                false,
-                "fold-me".into(),
-                Vec::new(),
+                None,
                 "r1".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         gate.open();
         approved.wait().await;
@@ -2531,59 +2531,6 @@ fn permitted_idle_turn_runs_ahead_of_earlier_queued_turn() {
 }
 
 #[test]
-fn idle_root_start_preserves_metadata_to_backend() {
-    smol::block_on(async {
-        let backend = ScriptedBackend::new();
-        let state = Arc::clone(&backend.state);
-        let (handle, task) = spawn(backend);
-        // Queue the root while idle: the runner pops it and starts it as its
-        // own turn, carrying the neutral display metadata.
-        handle
-            .rush(RootWork::new(
-                input("deferred"),
-                7,
-                false,
-                "deferred bubble".into(),
-                vec![test_image(), test_image(), test_image()],
-                "r7".into(),
-            ))
-            .unwrap();
-        // The runner starts the root (entered) and settles to Idle; both are
-        // observed before asserting, so the backend's run completed.
-        until(|| {
-            state.entered.load(Ordering::SeqCst) > 0
-                && handle.snapshot().status == ActorStatus::Idle
-        })
-        .await;
-
-        // Backend observed the started root with its exact metadata.
-        let runs: Vec<_> = state.runs.lock().unwrap().clone();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(
-            runs[0].0,
-            WorkKind::Root {
-                run_id: 7,
-                displayed: false,
-                text: "deferred bubble".into(),
-                images: vec![test_image(), test_image(), test_image()],
-                earlier: Vec::new(),
-                mcp_startup_notice: None,
-                already_displayed: false,
-            }
-        );
-        assert_eq!(runs[0].1, "deferred");
-        let metadata = state.root_metadata.lock().unwrap().clone();
-        assert_eq!(metadata, vec![(7, false, "deferred bubble".into(), 3)]);
-
-        let snapshot = handle.snapshot();
-        assert_eq!(snapshot.queued, 0);
-        assert_eq!(snapshot.status, ActorStatus::Idle);
-        handle.close();
-        task.await;
-    });
-}
-
-#[test]
 fn snapshot_queued_excludes_controls_from_pending_work_count() {
     smol::block_on(async {
         let gate = Gate::new();
@@ -2599,14 +2546,12 @@ fn snapshot_queued_excludes_controls_from_pending_work_count() {
             })
             .unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("queued"),
-                1,
-                false,
+                None,
                 "queued".into(),
-                Vec::new(),
-                "queued".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
 
         let snapshot = handle.snapshot();
@@ -2851,83 +2796,6 @@ fn close_rejects_new_admissions() {
         assert_eq!(handle.snapshot().lifecycle, ActorLifecycle::Closed);
         task.await;
     });
-}
-
-#[test]
-fn queue_pop_interrupt_keeps_incompatible_entries() {
-    let queue = ActorQueue::new();
-    queue.push(ActorWork::Compact {
-        run_id: 1,
-        instructions: None,
-        generation: 0,
-        policy: None,
-    });
-    queue.push(ActorWork::Control(ControlWork {
-        name: "c".into(),
-        correlation: "c".into(),
-    }));
-    assert!(matches!(
-        queue.pop_interrupt(
-            0,
-            &crate::batch_key(&input("t")),
-            &super::TurnProvenance {
-                origin: super::TurnOrigin::User,
-                ..Default::default()
-            }
-        ),
-        Some(ExtractedCommand::Compact(None))
-    ));
-    // A control at the front is incompatible: poll must not consume it.
-    assert!(
-        queue
-            .pop_interrupt(
-                0,
-                &crate::batch_key(&input("t")),
-                &super::TurnProvenance {
-                    origin: super::TurnOrigin::User,
-                    ..Default::default()
-                }
-            )
-            .is_none()
-    );
-    assert_eq!(queue.len(), 1);
-    // A turn at the front shields a root behind it.
-    let admission = TurnAdmission {
-        turn_id: crate::types::TurnId::generate(),
-        input: Some(input("t")),
-        event_sender: None,
-        correlation: "t".into(),
-        generation: 0,
-        policy: None,
-        admission: None,
-        ticket: super::TurnTicket::new(crate::types::TurnId::generate(), Arc::new(())),
-    };
-    queue.push(ActorWork::Turn(admission));
-    queue.push(ActorWork::Root(RootWork::new(
-        input("r"),
-        2,
-        false,
-        "r".into(),
-        Vec::new(),
-        "r2".into(),
-    )));
-    assert!(
-        queue
-            .pop_interrupt(
-                0,
-                &crate::batch_key(&input("t")),
-                &super::TurnProvenance {
-                    origin: super::TurnOrigin::User,
-                    ..Default::default()
-                }
-            )
-            .is_none()
-    );
-    assert_eq!(
-        queue.len(),
-        3,
-        "incompatible FIFO entries must not be discarded"
-    );
 }
 
 #[test]
@@ -3249,14 +3117,12 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
             .admit_turn(input("cleared"), None, "cleared".into())
             .unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("root"),
-                1,
-                false,
+                None,
                 "root".into(),
-                Vec::new(),
-                "root".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.queued, snapshot.queue.len());
@@ -3265,11 +3131,14 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
                 .queue
                 .contains(&QueueProjection::Turn("removed".into()))
         );
-        assert!(snapshot.queue.contains(&QueueProjection::Message {
-            text: "root".into(),
-            image_count: 0,
-            displayed: false,
-        }));
+        assert_eq!(
+            handle
+                .pending_submissions()
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["removed", "cleared", "root"]
+        );
         let index = snapshot
             .queue
             .iter()
@@ -3283,13 +3152,10 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
             removed.wait().await,
             TurnOutcome::Cancelled { .. }
         ));
+        let submission = handle.pending_submissions().pop().unwrap();
         assert_eq!(
-            handle.remove_visible_at(0),
-            Some(QueueProjection::Message {
-                text: "root".into(),
-                image_count: 0,
-                displayed: false,
-            })
+            handle.remove_submission(submission.id).unwrap().text,
+            "root"
         );
         assert_eq!(handle.clear(), 1);
         assert!(matches!(
@@ -3346,7 +3212,7 @@ fn root_batch_and_interrupt_respect_policy_generation() {
             ))
             .unwrap();
         let active = handle
-            .admit_turn_with_options(
+            .submit(
                 input("active"),
                 None,
                 "active".into(),
@@ -3360,29 +3226,25 @@ fn root_batch_and_interrupt_respect_policy_generation() {
             )
             .unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 1).await;
-        for (run_id, message) in [(1, "old"), (2, "old too")] {
+        for message in ["old", "old too"] {
             handle
-                .rush(RootWork::new(
+                .submit(
                     input(message),
-                    run_id,
-                    false,
+                    None,
                     message.into(),
-                    Vec::new(),
-                    message.into(),
-                ))
+                    super::TurnAdmissionOptions::default(),
+                )
                 .unwrap();
         }
         let reservation = handle.reserve_config_update().unwrap();
         reservation.resolve(Ok(fast_change(true))).unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("new"),
-                3,
-                false,
+                None,
                 "new".into(),
-                Vec::new(),
-                "new".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         gate.open();
         active.wait().await;
@@ -3393,7 +3255,7 @@ fn root_batch_and_interrupt_respect_policy_generation() {
         );
         assert_eq!(observed.policies.lock().unwrap()[0].2, 0);
         assert_eq!(observed.policies.lock().unwrap()[1].2, 1);
-        assert_eq!(observed.root_metadata.lock().unwrap()[0].2, "new");
+        assert_eq!(observed.runs.lock().unwrap()[1].1, "new");
         handle.close();
         task.await;
     });
@@ -3413,25 +3275,21 @@ fn deferred_roots_keep_setter_order() {
             .unwrap();
         let first = handle.reserve_config_update().unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("b"),
-                1,
-                false,
+                None,
                 "b".into(),
-                Vec::new(),
-                "b".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         let second = handle.reserve_config_update().unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("c"),
-                2,
-                false,
+                None,
                 "c".into(),
-                Vec::new(),
-                "c".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         second.resolve(Ok(fast_change(false))).unwrap();
         first.resolve(Ok(fast_change(true))).unwrap();
@@ -3459,25 +3317,21 @@ fn roots_reserve_between_setters() {
             .unwrap();
         let first = handle.reserve_config_update().unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("b"),
-                1,
-                false,
+                None,
                 "b".into(),
-                Vec::new(),
-                "b".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         let second = handle.reserve_config_update().unwrap();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("c"),
-                2,
-                false,
+                None,
                 "c".into(),
-                Vec::new(),
-                "c".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         second.resolve(Ok(fast_change(false))).unwrap();
         first.resolve(Ok(fast_change(true))).unwrap();
@@ -3614,14 +3468,12 @@ fn cancelled_running_turn_does_not_fold_next_generation() {
         until(|| backend_reached(&handle)).await;
         handle.cancel_existing();
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("new"),
-                2,
-                false,
+                None,
                 "new".into(),
-                Vec::new(),
-                "new".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         gate.open();
         running.wait().await;
@@ -3746,14 +3598,12 @@ fn targeted_cancel_matching_queued_correlation_and_reuse() {
             .unwrap();
         // Queue root work sharing the "drop" correlation, behind the turns.
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("root-drop"),
-                9,
-                false,
-                "root-drop".into(),
-                Vec::new(),
+                None,
                 "drop".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
 
         handle.cancel_correlation("drop", TurnCancellationReason::User);
@@ -3860,14 +3710,12 @@ fn precancel_marks_match_and_do_not_poison() {
         assert_eq!(events.len(), 1, "precancelled admission delivered once");
         // Precancelled root is dropped without executing.
         handle
-            .rush(RootWork::new(
+            .submit(
                 input("late-root"),
-                5,
-                false,
-                "late-root".into(),
-                Vec::new(),
+                None,
                 "run-5".into(),
-            ))
+                super::TurnAdmissionOptions::default(),
+            )
             .unwrap();
         assert_eq!(handle.snapshot().queued, 0);
         // The mark is retired: a later unrelated correlation runs fine.
@@ -3900,64 +3748,6 @@ fn targeted_cancel_first_reason_wins_vs_close() {
                 ..
             }
         ));
-        task.await;
-    });
-}
-
-#[test]
-fn remove_visible_at_skips_hidden_and_removes_deferred() {
-    smol::block_on(async {
-        let gate = Gate::new();
-        let backend = ScriptedBackend::gated(Arc::clone(&gate));
-        let (handle, task) = spawn(backend);
-        // The runner is parked in the gated backend on the admitted turn, so
-        // everything pushed below stays queued and the queue order is stable.
-        let running = handle
-            .admit_turn(input("running"), None, "r0".into())
-            .unwrap();
-        until(|| backend_reached(&handle)).await;
-        // Hidden rows: an already-displayed root.
-        handle
-            .rush(RootWork::new(
-                input("displayed-root"),
-                1,
-                true,
-                "displayed-root".into(),
-                Vec::new(),
-                "h2".into(),
-            ))
-            .unwrap();
-        // Visible rows: a deferred root and a compact.
-        handle
-            .rush(RootWork::new(
-                input("deferred-root"),
-                2,
-                false,
-                "deferred-root".into(),
-                Vec::new(),
-                "v1".into(),
-            ))
-            .unwrap();
-        handle.push_compact(3, None).unwrap();
-
-        let queue = handle.snapshot().queue;
-        assert_eq!(queue.len(), 3);
-
-        // Removing visible index 0 removes the deferred root, not the hidden
-        // displayed root.
-        let removed = handle.remove_visible_at(0).unwrap();
-        assert!(matches!(
-            removed,
-            QueueProjection::Message { ref text, .. } if text == "deferred-root"
-        ));
-        assert_eq!(handle.snapshot().queued, 2);
-        // The running turn finishes normally once the gate opens.
-        gate.open();
-        assert!(matches!(
-            running.wait().await,
-            TurnOutcome::Completed { .. }
-        ));
-        handle.close();
         task.await;
     });
 }
@@ -4229,7 +4019,12 @@ fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
         if bytes {
-            let text = "é".repeat((super::MAX_PENDING_INSTRUCTION_BYTES - TEXT.len()) / "é".len());
+            let initial = input(TEXT);
+            let overhead = serde_json::to_vec(&initial.images).unwrap().len()
+                + serde_json::to_vec(&initial.preamble).unwrap().len();
+            let text = "é".repeat(
+                (super::MAX_PENDING_INSTRUCTION_BYTES - TEXT.len() - 2 * overhead) / "é".len(),
+            );
             assert_eq!(
                 actor
                     .submit(input(&text), None, TEXT.into(), Default::default())
@@ -4269,6 +4064,360 @@ fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
         assert_ne!(first.turn_id(), successor.turn_id());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn graph_quiescence_probe_detects_extra_execution() {
+    smol::block_on(async {
+        const TEXT: &str = "probe";
+        let (actor, task) = spawn(ScriptedBackend::new());
+        let first = super::graph_quiescence_barrier(slice::from_ref(&actor))
+            .await
+            .unwrap();
+        let ticket = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        ticket.wait().await;
+        let second = super::graph_quiescence_barrier(slice::from_ref(&actor))
+            .await
+            .unwrap();
+        assert!(second.iter().all(super::ActorRuntimeProbe::is_quiescent));
+        assert_eq!(second[0].retained_results, first[0].retained_results + 1);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn pending_queue_preserves_compaction_boundary_order() {
+    smol::block_on(async {
+        const FIRST: &str = "first";
+        const NEXT: &str = "next";
+        const RUN: u64 = 19;
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        actor.push_compact(RUN, None).unwrap();
+        actor
+            .submit(input(NEXT), None, NEXT.into(), Default::default())
+            .unwrap();
+        let entries = actor.pending_queue();
+        assert!(
+            matches!(&entries[..], [super::PendingQueueEntry::Message(first), super::PendingQueueEntry::Compact {run_id: RUN, ..}, super::PendingQueueEntry::Message(next)] if first.text == FIRST && next.text == NEXT)
+        );
+        assert!(actor.remove_pending_compact(RUN).is_some());
+        assert!(actor.remove_pending_compact(RUN).is_none());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "accepted")]
+#[test_case::test_case(true; "rejected")]
+fn constrained_join_waits_for_ordered_policy(reject: bool) {
+    smol::block_on(async {
+        const FIRST: &str = "pending first";
+        const NEXT: &str = "pending constrained next";
+        const DENIED: &str = "ordered policy rejected";
+        let (_start, rx) = flume::bounded(1);
+        let backend = ScriptedBackend::new();
+        let observations = Arc::clone(&backend.state);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(backend),
+            None,
+            Some(Arc::new(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))),
+            Some(rx),
+        );
+        let boundary = actor.reserve_config_update().unwrap();
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        let constraint_actor = actor.clone();
+        let calls = Arc::new(AtomicU32::new(0));
+        let constraint_calls = Arc::clone(&calls);
+        let joined = actor
+            .submit(
+                input(NEXT),
+                None,
+                NEXT.into(),
+                super::TurnAdmissionOptions {
+                    policy_constraint: Some(Arc::new(move |config| {
+                        let _state = constraint_actor.inner.state.lock().unwrap();
+                        assert!(config.fast);
+                        constraint_calls.fetch_add(1, Ordering::SeqCst);
+                        if reject { Err(DENIED.into()) } else { Ok(()) }
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(joined.turn_id(), first.turn_id());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(actor.pending_submissions().len(), 2);
+        boundary.resolve(Ok(fast_change(true))).unwrap();
+        boundary.wait().await.unwrap();
+        if reject {
+            assert!(
+                matches!(joined.wait().await, TurnOutcome::Failed { failure, .. }
+                if failure.diagnostic == DENIED)
+            );
+            assert!(matches!(first.wait().await, TurnOutcome::Failed { .. }));
+            assert!(actor.pending_submissions().is_empty());
+            assert!(observations.runs.lock().unwrap().is_empty());
+        } else {
+            until(|| !actor.inner.queue.is_empty()).await;
+            let pending = actor.pending_submissions();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].text, FIRST);
+            assert_eq!(pending[1].text, NEXT);
+            assert!(joined.peek().is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_initial_submission_cannot_be_removed_and_constrained_join_uses_reserved_policy() {
+    smol::block_on(async {
+        const FIRST: &str = "prepared first";
+        const NEXT: &str = "constrained next";
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            crate::agent::TurnAdmissionSnapshot {
+                mode_def: None,
+                prompt_inputs: None,
+                bindings: Arc::default(),
+                mcp_startup_notice: None,
+            }
+        }));
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(backend),
+            None,
+            Some(Arc::new(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))),
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+        let constraint_actor = actor.clone();
+        let joined = actor
+            .submit(
+                input(NEXT),
+                None,
+                NEXT.into(),
+                super::TurnAdmissionOptions {
+                    policy_constraint: Some(Arc::new(move |config| {
+                        let _state = constraint_actor.inner.state.lock().unwrap();
+                        assert_eq!(config.mode, AgentMode::Build);
+                        Ok(())
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(joined.turn_id(), first.turn_id());
+        let initial = actor.pending_submissions()[0].clone();
+        assert!(actor.remove_submission(initial.id).is_none());
+        release_tx.send(()).unwrap();
+        until(|| actor.inner.queue.has_prepared_turn(first.turn_id())).await;
+        assert!(actor.remove_submission(initial.id).is_none());
+        let pending = actor.pending_submissions();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, initial.id);
+        assert_eq!(pending[0].text, FIRST);
+        assert_eq!(pending[1].text, NEXT);
+        assert!(actor.remove_submission(pending[1].id).is_some());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn stable_submission_removal_preserves_promoted_input_and_metadata() {
+    smol::block_on(async {
+        const FIRST: &str = "first";
+        const NEXT: &str = "next";
+        const LAST: &str = "last";
+        const PREAMBLE: &str = "context";
+        const NOTICE: usize = 3;
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        let mut next = input(NEXT);
+        next.images = vec![test_image()];
+        next.preamble = vec![Message::user(PREAMBLE.into())];
+        let joined = actor
+            .submit(
+                next,
+                None,
+                NEXT.into(),
+                super::TurnAdmissionOptions {
+                    already_displayed: true,
+                    mcp_startup_notice: Some(NOTICE),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        actor
+            .submit(input(LAST), None, LAST.into(), Default::default())
+            .unwrap();
+        assert_eq!(first.turn_id(), joined.turn_id());
+        let pending = actor.pending_submissions();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(actor.remove_submission(pending[0].id).unwrap().text, FIRST);
+        assert!(actor.remove_submission(pending[0].id).is_none());
+        assert_eq!(actor.remove_submission(pending[2].id).unwrap().text, LAST);
+        let remaining = actor.pending_submissions().pop().unwrap();
+        assert_eq!(remaining.id, pending[1].id);
+        assert_eq!(remaining.turn_id, first.turn_id());
+        assert_eq!(remaining.text, NEXT);
+        assert_eq!(remaining.images, vec![test_image()]);
+        assert!(remaining.already_displayed);
+        assert_eq!(remaining.mcp_startup_notice, Some(NOTICE));
+        let source = super::inbox::ActorTurnInbox::source(&actor.inner, first.turn_id(), None);
+        let events = actor.subscribe_events();
+        let consumed = source.take_initial_submission().unwrap();
+        assert_eq!(consumed.id, remaining.id);
+        assert!(events.drain().any(|event| matches!(event,
+            ActorEvent::SubmissionConsumed(entry) if entry.id == remaining.id)));
+        assert!(source.take_initial_submission().is_none());
+        let promoted = match actor.inner.queue.pop().unwrap() {
+            ActorWork::Turn(mut admission) => admission.input.take().unwrap(),
+            _ => panic!("expected promoted turn"),
+        };
+        assert_eq!(promoted.message, NEXT);
+        assert_eq!(promoted.images, vec![test_image()]);
+        assert_eq!(
+            serde_json::to_value(promoted.preamble).unwrap(),
+            serde_json::to_value(vec![Message::user(PREAMBLE.into())]).unwrap()
+        );
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn queued_submissions_do_not_cross_control_boundary() {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let first = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        actor
+            .push_control(ControlWork {
+                name: TEXT.into(),
+                correlation: TEXT.into(),
+            })
+            .unwrap();
+        let next = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        let joined = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert_ne!(first.turn_id(), next.turn_id());
+        assert_eq!(next.turn_id(), joined.turn_id());
+        let pending = actor.pending_submissions();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|entry| entry.turn_id)
+                .collect::<Vec<_>>(),
+            vec![first.turn_id(), next.turn_id(), next.turn_id()]
+        );
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn local_cancellation_preserves_pending_configuration_and_advances_fence() {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        const DISPLAYED: u64 = 7;
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let config = actor.reserve_config_update().unwrap();
+        let ticket = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        let (active, fence) = actor.cancel_local(DISPLAYED);
+        assert_eq!(active, None);
+        assert_eq!(fence, DISPLAYED + 1);
+        assert!(actor.pending_submissions().is_empty());
+        assert!(matches!(
+            ticket.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        config.resolve(Ok(fast_change(true))).unwrap();
+        config.wait().await.unwrap();
+        assert!(actor.policy_snapshot().unwrap().fast);
+        let next = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        assert!(matches!(next.wait().await, TurnOutcome::Completed { .. }));
+        assert!(actor.policy_snapshot().unwrap().fast);
         actor.close();
         task.await;
     });

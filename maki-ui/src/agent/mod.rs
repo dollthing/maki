@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+#[cfg(test)]
+use maki_agent::TurnId;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
     McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
-    ToolOutputLines, TurnId,
+    ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -240,6 +242,7 @@ pub(crate) struct SystemPromptOverride {
 }
 
 pub(crate) enum AgentCommand {
+    #[cfg(test)]
     Cancel {
         turn_id: Option<TurnId>,
         run_id: u64,
@@ -454,6 +457,7 @@ impl AgentHandles {
     }
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
+        app.chats[0].agent_id = Some(self.manager_and_root().1);
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
@@ -539,6 +543,7 @@ impl AgentHandles {
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old actor parks on its notify forever.
         self.apply_to_app(app);
+        self.queue.set_run_id(app.run_id);
         app.flush_restored_queue();
         self.release_runner();
         // Shut the old actor down after the app and queue are repointed, so
@@ -653,12 +658,18 @@ fn spawn_agent_internal(
     let mut orchestration_template = None;
     let root = manager
         .create_root_deferred_with_config(
-            Some(initial_config.unwrap_or_else(|| {
-                maki_agent::actor::EffectiveAgentConfig::new(
-                    initial_settings,
-                    maki_agent::AgentMode::Build,
-                )
-            })),
+            Some(
+                initial_config
+                    .unwrap_or_else(|| {
+                        maki_agent::actor::EffectiveAgentConfig::new(
+                            initial_settings,
+                            maki_agent::AgentMode::Build,
+                        )
+                    })
+                    .with_context(maki_agent::actor::AgentContextSnapshot::new(
+                        (**cwd.load()).clone(),
+                    )),
+            ),
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {

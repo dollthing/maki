@@ -30,10 +30,10 @@ read main.rs                 index main.rs
                              + read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A subagent started with `task_spawn` gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
+A subagent started with `task_spawn` has its own context. Its tool results stay there; the parent receives a result report rather than the full tool transcript. Later continuations can produce additional reports. Model tiers allow searches to use a cheaper model while the main agent uses a stronger model. See [Agent input and cancellation](/docs/quick-start/#agent-input-and-cancellation) for completion and resumed-result behavior.
 
 ```
-main context                subagent context (discarded)
+main context                separate subagent context
 ────────────                ────────────────────────────
 task_spawn("find auth") ─►  glob, grep ×6, read ×9, ...
                   ◄───────  "JWT middleware, auth.rs:120"
@@ -58,7 +58,7 @@ MCP results go through the same limit only when a session has a place to save th
 
 Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonblank long lines tolerate indentation changes. A long whitespace-only line requires a byte-identical line in `old_string` for each occurrence. An empty, shorter, or differently spaced blank line does not cover it. Exact substring edits remain available.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+Tools can preserve partial output on cancellation or deadline expiry: bash retains streamed lines and `code_execution` retains script output. UI cancellation is local to the viewed agent; it does not cancel its descendants or copy their partial transcripts into the parent context. A later child result can resume the parent in a new turn. See [Agent input and cancellation](/docs/quick-start/#agent-input-and-cancellation).
 
 Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#maki-api-register_tool).
 

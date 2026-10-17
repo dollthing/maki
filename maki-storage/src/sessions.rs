@@ -229,6 +229,8 @@ pub struct Session<M, U, T> {
     tool_outputs: HashMap<String, Arc<T>>,
     #[serde(default = "HashMap::new", skip_serializing_if = "HashMap::is_empty")]
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
+    #[serde(skip)]
+    subagent_history_epochs: HashMap<String, u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subagents: Vec<StoredSubagent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -967,6 +969,7 @@ where
             .into_iter()
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
+        subagent_history_epochs: HashMap::new(),
         subagents,
         posts,
         usage_by_model,
@@ -1375,6 +1378,7 @@ where
             token_usage: U::default(),
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagent_history_epochs: HashMap::new(),
             subagents: Vec::new(),
             posts: Vec::new(),
             usage_by_model: HashMap::new(),
@@ -1533,7 +1537,45 @@ where
         }
     }
 
+    pub fn subagent_history_snapshot(&self, id: &str) -> Option<HistorySnapshot<M>> {
+        self.subagent_messages
+            .get(id)
+            .map(|messages| HistorySnapshot {
+                epoch: self
+                    .subagent_history_epochs
+                    .get(id)
+                    .copied()
+                    .unwrap_or_default(),
+                compacted: false,
+                messages: Arc::clone(messages),
+            })
+    }
+
+    /// Rejects projections from a run superseded by a child history replacement.
+    pub fn adopt_subagent_history(&mut self, id: String, snapshot: &HistorySnapshot<M>) -> bool {
+        if self
+            .subagent_history_epochs
+            .get(&id)
+            .is_some_and(|epoch| *epoch > snapshot.epoch)
+        {
+            return false;
+        }
+        self.subagent_history_epochs
+            .insert(id.clone(), snapshot.epoch);
+        if self
+            .subagent_messages
+            .insert(id, Arc::clone(&snapshot.messages))
+            .is_some()
+        {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+        true
+    }
+
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
+        self.subagent_history_epochs.remove(&id);
         if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
             self.rewrite();
         } else {
@@ -1646,6 +1688,8 @@ where
             )
             .collect();
         self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        self.subagent_history_epochs
+            .retain(|id, _| main_ids.contains(id));
         self.subagents
             .retain(|sa| main_ids.contains(&sa.tool_use_id));
         self.posts.retain(|stored| {
@@ -1865,6 +1909,31 @@ mod tests {
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     /// A pid no live process on this machine has.
     const FAKE_LOCK_PID: u32 = u32::MAX - 1;
+
+    #[test]
+    fn child_history_epochs_fence_reconstructed_events_without_changing_disk_format() {
+        let mut session = TestSession::new("model", "/tmp");
+        let earlier = HistorySnapshot::new(vec![serde_json::json!("earlier")]);
+        let latest = HistorySnapshot::new(vec![serde_json::json!("latest")]);
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &earlier));
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &latest));
+        let reconstructed = HistorySnapshot {
+            messages: Arc::new(earlier.messages.as_ref().clone()),
+            ..earlier
+        };
+        assert!(!session.adopt_subagent_history(POST_AGENT.into(), &reconstructed));
+        let current = session.subagent_history_snapshot(POST_AGENT).unwrap();
+        assert_eq!(current.epoch, latest.epoch);
+        assert_eq!(current.messages, latest.messages);
+        let serialized = serde_json::to_value(&session).unwrap();
+        assert!(serialized.get("subagent_history_epochs").is_none());
+        let loaded: TestSession = serde_json::from_value(serialized).unwrap();
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        assert_eq!(
+            loaded.subagent_history_snapshot(POST_AGENT).unwrap().epoch,
+            0
+        );
+    }
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {

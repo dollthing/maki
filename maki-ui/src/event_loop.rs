@@ -76,8 +76,7 @@ use crate::agent::{
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
-    App, Msg, Notification, PreparedApp, QueuedMessage, SubmitOutcome, session_has_content,
-    turn_response,
+    App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
 };
 use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
@@ -113,6 +112,7 @@ const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
+const EMPTY_SESSION_PROMPT_ERR: &str = "prompt is empty";
 const NOT_LIVE_ERR: &str = "session not live";
 const CLOSED_TARGET_ERR: &str =
     "the selected agent has closed; switch to a live chat to change its model";
@@ -635,9 +635,42 @@ fn dispatch_mode_change_op(
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
 ) {
+    let target = selected_agent(runtime);
+    dispatch_target_mode_change_op(runtime, target, storage, modes, internal_tx, id);
+}
+
+fn dispatch_target_mode_change_op(
+    runtime: &SessionRuntime,
+    target: Option<maki_agent::AgentRef>,
+    storage: &StateDir,
+    modes: Arc<maki_agent::ModeRegistry>,
+    internal_tx: flume::Sender<InternalEvent>,
+    id: String,
+) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
-    let mut plan = runtime.app.state.plan.clone();
+    let root = runtime.handles.manager_and_root().1;
+    let is_root = target.as_ref().is_some_and(|target| target.id() == root);
+    let mut plan = if is_root {
+        runtime.app.state.plan.clone()
+    } else {
+        target
+            .as_ref()
+            .and_then(|target| {
+                target
+                    .manager()
+                    .effective_config(target.id())
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|config| {
+                config
+                    .mode
+                    .plan_path()
+                    .map(|path| crate::app::mode::PlanState::Drafting(path.to_path_buf()))
+            })
+            .unwrap_or_default()
+    };
     if id == "plan" {
         plan.allocate_path(storage);
     }
@@ -650,11 +683,17 @@ fn dispatch_mode_change_op(
         name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
     };
     let mode_def = modes.current(&mode);
-    let (manager, root) = runtime.handles.manager_and_root();
-    let reservation = manager
-        .actor(root)
-        .map_err(|error| error.to_string())
-        .and_then(|actor| {
+    let reservation = target
+        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+        .and_then(|target| {
+            target.validate_live().map_err(|error| error.to_string())?;
+            let actor = target
+                .manager()
+                .actor(target.id())
+                .map_err(|error| error.to_string())?;
+            actor
+                .validate_mode_change(&mode, &mode_def)
+                .map_err(|error| error.to_string())?;
             actor
                 .reserve_config_update()
                 .map_err(|error| error.to_string())
@@ -679,7 +718,11 @@ fn dispatch_mode_change_op(
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
-            kind: SessionOpKind::ModeChanged { id, plan },
+            kind: if is_root {
+                SessionOpKind::ModeChanged { id, plan }
+            } else {
+                SessionOpKind::ProviderRefreshed
+            },
             result,
         });
     })
@@ -1278,10 +1321,35 @@ impl SessionRuntime {
     }
 
     fn submit_text(&mut self, text: String) -> Result<SubmitOutcome, String> {
-        Ok(self.app.submit_prompt(QueuedMessage {
-            text,
+        if text.trim().is_empty() {
+            return Err(EMPTY_SESSION_PROMPT_ERR.to_owned());
+        }
+        let config = self.config().ok_or(NOT_LIVE_ERR)?;
+        let input = maki_agent::AgentInput {
+            message: text.clone(),
+            mode: config.mode.clone(),
             images: Vec::new(),
-        }))
+            preamble: Vec::new(),
+            thinking: config.thinking,
+            fast: config.fast,
+            workflow: config.workflow,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        };
+        let run_id = self.handles.queue.reserve_run_id(self.app.run_id);
+        self.handles
+            .queue
+            .try_push(QueueItem::Message {
+                text,
+                image_count: 0,
+                input,
+                run_id,
+                displayed: false,
+            })
+            .map_err(|error| error.to_string())?;
+        self.reset_run_notifications();
+        Ok(SubmitOutcome::Queued)
     }
 
     fn activate_deferred(&mut self) {
@@ -1739,7 +1807,8 @@ impl SpawnCtx {
             },
             initial_mode,
         )
-        .with_mode_def(initial_mode_def);
+        .with_mode_def(initial_mode_def)
+        .with_context(maki_agent::actor::AgentContextSnapshot::new(cwd.clone()));
         let handles = AgentHandles::prepare(
             &model_slot,
             effective_config.unwrap_or(initial_config),
@@ -1857,6 +1926,9 @@ enum SessionOpKind {
     ModelChanged { spec: String },
     /// OAuth refresh rebuilt the focused model's provider without changing its spec.
     ProviderRefreshed,
+    HistoryRewound {
+        change: Arc<Mutex<Option<maki_agent::actor::HistoryChange>>>,
+    },
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
     OptionToggled {
         id: &'static str,
@@ -1935,7 +2007,9 @@ fn orchestration_revision(runtime: &SessionRuntime) -> OrchestrationRevision {
         root_config: config(root),
         selected_config: config(selected),
         model_policy: Arc::clone(&runtime.handles.orchestration_template.model_policy),
-        cwd: runtime.handles.cwd_slot().load_full(),
+        cwd: config(root)
+            .map(|config| Arc::new(config.context.cwd().to_path_buf()))
+            .unwrap_or_else(|| runtime.handles.cwd_slot().load_full()),
     }
 }
 
@@ -2325,7 +2399,9 @@ impl<'t> EventLoop<'t> {
                 continue;
             };
             let mut template = runtime.handles.orchestration_template.clone();
-            template.cwd = (**runtime.handles.cwd_slot().load()).clone();
+            if let Some(config) = runtime.config() {
+                template.cwd = config.context.cwd().to_path_buf();
+            }
             self.orchestration
                 .register_root(maki_lua::orchestration::TrustedTarget {
                     target: root.clone(),
@@ -2754,6 +2830,51 @@ impl<'t> EventLoop<'t> {
                 ..
             } => {
                 if let maki_commands::HostRequest::Builtin(operation) = &request {
+                    if matches!(
+                        operation,
+                        maki_commands::BuiltinOperation::ToggleFast
+                            | maki_commands::BuiltinOperation::ToggleWorkflow
+                    ) {
+                        let id = if matches!(operation, maki_commands::BuiltinOperation::ToggleFast)
+                        {
+                            FAST_OPTION_ID
+                        } else {
+                            WORKFLOW_OPTION_ID
+                        };
+                        let result = admission
+                            .as_ref()
+                            .ok_or(maki_commands::CommandError::StaleTarget)
+                            .and_then(|pinned| {
+                                self.dispatch_target_toggle(index, &pinned.target, id)
+                                    .map_err(|error| {
+                                        maki_commands::CommandError::Producer(Arc::from(error))
+                                    })
+                            });
+                        let _ = reply.send(result.map(|()| maki_commands::HostResponse::Completed));
+                        return;
+                    }
+                    if let maki_commands::BuiltinOperation::Compact(instructions) = operation {
+                        let result = admission
+                            .as_ref()
+                            .ok_or(maki_commands::CommandError::StaleTarget)
+                            .and_then(|pinned| {
+                                self.target_actor(index, &pinned.target).map_err(|error| {
+                                    maki_commands::CommandError::Producer(Arc::from(error))
+                                })
+                            })
+                            .and_then(|actor| {
+                                let run_id = actor.reserve_presentation(actor.presentation_id());
+                                actor
+                                    .push_compact(run_id, instructions.clone())
+                                    .map_err(|error| {
+                                        maki_commands::CommandError::Producer(Arc::from(
+                                            error.to_string(),
+                                        ))
+                                    })
+                            });
+                        let _ = reply.send(result.map(|()| maki_commands::HostResponse::Completed));
+                        return;
+                    }
                     let selection = match operation {
                         maki_commands::BuiltinOperation::SelectModel(selection) => {
                             Some(selection.clone())
@@ -2779,6 +2900,78 @@ impl<'t> EventLoop<'t> {
                         );
                         return;
                     }
+                }
+                if let maki_commands::HostRequest::Builtin(
+                    maki_commands::BuiltinOperation::ChangeDirectory { path },
+                ) = &request
+                {
+                    let result = admission
+                        .as_ref()
+                        .ok_or(maki_commands::CommandError::StaleTarget)
+                        .and_then(|pinned| {
+                            self.dispatch_target_directory(index, &pinned.target, path.clone())
+                                .map_err(|error| {
+                                    maki_commands::CommandError::Producer(Arc::from(error))
+                                })
+                        });
+                    let _ = reply.send(result.map(|()| maki_commands::HostResponse::Completed));
+                    return;
+                }
+                if matches!(
+                    request,
+                    maki_commands::HostRequest::Context(
+                        maki_commands::HostContextRequest::WorkingDirectory
+                    )
+                ) {
+                    let result = admission
+                        .as_ref()
+                        .ok_or(maki_commands::CommandError::StaleTarget)
+                        .and_then(|pinned| {
+                            self.target_actor(index, &pinned.target)
+                                .map_err(|_| maki_commands::CommandError::StaleTarget)
+                        })
+                        .and_then(|actor| {
+                            actor
+                                .effective_config()
+                                .ok_or(maki_commands::CommandError::StaleTarget)
+                        })
+                        .map(|config| {
+                            maki_commands::HostResponse::Context(
+                                maki_commands::HostContextResponse::WorkingDirectory(
+                                    config.context.cwd().to_path_buf(),
+                                ),
+                            )
+                        });
+                    let _ = reply.send(result);
+                    return;
+                }
+                if matches!(
+                    request,
+                    maki_commands::HostRequest::Context(
+                        maki_commands::HostContextRequest::FastModeSupported
+                    )
+                ) {
+                    let result = admission
+                        .as_ref()
+                        .ok_or(maki_commands::CommandError::StaleTarget)
+                        .and_then(|pinned| {
+                            self.target_actor(index, &pinned.target)
+                                .map_err(|_| maki_commands::CommandError::StaleTarget)
+                        })
+                        .and_then(|actor| {
+                            actor
+                                .effective_config()
+                                .ok_or(maki_commands::CommandError::StaleTarget)
+                        })
+                        .map(|config| {
+                            maki_commands::HostResponse::Context(
+                                maki_commands::HostContextResponse::FastModeSupported(
+                                    config.model.supports_fast() || config.model.fast_pending(),
+                                ),
+                            )
+                        });
+                    let _ = reply.send(result);
+                    return;
                 }
                 if let (
                     maki_commands::HostRequest::Context(
@@ -2828,13 +3021,19 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
-            CommandEvent::Outcome { outcome, .. } => match outcome {
+            CommandEvent::Outcome {
+                outcome, admission, ..
+            } => match outcome {
                 maki_commands::CommandOutcome::AgentTurn(turn) => {
-                    let actions = self.sessions[index].app.submit_command_turn(turn);
+                    let actions = self.sessions[index]
+                        .app
+                        .submit_command_turn(turn, admission.as_deref());
                     self.dispatch(index, actions);
                 }
                 maki_commands::CommandOutcome::IsolatedTurn(turn) => {
-                    let actions = self.sessions[index].app.submit_isolated_turn(turn);
+                    let actions = self.sessions[index]
+                        .app
+                        .submit_isolated_turn(turn, admission.as_deref());
                     self.dispatch(index, actions);
                 }
                 maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
@@ -3008,8 +3207,15 @@ impl<'t> EventLoop<'t> {
                     tracing::warn!(%error, "failed to set window title");
                 }
             }
-            UiAction::OpenEditor { path, reply_tx } => {
-                let code = self.open_editor(self.focused, &path);
+            UiAction::OpenEditor {
+                target,
+                path,
+                reply_tx,
+            } => {
+                let code = target
+                    .as_ref()
+                    .and_then(|target| self.pinned_editor_path(target, &path).ok())
+                    .map_or(-1, |(index, path)| self.open_editor(index, &path));
                 let _ = reply_tx.send(code);
             }
             UiAction::OpenListPicker {
@@ -3300,6 +3506,25 @@ impl<'t> EventLoop<'t> {
 
     /// Exits with the editor's status code; `-1` (flashed on the session's
     /// app) when the editor could not be launched.
+    fn pinned_editor_path(
+        &self,
+        target: &maki_agent::AgentRef,
+        path: &std::path::Path,
+    ) -> Result<(usize, PathBuf), String> {
+        for (index, runtime) in self.sessions.iter().enumerate() {
+            let (manager, root) = runtime.handles.manager_and_root();
+            if manager
+                .lookup(root)
+                .is_ok_and(|root| root.same_manager(target))
+            {
+                let actor = self.target_actor(index, target)?;
+                let config = actor.effective_config().ok_or(NOT_LIVE_ERR)?;
+                return Ok((index, config.context.cwd().join(path)));
+            }
+        }
+        Err(NOT_LIVE_ERR.to_owned())
+    }
+
     fn open_editor(&mut self, idx: usize, path: &std::path::Path) -> i32 {
         self.prepare_terminal_handoff();
         let result = {
@@ -3869,6 +4094,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
+        self.sync_orchestration();
         match self.sessions[idx].submit_text(text)? {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
@@ -3914,7 +4140,7 @@ impl<'t> EventLoop<'t> {
             focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
             queue: Some(SessionQueueSnapshot {
-                count: app.queue.text_messages().len(),
+                count: app.queue.root_text_messages().len(),
             }),
             usage: app.state.token_usage,
             context_size: app.state.context_size,
@@ -4063,11 +4289,13 @@ impl<'t> EventLoop<'t> {
     fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
         let PendingReplacement { prepared, kind } = pending;
         match self.replace_prepared_runtime(idx, prepared) {
-            Ok(()) => {
-                if let SessionReplacementKind::Reset { ended_id } = kind {
-                    self.fire_session_reset(idx, ended_id);
+            Ok(()) => match kind {
+                SessionReplacementKind::Reset { ended_id } => {
+                    self.fire_session_reset(idx, ended_id)
                 }
-            }
+                #[cfg(test)]
+                SessionReplacementKind::Load => {}
+            },
             Err(error) => self.sessions[idx].app.flash(error),
         }
     }
@@ -4114,9 +4342,13 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        if SessionStatus::of(&self.sessions[self.focused].app) == SessionStatus::Idle
-            && !self.sessions[self.focused].app.has_content()
-        {
+        let current = &self.sessions[self.focused];
+        let (manager, root) = current.handles.manager_and_root();
+        let actor_idle = manager.actor(root).is_ok_and(|actor| {
+            let snapshot = actor.snapshot();
+            snapshot.status == maki_agent::actor::ActorStatus::Idle && snapshot.queued == 0
+        });
+        if current.quiescent() && actor_idle && !current.app.has_content() {
             return self.replace_runtime(self.focused, session);
         }
         let provider = self.ctx.prepare_replacement_provider(&session)?;
@@ -4258,13 +4490,8 @@ impl<'t> EventLoop<'t> {
                     displayed: true,
                 });
             }
-            Action::CancelAgent { turn_id, run_id } => {
-                let rt = &mut self.sessions[idx];
-                rt.notifications.reset();
-                let _ = rt
-                    .handles
-                    .cmd_tx
-                    .try_send(AgentCommand::Cancel { turn_id, run_id });
+            Action::CancelAgent { .. } => {
+                self.sessions[idx].notifications.reset();
             }
             Action::CancelSubagent { tool_use_id } => {
                 let _ = self.sessions[idx]
@@ -4273,28 +4500,46 @@ impl<'t> EventLoop<'t> {
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
+            Action::RewindAgent { target, boundary } => {
+                if let Err(error) = self.dispatch_rewind(idx, target, boundary) {
+                    self.sessions[idx].app.flash(error);
+                }
+            }
             Action::ToggleSessionOption { id } => {
-                handle_toggle_session_option(&mut self.sessions[idx], id, self.internal_tx.clone());
+                if matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
+                    let result = self
+                        .selected_target(idx)
+                        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                        .and_then(|target| self.dispatch_target_toggle(idx, &target, id));
+                    if let Err(error) = result {
+                        self.sessions[idx].app.flash(error);
+                    }
+                } else {
+                    handle_toggle_session_option(
+                        &mut self.sessions[idx],
+                        id,
+                        self.internal_tx.clone(),
+                    );
+                }
             }
             Action::ChangeDirectory(path) => {
-                self.note_if_deferred(idx, "cd");
-                let coordinator = self.sessions[idx].coordinator.clone();
-                let adopted: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
-                let slot = Arc::clone(&adopted);
-                self.dispatch_session_op(
-                    idx,
-                    SessionOpKind::DirectoryChanged { adopted },
-                    async move {
-                        let canonical = coordinator
-                            .change_directory(path)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
-                        Ok(())
-                    },
-                );
+                let result = self
+                    .selected_target(idx)
+                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                    .and_then(|target| self.dispatch_target_directory(idx, &target, path));
+                if let Err(error) = result {
+                    self.sessions[idx].app.flash(format!("cd: {error}"));
+                }
             }
-            Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::ChangeModel(spec) => self.dispatch_model_selection(
+                idx,
+                self.selected_target(idx),
+                maki_commands::ModelSelection {
+                    spec: Some(Arc::from(spec)),
+                    ..Default::default()
+                },
+                None,
+            ),
             Action::ChangePinnedModel { target, spec } => self.dispatch_model_selection(
                 idx,
                 Some(target),
@@ -4328,13 +4573,19 @@ impl<'t> EventLoop<'t> {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
             Action::Compact(instructions) => {
-                let rt = &mut self.sessions[idx];
-                rt.reset_run_notifications();
-                let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact {
-                    run_id,
-                    instructions,
-                });
+                let result = self
+                    .selected_target(idx)
+                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                    .and_then(|target| self.target_actor(idx, &target))
+                    .and_then(|actor| {
+                        let run_id = actor.reserve_presentation(actor.presentation_id());
+                        actor
+                            .push_compact(run_id, instructions)
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = result {
+                    self.sessions[idx].app.flash(error);
+                }
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
@@ -4343,13 +4594,24 @@ impl<'t> EventLoop<'t> {
                 });
             }
             Action::ShellCommand {
+                target,
+                cwd,
                 id,
                 command,
                 visible,
             } => {
+                let (manager, root) = self.sessions[idx].handles.manager_and_root();
+                let validation = manager
+                    .lookup(target.unwrap_or(root))
+                    .map_err(|error| error.to_string())
+                    .and_then(|target| self.target_actor(idx, &target).map(|_| ()));
+                if let Err(error) = validation {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
                 let rt = &mut self.sessions[idx];
                 let (trigger, cancel) = CancelToken::new();
-                rt.app.shell.add_trigger(trigger);
+                rt.app.shell.add_trigger_for(id.clone(), trigger);
                 spawn_shell(
                     command,
                     id,
@@ -4357,6 +4619,7 @@ impl<'t> EventLoop<'t> {
                     rt.shell_tx.clone(),
                     cancel,
                     self.ctx.config.clone(),
+                    cwd,
                 );
             }
             Action::OpenEditor(path) => {
@@ -4397,27 +4660,6 @@ impl<'t> EventLoop<'t> {
             Action::RefreshModels => self.refresh_models(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
-    }
-
-    /// Runs `op` off the event-loop thread and delivers its result back as an
-    /// [`InternalEvent::SessionOp`]. See [`SessionOpKind`] for why.
-    fn dispatch_session_op<F>(&self, idx: usize, kind: SessionOpKind, op: F)
-    where
-        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
-    {
-        let session = self.sessions[idx].id();
-        let identity = self.sessions[idx].handles.identity();
-        let internal_tx = self.internal_tx.clone();
-        smol::spawn(async move {
-            let result = op.await;
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                runtime: identity,
-                kind,
-                result,
-            });
-        })
-        .detach();
     }
 
     /// The coordinator serves option changes while a turn holds the lease, but
@@ -4464,6 +4706,23 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
+            SessionOpKind::HistoryRewound { change } => match result {
+                Ok(()) => {
+                    if let Some(change) = change
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                    {
+                        let app = &mut self.sessions[idx].app;
+                        if app.chats[0].agent_id == Some(change.agent_id) {
+                            app.state.session_mut().meta.queued_messages.clear();
+                            app.flush_restored_queue();
+                        }
+                        app.apply_history_change(change);
+                    }
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
             SessionOpKind::OptionToggled { id, committed } => match result {
                 Ok(()) => {
                     if let Some(enabled) = committed
@@ -4729,6 +4988,200 @@ impl<'t> EventLoop<'t> {
 
     fn selected_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
         selected_agent(&self.sessions[idx])
+    }
+
+    fn dispatch_rewind(
+        &self,
+        idx: usize,
+        target: maki_agent::AgentRef,
+        boundary: maki_agent::actor::HistoryBoundary,
+    ) -> Result<(), String> {
+        let actor = self.target_actor(idx, &target)?;
+        let guard = actor.prepare_idle().map_err(|error| error.to_string())?;
+        let root = self.sessions[idx].handles.manager_and_root().1;
+        let checkpoint: maki_agent::actor::HistoryEditCheckpoint = if target.id() == root {
+            let coordinator = self.sessions[idx].coordinator.clone();
+            Arc::new(move |messages| {
+                let coordinator = coordinator.clone();
+                Box::pin(async move {
+                    coordinator
+                        .replace_history(messages.messages.as_ref().clone())
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            })
+        } else {
+            let key = self.sessions[idx]
+                .app
+                .chats
+                .iter()
+                .find(|chat| chat.agent_id == Some(target.id()))
+                .and_then(|chat| chat.subagent_id.clone())
+                .ok_or_else(|| "child history storage identity is unavailable".to_owned())?;
+            let writer = Arc::clone(&self.ctx.storage_writer);
+            let session = self.sessions[idx].id();
+            Arc::new(move |messages| {
+                let writer = Arc::clone(&writer);
+                let key = key.clone();
+                Box::pin(async move {
+                    writer
+                        .checkpoint_child_history(session, key, messages)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            })
+        };
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let change = Arc::new(Mutex::new(None));
+            let result = guard
+                .rewind(boundary, checkpoint)
+                .await
+                .map(|updated| {
+                    *change.lock().unwrap_or_else(|error| error.into_inner()) = Some(updated);
+                })
+                .map_err(|error| error.to_string());
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime,
+                kind: SessionOpKind::HistoryRewound { change },
+                result,
+            });
+        })
+        .detach();
+        Ok(())
+    }
+
+    fn dispatch_target_toggle(
+        &self,
+        idx: usize,
+        target: &maki_agent::AgentRef,
+        id: &'static str,
+    ) -> Result<(), String> {
+        let actor = self.target_actor(idx, target)?;
+        let change = match id {
+            FAST_OPTION_ID => maki_agent::actor::ConfigChange::ToggleFast,
+            WORKFLOW_OPTION_ID => maki_agent::actor::ConfigChange::ToggleWorkflow,
+            _ => return Err(format!("unsupported agent option: {id}")),
+        };
+        let ticket = actor
+            .reserve_config_update()
+            .map_err(|error| error.to_string())?;
+        ticket
+            .resolve(Ok(change))
+            .map_err(|error| error.to_string())?;
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = ticket
+                .wait()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime,
+                kind: SessionOpKind::ProviderRefreshed,
+                result,
+            });
+        })
+        .detach();
+        Ok(())
+    }
+
+    fn dispatch_target_directory(
+        &self,
+        idx: usize,
+        target: &maki_agent::AgentRef,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        let actor = self.target_actor(idx, target)?;
+        let ticket = actor
+            .reserve_prepared_operation(None)
+            .map_err(|error| error.to_string())?;
+        let root = self.sessions[idx].handles.manager_and_root().1;
+        let coordinator = (target.id() == root).then(|| self.sessions[idx].coordinator.clone());
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let adopted = Arc::new(Mutex::new(None));
+            let result = async {
+                let config = ticket
+                    .wait_predecessor()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let path = config.context.cwd().join(path);
+                let path = smol::unblock(move || {
+                    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+                    if !canonical.is_dir() {
+                        return Err(format!("{} is not a directory", canonical.display()));
+                    }
+                    Ok(canonical)
+                })
+                .await?;
+                ticket
+                    .resolve(Some(maki_agent::actor::ConfigChange::WorkingDirectory(
+                        path.clone(),
+                    )))
+                    .map_err(|error| error.to_string())?;
+                ticket
+                    .wait_ready()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(coordinator) = &coordinator {
+                    coordinator
+                        .change_directory(path.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                if let Err(error) = ticket.commit() {
+                    if let Some(coordinator) = &coordinator {
+                        coordinator
+                            .change_directory(config.context.cwd().to_path_buf())
+                            .await
+                            .map_err(|rollback| {
+                                format!("{error}; directory rollback failed: {rollback}")
+                            })?;
+                    }
+                    return Err(error.to_string());
+                }
+                if coordinator.is_some() {
+                    *adopted.lock().unwrap_or_else(|error| error.into_inner()) = Some(path);
+                }
+                Ok(())
+            }
+            .await;
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime,
+                kind: SessionOpKind::DirectoryChanged { adopted },
+                result,
+            });
+        })
+        .detach();
+        Ok(())
+    }
+
+    fn target_actor(
+        &self,
+        idx: usize,
+        target: &maki_agent::AgentRef,
+    ) -> Result<maki_agent::AgentActorHandle, String> {
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let root = manager.lookup(root).map_err(|error| error.to_string())?;
+        if !root.same_manager(target) {
+            return Err(NOT_LIVE_ERR.to_owned());
+        }
+        target.validate_live().map_err(|error| error.to_string())?;
+        target
+            .manager()
+            .actor(target.id())
+            .map_err(|error| error.to_string())
     }
 
     fn dispatch_model_selection(
@@ -6943,9 +7396,7 @@ mod tests {
             let storage = ctx.storage.clone();
             let writer = Arc::clone(&ctx.storage_writer);
             drop(ctx);
-            Arc::try_unwrap(writer)
-                .unwrap_or_else(|_| panic!("runtime harness owns storage writer"))
-                .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+            writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
             storage
         }
     }
@@ -6957,9 +7408,6 @@ mod tests {
             };
             let storage_writer = Arc::clone(&ctx.storage_writer);
             drop(ctx);
-            let Ok(storage_writer) = Arc::try_unwrap(storage_writer) else {
-                panic!("runtime harness owns storage writer");
-            };
             storage_writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
         }
     }
@@ -7855,15 +8303,18 @@ mod tests {
         runtime.activate_deferred();
         runtime.activate_deferred();
 
-        let envelope = runtime
-            .handles
-            .agent_rx
-            .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
-            .expect("restored queue item was not consumed");
-        assert!(matches!(
-            envelope.event,
-            AgentEvent::QueueItemConsumed { ref text, .. } if text == "restored"
-        ));
+        let deadline = Instant::now() + RUNTIME_SHUTDOWN_TIMEOUT;
+        loop {
+            let envelope = runtime
+                .handles
+                .agent_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("restored queue item was not consumed");
+            if let AgentEvent::QueueItemConsumed { text, .. } = envelope.event {
+                assert_eq!(text, "restored");
+                break;
+            }
+        }
         assert!(runtime.handles.queue.is_empty());
         assert!(!runtime.restore_pending);
 
@@ -7874,70 +8325,66 @@ mod tests {
     fn committed_rewind_does_not_restore_failed_turn_queue() {
         const RECOVERY_TEXT: &str = "retained after failure";
         const REWOUND_TEXT: &str = "rewound prompt";
-
-        let harness = RuntimeHarness::new();
-        let mut session = harness.session();
-        session.push_message(Message::user(REWOUND_TEXT.into()));
-        let mut app = crate::app::tests::test_app();
-        app.apply_loaded_session(session.clone(), &harness.ctx().model_slot.load().model);
-        app.status = Status::Streaming;
-        app.run_id = 1;
-        assert!(matches!(
-            app.submit_prompt(QueuedMessage {
-                text: RECOVERY_TEXT.into(),
-                images: Vec::new(),
-            }),
-            SubmitOutcome::Queued
-        ));
-        app.update(Msg::Agent(Box::new(Envelope {
-            event: AgentEvent::ControlError {
-                message: "failed".into(),
-            },
-            subagent: None,
-            run_id: 1,
-        })));
-
-        app.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Esc,
-        )));
-        app.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Esc,
-        )));
-        let actions = app.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Enter,
-        )));
-        let Action::ReplaceSession(request) = actions.into_iter().next().unwrap() else {
-            panic!("expected replacement request");
-        };
-        let mut runtime = harness.runtime(session);
-        let prepared = harness.ctx().prepare_runtime(request.session).unwrap();
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
-
-        assert!(runtime.handles.queue.is_empty());
-        assert!(
-            runtime
-                .handles
-                .agent_rx
-                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
-                .is_err()
-        );
-
-        let actions = runtime.app.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Enter,
-        )));
-        let Action::SendMessage(input) = actions.into_iter().next().unwrap() else {
-            panic!("expected send message action");
-        };
-        assert_eq!(input.message, REWOUND_TEXT);
-
-        release_runtime(old);
-        release_runtime(runtime);
+        with_event_loop(|event_loop| {
+            let model = event_loop.sessions[0].app.state.model.clone();
+            let mut session = AppSession::new(&model.spec(), &event_loop.session_cwd);
+            session.push_message(Message::user(REWOUND_TEXT.into()));
+            let prepared = event_loop
+                .ctx
+                .prepare_runtime_with_provider(
+                    session,
+                    Some(PreparedProvider {
+                        model,
+                        provider: Arc::new(StubProvider),
+                    }),
+                )
+                .unwrap();
+            event_loop.replace_prepared_runtime(0, prepared).unwrap();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let guard = actor.prepare_idle().unwrap();
+            event_loop.submit_text(0, RECOVERY_TEXT.into()).unwrap();
+            let app = &mut event_loop.sessions[0].app;
+            app.status = Status::Streaming;
+            app.update(Msg::Agent(Box::new(Envelope {
+                event: AgentEvent::ControlError {
+                    message: OBSERVATION.into(),
+                },
+                subagent: None,
+                run_id: app.run_id,
+            })));
+            assert!(app.holds_recovery_text());
+            assert!(actor.pending_submissions().is_empty());
+            drop(guard);
+            let boundary = actor.history_boundaries().unwrap().pop().unwrap();
+            event_loop
+                .dispatch_rewind(0, manager.lookup(root).unwrap(), boundary)
+                .unwrap();
+            loop {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                let rewound = matches!(
+                    &event,
+                    InternalEvent::SessionOp {
+                        kind: SessionOpKind::HistoryRewound { .. },
+                        result: Ok(()),
+                        ..
+                    }
+                );
+                event_loop.handle_internal(event);
+                if rewound {
+                    break;
+                }
+            }
+            let app = &mut event_loop.sessions[0].app;
+            assert_eq!(app.input_box.buffer.value(), REWOUND_TEXT);
+            assert!(!app.holds_recovery_text());
+            app.checkpoint_now();
+            assert!(app.state.session.meta.queued_messages.is_empty());
+            assert!(actor.pending_submissions().is_empty());
+        });
     }
 
     #[test]
@@ -8381,6 +8828,427 @@ mod tests {
             ));
             assert_eq!(manager.snapshot().len(), 1);
         });
+    }
+
+    #[test_case(false ; "working_directory")]
+    #[test_case(true ; "fast_support")]
+    fn delayed_agent_context_request_keeps_admitted_target(fast_support: bool) {
+        with_event_loop(|event_loop| {
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            let expected = manager.actor(root).unwrap().effective_config().unwrap();
+            let template = event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .clone();
+            let other = test_runtime(model_named("other-model"));
+            event_loop.sessions.push(other);
+            event_loop.set_focused(1);
+            let (reply, response) = flume::bounded(1);
+            event_loop.handle_command(CommandEvent::Host {
+                target: event_loop.sessions[0].app.command_target.id(),
+                request: maki_commands::HostRequest::Context(if fast_support {
+                    maki_commands::HostContextRequest::FastModeSupported
+                } else {
+                    maki_commands::HostContextRequest::WorkingDirectory
+                }),
+                admission: Some(Box::new(maki_lua::orchestration::TrustedTarget {
+                    target,
+                    template,
+                })),
+                reply,
+            });
+            let response = response.recv().unwrap().unwrap();
+            match response {
+                maki_commands::HostResponse::Context(
+                    maki_commands::HostContextResponse::WorkingDirectory(path),
+                ) => {
+                    assert!(!fast_support);
+                    assert_eq!(path, expected.context.cwd());
+                }
+                maki_commands::HostResponse::Context(
+                    maki_commands::HostContextResponse::FastModeSupported(supported),
+                ) => {
+                    assert!(fast_support);
+                    assert_eq!(
+                        supported,
+                        expected.model.supports_fast() || expected.model.fast_pending()
+                    );
+                }
+                _ => panic!("unexpected agent context response"),
+            }
+        });
+    }
+
+    #[test_case(false; "fast")]
+    #[test_case(true; "workflow")]
+    fn delayed_agent_toggle_keeps_admitted_target(workflow: bool) {
+        with_event_loop(|event_loop| {
+            if !workflow {
+                let mut model = model_named("fast-model");
+                model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+                let replacement = test_runtime(model);
+                let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
+                release_runtime(old);
+            }
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let original = actor.effective_config().unwrap();
+            let target = manager.lookup(root).unwrap();
+            let template = event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .clone();
+            event_loop
+                .sessions
+                .push(test_runtime(model_named("other-model")));
+            let (other_manager, other_root) = event_loop.sessions[1].handles.manager_and_root();
+            let other = other_manager.actor(other_root).unwrap();
+            let other_original = other.effective_config().unwrap();
+            let commits = actor.subscribe_config_commits();
+            event_loop.set_focused(1);
+            let (reply, response) = flume::bounded(1);
+            event_loop.handle_command(CommandEvent::Host {
+                target: event_loop.sessions[0].app.command_target.id(),
+                request: maki_commands::HostRequest::Builtin(if workflow {
+                    maki_commands::BuiltinOperation::ToggleWorkflow
+                } else {
+                    maki_commands::BuiltinOperation::ToggleFast
+                }),
+                admission: Some(Box::new(maki_lua::orchestration::TrustedTarget {
+                    target,
+                    template,
+                })),
+                reply,
+            });
+            assert!(matches!(
+                response.recv().unwrap().unwrap(),
+                maki_commands::HostResponse::Completed
+            ));
+            let commit = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+            if workflow {
+                assert_eq!(commit.config.workflow, !original.workflow);
+                assert_eq!(commit.config.fast, original.fast);
+            } else {
+                assert_eq!(commit.config.fast, !original.fast);
+                assert_eq!(commit.config.workflow, original.workflow);
+            }
+            assert!(Arc::ptr_eq(
+                &other_original,
+                &other.effective_config().unwrap()
+            ));
+        });
+    }
+
+    #[test]
+    fn editor_path_keeps_pinned_runtime_and_rejects_closed_target() {
+        with_event_loop(|event_loop| {
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            let cwd = manager
+                .actor(root)
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .context
+                .cwd()
+                .to_path_buf();
+            event_loop
+                .sessions
+                .push(test_runtime(model_named("other-model")));
+            event_loop.set_focused(1);
+            let (index, path) = event_loop
+                .pinned_editor_path(&target, std::path::Path::new("plan.md"))
+                .unwrap();
+            assert_eq!(index, 0);
+            assert_eq!(path, cwd.join("plan.md"));
+            manager.actor(root).unwrap().close();
+            assert!(
+                event_loop
+                    .pinned_editor_path(&target, std::path::Path::new("plan.md"))
+                    .is_err()
+            );
+            let (reply_tx, response) = flume::bounded(1);
+            event_loop.handle_ui_action(UiAction::OpenEditor {
+                target: None,
+                path: PathBuf::from("plan.md"),
+                reply_tx,
+            });
+            assert_eq!(response.recv().unwrap(), -1);
+        });
+    }
+
+    #[test]
+    fn queued_relative_directory_uses_fifo_predecessor() {
+        with_event_loop(|event_loop| {
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let target = manager.lookup(root).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let child = directory.path().join("child");
+            std::fs::create_dir(&child).unwrap();
+            let barrier = actor.reserve_prepared_operation(None).unwrap();
+            event_loop
+                .dispatch_target_directory(0, &target, directory.path().to_path_buf())
+                .unwrap();
+            event_loop
+                .dispatch_target_directory(0, &target, PathBuf::from("child"))
+                .unwrap();
+            barrier.resolve(None).unwrap();
+            smol::block_on(barrier.wait_ready()).unwrap();
+            barrier.commit().unwrap();
+            let mut completed = 0;
+            while completed < 2 {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                if let InternalEvent::SessionOp {
+                    kind: SessionOpKind::DirectoryChanged { .. },
+                    result,
+                    ..
+                } = &event
+                {
+                    assert!(result.is_ok(), "{result:?}");
+                    completed += 1;
+                }
+                event_loop.handle_internal(event);
+            }
+            assert_eq!(actor.effective_config().unwrap().context.cwd(), child);
+            assert_eq!(event_loop.sessions[0].coordinator.read().cwd(), child);
+        });
+    }
+
+    #[test]
+    fn failed_directory_persistence_does_not_publish_actor_context() {
+        with_event_loop(|event_loop| {
+            let model = event_loop.sessions[0].app.state.model.clone();
+            let session = AppSession::new(&model.spec(), &event_loop.session_cwd);
+            let prepared = event_loop
+                .ctx
+                .prepare_runtime_with_provider(
+                    session,
+                    Some(PreparedProvider {
+                        model,
+                        provider: Arc::new(StubProvider),
+                    }),
+                )
+                .unwrap();
+            event_loop.replace_prepared_runtime(0, prepared).unwrap();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let original = actor.effective_config().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            event_loop.sessions[0].coordinator.retire();
+            event_loop
+                .dispatch_target_directory(
+                    0,
+                    &manager.lookup(root).unwrap(),
+                    directory.path().to_path_buf(),
+                )
+                .unwrap();
+            loop {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                let finished = matches!(
+                    &event,
+                    InternalEvent::SessionOp {
+                        kind: SessionOpKind::DirectoryChanged { .. },
+                        result: Err(_),
+                        ..
+                    }
+                );
+                event_loop.handle_internal(event);
+                if finished {
+                    break;
+                }
+            }
+            assert!(Arc::ptr_eq(&original, &actor.effective_config().unwrap()));
+            assert_eq!(
+                event_loop.sessions[0].app.state.session.cwd,
+                original.context.cwd().to_string_lossy()
+            );
+        });
+    }
+
+    #[test]
+    fn focused_operations_reject_foreign_and_closed_targets() {
+        with_event_loop(|event_loop| {
+            let foreign = test_runtime(model_named("other-model"));
+            let (foreign_manager, foreign_root) = foreign.handles.manager_and_root();
+            let target = foreign_manager.lookup(foreign_root).unwrap();
+            assert!(event_loop.target_actor(0, &target).is_err());
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            manager.actor(root).unwrap().close();
+            assert!(event_loop.target_actor(0, &target).is_err());
+            release_runtime(foreign);
+        });
+    }
+
+    #[test]
+    fn focused_history_operations_preserve_identity_and_children() {
+        const FIRST: &str = "first prompt";
+        const DRAFT: &str = "second prompt";
+        with_event_loop(|event_loop| {
+            let mut session = AppSession::new(
+                &event_loop.sessions[0].app.state.model.spec(),
+                &event_loop.session_cwd,
+            );
+            session.replace_messages(vec![
+                Message::user(FIRST.into()),
+                Message::user(DRAFT.into()),
+            ]);
+            let model = event_loop.sessions[0].app.state.model.clone();
+            let prepared = event_loop
+                .ctx
+                .prepare_runtime_with_provider(
+                    session,
+                    Some(PreparedProvider {
+                        model,
+                        provider: Arc::new(StubProvider),
+                    }),
+                )
+                .unwrap();
+            event_loop.replace_prepared_runtime(0, prepared).unwrap();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            let actor = manager.actor(root).unwrap();
+            let identity = actor.identity();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                event_loop.ctx.command_runtime.registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "rewind_child",
+                r#"
+                maki.api.register_command({
+                    name = "/rewind-child", tui_only = false,
+                    handler = function(_, ctx)
+                        assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true }))
+                        maki.ui.flash("rewind child ready")
+                    end,
+                })
+            "#,
+            )
+            .unwrap();
+            event_loop.sync_orchestration();
+            let outcome = smol::block_on(event_loop.ctx.command_runtime.registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/rewind-child".into(),
+            ));
+            assert!(
+                matches!(
+                    outcome,
+                    maki_commands::InputDispatch::Dispatched(
+                        maki_commands::CommandOutcome::Completed
+                    )
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                matches!(host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(), UiAction::Flash(text) if text == "rewind child ready")
+            );
+            let child = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root))
+                .unwrap()
+                .agent_id;
+            let child_actor = manager.actor(child).unwrap();
+            let child_identity = child_actor.identity();
+            let child_before = child_actor.snapshot();
+            let boundary = actor.history_boundaries().unwrap().pop().unwrap();
+            event_loop.dispatch_rewind(0, target, boundary).unwrap();
+            loop {
+                let event = event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap();
+                let rewound = matches!(
+                    &event,
+                    InternalEvent::SessionOp {
+                        kind: SessionOpKind::HistoryRewound { .. },
+                        ..
+                    }
+                );
+                event_loop.handle_internal(event);
+                if rewound {
+                    break;
+                }
+            }
+            assert!(Arc::ptr_eq(
+                &identity,
+                &manager.actor(root).unwrap().identity()
+            ));
+            assert_eq!(event_loop.sessions[0].app.state.session.messages().len(), 1);
+            assert_eq!(event_loop.sessions[0].app.input_box.buffer.value(), DRAFT);
+            assert_eq!(actor.history_boundaries().unwrap().len(), 1);
+            assert!(Arc::ptr_eq(
+                &child_identity,
+                &manager.actor(child).unwrap().identity()
+            ));
+            assert_eq!(child_actor.snapshot().status, child_before.status);
+            assert_eq!(child_actor.snapshot().latest, child_before.latest);
+            assert!(
+                manager
+                    .snapshot()
+                    .iter()
+                    .any(|node| { node.agent_id == child && node.parent_id == Some(root) })
+            );
+        });
+    }
+
+    #[test]
+    fn session_operations_do_not_follow_child_focus() {
+        const PROMPT: &str = "session-root prompt";
+        with_event_loop(|event_loop| {
+            let app = &mut event_loop.sessions[0].app;
+            let mut child = crate::chat::Chat::new(
+                "historical child".into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            child.agent_id = Some(AgentId::generate());
+            child.subagent_id = Some("historical-child".into());
+            app.chats.push(child);
+            app.active_chat = 1;
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let guard = actor.prepare_idle().unwrap();
+            let (reply, response) = flume::bounded(1);
+            event_loop.handle_session_request(
+                SessionRequest::Prompt {
+                    id: None,
+                    text: PROMPT.into(),
+                },
+                reply,
+            );
+            assert_eq!(response.recv().unwrap().unwrap(), json!("queued"));
+            assert_eq!(event_loop.sessions[0].app.active_chat, 1);
+            let pending = actor.pending_submissions();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].text, PROMPT);
+            drop(guard);
+        });
+    }
+
+    #[test]
+    fn session_prompt_rejects_empty_input_without_admission() {
+        let mut runtime = test_runtime(model_named("test-model"));
+        assert_eq!(
+            runtime.submit_text("  ".into()).err().as_deref(),
+            Some(EMPTY_SESSION_PROMPT_ERR)
+        );
+        assert!(runtime.handles.queue.is_empty());
+        release_runtime(runtime);
     }
 
     #[test]

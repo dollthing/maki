@@ -3181,7 +3181,6 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                input_tx: None,
                 cancel: None,
             }),
             run_id: 9,

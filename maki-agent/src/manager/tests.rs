@@ -17,8 +17,8 @@ use super::{AgentLimits, AgentManagerHandle, AgentMetadata, GraphLifecycle, Mana
 use crate::actor::PreparedTurn;
 use crate::{
     ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, ConfigChange,
-    ConfigPatch, ControlWork, EventSender, History, PreparedModel, RootWork, TurnContext,
-    TurnOutcome, WorkKind,
+    ConfigPatch, ControlWork, EventSender, History, PreparedModel, TurnAdmissionOptions,
+    TurnContext, TurnOutcome, WorkKind,
 };
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -291,7 +291,7 @@ fn idle_guard_rejects_popped_work() {
 enum PoppedWork {
     Admitted,
     Prepared,
-    Root,
+    Submitted,
 }
 
 enum MatchingSuccessor {
@@ -301,7 +301,7 @@ enum MatchingSuccessor {
 }
 
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::User, MatchingSuccessor::None; "admitted_user")]
-#[test_case(PoppedWork::Root, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "root_shutdown")]
+#[test_case(PoppedWork::Submitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "root_shutdown")]
 #[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Admitted; "prepared_matching_admitted")]
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Prepared; "admitted_matching_prepared")]
 fn correlation_cancel_settles_popped_work_without_backend_entry(
@@ -348,19 +348,16 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                 operation.wait_ready().await.unwrap();
                 operation.commit().unwrap().ticket
             }
-            PoppedWork::Root => {
+            PoppedWork::Submitted => Some(
                 actor
-                    .rush(RootWork::new(
+                    .submit(
                         input(),
-                        RUN_ID,
-                        false,
+                        Some(EventSender::new(event_tx, RUN_ID)),
                         CORRELATION.into(),
-                        Vec::new(),
-                        CORRELATION.into(),
-                    ))
-                    .unwrap();
-                None
-            }
+                        TurnAdmissionOptions::default(),
+                    )
+                    .unwrap(),
+            ),
         };
         popped.recv_async().await.unwrap();
         let (successor_ticket, successor_operation) = match successor {
@@ -464,8 +461,6 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
         const LAST: &str = "last-root";
         const UNRELATED: &str = "unrelated";
         const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-        const EARLIER_RUN: u64 = 7;
-        const LAST_RUN: u64 = 8;
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (start_tx, start_rx) = flume::bounded(1);
         let (entered_tx, entered_rx) = flume::unbounded();
@@ -482,16 +477,14 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
         let identity = actor.identity();
         let events = actor.subscribe_events();
         let (popped, release) = actor.pause_after_next_pop();
-        for (run_id, correlation) in [(EARLIER_RUN, EARLIER), (LAST_RUN, LAST)] {
+        for correlation in [EARLIER, LAST] {
             actor
-                .rush(RootWork::new(
+                .submit(
                     input(),
-                    run_id,
-                    false,
+                    None,
                     correlation.into(),
-                    Vec::new(),
-                    correlation.into(),
-                ))
+                    TurnAdmissionOptions::default(),
+                )
                 .unwrap();
         }
         start_tx.send(()).unwrap();
@@ -796,14 +789,12 @@ fn root_cancelled_before_managed_admission_has_no_start_and_resolves_end() {
     let (release_tx, release_rx) = flume::bounded(1);
     manager.set_managed_acquire_gate(acquire_tx, release_rx);
     actor
-        .rush(RootWork::new(
+        .submit(
             input(),
-            1,
-            false,
-            String::new(),
-            Vec::new(),
+            None,
             CORRELATION.into(),
-        ))
+            TurnAdmissionOptions::default(),
+        )
         .unwrap();
     acquire_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     let turn_id = actor.snapshot().active_turn.unwrap();
@@ -1128,7 +1119,6 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     root_work: bool,
 ) {
     const CORRELATION: &str = "reused";
-    const RUN_ID: u64 = 7;
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
@@ -1139,14 +1129,12 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     let (popped, release) = actor.pause_after_next_pop();
     let target = if root_work {
         actor
-            .rush(RootWork::new(
+            .submit(
                 input(),
-                RUN_ID,
-                false,
+                None,
                 CORRELATION.into(),
-                Vec::new(),
-                CORRELATION.into(),
-            ))
+                TurnAdmissionOptions::default(),
+            )
             .unwrap();
         None
     } else {
@@ -1231,8 +1219,6 @@ fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
 fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bool) {
     const CORRELATION: &str = "reused";
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-    const FIRST_RUN_ID: u64 = 7;
-    const SUCCESSOR_RUN_ID: u64 = 8;
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
@@ -1245,14 +1231,12 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bo
     let actor = root.actor().unwrap();
     let first = if root_work {
         actor
-            .rush(RootWork::new(
+            .submit(
                 input(),
-                FIRST_RUN_ID,
-                false,
+                None,
                 CORRELATION.into(),
-                Vec::new(),
-                CORRELATION.into(),
-            ))
+                TurnAdmissionOptions::default(),
+            )
             .unwrap();
         None
     } else {
@@ -1274,14 +1258,12 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bo
     ));
     let successor = if root_work {
         actor
-            .rush(RootWork::new(
+            .submit(
                 input(),
-                SUCCESSOR_RUN_ID,
-                false,
+                None,
                 CORRELATION.into(),
-                Vec::new(),
-                CORRELATION.into(),
-            ))
+                TurnAdmissionOptions::default(),
+            )
             .unwrap();
         None
     } else {
@@ -2253,6 +2235,165 @@ fn install_active_turn(
     let mut state = actor.inner.state.lock().unwrap();
     state.status = crate::ActorStatus::Running(turn_id);
     state.active = Some(crate::actor::ActiveCancel::new(None).0);
+}
+
+fn initialize_delegating_turn(current: &mut crate::CurrentManagedTurn) {
+    let config = config("anthropic/claude-sonnet-4-20250514", false).with_mode_def(Some(
+        crate::modes::ModeRegistry::builtin().current(&AgentMode::Build),
+    ));
+    current.policy = Some(Arc::new(config.settings));
+    current.mode = Some(config.mode);
+    current.mode_def = config.mode_def;
+}
+
+#[test]
+fn local_cancel_retires_unpolled_turn_authority_without_closing_live_child() {
+    const DISPLAYED: u64 = 7;
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let turn_id = crate::TurnId::generate();
+        install_active_turn(&manager, root.id(), turn_id);
+        let (_cancel, token) = crate::ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn_id, &token)
+                .await
+                .unwrap();
+        let mut current = current;
+        initialize_delegating_turn(&mut current);
+        let execution = super::manage_execution(
+            Box::pin(std::future::pending()),
+            guard,
+            Arc::clone(&current.lease.inner),
+            token,
+        );
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let child_turn = crate::TurnId::generate();
+        install_active_turn(&manager, child.id(), child_turn);
+        let (_child_cancel, child_token) = crate::ReasonedCancelToken::new();
+        let (child_guard, child_current) = super::enter_managed_turn(
+            &Arc::downgrade(&manager.0),
+            child.id(),
+            child_turn,
+            &child_token,
+        )
+        .await
+        .unwrap();
+
+        let mut child_current = child_current;
+        initialize_delegating_turn(&mut child_current);
+        let captured = manager.local_cancel(root.id(), DISPLAYED).unwrap();
+        assert_eq!(captured, (Some(turn_id), DISPLAYED + 1));
+        let inactive = ManagerError::InactiveTurn {
+            agent_id: root.id(),
+            turn_id,
+        };
+        assert_eq!(current.validate_active(), Err(inactive.clone()));
+        assert!(matches!(
+            current.spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            ),
+            Err(error) if error == inactive
+        ));
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Live
+        );
+        assert_eq!(
+            child.actor().unwrap().snapshot().lifecycle,
+            crate::ActorLifecycle::Open
+        );
+        child_current.validate_active().unwrap();
+        child_current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+
+        drop(execution);
+        drop(child_guard);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn local_cancel_preserves_successor_authority_after_retired_execution_drops() {
+    const DISPLAYED: u64 = 7;
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let turn_id = crate::TurnId::generate();
+        install_active_turn(&manager, root.id(), turn_id);
+        let (_cancel, token) = crate::ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn_id, &token)
+                .await
+                .unwrap();
+        assert_eq!(
+            manager.local_cancel(root.id(), DISPLAYED).unwrap(),
+            (Some(turn_id), DISPLAYED + 1)
+        );
+        assert!(current.validate_active().is_err());
+
+        let successor_id = crate::TurnId::generate();
+        install_active_turn(&manager, root.id(), successor_id);
+        let (_successor_cancel, successor_token) = crate::ReasonedCancelToken::new();
+        let (successor_guard, successor) = super::enter_managed_turn(
+            &Arc::downgrade(&manager.0),
+            root.id(),
+            successor_id,
+            &successor_token,
+        )
+        .await
+        .unwrap();
+        let mut successor = successor;
+        initialize_delegating_turn(&mut successor);
+        drop(guard);
+        successor.validate_active().unwrap();
+        let child = successor
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Live
+        );
+        drop(successor_guard);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
 }
 
 #[test]

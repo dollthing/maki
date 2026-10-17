@@ -430,8 +430,9 @@ impl TuiActorBackend {
                 .reason()
                 .unwrap_or(TurnCancellationReason::User),
         );
-        EventSender::new(self.agent_tx.clone(), run_id)
-            .try_send(AgentEvent::TurnOutcome(outcome.clone()));
+        context
+            .output
+            .set_terminal_sender(EventSender::new(self.agent_tx.clone(), run_id));
         outcome
     }
 
@@ -537,7 +538,8 @@ impl TuiActorBackend {
         .with_cancel(context.cancel.clone())
         .with_cancel_reason_source(context.cancel_reason.clone())
         .with_mcp(self.mcp.clone())
-        .with_admission(context.admission.clone());
+        .with_admission(context.admission.clone())
+        .with_deferred_outcome();
 
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
@@ -656,14 +658,6 @@ impl ActorBackend for TuiActorBackend {
         }))
     }
 
-    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
-        let agent_tx = self.agent_tx.clone();
-        Some(Arc::new(move |run_id, message| {
-            EventSender::new(agent_tx.clone(), run_id)
-                .try_send(AgentEvent::ControlError { message });
-        }))
-    }
-
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
         let registry = Arc::clone(ToolRegistry::global_arc());
         let mcp = self.mcp.clone();
@@ -680,7 +674,9 @@ impl ActorBackend for TuiActorBackend {
                     .count();
                 (count > 0).then_some(count)
             });
-            let cwd = (**cwd.load()).clone();
+            let cwd = config
+                .map(|config| config.context.cwd().to_path_buf())
+                .unwrap_or_else(|| (**cwd.load()).clone());
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
             let binding = input
                 .prompt
@@ -762,20 +758,24 @@ impl ActorBackend for TuiActorBackend {
             }
             let explicit = matches!(&work, WorkKind::Turn)
                 && !context.correlation.starts_with(ROOT_CORRELATION_PREFIX);
-            let standalone_presentation = explicit || matches!(&work, WorkKind::Root { .. });
+            let undisplayed_submission = context.managed_turn.as_ref().is_some_and(|current| {
+                current
+                    .manager()
+                    .actor(context.agent_id)
+                    .is_ok_and(|actor| {
+                        actor
+                            .pending_submissions()
+                            .into_iter()
+                            .find(|entry| entry.turn_id == turn_id)
+                            .is_some_and(|entry| !entry.already_displayed)
+                    })
+            });
+            let standalone_presentation = explicit || undisplayed_submission;
             let run_id = if standalone_presentation {
-                let displayed_run = match &work {
-                    WorkKind::Root {
-                        run_id,
-                        displayed: true,
-                        ..
-                    } => Some(*run_id),
-                    _ => None,
-                };
                 if let Some(current) = &context.managed_turn {
                     let allocated = current.manager().actor(context.agent_id).and_then(|actor| {
                         actor
-                            .allocate_processing_presentation(turn_id, displayed_run)
+                            .allocate_processing_presentation(turn_id, None)
                             .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
                     });
                     match allocated {
@@ -791,36 +791,18 @@ impl ActorBackend for TuiActorBackend {
                             ));
                         }
                     }
-                } else if let Some(displayed_run) = displayed_run
-                    && self
-                        .run_id
-                        .compare_exchange(
-                            displayed_run,
-                            displayed_run,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                {
-                    displayed_run
                 } else {
                     self.run_id.fetch_add(1, Ordering::Relaxed) + 1
                 }
             } else {
                 correlation_to_run_id(&context.correlation)
             };
+            context
+                .output
+                .set_terminal_sender(EventSender::new(self.agent_tx.clone(), run_id));
             if standalone_presentation {
                 if let Some(current) = &context.managed_turn {
                     let bound = current.manager().actor(context.agent_id).and_then(|actor| {
-                        if let WorkKind::Root { earlier, .. } = &work {
-                            for item in earlier {
-                                actor
-                                    .bind_active_correlation(turn_id, item.correlation.clone())
-                                    .map_err(|error| {
-                                        maki_agent::ManagerError::Policy(error.to_string())
-                                    })?;
-                            }
-                        }
                         actor
                             .bind_active_correlation(
                                 turn_id,
@@ -829,69 +811,12 @@ impl ActorBackend for TuiActorBackend {
                             .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
                     });
                     if bound.is_err() || context.cancel.is_cancelled() {
-                        return BackendResult::EnteredRun(self.cancel_setup(
-                            &context,
-                            turn_id,
-                            admission_run_id,
-                        ));
-                    }
-                }
-                context.correlation = format!("{ROOT_CORRELATION_PREFIX}{run_id}");
-            }
-            if explicit && (!input.message.is_empty() || !input.images.is_empty()) {
-                EventSender::new(self.agent_tx.clone(), run_id).try_send(
-                    AgentEvent::QueueItemConsumed {
-                        text: input.message.clone(),
-                        images: input.images.clone(),
-                        mcp_startup_notice: context
-                            .admission
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.mcp_startup_notice),
-                        already_displayed: false,
-                    },
-                );
-            }
-            // A root admitted as a standalone turn carries the presentation
-            // metadata: draw the bubble exactly once when the UI has not drawn
-            // it yet. Immediate-dispatch roots (`displayed == true`) were drawn
-            // by `start_from_queue`, and folded roots never reach here (the
-            // active run consumes them through its interrupt source).
-            if let WorkKind::Root {
-                text,
-                images,
-                earlier,
-                mcp_startup_notice,
-                already_displayed,
-                ..
-            } = &work
-            {
-                for item in earlier {
-                    let notice = item.mcp_startup_notice;
-                    if !item.displayed || notice.is_some() {
-                        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
-                            AgentEvent::QueueItemConsumed {
-                                text: item.text.clone(),
-                                images: item.images.clone(),
-                                mcp_startup_notice: notice,
-                                already_displayed: item.already_displayed,
-                            },
+                        return BackendResult::EnteredRun(
+                            self.cancel_setup(&context, turn_id, run_id),
                         );
                     }
                 }
-                let notice = mcp_startup_notice.or_else(|| {
-                    context
-                        .admission
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.mcp_startup_notice)
-                });
-                let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
-                    AgentEvent::QueueItemConsumed {
-                        text: text.clone(),
-                        images: images.clone(),
-                        mcp_startup_notice: notice,
-                        already_displayed: *already_displayed,
-                    },
-                );
+                context.correlation = format!("{ROOT_CORRELATION_PREFIX}{run_id}");
             }
             if standalone_presentation && let Some(policy) = &context.policy {
                 EventSender::new(self.agent_tx.clone(), run_id).try_send(
@@ -901,9 +826,6 @@ impl ActorBackend for TuiActorBackend {
                 );
             }
             let result = if matches!(&work, WorkKind::Control | WorkKind::Compact) {
-                // The TUI has no standalone controls/compacts; the runner
-                // only reaches here with a Turn or a started Root. Treat an
-                // unexpected work kind as a setup failure instead of panicking.
                 warn!(?work, "unexpected work kind in TUI run_turn");
                 BackendResult::SetupFailed {
                     agent_id: context.agent_id,
@@ -936,7 +858,7 @@ impl ActorBackend for TuiActorBackend {
                     },
                 }
             };
-            if standalone_presentation && matches!(result, BackendResult::SetupFailed { .. }) {
+            if matches!(result, BackendResult::SetupFailed { .. }) {
                 if let Some(inbox) = &context.inbox {
                     inbox.close();
                 }
@@ -952,8 +874,6 @@ impl ActorBackend for TuiActorBackend {
                         retryable: true,
                     },
                 );
-                EventSender::new(self.agent_tx.clone(), run_id)
-                    .try_send(AgentEvent::TurnOutcome(outcome.clone()));
                 BackendResult::EnteredRun(outcome)
             } else {
                 result
@@ -1193,14 +1113,15 @@ mod tests {
                 actor_run_id.store(RUN_ID - 2, Ordering::Relaxed);
                 actor.observe_presentation(RUN_ID - 1);
                 actor
-                    .rush(maki_agent::actor::RootWork::new(
+                    .submit(
                         make_input("successor"),
-                        RUN_ID - 1,
-                        true,
-                        "successor".into(),
-                        Vec::new(),
+                        None,
                         format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
-                    ))
+                        maki_agent::TurnAdmissionOptions {
+                            already_displayed: true,
+                            ..Default::default()
+                        },
+                    )
                     .unwrap();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
@@ -1211,14 +1132,15 @@ mod tests {
                 }
                 let active_policy_generation = actor.config_snapshot().unwrap().generation;
                 actor
-                    .rush(maki_agent::actor::RootWork::new(
-                        make_input("successor"),
-                        RUN_ID - 1,
-                        false,
-                        "folded user input".into(),
-                        Vec::new(),
+                    .submit(
+                        make_input("folded user input"),
+                        None,
                         format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
-                    ))
+                        maki_agent::TurnAdmissionOptions {
+                            already_displayed: false,
+                            ..Default::default()
+                        },
+                    )
                     .unwrap();
                 let barrier = actor.reserve_config_update().unwrap();
                 barrier
@@ -1241,12 +1163,12 @@ mod tests {
                     Some((AgentMode::Build, false))
                 );
                 assert_eq!(
-                    actor.snapshot().queue,
-                    vec![maki_agent::actor::QueueProjection::Message {
-                        text: "folded user input".into(),
-                        image_count: 0,
-                        displayed: false,
-                    }]
+                    actor
+                        .pending_submissions()
+                        .iter()
+                        .map(|entry| entry.text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["folded user input"]
                 );
                 release.send(()).unwrap();
                 let mut folded_bubble = false;
@@ -1279,6 +1201,7 @@ mod tests {
                 )
                 .unwrap();
             let successor = if deferred {
+                let barrier = actor.reserve_config_update().unwrap();
                 let queue = crate::agent::shared_queue::actor_queue(
                     Arc::new(actor.clone()),
                     Arc::clone(&actor_run_id),
@@ -1293,7 +1216,6 @@ mod tests {
                         displayed: false,
                     });
                 }
-                let barrier = actor.reserve_config_update().unwrap();
                 barrier
                     .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
                     .unwrap();
@@ -1579,6 +1501,7 @@ mod tests {
                     }
                 }
                 let second = if deferred {
+                    let boundary = actor.reserve_config_update().unwrap();
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: "deferred root".into(),
                         image_count: 0,
@@ -1586,6 +1509,10 @@ mod tests {
                         run_id: FIRST_RUN,
                         displayed: false,
                     });
+                    boundary
+                        .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
+                        .unwrap();
+                    assert!(boundary.wait().await.is_err());
                     None
                 } else {
                     Some(
@@ -1630,12 +1557,12 @@ mod tests {
                 });
                 assert_eq!(queue.current_run_id(), PENDING_RUN);
                 assert_eq!(actor.snapshot().active_turn, Some(second.turn_id()));
-                while !actor.snapshot().queue.iter().any(|item| {
-                    matches!(item, maki_agent::actor::QueueProjection::Turn(correlation)
-                        if correlation == &format!("{ROOT_CORRELATION_PREFIX}{PENDING_RUN}"))
-                }) {
-                    smol::future::yield_now().await;
-                }
+                assert!(
+                    actor
+                        .pending_submissions()
+                        .iter()
+                        .any(|entry| { entry.text == "explicit root" && entry.already_displayed })
+                );
                 let actions = app.update(crate::app::Msg::Key(crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::Char('c'),
                     crossterm::event::KeyModifiers::CONTROL,
@@ -1737,8 +1664,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tui_queue_adapter_folds_into_initial_user_turn() {
+    #[test_case(false; "root")]
+    #[test_case(true; "child")]
+    fn ordinary_submission_paths_have_runtime_parity(child: bool) {
         smol::block_on(futures_lite::future::or(
             async {
                 use crate::agent::shared_queue::{QueueItem, actor_queue};
@@ -1750,35 +1678,49 @@ mod tests {
                 let (release, released) = flume::bounded(1);
                 let run_id = Arc::clone(&backend.run_id);
                 let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
-                let root = manager
-                    .create_root_with_config(
-                        Some(
-                            maki_agent::EffectiveAgentConfig::new(
-                                maki_agent::RunSettings {
-                                    provider: Arc::new(QueueProvider {
-                                        requests: requests_tx,
-                                        release: released,
-                                    }),
-                                    model: crate::components::test_model(),
-                                    fast: false,
-                                    workflow: false,
-                                    thinking: Default::default(),
-                                },
-                                AgentMode::Build,
-                            )
-                            .with_mode_def(
-                                maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build),
-                            ),
-                        ),
-                        Vec::new(),
-                        None,
-                        |agent_id| {
+                let config = maki_agent::EffectiveAgentConfig::new(
+                    maki_agent::RunSettings {
+                        provider: Arc::new(QueueProvider {
+                            requests: requests_tx,
+                            release: released,
+                        }),
+                        model: crate::components::test_model(),
+                        fast: false,
+                        workflow: false,
+                        thinking: Default::default(),
+                    },
+                    AgentMode::Build,
+                )
+                .with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
+                let target = if child {
+                    let (parent_backend, _, _) = failing_backend();
+                    let parent = manager
+                        .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+                            Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend))
+                        })
+                        .unwrap();
+                    manager
+                        .spawn_child_trusted_with_config(
+                            &parent,
+                            config,
+                            Default::default(),
+                            Vec::new(),
+                            None,
+                            |agent_id| {
+                                backend.agent_id = agent_id;
+                                Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                            },
+                        )
+                        .unwrap()
+                } else {
+                    manager
+                        .create_root_with_config(Some(config), Vec::new(), None, |agent_id| {
                             backend.agent_id = agent_id;
                             Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
-                        },
-                    )
-                    .unwrap();
-                let actor = root.actor().unwrap();
+                        })
+                        .unwrap()
+                };
+                let actor = target.actor().unwrap();
                 let queue = actor_queue(Arc::new(actor.clone()), run_id);
                 let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
                 app.update(crate::app::Msg::Paste(INITIAL.into()));
@@ -1991,14 +1933,15 @@ mod tests {
             let images = input.images.clone();
             if root_work {
                 actor
-                    .rush(maki_agent::actor::RootWork::new(
+                    .submit(
                         *input,
-                        submitted_run,
-                        true,
-                        text,
-                        images,
+                        None,
                         format!("{ROOT_CORRELATION_PREFIX}{submitted_run}"),
-                    ))
+                        maki_agent::TurnAdmissionOptions {
+                            already_displayed: true,
+                            ..Default::default()
+                        },
+                    )
                     .unwrap();
             } else {
                 queue.push(crate::agent::shared_queue::QueueItem::Message {
@@ -2074,27 +2017,76 @@ mod tests {
         });
     }
 
-    #[test_case(false, false, false; "consumed_before_initialization")]
-    #[test_case(false, true, false; "displayed_root_adopts_without_duplicate_bubble")]
-    #[test_case(false, true, true; "current_displayed_root_reuses_presentation")]
-    #[test_case(true, false, false; "cancelled_admission_cannot_bypass_fence")]
-    #[test_case(true, true, true; "cancelled_current_displayed_root_cannot_restart")]
-    fn deferred_root_presentation_respects_admission_cancellation(
-        cancelled: bool,
-        displayed: bool,
-        current: bool,
-    ) {
+    #[test]
+    fn queue_facade_preserves_compaction_order_and_removes_selected_entry() {
+        smol::block_on(async {
+            const FIRST: &str = "before compact";
+            const LAST: &str = "after compact";
+            const RUN_ID: u64 = 9;
+            let (backend, _, _) = failing_backend();
+            let run_id = Arc::clone(&backend.run_id);
+            let (actor, task) = maki_agent::actor::AgentActorHandle::spawn(
+                backend.agent_id,
+                Vec::new(),
+                None,
+                Box::new(backend),
+            );
+            let boundary = actor.reserve_config_update().unwrap();
+            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()), run_id);
+            let push = |text: &str| {
+                queue
+                    .try_push(crate::agent::shared_queue::QueueItem::Message {
+                        text: text.into(),
+                        image_count: 0,
+                        input: AgentInput::from_defaults(
+                            text.into(),
+                            AgentMode::Build,
+                            Vec::new(),
+                            Default::default(),
+                        ),
+                        run_id: RUN_ID,
+                        displayed: false,
+                    })
+                    .unwrap();
+            };
+            push(FIRST);
+            queue
+                .try_push(crate::agent::shared_queue::QueueItem::Compact {
+                    run_id: RUN_ID,
+                    instructions: None,
+                })
+                .unwrap();
+            push(LAST);
+            assert_eq!(
+                queue
+                    .panel_entries()
+                    .iter()
+                    .map(|entry| entry.text.as_ref())
+                    .collect::<Vec<_>>(),
+                [FIRST, maki_commands::COMPACT_COMMAND_NAME, LAST]
+            );
+            assert!(queue.remove(1));
+            assert_eq!(queue.text_messages(), [FIRST, LAST]);
+            assert_eq!(queue.panel_len(), 2);
+            assert!(queue.remove(1));
+            assert_eq!(queue.text_messages(), [FIRST]);
+            assert!(!queue.remove(1));
+            actor.close();
+            drop(boundary);
+            task.await;
+        });
+    }
+
+    #[test_case(false; "setup_failure")]
+    #[test_case(true; "cancelled_admission")]
+    fn submission_setup_respects_admission_cancellation(cancelled: bool) {
         smol::block_on(async {
             const ADMISSION_RUN: u64 = 1;
             const ALLOCATED_RUN: u64 = 7;
             let (mut backend, mut input, events) = failing_backend();
             input.prompt = None;
             backend.initialized = false;
-            let allocated_run = if current {
-                ADMISSION_RUN
-            } else {
-                ALLOCATED_RUN
-            };
+            let allocated_run = ALLOCATED_RUN;
             backend.run_id.store(allocated_run, Ordering::Relaxed);
             let (trigger, cancel) = CancelToken::new();
             let (reason_trigger, cancel_reason) = ReasonedCancelToken::new();
@@ -2121,58 +2113,37 @@ mod tests {
                 inbox: None,
                 managed_turn: None,
             };
-            let work = WorkKind::Root {
-                run_id: ADMISSION_RUN,
-                displayed,
-                text: input.message.clone(),
-                images: Vec::new(),
-                earlier: Vec::new(),
-                mcp_startup_notice: None,
-                already_displayed: displayed,
-            };
+            let work = WorkKind::Turn;
             let mut history = History::new(Vec::new());
             let result = backend.run_turn(&mut history, context, input, work).await;
-            assert!(matches!(result, BackendResult::EnteredRun(_)));
-            let emitted = events.drain().collect::<Vec<_>>();
-            assert!(emitted.iter().any(|envelope| {
-                matches!(&envelope.event, AgentEvent::TurnOutcome(outcome)
-                    if matches!(outcome, TurnOutcome::Cancelled { .. }) == cancelled)
-            }));
-            let presentation_run = if cancelled || current {
-                ADMISSION_RUN
-            } else {
-                allocated_run + 1
+            let BackendResult::EnteredRun(outcome) = result else {
+                panic!("setup must return its terminal outcome");
             };
-            assert!(emitted.iter().all(|event| event.run_id == presentation_run));
-            if displayed && !cancelled {
+            if cancelled {
                 assert!(matches!(
-                    &emitted[0].event,
-                    AgentEvent::QueueItemConsumed {
-                        already_displayed: true,
+                    outcome,
+                    TurnOutcome::Cancelled {
+                        reason: TurnCancellationReason::User,
                         ..
                     }
                 ));
+            } else {
+                assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             }
-            assert_eq!(
-                emitted
+            let emitted = events.drain().collect::<Vec<_>>();
+            assert!(
+                !emitted
                     .iter()
-                    .any(|event| matches!(event.event, AgentEvent::QueueItemConsumed { .. })),
-                !cancelled
+                    .any(|envelope| { matches!(envelope.event, AgentEvent::TurnOutcome(_)) }),
+                "backend published before actor sealing"
             );
-            assert_eq!(
-                backend.run_id.load(Ordering::Relaxed),
-                if cancelled || current {
-                    allocated_run
-                } else {
-                    allocated_run + 1
-                }
+            assert!(emitted.iter().all(|event| event.run_id == ADMISSION_RUN));
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::QueueItemConsumed { .. }))
             );
-            if displayed && !cancelled {
-                crate::app::tests::assert_displayed_root_adoption(
-                    emitted.into_iter().next().unwrap(),
-                    presentation_run,
-                );
-            }
+            assert_eq!(backend.run_id.load(Ordering::Relaxed), allocated_run);
         });
     }
 
@@ -3130,11 +3101,7 @@ mod tests {
                 outcome,
                 TurnOutcome::cancelled(backend.agent_id, turn_id, Default::default(), 0, reason)
             );
-            let emitted = events.drain().collect::<Vec<_>>();
-            assert_eq!(emitted.len(), 1);
-            assert!(
-                matches!(&emitted[0].event, AgentEvent::TurnOutcome(actual) if actual == &outcome)
-            );
+            assert!(events.is_empty(), "backend published before actor sealing");
             assert!(pending_prompt.is_disconnected());
 
             let successor = TurnContext {
@@ -3155,11 +3122,21 @@ mod tests {
             let result = backend
                 .run_turn(&mut history, successor, successor_input, WorkKind::Turn)
                 .await;
-            assert!(matches!(result, BackendResult::SetupFailed { .. }));
+            assert!(matches!(
+                result,
+                BackendResult::EnteredRun(TurnOutcome::Failed { .. })
+            ));
+            let emitted = events.drain().collect::<Vec<_>>();
             assert!(
-                events
-                    .drain()
-                    .any(|event| matches!(event.event, AgentEvent::ControlError { .. }))
+                emitted
+                    .iter()
+                    .any(|event| { matches!(event.event, AgentEvent::ControlError { .. }) })
+            );
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| { matches!(event.event, AgentEvent::TurnOutcome(_)) }),
+                "backend published before actor sealing"
             );
         });
     }

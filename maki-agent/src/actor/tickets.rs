@@ -45,12 +45,29 @@ struct OutputState {
     output: Vec<serde_json::Value>,
     result: Option<TurnResult>,
     started: Option<Instant>,
+    terminal_sender: Option<crate::EventSender>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutput(Arc<Mutex<OutputState>>);
 
 impl TurnOutput {
+    /// Registers the presentation sink used only after the actor seals its result.
+    pub fn set_terminal_sender(&self, sender: crate::EventSender) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_sender = Some(sender.without_output());
+    }
+
+    pub(super) fn take_terminal_sender(&self) -> Option<crate::EventSender> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_sender
+            .take()
+    }
+
     pub fn begin_text_attempt(&self) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() {
@@ -114,10 +131,6 @@ impl TurnTicket {
     }
 
     /// Assigns a ticket when a root input starts rather than when it queues.
-    pub(crate) fn new_anonymous(actor_identity: Arc<()>) -> Self {
-        Self::new(TurnId::generate(), actor_identity)
-    }
-
     pub(crate) fn with_provenance(mut self, provenance: TurnProvenance) -> Self {
         self.provenance = provenance;
         self

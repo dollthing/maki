@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{
-    ActorIdleGuard, ConfigCommit, PreparedCommit, PreparedOperationTicket, PreparedTurn, TurnTicket,
+    ActorIdleGuard, ConfigCommit, HistoryChange, HistoryEditCheckpoint, PreparedCommit,
+    PreparedOperationTicket, PreparedTurn, TurnTicket,
 };
 use maki_agent::session_coordinator::IdleSessionLease;
 use maki_agent::{AgentInput, AgentMode, CancelToken, EventSender, ModeDef, SessionDefaults};
@@ -30,6 +31,8 @@ pub(super) struct PendingPlanApproval {
     pub(super) identity: Arc<()>,
     pub(super) cancel: Option<maki_agent::CancelTrigger>,
     pub(super) waiting_for_lock: Option<ApprovalStep>,
+    committing: bool,
+    child: Option<maki_agent::AgentId>,
 }
 
 impl Drop for PendingPlanApproval {
@@ -43,13 +46,16 @@ impl Drop for PendingPlanApproval {
 pub(super) enum ApprovalStep {
     Captured(Box<PreparedPlanApproval>),
     Fresh(Box<FreshPlanApproval>),
+    Child(Box<PreparedChildApproval>),
+    ChildCommitted(Box<CommittedChildApproval>),
 }
 
 impl ApprovalStep {
-    fn prepared(&self) -> &PreparedPlanApproval {
+    fn prepared(&self) -> Option<&PreparedPlanApproval> {
         match self {
-            Self::Captured(prepared) => prepared,
-            Self::Fresh(fresh) => &fresh.source,
+            Self::Captured(prepared) => Some(prepared),
+            Self::Fresh(fresh) => Some(&fresh.source),
+            Self::Child(_) | Self::ChildCommitted(_) => None,
         }
     }
 }
@@ -73,6 +79,22 @@ pub(super) struct FreshPlanApproval {
     lock: ClaimedSessionLock,
 }
 
+pub(super) struct PreparedChildApproval {
+    target: maki_agent::AgentRef,
+    config: Arc<maki_agent::EffectiveAgentConfig>,
+    plan: ApprovedPlan,
+    idle: ActorIdleGuard,
+    operation: PreparedOperationTicket,
+    clear_context: bool,
+    checkpoint: HistoryEditCheckpoint,
+}
+
+pub(super) struct CommittedChildApproval {
+    target: maki_agent::AgentRef,
+    plan: ApprovedPlan,
+    history: Option<HistoryChange>,
+}
+
 struct PlanApprovalRequest {
     path: PathBuf,
     model: Option<String>,
@@ -94,7 +116,19 @@ impl SessionRuntime {
 
     /// The one place a staged approval is torn down.
     pub(super) fn end_plan_approval(&mut self) {
-        self.pending_approval.take();
+        if self
+            .pending_approval
+            .as_ref()
+            .is_some_and(|pending| pending.committing)
+        {
+            return;
+        }
+        if let Some(pending) = self.pending_approval.take()
+            && let Some(target) = pending.child
+        {
+            self.app.finish_child_plan_approval(target);
+            return;
+        }
         self.app.plan_approval_pending = false;
     }
 
@@ -102,7 +136,12 @@ impl SessionRuntime {
     /// runtime's knowledge (a mode switch or an actor config projection
     /// leaving plan mode). Runs wherever `App::set_mode_id` can fire.
     pub(super) fn settle_plan_approval(&mut self) {
-        if !self.app.plan_approval_pending {
+        if !self.app.plan_approval_pending
+            && !self
+                .pending_approval
+                .as_ref()
+                .is_some_and(|pending| pending.committing || pending.child.is_some())
+        {
             self.pending_approval = None;
         }
     }
@@ -177,13 +216,24 @@ impl EventLoop<'_> {
         idx: usize,
         result: Result<ApprovalStep, String>,
     ) {
+        let result = match result {
+            Ok(ApprovalStep::ChildCommitted(committed)) => {
+                return self.finish_child_plan_approval(idx, *committed);
+            }
+            result => result,
+        };
+        if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
+            pending.committing = false;
+        }
         let runtime = &mut self.sessions[idx];
         if runtime.lock_lost {
             // Losing the lock already flashed why the session is stopping.
             return runtime.end_plan_approval();
         }
         let step = match result.and_then(|step| {
-            runtime.check_plan_approval(step.prepared())?;
+            if let Some(prepared) = step.prepared() {
+                runtime.check_plan_approval(prepared)?;
+            }
             Ok(step)
         }) {
             Ok(step) => step,
@@ -200,7 +250,213 @@ impl EventLoop<'_> {
             }
             ApprovalStep::Captured(prepared) => self.commit_plan_approval(idx, *prepared),
             ApprovalStep::Fresh(fresh) => self.activate_fresh_plan_approval(idx, *fresh),
+            ApprovalStep::Child(child) => self.commit_child_plan_approval(idx, *child),
+            ApprovalStep::ChildCommitted(_) => unreachable!(),
         }
+    }
+
+    fn prepare_child_plan_approval(
+        &mut self,
+        idx: usize,
+        clear_context: bool,
+        model: Option<String>,
+        parallel: bool,
+        path: PathBuf,
+    ) {
+        if self.sessions[idx].pending_approval.is_some() {
+            return;
+        }
+        let prepared = (|| -> Result<_, String> {
+            if self.sessions[idx].lock_lost || self.sessions[idx].session_lock.is_none() {
+                return Err(APPROVAL_LOCK_LOST.into());
+            }
+            let selected = self.sessions[idx]
+                .app
+                .selected_agent_id()
+                .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+            let target = self
+                .selected_target(idx)
+                .filter(|target| target.id() == selected)
+                .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+            let actor = self.target_actor(idx, &target)?;
+            let template = maki_lua::orchestration::OrchestrationServices::template(
+                &*self.orchestration,
+                &target,
+            )?;
+            let mode = template.modes.current(&AgentMode::Build);
+            actor
+                .validate_mode_change(&AgentMode::Build, &mode)
+                .map_err(|error| error.to_string())?;
+            let idle = target
+                .manager()
+                .prepare_idle_subtree(target.id())
+                .map_err(idle_error_message)?;
+            let config = actor
+                .effective_config()
+                .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+            if config.mode.plan_path() != Some(path.as_path()) {
+                return Err(APPROVAL_CHANGED.into());
+            }
+            let key = self.sessions[idx]
+                .app
+                .chats
+                .iter()
+                .find(|chat| chat.agent_id == Some(target.id()))
+                .and_then(|chat| chat.subagent_id.clone())
+                .ok_or_else(|| "child history storage identity is unavailable".to_owned())?;
+            let writer = Arc::clone(&self.ctx.storage_writer);
+            let session = self.sessions[idx].id();
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
+                let writer = Arc::clone(&writer);
+                let key = key.clone();
+                Box::pin(async move {
+                    writer
+                        .checkpoint_child_history(session, key, messages)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+            });
+            let operation = actor
+                .reserve_prepared_operation(Some(PreparedTurn {
+                    input: build_input(String::new()),
+                    event_sender: None,
+                    correlation: String::new(),
+                }))
+                .map_err(|error| error.to_string())?;
+            Ok((target, config, template, mode, idle, checkpoint, operation))
+        })();
+        let (target, config, template, mode, idle, checkpoint, operation) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return self.sessions[idx].abort_plan_approval(error),
+        };
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            config.context.cwd().join(path)
+        };
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let child_id = target.id();
+        self.spawn_approval_step(idx, async move {
+            let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;
+            operation
+                .replace_turn_input(build_input(plan.message.clone()))
+                .map_err(|error| error.to_string())?;
+            let change = smol::unblock(move || {
+                prepare_change(
+                    model,
+                    &template.model_policy,
+                    template.timeouts,
+                    &prepare,
+                    mode,
+                )
+            })
+            .await?;
+            operation
+                .resolve(Some(change))
+                .map_err(|error| error.to_string())?;
+            operation
+                .wait_ready()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(ApprovalStep::Child(Box::new(PreparedChildApproval {
+                target,
+                config,
+                plan,
+                idle,
+                operation,
+                clear_context,
+                checkpoint,
+            })))
+        });
+        if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
+            pending.child = Some(child_id);
+        }
+    }
+
+    fn commit_child_plan_approval(&mut self, idx: usize, child: PreparedChildApproval) {
+        if self.sessions[idx].session_lock.is_none() {
+            return self.sessions[idx].abort_plan_approval(APPROVAL_LOCK_LOST.into());
+        }
+        let valid = self.target_actor(idx, &child.target).and_then(|actor| {
+            let config = actor
+                .effective_config()
+                .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+            if !Arc::ptr_eq(&config, &child.config) {
+                return Err(APPROVAL_CHANGED.into());
+            }
+            Ok(())
+        });
+        if let Err(error) = valid {
+            return self.sessions[idx].abort_plan_approval(error);
+        }
+        let runtime = &mut self.sessions[idx];
+        let Some(pending) = runtime.pending_approval.as_mut() else {
+            return;
+        };
+        pending.committing = true;
+        // Preparation is cancellable. Once checkpointing starts, completion must be observed.
+        pending.cancel.take();
+        let request = Arc::clone(&pending.identity);
+        let session = runtime.id();
+        let identity = runtime.handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let PreparedChildApproval {
+                target,
+                config: _,
+                plan,
+                idle,
+                operation,
+                clear_context,
+                checkpoint,
+            } = child;
+            let result = idle
+                .commit_prepared(operation, clear_context, checkpoint)
+                .await
+                .map(|(_, history)| {
+                    ApprovalStep::ChildCommitted(Box::new(CommittedChildApproval {
+                        target,
+                        plan,
+                        history,
+                    }))
+                })
+                .map_err(|error| error.to_string());
+            let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
+                session,
+                runtime: identity,
+                request,
+                result,
+            });
+        })
+        .detach();
+    }
+
+    fn finish_child_plan_approval(&mut self, idx: usize, committed: CommittedChildApproval) {
+        let runtime = &mut self.sessions[idx];
+        runtime.pending_approval.take();
+        let CommittedChildApproval {
+            target,
+            plan,
+            history,
+        } = committed;
+        if let Some(history) = history {
+            let draft = runtime.app.input_box.buffer.value().to_owned();
+            runtime.app.apply_history_change(history);
+            runtime.app.input_box.set_input(draft);
+        }
+        if let Some(chat) = runtime
+            .app
+            .chats
+            .iter_mut()
+            .find(|chat| chat.agent_id == Some(target.id()))
+        {
+            chat.push(crate::components::DisplayMessage::plan(
+                plan.content,
+                plan.path.display().to_string(),
+            ));
+        }
+        runtime.app.finish_child_plan_approval(target.id());
     }
 
     fn commit_plan_approval(&mut self, idx: usize, prepared: PreparedPlanApproval) {
@@ -212,6 +468,9 @@ impl EventLoop<'_> {
             source,
             idle,
         } = prepared;
+        if let Err(error) = operation.set_turn_displayed(true) {
+            return runtime.abort_plan_approval(error.to_string());
+        }
         let commit = match operation.commit() {
             Ok(commit) => commit,
             Err(error) => return runtime.abort_plan_approval(error.to_string()),
@@ -325,6 +584,8 @@ impl EventLoop<'_> {
             identity: Arc::clone(&identity),
             cancel: Some(trigger),
             waiting_for_lock: None,
+            committing: false,
+            child: None,
         });
         let session = runtime.id();
         let runtime_identity = runtime.handles.identity();
@@ -408,6 +669,9 @@ impl EventLoop<'_> {
                 .wait_ready()
                 .await
                 .map_err(|error| error.to_string())?;
+            operation
+                .set_turn_displayed(true)
+                .map_err(|error| error.to_string())?;
             let PreparedCommit { config, ticket } =
                 operation.commit().map_err(|error| error.to_string())?;
             let ticket = ticket.ok_or_else(|| APPROVAL_CHANGED.to_string())?;
@@ -435,6 +699,9 @@ impl EventLoop<'_> {
         path: PathBuf,
     ) {
         let runtime = &mut self.sessions[idx];
+        if runtime.app.active_chat != 0 {
+            return self.prepare_child_plan_approval(idx, clear_context, model, parallel, path);
+        }
         if runtime.pending_approval.is_some() {
             return;
         }

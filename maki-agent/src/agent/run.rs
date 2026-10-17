@@ -247,6 +247,7 @@ pub struct Agent<'h> {
     admission: Option<TurnAdmissionSnapshot>,
     completion_check: Option<CompletionCheck>,
     completion_exhausted: Option<CompletionExhausted>,
+    defer_outcome: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -302,6 +303,7 @@ impl<'h> Agent<'h> {
             admission: None,
             completion_check: None,
             completion_exhausted: None,
+            defer_outcome: false,
         }
     }
 
@@ -383,21 +385,37 @@ impl<'h> Agent<'h> {
         self
     }
 
-    /// Runs one accepted turn and returns its authoritative terminal outcome.
-    ///
-    /// Exactly one terminal event delivery is attempted. A closed event channel
-    /// does not change the returned outcome and is never retried.
     pub fn with_admission(mut self, admission: Option<TurnAdmissionSnapshot>) -> Self {
         self.admission = admission;
         self
     }
 
+    /// Leaves terminal event delivery to the actor finalizer after it seals the result.
+    pub fn with_deferred_outcome(mut self) -> Self {
+        self.defer_outcome = true;
+        self
+    }
+
+    /// Returns the terminal outcome and attempts one event delivery unless deferred.
+    /// A closed event channel does not change the outcome and is never retried.
     pub async fn run(&mut self, turn_id: TurnId, input: AgentInput) -> TurnOutcome {
         self.num_turns = 0;
         self.reauth_attempts = 0;
         self.rollback_len = self.history.len();
         self.ledger = Arc::new(RunLedger::default());
 
+        if let Some(submission) = self
+            .turn_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.take_initial_submission())
+        {
+            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: submission.text,
+                images: submission.images,
+                mcp_startup_notice: submission.mcp_startup_notice,
+                already_displayed: submission.already_displayed,
+            });
+        }
         let AgentInput {
             message,
             mode,
@@ -565,7 +583,7 @@ impl<'h> Agent<'h> {
                     if self.cancel.is_cancelled() {
                         return Err(AgentError::Cancelled);
                     }
-                    if self.consume_instruction_inbox() {
+                    if self.consume_instruction_inbox()? {
                         continue;
                     }
                     if let Some(inbox) = &self.turn_inbox
@@ -809,6 +827,9 @@ impl<'h> Agent<'h> {
             },
             "agent run terminalized"
         );
+        if self.defer_outcome {
+            return;
+        }
         if let Err(error) = self.event_tx.send(AgentEvent::TurnOutcome(outcome.clone())) {
             error!(
                 agent_id = %outcome.agent_id(),
@@ -852,12 +873,19 @@ impl<'h> Agent<'h> {
 
     pub fn tool_context(&self) -> ToolContext {
         let cwd = self
-            .session_id
+            .admission
             .as_ref()
-            .and_then(|session| {
-                crate::session_coordinator::SessionCoordinatorHandle::resolve(session.id()).ok()
+            .and_then(|admission| admission.prompt_inputs.as_ref())
+            .map(|inputs| inputs.cwd.clone())
+            .or_else(|| {
+                self.session_id
+                    .as_ref()
+                    .and_then(|session| {
+                        crate::session_coordinator::SessionCoordinatorHandle::resolve(session.id())
+                            .ok()
+                    })
+                    .map(|coordinator| coordinator.read().cwd())
             })
-            .map(|coordinator| coordinator.read().cwd())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         ToolContext {
@@ -979,25 +1007,24 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn consume_instruction_inbox(&mut self) -> bool {
+    fn consume_instruction_inbox(&mut self) -> Result<bool, AgentError> {
         let Some(inbox) = self.turn_inbox.clone() else {
-            return false;
+            return Ok(false);
         };
-        let instructions = inbox.drain_instructions();
+        let instructions = inbox.drain_presented_instructions();
         let consumed = !instructions.is_empty();
-        if !instructions.is_empty() {
-            self.instruction_consumed();
-        }
-        for input in instructions {
-            self.push_input_context(input.preamble);
-            self.history
-                .push(Message::user_with_images(input.message, input.images));
-        }
-        consumed
+        self.consume_presented_inputs(instructions.into_iter().map(|(presentation, input)| {
+            crate::PresentedInput {
+                input,
+                already_displayed: presentation.already_displayed,
+                mcp_startup_notice: presentation.mcp_startup_notice,
+            }
+        }))?;
+        Ok(consumed)
     }
 
     fn consume_turn_inbox(&mut self) -> Result<(), AgentError> {
-        self.consume_instruction_inbox();
+        self.consume_instruction_inbox()?;
         if let Some(inbox) = self.turn_inbox.clone() {
             inbox.commit_completions(&mut |message| self.history.push(message));
         }
@@ -1040,15 +1067,19 @@ impl<'h> Agent<'h> {
         &mut self,
         inputs: impl IntoIterator<Item = crate::PresentedInput>,
     ) -> Result<(), AgentError> {
+        let mut presentation_failed = false;
         for presented in inputs {
             let input = presented.input;
             self.instruction_consumed();
-            self.event_tx.send(AgentEvent::QueueItemConsumed {
-                text: input.message.clone(),
-                images: input.images.clone(),
-                mcp_startup_notice: presented.mcp_startup_notice,
-                already_displayed: presented.already_displayed,
-            })?;
+            presentation_failed |= self
+                .event_tx
+                .send(AgentEvent::QueueItemConsumed {
+                    text: input.message.clone(),
+                    images: input.images.clone(),
+                    mcp_startup_notice: presented.mcp_startup_notice,
+                    already_displayed: presented.already_displayed,
+                })
+                .is_err();
             self.push_input_context(input.preamble);
             let wrapped = format!(
                 "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
@@ -1075,6 +1106,9 @@ impl<'h> Agent<'h> {
                 }
             }
             self.history.push(message);
+        }
+        if presentation_failed {
+            return Err(AgentError::Channel);
         }
         Ok(())
     }
@@ -1341,6 +1375,52 @@ mod tests {
         make_agent_with_sender(provider, history, raw_tx, event_rx)
     }
 
+    #[test_case(false, false, false; "standalone_completed")]
+    #[test_case(false, true, false; "standalone_failed")]
+    #[test_case(false, false, true; "standalone_cancelled")]
+    #[test_case(true, false, false; "actor_completed")]
+    #[test_case(true, true, false; "actor_failed")]
+    #[test_case(true, false, true; "actor_cancelled")]
+    fn terminal_delivery_is_explicitly_deferred(deferred: bool, failed: bool, cancelled: bool) {
+        smol::block_on(async {
+            let result = if failed {
+                Err(AgentError::api(400, "invalid request"))
+            } else {
+                Ok(text_response(StopReason::EndTurn))
+            };
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([result])),
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent(provider, &mut history);
+            if deferred {
+                agent = agent.with_deferred_outcome();
+            }
+            if cancelled {
+                let (trigger, token) = CancelToken::new();
+                trigger.cancel();
+                agent = agent.with_cancel(token);
+            }
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), failed);
+            assert_eq!(matches!(outcome, TurnOutcome::Cancelled { .. }), cancelled);
+            let delivered: Vec<_> = events
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            if deferred {
+                assert!(delivered.is_empty());
+            } else {
+                assert_eq!(delivered, vec![outcome]);
+            }
+        });
+    }
+
     struct FinishRaceInbox {
         pending: Mutex<Vec<AgentInput>>,
         inject_on_finish: Mutex<bool>,
@@ -1385,6 +1465,48 @@ mod tests {
 
     const STEERING_MESSAGE: &str = "revise the task before finishing";
 
+    #[test]
+    fn disconnected_presentation_preserves_all_drained_instructions_and_fails() {
+        smol::block_on(async {
+            const INSTRUCTIONS: [&str; 2] =
+                ["first accepted instruction", "second accepted instruction"];
+            let inbox = Arc::new(FinishRaceInbox {
+                pending: Mutex::new(
+                    INSTRUCTIONS
+                        .into_iter()
+                        .map(|message| {
+                            let mut input = default_input();
+                            input.message = message.into();
+                            input
+                        })
+                        .collect(),
+                ),
+                inject_on_finish: Mutex::new(false),
+                submitted: Mutex::new(false),
+            });
+            let provider = MockProvider::new(Vec::new());
+            let requests = Arc::clone(&provider.captured_messages);
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            drop(events);
+            let mut agent = agent.with_turn_inbox(Some(inbox.clone()));
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(!*inbox.submitted.lock().unwrap());
+            assert!(inbox.pending.lock().unwrap().is_empty());
+            drop(agent);
+            for instruction in INSTRUCTIONS {
+                assert!(history.as_slice().iter().any(|message| {
+                    message.display_text.as_deref() == Some(instruction)
+                        && message
+                            .first_text_content()
+                            .is_some_and(|text| text.contains(instruction))
+                }));
+            }
+        });
+    }
+
     #[test_case(None; "accepted_instruction_reaches_next_request")]
     #[test_case(Some(1); "budget_failure_is_not_success")]
     fn accepted_instruction_request_coverage(max_turns: Option<u32>) {
@@ -1416,7 +1538,9 @@ mod tests {
                 assert_eq!(requests.len(), 2);
                 assert!(requests[1].iter().any(|message| {
                     matches!(message.role, Role::User)
-                        && message.first_text_content() == Some(STEERING_MESSAGE)
+                        && message.first_text_content().is_some_and(|text| {
+                            text.contains(STEERING_MESSAGE) && text.starts_with("<user-interrupt>")
+                        })
                 }));
             }
             assert_eq!(
@@ -1647,11 +1771,12 @@ mod tests {
                 *invalidations.lock().unwrap(),
                 usize::from(!observation_only)
             );
-            assert!(
-                requests.lock().unwrap()[0]
-                    .iter()
-                    .any(|message| { message.first_text_content() == Some(STEERING_MESSAGE) })
-            );
+            assert!(requests.lock().unwrap()[0].iter().any(|message| {
+                message.first_text_content().is_some_and(|text| {
+                    text.contains(STEERING_MESSAGE)
+                        && (observation_only || text.starts_with("<user-interrupt>"))
+                })
+            }));
         });
     }
 

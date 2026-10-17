@@ -3,6 +3,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
 use crossterm::event::KeyEvent;
+#[cfg(test)]
 use maki_providers::{Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -20,6 +21,7 @@ pub enum RewindPickerAction {
 pub struct RewindEntry {
     pub turn_index: usize,
     pub prompt_preview: String,
+    #[cfg(test)]
     pub prompt_text: String,
 }
 
@@ -31,16 +33,68 @@ impl PickerItem for RewindEntry {
 
 pub struct RewindPicker {
     picker: ListPicker<RewindEntry>,
+    target: Option<maki_agent::AgentRef>,
+    boundaries: Vec<maki_agent::actor::HistoryBoundary>,
 }
 
 impl RewindPicker {
     pub fn new() -> Self {
         Self {
             picker: ListPicker::new(),
+            target: None,
+            boundaries: Vec::new(),
         }
     }
 
+    pub fn open_actor(&mut self, target: maki_agent::AgentRef) -> Result<(), String> {
+        let actor = target.actor().map_err(|error| error.to_string())?;
+        let boundaries = actor
+            .history_boundaries()
+            .map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        for boundary in &boundaries {
+            let message = actor
+                .history_boundary_message(boundary)
+                .map_err(|error| error.to_string())?;
+            let Some(text) = message.user_text() else {
+                continue;
+            };
+            let first = text.lines().next().unwrap_or("");
+            let preview = &first[..first.floor_char_boundary(PREVIEW_MAX_LEN)];
+            entries.push(RewindEntry {
+                turn_index: boundary.offset,
+                prompt_preview: format!("{}: {preview}", entries.len() + 1),
+                #[cfg(test)]
+                prompt_text: text.to_owned(),
+            });
+        }
+        if entries.is_empty() {
+            return Err(NO_TURNS_MSG.into());
+        }
+        entries.reverse();
+        self.target = Some(target);
+        self.boundaries = boundaries;
+        self.picker.open(entries, TITLE);
+        Ok(())
+    }
+
+    pub fn target_boundary(
+        &self,
+        offset: usize,
+    ) -> Option<(maki_agent::AgentRef, maki_agent::actor::HistoryBoundary)> {
+        Some((
+            self.target.clone()?,
+            self.boundaries
+                .iter()
+                .find(|boundary| boundary.offset == offset)?
+                .clone(),
+        ))
+    }
+
+    #[cfg(test)]
     pub fn open(&mut self, messages: &[Message]) -> Result<(), String> {
+        self.target = None;
+        self.boundaries.clear();
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
         for (msg_idx, msg) in messages.iter().enumerate() {

@@ -185,7 +185,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 
 ### `task_wait` {#task_wait}
 
-Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. A subagent's turn does not end while its own subagents are still running, so their results arrive within that turn unless its request budget runs out; follow-up turns it runs for later reports are not delivered on their own. Later messages accepted into this same turn extend its work; a successor never retargets an existing wait. Child reports arrive at safe request boundaries for active shared-actor parents, or in a batched idle continuation. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved unique tickets, new turns reject without cancelling accepted work; further messages may reuse an open ticket. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.
+Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. Non-main agents join reporting children before completing, subject to execution limits; the main agent may complete while children run. Late child reports can wake an idle or locally cancelled agent. Resumed work produces a new immutable turn result that can report upward to its parent; earlier completed or cancelled tickets do not change. Later messages accepted into this same turn extend its work; a successor never retargets an existing wait. Child reports arrive at safe request boundaries for active shared-actor parents, or in a batched idle continuation. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved unique tickets, new turns reject without cancelling accepted work; further messages may reuse an open ticket. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -195,16 +195,16 @@ Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn o
 
 ### `task_send` {#task_send}
 
-Submit instructions to a background subagent and return immediately. Busy sends join open work and return the same turn_id; idle or admission-closed sends start a new turn with a fresh ID. Instructions reach the next safe model request, not an in-flight request or blocked tool. Acceptance is not proof of processing. The bounded inbox rejects overflow without cancelling the child or earlier instructions. Returns { queued = true, turn_id }, or an admission error. Also callable from a code_execution script as a Python async function.
+Submit instructions to a background subagent and return immediately. Compatible sends join eligible open work and return the same turn_id. Idle, admission-closed, or boundary-separated sends receive a successor ID. Queued configuration, working-directory changes, control operations, and exact-work boundaries prevent merging across them. Pending messages drain in order before the next eligible model request, after current model/tool work completes, without interrupting an in-flight request or tool. Acceptance is not proof of processing. The bounded inbox rejects overflow without cancelling the child or earlier instructions. Returns { queued = true, turn_id }, or an admission error. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message` | string | yes | Instructions for the subagent. Busy sends join its open work turn; idle sends start a new turn. |
+| `message` | string | yes | Instructions for the subagent. Compatible sends join eligible open work; idle or boundary-separated sends receive a successor turn. |
 | `task_id` | string | yes | Task id returned by task_spawn. |
 
 ### `task_despawn` {#task_despawn}
 
-Cancel a background subagent, discard messages not yet admitted, flush its chat transcript, and release active turn permits. Returns { ok = true }. Also callable from a code_execution script as a Python async function.
+Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. Unlike local UI cancellation, this retires the subtree. Returns { ok = true }. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

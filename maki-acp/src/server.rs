@@ -4686,7 +4686,6 @@ mod tests {
                 model: Some(OFFLINE_SPEC.to_owned()),
                 opts: None,
                 answer_tx,
-                input_tx: None,
                 cancel: None,
             }),
             run_id: 0,

@@ -27,6 +27,7 @@ use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
+use maki_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
 #[cfg(test)]
@@ -63,6 +64,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
+use maki_agent::actor::{TranscriptRequest, TurnAdmissionOptions, TurnOrigin, TurnProvenance};
+use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, Post,
@@ -75,6 +78,7 @@ use maki_commands::{
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
+use maki_lua::orchestration::TrustedTarget;
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
@@ -89,10 +93,14 @@ use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
+const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
+const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
+const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
 const COMPLETION_LABEL_CHARS: usize = 80;
 const COMPLETION_PREVIEW_CHARS: usize = 512;
 
+#[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
 
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -260,8 +268,6 @@ impl PickerItem for TaskEntry {
 #[derive(Clone, Default)]
 struct SubagentChannels {
     answer_tx: Option<flume::Sender<String>>,
-    input_tx: Option<flume::Sender<String>>,
-    cancel: Option<maki_agent::SubagentCancel>,
     closed: bool,
 }
 
@@ -360,6 +366,8 @@ pub struct App {
     pub(super) file_completion: FileCompletionMenu,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    plan_form_target: Option<AgentId>,
+    plan_forms: HashMap<Option<AgentId>, (PlanForm, bool)>,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -558,6 +566,8 @@ impl App {
             file_completion: FileCompletionMenu::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            plan_form_target: None,
+            plan_forms: HashMap::new(),
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
@@ -665,6 +675,58 @@ impl App {
         .activate()
     }
 
+    pub(crate) fn focused_config(&self) -> Option<Arc<maki_agent::EffectiveAgentConfig>> {
+        self.command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .and_then(|target| target.effective_config().ok().flatten())
+    }
+
+    pub(super) fn focused_model_spec(&self) -> String {
+        self.focused_config()
+            .map(|config| config.model.spec())
+            .unwrap_or_else(|| {
+                self.chats[self.active_chat]
+                    .model_id
+                    .clone()
+                    .unwrap_or_else(|| self.state.model.spec())
+            })
+    }
+
+    pub(super) fn focused_mode(&self) -> Mode {
+        self.focused_config()
+            .map(|config| match &config.mode {
+                maki_agent::AgentMode::Build => Mode::Build,
+                maki_agent::AgentMode::Plan(_) => Mode::Plan,
+                maki_agent::AgentMode::Custom(id) => match id {
+                    maki_agent::ModeId::Build => Mode::Build,
+                    maki_agent::ModeId::Plan => Mode::Plan,
+                    maki_agent::ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
+                },
+            })
+            .unwrap_or_else(|| {
+                if self.is_main_chat() {
+                    self.state.mode.clone()
+                } else {
+                    Mode::Build
+                }
+            })
+    }
+
+    pub(super) fn focused_retry(&self) -> Option<&RetryInfo> {
+        if self.is_main_chat() {
+            self.retry_info.as_ref()
+        } else {
+            self.chats[self.active_chat].retry_info.as_ref()
+        }
+    }
+
+    pub(crate) fn focused_cwd(&self) -> PathBuf {
+        self.focused_config()
+            .map(|config| config.context.cwd().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(&self.state.session.cwd))
+    }
+
     pub(crate) fn selected_agent_id(&self) -> Option<maki_agent::AgentId> {
         self.chats
             .get(self.active_chat)
@@ -675,25 +737,70 @@ impl App {
         &mut self.chats[0]
     }
 
-    fn is_main_chat(&self) -> bool {
+    pub(crate) fn is_main_chat(&self) -> bool {
         self.active_chat == 0
     }
 
+    pub(super) fn focused_streaming(&self) -> bool {
+        if let Some(actor) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .and_then(|target| target.actor().ok())
+        {
+            return matches!(
+                actor.snapshot().status,
+                maki_agent::actor::ActorStatus::Running(_)
+            );
+        }
+        *self.status_for_chat(self.active_chat) == Status::Streaming
+    }
+
     fn status_for_chat(&self, chat_idx: usize) -> &Status {
-        if chat_idx > 0
-            && self
-                .chats
-                .get(chat_idx)
-                .is_some_and(|chat| !chat.is_finished())
+        if chat_idx == 0 {
+            &self.status
+        } else if self
+            .chats
+            .get(chat_idx)
+            .is_some_and(|chat| !chat.is_finished())
         {
             &SUBAGENT_STREAMING_STATUS
         } else {
-            &self.status
+            &SUBAGENT_IDLE_STATUS
         }
     }
 
+    pub(super) fn focused_plan_path(&self) -> Option<PathBuf> {
+        if self.is_main_chat() {
+            self.state.plan.path().map(Path::to_path_buf)
+        } else {
+            self.focused_config()
+                .and_then(|config| config.mode.plan_path().map(Path::to_path_buf))
+        }
+    }
+
+    fn sync_plan_form_target(&mut self) {
+        let target = if self.is_main_chat() {
+            None
+        } else {
+            self.selected_agent_id()
+        };
+        if target == self.plan_form_target {
+            return;
+        }
+        let (form, pending) = self
+            .plan_forms
+            .remove(&target)
+            .unwrap_or_else(|| (PlanForm::new(), false));
+        let previous = std::mem::replace(&mut self.plan_form, form);
+        let previous_pending = std::mem::replace(&mut self.plan_approval_pending, pending);
+        self.plan_forms
+            .insert(self.plan_form_target, (previous, previous_pending));
+        self.plan_form_target = target;
+    }
+
     fn plan_form_active(&self) -> bool {
-        self.state.mode == Mode::Plan && self.plan_form.is_visible()
+        self.focused_plan_path().is_some() && self.plan_form.is_visible()
     }
 
     pub(crate) fn update_model(&mut self, model: &Model) {
@@ -800,7 +907,19 @@ impl App {
         }
     }
 
+    pub(crate) fn sync_focused_queue(&mut self) {
+        self.sync_plan_form_target();
+        let id = self.selected_agent_id();
+        let actor = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == id)
+            .and_then(|target| target.actor().ok());
+        self.queue.select(id, !self.is_main_chat(), actor);
+    }
+
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        self.sync_focused_queue();
         match &msg {
             Msg::Key(key) if key.kind == CrosstermKeyEventKind::Release => return vec![],
             Msg::Key(key) => {
@@ -839,6 +958,7 @@ impl App {
             }
             Msg::Agent(envelope) => self.handle_agent_event(*envelope),
         };
+        self.sync_plan_form_target();
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
         let dirty = self.promote_deferred_if_ready();
@@ -993,10 +1113,10 @@ impl App {
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
         self.command_palette
-            .set_cwd(Arc::from(self.state.session.cwd.as_str()));
+            .set_cwd(Arc::from(self.focused_cwd().to_string_lossy().as_ref()));
         if self
             .command_palette
-            .sync_arguments(input, cursor, &self.state.mode.id_key())
+            .sync_arguments(input, cursor, &self.focused_mode().id_key())
         {
             self.command_runtime
                 .finish_theme_preview(self.command_target.id(), false);
@@ -1032,8 +1152,8 @@ impl App {
         if key::QUIT.matches(key) {
             self.close_command_palette();
             self.sync_file_completion();
-            return Some(if !self.is_main_chat() || self.input_box.is_empty() {
-                if self.status == Status::Streaming {
+            return Some(if self.input_box.is_empty() {
+                if self.focused_streaming() {
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -1116,8 +1236,8 @@ impl App {
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
-            self.plan_form
-                .clear_model_if_current(&self.state.model.spec());
+            let model = self.focused_model_spec();
+            self.plan_form.clear_model_if_current(&model);
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
@@ -1317,8 +1437,8 @@ impl App {
                 .plan_form
                 .implementation_model()
                 .map(str::to_owned)
-                .unwrap_or_else(|| self.state.model.spec()),
-            ModelPickerPurpose::Session => self.state.model.spec(),
+                .unwrap_or_else(|| self.focused_model_spec()),
+            ModelPickerPurpose::Session => self.focused_model_spec(),
         };
         self.model_picker_purpose = purpose;
         self.model_picker.open(&spec);
@@ -1338,8 +1458,8 @@ impl App {
             ModelPickerAction::Select(spec) => {
                 let purpose = std::mem::take(&mut self.model_picker_purpose);
                 if purpose == ModelPickerPurpose::PlanImplementation {
-                    self.plan_form
-                        .set_implementation_model(spec, &self.state.model.spec());
+                    let model = self.focused_model_spec();
+                    self.plan_form.set_implementation_model(spec, &model);
                     vec![]
                 } else if let Some(target) = self.model_picker_target.take() {
                     vec![Action::ChangePinnedModel { target, spec }]
@@ -1357,27 +1477,30 @@ impl App {
     }
 
     fn plan_toggle_ready(&self) -> bool {
-        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+        if self.is_main_chat() {
+            self.state.mode == Mode::Plan && self.state.plan.is_ready()
+        } else {
+            self.focused_plan_path().is_some() && self.plan_form.is_visible()
+        }
     }
 
     /// True when `plan_submit` is in the active mode's toolset (set by
     /// `mode_plan_override`), flipping the plan auto-hooks on/off.
     fn plan_submit_active(&self) -> bool {
-        if self.state.mode != Mode::Plan {
+        if self.focused_plan_path().is_none() {
             return false;
         }
-        let def = self.state.mode.def(&self.lua_event_handle.mode_registry());
+        let def = self
+            .focused_config()
+            .and_then(|config| config.mode_def.clone())
+            .unwrap_or_else(|| self.state.mode.def(&self.lua_event_handle.mode_registry()));
         def.tools
             .as_deref()
             .is_some_and(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
     }
 
     fn submit_plan(&mut self) -> Vec<Action> {
-        if self.state.mode != Mode::Plan {
-            self.flash(FLASH_NO_PLAN.into());
-            return vec![];
-        }
-        let Some(path) = self.state.plan.path().map(Path::to_path_buf) else {
+        let Some(path) = self.focused_plan_path() else {
             self.flash(FLASH_NO_PLAN.into());
             return vec![];
         };
@@ -1388,9 +1511,11 @@ impl App {
                 return vec![];
             }
         };
-        self.state.plan.mark_ready();
+        if self.is_main_chat() {
+            self.state.plan.mark_ready();
+        }
         self.plan_form.on_plan_ready();
-        self.main_chat()
+        self.active_chat()
             .push(DisplayMessage::plan(content, path.display().to_string()));
         vec![]
     }
@@ -1458,7 +1583,7 @@ impl App {
             return actions;
         }
 
-        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
+        if !(self.focused_streaming() && is_streaming_stop_key(key))
             && let Some(id) = self.dispatch_override(key)
         {
             return vec![Action::RunKeybind(id)];
@@ -1468,26 +1593,7 @@ impl App {
             return actions;
         }
 
-        if !self.is_main_chat() {
-            match key.code {
-                KeyCode::Tab if !self.is_bash_input() => return self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
-                    return if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
-                    {
-                        self.handle_subagent_cancel()
-                    } else {
-                        self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
-                        vec![]
-                    };
-                }
-                _ => {}
-            }
-            return self.handle_subagent_chat_key(key);
-        }
-
-        self.handle_main_chat_key(key)
+        self.handle_chat_key(key)
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
@@ -1500,7 +1606,7 @@ impl App {
             .map(|entry| entry.id)
     }
 
-    fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+    fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
@@ -1525,7 +1631,7 @@ impl App {
             return vec![];
         }
 
-        if self.status == Status::Streaming {
+        if self.focused_streaming() {
             self.file_completion.close();
         }
         if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
@@ -1613,7 +1719,7 @@ impl App {
     }
 
     fn handle_input_action(&mut self, action: InputAction) -> Vec<Action> {
-        let streaming = self.status == Status::Streaming;
+        let streaming = self.focused_streaming();
         match action {
             InputAction::Submit(sub) => {
                 self.file_completion.close();
@@ -1686,7 +1792,7 @@ impl App {
     /// available-models list, already loaded.
     fn completion_ctx(&self) -> CompletionCtx {
         CompletionCtx {
-            mode: self.state.mode.id_key(),
+            mode: self.focused_mode().id_key(),
             models: self
                 .available_models
                 .load_full()
@@ -1726,9 +1832,9 @@ impl App {
     }
 
     fn sync_file_completion(&mut self) {
-        self.command_palette
-            .set_cwd(Arc::from(self.state.session.cwd.as_str()));
-        if self.status == Status::Streaming || self.typed_path_completion_context().is_some() {
+        let cwd = self.focused_cwd().to_string_lossy().into_owned();
+        self.command_palette.set_cwd(Arc::from(cwd.as_str()));
+        if self.focused_streaming() || self.typed_path_completion_context().is_some() {
             self.file_completion.close();
             return;
         }
@@ -1742,7 +1848,6 @@ impl App {
             return;
         }
         let query = at_token_query(&buf.lines()[buf.y()], buf.x()).unwrap_or_default();
-        let cwd = self.state.session.cwd.clone();
         self.file_completion.set_token_byte_range(range);
         if self.file_completion.is_active() && !self.file_completion.needs_reopen(&cwd) {
             self.file_completion.sync_query(&query);
@@ -1781,19 +1886,6 @@ impl App {
         let value = self.input_box.buffer.value();
         self.pending_dirty |= self.command_palette.sync(&value);
         self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
-    }
-
-    /// Typing path for a focused subagent tab: characters go into the shared
-    /// input box, and Enter submits to that subagent's driver queue. Tab toggles
-    /// mode and Esc cancels the subagent, both handled in `handle_key`.
-    fn handle_subagent_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
-        match self.input_box.handle_key(key) {
-            InputAction::Submit(sub) if !sub.is_empty() => {
-                self.submit_released = true;
-                self.submit_or_queue(sub.into())
-            }
-            _ => vec![],
-        }
     }
 
     fn quit(&mut self) -> Vec<Action> {
@@ -1845,15 +1937,21 @@ impl App {
         }
 
         if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+            if self.active_subagent_closed() {
+                self.flash(queue::NO_SUBAGENT_ERR.into());
+                return vec![];
+            }
             let cmd = prefix.command.trim();
             if cmd == "cd" || cmd.starts_with("cd ") {
                 self.flash("Only /cd can change the working directory".into());
             }
-            let id = self.shell.reserve_id();
+            let id = self.shell.reserve_for(self.selected_agent_id());
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().show_user_message(display, Vec::new());
+            self.active_chat().show_user_message(display, Vec::new());
             return vec![Action::ShellCommand {
+                target: self.selected_agent_id(),
+                cwd: self.focused_cwd(),
                 id,
                 command: prefix.command,
                 visible: prefix.visible,
@@ -1895,6 +1993,37 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        if let Some(target) = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+        {
+            let (_, fence) = match target.manager().local_cancel(target.id(), self.run_id) {
+                Ok(cut) => cut,
+                Err(error) => {
+                    self.flash(error.to_string());
+                    return Vec::new();
+                }
+            };
+            let id = self.selected_agent_id();
+            self.shell.cancel_for(id);
+            self.active_chat().flush();
+            self.active_chat().cancel_in_progress();
+            self.active_chat().retry_info = None;
+            self.queue.unfocus();
+            if self.is_main_chat() {
+                self.run_id = fence;
+                self.queue.fence_cancelled_presentations(fence);
+                self.status = Status::Idle;
+                self.retry_info = None;
+                self.recoverable_queue.clear();
+            }
+            return Vec::new();
+        }
+        if !self.is_main_chat() || self.selected_agent_id().is_some() {
+            self.flash(queue::NO_SUBAGENT_ERR.into());
+            return Vec::new();
+        }
         let (turn_id, run_id) = self.capture_cancel();
         self.finish_cancel(turn_id, run_id)
     }
@@ -1905,36 +2034,15 @@ impl App {
         self.pending_input = PendingInput::None;
         self.input_queue.clear();
         self.active_input = None;
-        self.finish_subagents(DisplayRole::Error, CANCELLED_TEXT);
-        self.subagent_channels.clear();
-        self.shell.cancel_all();
-        for chat in &mut self.chats {
-            chat.flush();
-            chat.cancel_in_progress();
-        }
+        self.shell.cancel_for(self.chats[0].agent_id);
+        self.main_chat().flush();
+        self.main_chat().cancel_in_progress();
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         self.queue.unfocus();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent { turn_id, run_id }]
-    }
-
-    fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let Some(agent_id) = self.chats[self.active_chat].agent_id else {
-            return vec![];
-        };
-
-        self.chats[self.active_chat].flush();
-        self.chats[self.active_chat].cancel_in_progress();
-        if let Some(cancel) = self
-            .subagent_channels
-            .get(&agent_id)
-            .and_then(|channels| channels.cancel.as_ref())
-        {
-            cancel.cancel();
-        }
-        vec![]
     }
 
     pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
@@ -2001,6 +2109,7 @@ impl App {
         if envelope.subagent.is_none()
             && let AgentEvent::ModelSwitched { spec } = &envelope.event
         {
+            self.retry_info = None;
             self.run_model = Some(spec.clone());
             if let Ok(model) = maki_providers::Model::from_spec(spec) {
                 self.run_context_window = Some(model.context_window);
@@ -2013,11 +2122,18 @@ impl App {
                 match envelope.event {
                     AgentEvent::SubagentHistory {
                         tool_use_id,
+                        history_epoch,
                         messages,
-                    } => self
-                        .state
-                        .session_mut()
-                        .set_subagent_messages(tool_use_id, messages),
+                    } => {
+                        self.state.session_mut().adopt_subagent_history(
+                            tool_use_id,
+                            &HistorySnapshot {
+                                epoch: history_epoch,
+                                compacted: false,
+                                messages: Arc::new(messages),
+                            },
+                        );
+                    }
                     AgentEvent::TurnComplete(turn) => {
                         let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
                         self.account_turn_complete(chat_idx, &turn);
@@ -2036,6 +2152,7 @@ impl App {
                 self.cleanup_subagent_input(subagent.agent_id);
                 if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
                     self.chats[chat_idx].cancel_in_progress();
+                    self.chats[chat_idx].retry_info = None;
                     if !self.chats[chat_idx].is_finished() {
                         self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
                     }
@@ -2058,6 +2175,7 @@ impl App {
                 return vec![];
             }
             let chat_idx = self.resolve_or_create_chat(subagent);
+            self.chats[chat_idx].retry_info = None;
             match outcome {
                 maki_agent::TurnOutcome::Completed { .. } => {
                     self.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
@@ -2076,6 +2194,7 @@ impl App {
         let subagent_agent_id = envelope.subagent.as_ref().map(|subagent| subagent.agent_id);
         if let AgentEvent::SubagentHistory {
             tool_use_id,
+            history_epoch,
             messages,
         } = envelope.event
         {
@@ -2093,9 +2212,14 @@ impl App {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             self.sync_task_picker();
-            self.state
-                .session_mut()
-                .set_subagent_messages(tool_use_id, messages);
+            self.state.session_mut().adopt_subagent_history(
+                tool_use_id,
+                &HistorySnapshot {
+                    epoch: history_epoch,
+                    compacted: false,
+                    messages: Arc::new(messages),
+                },
+            );
             return vec![];
         }
 
@@ -2126,7 +2250,17 @@ impl App {
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
-            if self.state.mode == Mode::Plan
+            if chat_idx > 0
+                && self
+                    .focused_config()
+                    .filter(|_| self.active_chat == chat_idx)
+                    .and_then(|config| config.mode.plan_path().map(Path::to_path_buf))
+                    .is_some_and(|path| e.wrote_to(&path))
+            {
+                self.plan_form.on_plan_ready();
+            }
+            if chat_idx == 0
+                && self.state.mode == Mode::Plan
                 && !self.plan_submit_active()
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -2169,17 +2303,24 @@ impl App {
         } = envelope.event
         {
             self.chats[chat_idx].stream_reset();
+            let retry = RetryInfo {
+                attempt,
+                message,
+                deadline: Instant::now() + Duration::from_millis(delay_ms),
+            };
             if chat_idx == 0 {
-                self.retry_info = Some(RetryInfo {
-                    attempt,
-                    message,
-                    deadline: Instant::now() + Duration::from_millis(delay_ms),
-                });
+                self.retry_info = Some(retry);
+            } else {
+                self.chats[chat_idx].retry_info = Some(retry);
             }
             return vec![];
         }
 
-        self.retry_info = None;
+        if chat_idx == 0 {
+            self.retry_info = None;
+        } else {
+            self.chats[chat_idx].retry_info = None;
+        }
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.account_turn_complete(Some(chat_idx), tc);
@@ -2209,15 +2350,14 @@ impl App {
             already_displayed,
         } = result
         {
+            let notice = mcp_startup_notice
+                .map(|count| format!("{count} MCP servers are not ready; no MCP tools exposed"));
+            if !already_displayed {
+                self.chats[chat_idx].show_user_message_with_notice(text, images, notice);
+            } else if let Some(notice) = notice {
+                self.chats[chat_idx].annotate_last_user_message(notice);
+            }
             if chat_idx == 0 {
-                let notice = mcp_startup_notice.map(|count| {
-                    format!("{count} MCP servers are not ready; no MCP tools exposed")
-                });
-                if !already_displayed {
-                    self.chats[chat_idx].show_user_message_with_notice(text, images, notice);
-                } else if let Some(notice) = notice {
-                    self.chats[chat_idx].annotate_last_user_message(notice);
-                }
                 self.status = Status::Streaming;
             }
             return vec![];
@@ -2265,7 +2405,6 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.retain_live_async_subagents();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -2278,9 +2417,8 @@ impl App {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.terminalize_turn(&message);
-                    self.retain_live_async_subagents();
-                    self.recoverable_queue = self.queue.text_messages();
-                    self.queue.clear_user_work();
+                    self.recoverable_queue = self.queue.root_text_messages();
+                    self.queue.clear_root_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -2375,8 +2513,6 @@ impl App {
             subagent.agent_id,
             SubagentChannels {
                 answer_tx: subagent.answer_tx.clone(),
-                input_tx: subagent.input_tx.clone(),
-                cancel: subagent.cancel.clone(),
                 closed: false,
             },
         );
@@ -2479,12 +2615,14 @@ impl App {
                         }
                     }
                 }
-                crate::command_runtime::CommandEvent::Outcome { outcome, .. } => match outcome {
+                crate::command_runtime::CommandEvent::Outcome {
+                    outcome, admission, ..
+                } => match outcome {
                     maki_commands::CommandOutcome::AgentTurn(turn) => {
-                        actions.extend(self.submit_command_turn(turn))
+                        actions.extend(self.submit_command_turn(turn, admission.as_deref()))
                     }
                     maki_commands::CommandOutcome::IsolatedTurn(turn) => {
-                        actions.extend(self.submit_isolated_turn(turn))
+                        actions.extend(self.submit_isolated_turn(turn, admission.as_deref()))
                     }
                     maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
                         self.present_frontend_feedback(feedback)
@@ -2695,7 +2833,43 @@ impl App {
         Ok((HostResponse::Completed, actions))
     }
 
-    pub(crate) fn submit_isolated_turn(&self, turn: maki_commands::IsolatedTurn) -> Vec<Action> {
+    pub(crate) fn submit_isolated_turn(
+        &mut self,
+        turn: maki_commands::IsolatedTurn,
+        admission: Option<&TrustedTarget>,
+    ) -> Vec<Action> {
+        let Some(admission) = admission else {
+            self.flash(CommandError::StaleTarget.to_string());
+            return vec![];
+        };
+        let actor = match admission
+            .target
+            .validate_live()
+            .and_then(|()| admission.target.actor())
+        {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.flash(error.to_string());
+                return vec![];
+            }
+        };
+        let history = match actor
+            .transcript(TranscriptRequest {
+                through_turn: None,
+                last_messages: COMMAND_TRANSCRIPT_MESSAGES,
+                max_bytes: COMMAND_TRANSCRIPT_BYTES,
+            })
+            .map_err(|error| error.to_string())
+            .and_then(|snapshot| {
+                serde_json::from_value::<Vec<Message>>(snapshot.messages)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(history) => history,
+            Err(error) => {
+                self.flash(error);
+                return vec![];
+            }
+        };
         let images = turn
             .content
             .attachments
@@ -2705,7 +2879,26 @@ impl App {
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        vec![Action::Btw(turn.content.text.to_string(), images)]
+        let system = if self.chats[0].agent_id == Some(admission.target.id()) {
+            self.btw_system
+                .as_ref()
+                .map(|system| String::clone(&system.load()))
+                .filter(|system| !system.is_empty())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| btw::BTW_FALLBACK_SYSTEM.to_string());
+        self.start_btw_request(IsolatedTurnRequest {
+            provider: Arc::clone(&admission.template.provider),
+            model: (*admission.template.model).clone(),
+            history,
+            system,
+            question: turn.content.text.to_string(),
+            images,
+            session_id: admission.template.session_id.clone(),
+            cancel: maki_agent::CancelToken::none(),
+        });
+        vec![]
     }
 
     pub(crate) fn present_frontend_feedback(&mut self, feedback: maki_commands::FrontendFeedback) {
@@ -2717,7 +2910,26 @@ impl App {
         }
     }
 
-    pub(crate) fn submit_command_turn(&mut self, turn: AgentTurn) -> Vec<Action> {
+    pub(crate) fn submit_command_turn(
+        &mut self,
+        turn: AgentTurn,
+        admission: Option<&TrustedTarget>,
+    ) -> Vec<Action> {
+        let Some(admission) = admission else {
+            self.flash(CommandError::StaleTarget.to_string());
+            return vec![];
+        };
+        let actor = match admission
+            .target
+            .validate_live()
+            .and_then(|()| admission.target.actor())
+        {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.flash(error.to_string());
+                return vec![];
+            }
+        };
         let images = turn
             .content
             .attachments
@@ -2727,45 +2939,60 @@ impl App {
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        let message = QueuedMessage {
-            text: turn.content.text.to_string(),
+        let mut input = maki_agent::AgentInput {
+            message: turn.content.text.to_string(),
             images,
+            mode: admission.template.mode.clone(),
+            thinking: admission.template.opts.thinking,
+            fast: admission.template.opts.fast,
+            workflow: admission.template.workflow,
+            preamble: self.shell.drain_results_for(Some(admission.target.id())),
+            prompt: turn.prompt.map(|prompt| {
+                Box::new(maki_agent::McpPromptRef {
+                    qualified_name: prompt.qualified_name.to_string(),
+                    arguments: prompt
+                        .arguments
+                        .iter()
+                        .map(|(name, value)| (name.to_string(), value.to_string()))
+                        .collect(),
+                })
+            }),
+            cancel: None,
+            lease_committer: None,
         };
-        if let Some(prompt) = turn.prompt {
-            let display = match self.lua_event_handle.expand_references(&message.text) {
-                Ok(text) => text,
-                Err(error) => {
-                    self.flash(error);
-                    return vec![];
-                }
+        let root = self.chats[0].agent_id == Some(admission.target.id());
+        let starting = root && self.status != Status::Streaming;
+        let correlation = if root {
+            input.preamble.extend(self.shell.drain_results());
+            let run_id = if starting {
+                actor.reserve_presentation(self.run_id)
+            } else {
+                actor.presentation_id()
             };
-            if self.status == Status::Streaming {
-                self.flash("Agent is busy, try again later".into());
-                return vec![];
-            }
-            let mut input = self.build_agent_input(&QueuedMessage {
-                text: display.clone(),
-                images: message.images,
-            });
-            input.prompt = Some(Box::new(maki_agent::McpPromptRef {
-                qualified_name: prompt.qualified_name.to_string(),
-                arguments: prompt
-                    .arguments
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect(),
-            }));
-            self.start_run(input, display)
+            crate::agent::shared_queue::correlation(run_id)
         } else {
-            match self.submit_prompt(message) {
-                SubmitOutcome::Started(actions) => actions,
-                SubmitOutcome::Queued => vec![],
-                SubmitOutcome::Rejected(error) => {
-                    self.flash(error);
-                    vec![]
+            String::new()
+        };
+        match actor.admit_turn_with_options(
+            input,
+            None,
+            correlation,
+            TurnAdmissionOptions {
+                provenance: TurnProvenance {
+                    origin: TurnOrigin::User,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => {
+                if starting {
+                    self.record_run_start(actor.presentation_id());
                 }
             }
+            Err(error) => self.flash(error.to_string()),
         }
+        vec![]
     }
 
     pub(crate) fn open_startup_session_picker(&self) {
@@ -3218,7 +3445,7 @@ impl App {
             StatusBar::cadence(
                 self.status_for_chat(self.active_chat),
                 self.restoring.load(Ordering::Relaxed),
-                self.retry_info.is_some(),
+                self.focused_retry().is_some(),
             ),
             self.selection_state
                 .as_ref()
@@ -3234,82 +3461,11 @@ impl App {
         ])
     }
 
-    fn finish_subagents(&mut self, role: DisplayRole, text: &str) {
-        self.terminal_subagents
-            .extend(self.live_chat_index.keys().copied());
-        self.retain_resolved_subagents(role, text);
-        self.chat_index.clear();
-        self.live_chat_index.clear();
-    }
-
-    /// Terminalizes every tool left in progress when a turn ends, sparing
-    /// shell commands and reusable async subagents that outlive the agent.
+    /// Finishes only the main turn's tools; descendants own their terminal events.
     fn terminalize_turn(&mut self, message: &str) {
-        let reusable: HashSet<usize> = self
-            .live_chat_index
-            .iter()
-            .filter(|(id, _)| {
-                self.subagent_channels
-                    .get(id)
-                    .is_some_and(|channels| channels.input_tx.is_some())
-            })
-            .map(|(_, &index)| index)
-            .collect();
-        self.chat_index.retain(|_, &mut sub_idx| {
-            if reusable.contains(&sub_idx) || self.chats[sub_idx].is_finished() {
-                true
-            } else {
-                self.chats[sub_idx].mark_finished(DisplayRole::Error, ERROR_TEXT);
-                false
-            }
-        });
-        self.live_chat_index.retain(|_, index| {
-            reusable.contains(index) || self.chat_index.values().any(|value| value == index)
-        });
-        self.subagent_channels
-            .retain(|id, _| self.live_chat_index.contains_key(id));
-        self.sync_subagents();
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for (index, chat) in self.chats.iter_mut().enumerate().skip(1) {
-            if !reusable.contains(&index) {
-                chat.fail_in_progress_with_message(message.into());
-            }
-        }
-        self.sync_task_picker();
-    }
-
-    fn retain_live_async_subagents(&mut self) {
-        self.live_chat_index.retain(|id, _| {
-            self.subagent_channels
-                .get(id)
-                .is_some_and(|channels| channels.input_tx.is_some())
-        });
-        self.subagent_channels
-            .retain(|id, _| self.live_chat_index.contains_key(id));
-        self.chat_index.retain(|_, index| {
-            self.live_chat_index
-                .values()
-                .any(|live_index| live_index == index)
-        });
-    }
-
-    /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, so the session records only the children that really
-    /// completed.
-    fn retain_resolved_subagents(&mut self, role: DisplayRole, text: &str) {
-        self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
-                true
-            } else {
-                self.chats[sub_idx].mark_finished(role.clone(), text);
-                false
-            }
-        });
-        self.live_chat_index
-            .retain(|_, index| self.chat_index.values().any(|value| value == index));
-        self.subagent_channels
-            .retain(|id, _| self.live_chat_index.contains_key(id));
         self.sync_subagents();
+        self.sync_task_picker();
     }
 
     pub fn flush_all_chats(&mut self) {
@@ -3365,14 +3521,6 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() {
-            // Empty paste means "attach from clipboard"; other chats never
-            // take images, so it does nothing there.
-            if !text.is_empty() {
-                self.input_box.handle_paste(text);
-            }
-            return;
-        }
         if self.attach_pasted_images(text) {
             return;
         }
@@ -3415,8 +3563,8 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
-            PlanFormAction::OpenEditor => match self.state.plan.path() {
-                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+            PlanFormAction::OpenEditor => match self.focused_plan_path() {
+                Some(p) => vec![Action::OpenEditor(p)],
                 None => {
                     self.flash(FLASH_NO_PLAN.into());
                     vec![]
@@ -3428,7 +3576,7 @@ impl App {
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
-        let Some(path) = self.state.plan.path().map(Path::to_path_buf) else {
+        let Some(path) = self.focused_plan_path() else {
             self.flash(FLASH_NO_PLAN.into());
             return vec![];
         };
@@ -3443,9 +3591,19 @@ impl App {
 
     pub(crate) fn plan_approval_matches(&self, model: Option<&str>, parallel: bool) -> bool {
         self.plan_approval_pending
-            && self.state.mode == Mode::Plan
+            && self.focused_plan_path().is_some()
             && self.plan_form.implementation_model() == model
             && self.plan_form.parallel() == parallel
+    }
+
+    pub(crate) fn finish_child_plan_approval(&mut self, target: maki_agent::AgentId) {
+        if self.plan_form_target == Some(target) {
+            self.plan_approval_pending = false;
+            self.plan_form.reset();
+        } else if let Some((form, pending)) = self.plan_forms.get_mut(&Some(target)) {
+            form.reset();
+            *pending = false;
+        }
     }
 
     pub(crate) fn record_plan_implementation(
