@@ -100,6 +100,8 @@ use crate::terminal;
 use crate::theme::ThemesProvider;
 
 mod approval;
+#[cfg(test)]
+mod discovery_tests;
 
 use approval::{ApprovalStep, PendingPlanApproval};
 
@@ -2380,7 +2382,8 @@ impl<'t> EventLoop<'t> {
         &mut self.sessions[self.focused].app
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+    fn start(&mut self, initial_prompt: Option<String>) {
+        self.sync_orchestration();
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -2391,6 +2394,10 @@ impl<'t> EventLoop<'t> {
         } else if self.session_picker {
             self.focused_app().open_startup_session_picker();
         }
+    }
+
+    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+        self.start(initial_prompt);
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
@@ -4883,7 +4890,6 @@ impl<'t> EventLoop<'t> {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
-        available.store(None);
         smol::spawn(async move {
             fetch_all_models(
                 &policy,
@@ -6768,6 +6774,81 @@ mod tests {
         harness.ctx = Some(event_loop.ctx);
     }
 
+    #[test_case(false; "bare_model")]
+    #[test_case(true; "explicit_model")]
+    fn initial_cli_model_prompt_syncs_admission_before_submission(explicit_model: bool) {
+        const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let app = &mut event_loop.sessions[0].app;
+            app.command_runtime = Arc::clone(&command_runtime);
+            app.command_target = command_runtime.bind_target();
+            let target = app.command_target.clone();
+            assert!(command_runtime.target_agent(&target).is_none());
+            assert!(event_loop.orchestration_revisions.is_empty());
+            event_loop.ctx.prepare_provider = Arc::new(|model, _| {
+                Ok(maki_agent::actor::PreparedModel {
+                    model,
+                    provider: Arc::new(StubProvider),
+                })
+            });
+            let initial_prompt = if explicit_model {
+                format!("/model {MODEL}")
+            } else {
+                "/model".into()
+            };
+
+            event_loop.start(Some(initial_prompt));
+
+            let command = command_runtime
+                .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            let CommandEvent::Host {
+                target: captured_target,
+                admission: Some(admission),
+                ..
+            } = &command
+            else {
+                panic!("initial model prompt must capture admission before dispatch");
+            };
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            assert_eq!(*captured_target, target.id());
+            assert_eq!(admission.target.id(), root);
+            assert!(
+                admission
+                    .target
+                    .same_manager(&manager.lookup(root).unwrap())
+            );
+            event_loop.handle_command(command);
+            assert!(matches!(
+                command_runtime
+                    .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                    .unwrap(),
+                CommandEvent::Outcome {
+                    outcome: maki_commands::CommandOutcome::Completed,
+                    ..
+                }
+            ));
+            if explicit_model {
+                assert_eq!(
+                    manager
+                        .actor(root)
+                        .unwrap()
+                        .effective_config()
+                        .unwrap()
+                        .model
+                        .spec(),
+                    MODEL
+                );
+            } else {
+                let app = &event_loop.sessions[0].app;
+                assert!(app.model_picker.is_open());
+                assert_eq!(app.model_picker_target.as_ref().unwrap().id(), root);
+            }
+        });
+    }
+
     struct RuntimeHarness {
         _temp_dir: TempDir,
         ctx: Option<SpawnCtx>,
@@ -8421,12 +8502,7 @@ mod tests {
                 }
                 event_loop.sessions[0].app.active_chat = 0;
                 event_loop.sync_orchestration();
-                let catalog = std::mem::replace(
-                    &mut event_loop.ctx.available_models,
-                    Arc::new(ArcSwapOption::empty()),
-                );
                 event_loop.handle_command(command);
-                event_loop.ctx.available_models = catalog;
                 let outcome = smol::block_on(dispatch);
                 if close_before_open {
                     assert!(matches!(
