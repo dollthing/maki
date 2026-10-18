@@ -3064,6 +3064,7 @@ version = "0.5.5-makima"
 dependencies = [
  "bs58",
  "etcetera",
+ "event-listener",
  "flume 0.11.1",
  "fs2",
  "fs4",

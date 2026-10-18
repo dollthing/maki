@@ -1,8 +1,70 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use event_listener::Event;
 
 use crate::id::MakiId;
+
+const PENDING: u8 = 0;
+const CANCELLED: u8 = 1;
+const PUBLISHING: u8 = 2;
+
+#[derive(Default)]
+struct PublicationState {
+    phase: AtomicU8,
+    cancelled: Event,
+}
+
+/// Arbitrates cancellation against the final durable replacement, not its waiter.
+#[derive(Clone, Default)]
+pub struct CheckpointPublication(Arc<PublicationState>);
+
+impl CheckpointPublication {
+    pub fn cancel(&self) -> bool {
+        match self
+            .0
+            .phase
+            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                self.0.cancelled.notify(usize::MAX);
+                true
+            }
+            Err(phase) => phase == CANCELLED,
+        }
+    }
+
+    pub fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.phase.load(Ordering::Acquire) == CANCELLED
+    }
+
+    pub fn try_publish(&self) -> bool {
+        self.0
+            .phase
+            .compare_exchange(PENDING, PUBLISHING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn finish_commit(&self) -> bool {
+        self.try_publish() || self.0.phase.load(Ordering::Acquire) == PUBLISHING
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let listener = self.0.cancelled.listen();
+            if self.is_cancelled() {
+                return;
+            }
+            listener.await;
+        }
+    }
+}
 
 pub type CheckpointFuture =
     Pin<Box<dyn Future<Output = Result<CheckpointAck, CheckpointError>> + Send + 'static>>;
@@ -56,6 +118,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use test_case::test_case;
+
+    #[test_case(false; "publication_wins")]
+    #[test_case(true; "cancellation_wins")]
+    fn publication_has_one_owner(cancel_first: bool) {
+        let publication = CheckpointPublication::default();
+        if cancel_first {
+            assert!(publication.cancel());
+            assert!(!publication.try_publish());
+            assert!(publication.cancel());
+        } else {
+            assert!(publication.try_publish());
+            assert!(!publication.cancel());
+            assert!(!publication.try_publish());
+        }
+    }
 
     #[test]
     fn acknowledgement_identifies_the_durable_revision() {

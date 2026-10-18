@@ -16,12 +16,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
+use tempfile::NamedTempFile;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::id::MakiId;
 use crate::offload_cleanup::Root;
 use crate::paths::canonical_key;
+use crate::session_lock::SessionPublicationGuard;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -449,6 +451,33 @@ pub struct SessionLog {
     saved_meta: Vec<u8>,
 }
 
+pub struct StagedChildHistory {
+    temporary: NamedTempFile,
+    path: PathBuf,
+}
+
+impl StagedChildHistory {
+    pub fn publish(
+        self,
+        guard: &SessionPublicationGuard,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<bool, SessionError> {
+        guard
+            .publish(|| {
+                if !claim_publication() {
+                    return Ok(false);
+                }
+                self.temporary
+                    .persist(&self.path)
+                    .map_err(|error| StorageError::from(error.error))?;
+                crate::sync_parent_dir(&self.path);
+                Ok(true)
+            })
+            .map_err(StorageError::from)?
+            .unwrap_or(Ok(false))
+    }
+}
+
 fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, usize> {
     map.iter().map(|(k, v)| (k.clone(), v.len())).collect()
 }
@@ -642,6 +671,27 @@ impl SessionLog {
             .open(&path)
             .map_err(StorageError::from)?;
         Ok(Self::cursor_from(session, file))
+    }
+
+    /// Stages a full child-history replacement without changing root history or cwd indexing.
+    pub fn stage_child_history<M, U, T>(
+        dir: &Path,
+        session: &Session<M, U, T>,
+    ) -> Result<StagedChildHistory, SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        fs::create_dir_all(dir).map_err(StorageError::from)?;
+        let path = jsonl_path(dir, session.id);
+        let mut temporary = NamedTempFile::new_in(dir).map_err(StorageError::from)?;
+        write_full_session(temporary.as_file_mut(), session)?;
+        temporary
+            .as_file()
+            .sync_data()
+            .map_err(StorageError::from)?;
+        Ok(StagedChildHistory { temporary, path })
     }
 
     pub fn session_id(&self) -> MakiId {

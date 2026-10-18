@@ -404,6 +404,7 @@ impl Drop for HeartbeatCompletion {
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.session_lock = None;
     runtime.lock_lost = true;
+    runtime.end_plan_approval();
     runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
     let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);

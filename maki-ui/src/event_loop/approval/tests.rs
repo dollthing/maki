@@ -358,15 +358,20 @@ fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
     });
 }
 
-#[test_case(false, false, false; "keep_context")]
-#[test_case(true, false, false; "clear_context")]
-#[test_case(true, true, false; "checkpoint_failure")]
-#[test_case(true, false, true; "checkpoint_deadline_then_success")]
-#[test_case(true, true, true; "checkpoint_deadline_then_failure")]
+#[test_case(false, false, false, false, false; "keep_context")]
+#[test_case(true, false, false, false, false; "clear_context")]
+#[test_case(true, true, false, false, false; "checkpoint_failure")]
+#[test_case(true, false, true, false, false; "checkpoint_deadline")]
+#[test_case(true, true, true, false, false; "checkpoint_deadline_with_late_failure")]
+#[test_case(true, false, true, true, false; "checkpoint_escape")]
+#[test_case(true, false, true, false, true; "checkpoint_lock_loss")]
+#[test_case(false, false, false, false, true; "keep_context_lock_loss")]
 fn managed_child_approval_is_pinned(
     clear_context: bool,
     fail_checkpoint: bool,
     delay_checkpoint: bool,
+    escape: bool,
+    lose_lock: bool,
 ) {
     const CHECKPOINT_FAILURE: &str = "child approval checkpoint failed";
     const CHECKPOINT_FLASH: &str = "history checkpoint failed: child approval checkpoint failed";
@@ -533,6 +538,7 @@ fn managed_child_approval_is_pinned(
             .position(|chat| chat.agent_id == Some(child_id))
             .unwrap();
         event_loop.sessions[index].app.active_chat = child_chat;
+        event_loop.sessions[index].app.sync_focused_queue();
         event_loop.sync_orchestration();
         event_loop.prepare_plan_approval(
             index,
@@ -551,6 +557,7 @@ fn managed_child_approval_is_pinned(
             event_loop.handle_agent(index, Box::new(envelope));
         }
         let (checkpoint_release, checkpoint_gate) = flume::bounded(1);
+        let (checkpoint_entered, checkpoint_entry) = flume::bounded(1);
         if fail_checkpoint || delay_checkpoint {
             let InternalEvent::PlanApprovalReady {
                 result: Ok(ApprovalStep::Child(prepared)),
@@ -559,10 +566,12 @@ fn managed_child_approval_is_pinned(
             else {
                 panic!("child preparation failed");
             };
-            prepared.checkpoint = Arc::new(move |_| {
+            prepared.checkpoint = Some(Arc::new(move |_| {
                 let checkpoint_gate = checkpoint_gate.clone();
+                let checkpoint_entered = checkpoint_entered.clone();
                 Box::pin(async move {
                     if delay_checkpoint {
+                        checkpoint_entered.send(()).unwrap();
                         checkpoint_gate
                             .recv_async()
                             .await
@@ -574,9 +583,43 @@ fn managed_child_approval_is_pinned(
                         Ok(())
                     }
                 })
-            });
+            }));
         }
         event_loop.sessions[index].app.active_chat = 0;
+        event_loop.sessions[index].app.sync_focused_queue();
+        if lose_lock && !clear_context {
+            let InternalEvent::PlanApprovalReady {
+                result: Ok(ApprovalStep::Child(prepared)),
+                ..
+            } = ready
+            else {
+                panic!("child preparation failed");
+            };
+            let publication = prepared.publication.clone();
+            let pending = event_loop.sessions[index]
+                .pending_approval
+                .as_mut()
+                .unwrap();
+            pending.committing = true;
+            pending.publication = Some(publication.clone());
+            super::super::mark_runtime_lock_lost(&mut event_loop.sessions[index]);
+            assert!(publication.is_cancelled());
+            let result = smol::block_on(prepared.idle.commit_prepared_held_cancellable(
+                prepared.operation,
+                false,
+                Arc::new(|_| panic!("keep-context approval must not checkpoint")),
+                publication,
+            ));
+            assert!(result.is_err());
+            event_loop.complete_plan_approval(index, Err(LOCK_LOST_MSG.into()));
+            assert!(event_loop.sessions[index].pending_approval.is_none());
+            drop(child.prepare_idle().expect(LOCK_LOST_MSG));
+            assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
+            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert!(requests.is_empty());
+            shutdown_manager(&manager);
+            return;
+        }
         if delay_checkpoint {
             let InternalEvent::PlanApprovalReady {
                 result: Ok(ApprovalStep::Child(prepared)),
@@ -585,21 +628,64 @@ fn managed_child_approval_is_pinned(
             else {
                 panic!("child preparation failed");
             };
-            event_loop.commit_child_plan_approval_with_timeout(index, *prepared, Duration::ZERO);
+            event_loop.commit_child_plan_approval_with_timeout(
+                index,
+                *prepared,
+                if escape || lose_lock {
+                    WAIT
+                } else {
+                    Duration::ZERO
+                },
+            );
+            if escape || lose_lock {
+                checkpoint_entry.recv_timeout(WAIT).unwrap();
+                if lose_lock {
+                    super::super::mark_runtime_lock_lost(&mut event_loop.sessions[index]);
+                } else {
+                    event_loop.sessions[index].end_plan_approval();
+                }
+            }
             let deadline = next_ready(event_loop);
             assert!(matches!(
                 &deadline,
                 InternalEvent::PlanApprovalReady {
-                    result: Ok(ApprovalStep::ChildCommitPending),
+                    result: Err(error),
                     ..
-                }
+                } if escape || lose_lock || error == super::APPROVAL_CHECKPOINT_TIMEOUT
             ));
             event_loop.handle_internal(deadline);
-            assert!(event_loop.sessions[index].pending_approval.is_some());
+            assert!(event_loop.sessions[index].pending_approval.is_none());
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            drop(
+                child
+                    .prepare_idle()
+                    .expect("deadline must release actor reservation"),
+            );
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
             assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
             assert!(requests.is_empty());
-            checkpoint_release.send(()).unwrap();
+            drop(checkpoint_release);
+            event_loop.sessions[index].app.active_chat = child_chat;
+            event_loop.sessions[index].app.sync_focused_queue();
+            assert!(!event_loop.sessions[index].app.plan_approval_pending);
+            if lose_lock {
+                assert_eq!(
+                    event_loop.sessions[index].app.status_bar.flash_text(),
+                    Some(LOCK_LOST_MSG)
+                );
+                shutdown_manager(&manager);
+                return;
+            }
+            event_loop.prepare_plan_approval(
+                index,
+                clear_context,
+                Some(TARGET_MODEL.into()),
+                false,
+                path.clone(),
+            );
+            assert!(event_loop.sessions[index].pending_approval.is_some());
+            let retry = next_ready(event_loop);
+            event_loop.handle_internal(retry);
         } else {
             event_loop.handle_internal(ready);
         }
@@ -610,10 +696,12 @@ fn managed_child_approval_is_pinned(
                 .unwrap()
                 .committing
         );
-        event_loop.sessions[index].end_plan_approval();
         assert!(event_loop.sessions[index].pending_approval.is_some());
         let committed = next_ready(event_loop);
+        let fail_checkpoint = fail_checkpoint && !delay_checkpoint;
         if !fail_checkpoint {
+            event_loop.sessions[index].end_plan_approval();
+            assert!(event_loop.sessions[index].pending_approval.is_some());
             assert!(requests.is_empty());
             assert!(matches!(child.snapshot().status, ActorStatus::Idle));
             while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use futures_lite::FutureExt;
 
 use maki_providers::{ContentBlock, Message, MessageKind, Role};
+use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 
 use super::prepared::PreparedOperation;
@@ -61,6 +62,7 @@ enum HistoryEditAction {
         operation: Box<PreparedOperation>,
         clear_history: bool,
         held: bool,
+        publication: Option<CheckpointPublication>,
         completion: flume::Sender<PreparedEditResult>,
     },
 }
@@ -149,7 +151,7 @@ impl ActorIdleGuard {
         clear_history: bool,
         checkpoint: HistoryEditCheckpoint,
     ) -> Result<(PreparedCommit, Option<HistoryChange>), ActorError> {
-        self.commit_prepared_inner(operation, clear_history, checkpoint, false)
+        self.commit_prepared_inner(operation, clear_history, checkpoint, false, None)
             .await
             .map(|(_, commit, history)| (commit, history))
     }
@@ -161,7 +163,26 @@ impl ActorIdleGuard {
         checkpoint: HistoryEditCheckpoint,
     ) -> Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError> {
         let (guard, commit, history) = self
-            .commit_prepared_inner(operation, clear_history, checkpoint, true)
+            .commit_prepared_inner(operation, clear_history, checkpoint, true, None)
+            .await?;
+        Ok((guard.ok_or(ActorError::PolicyCancelled)?, commit, history))
+    }
+
+    pub async fn commit_prepared_held_cancellable(
+        self,
+        operation: PreparedOperationTicket,
+        clear_history: bool,
+        checkpoint: HistoryEditCheckpoint,
+        publication: CheckpointPublication,
+    ) -> Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError> {
+        let (guard, commit, history) = self
+            .commit_prepared_inner(
+                operation,
+                clear_history,
+                checkpoint,
+                true,
+                Some(publication),
+            )
             .await?;
         Ok((guard.ok_or(ActorError::PolicyCancelled)?, commit, history))
     }
@@ -172,10 +193,16 @@ impl ActorIdleGuard {
         clear_history: bool,
         checkpoint: HistoryEditCheckpoint,
         held: bool,
+        publication: Option<CheckpointPublication>,
     ) -> PreparedEditResult {
-        if !operation.belongs_to(&self.actor) {
+        if !operation.belongs_to(&self.actor)
+            || publication
+                .as_ref()
+                .is_some_and(CheckpointPublication::is_cancelled)
+        {
             return Err(ActorError::PolicyCancelled);
         }
+        let cancellation = publication.clone();
         let (completion, response) = flume::bounded(1);
         let actor = self.actor.clone();
         {
@@ -197,6 +224,7 @@ impl ActorIdleGuard {
                     operation: Box::new(pending),
                     clear_history,
                     held,
+                    publication,
                     completion,
                 },
                 checkpoint,
@@ -205,6 +233,29 @@ impl ActorIdleGuard {
             actor.inner.queue.notify();
         }
         drop(operation);
+        if let Some(publication) = cancellation {
+            let result = futures_lite::future::or(
+                async {
+                    publication.cancelled().await;
+                    let edit = {
+                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state
+                            .owned_idle(&self.owner)
+                            .and_then(|idle| idle.edit.take())
+                    };
+                    if let Some(edit) = edit {
+                        edit.fail(ActorError::PolicyCancelled);
+                        self.release = true;
+                    }
+                    None
+                },
+                async { Some(response.recv_async().await) },
+            )
+            .await;
+            if let Some(result) = result {
+                return result.map_err(|_| ActorError::Closed)?;
+            }
+        }
         response
             .recv_async()
             .await
@@ -291,6 +342,7 @@ impl HistoryEditWork {
                 operation,
                 clear_history,
                 held,
+                publication,
                 completion,
             } => {
                 let snapshot = clear_history.then(|| {
@@ -298,7 +350,31 @@ impl HistoryEditWork {
                     snapshot.compacted = actor.inner.history.load().compacted;
                     snapshot
                 });
-                let result = if let Some(snapshot) = &snapshot {
+                let result = if let Some(publication) = &publication {
+                    if publication.is_cancelled() {
+                        Err(ActorError::PolicyCancelled)
+                    } else if let Some(snapshot) = &snapshot {
+                        futures_lite::future::or(
+                            checkpoint(&self.checkpoint, snapshot.clone()),
+                            async {
+                                publication.cancelled().await;
+                                Err(ActorError::PolicyCancelled)
+                            },
+                        )
+                        .await
+                        .and_then(|()| {
+                            if publication.finish_commit() {
+                                Ok(())
+                            } else {
+                                Err(ActorError::PolicyCancelled)
+                            }
+                        })
+                    } else if publication.try_publish() {
+                        Ok(())
+                    } else {
+                        Err(ActorError::PolicyCancelled)
+                    }
+                } else if let Some(snapshot) = &snapshot {
                     checkpoint(&self.checkpoint, snapshot.clone()).await
                 } else {
                     Ok(())
@@ -481,6 +557,7 @@ mod tests {
 
     use futures_lite::future;
     use maki_providers::{ContentBlock, Message, Role, ThinkingConfig, TokenUsage};
+    use maki_storage::checkpoint::CheckpointPublication;
     use maki_storage::sessions::HistorySnapshot;
     use test_case::test_case;
 
@@ -856,6 +933,176 @@ mod tests {
                 ticket.wait().await;
                 assert!(actor.inner.queue.remove_turn(ticket.turn_id()).is_none());
             }
+            actor.close();
+            runner.await;
+        });
+    }
+
+    #[test_case(true, true; "cancel_before_checkpoint")]
+    #[test_case(true, false; "cancel_permanently_gated_checkpoint")]
+    #[test_case(false, true; "cancel_without_history_checkpoint")]
+    fn cancellable_prepared_commit_releases_reservation(clear_history: bool, cancel_before: bool) {
+        smol::block_on(async {
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user(CHECKPOINT_ERROR.into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let history = actor.inner.history.load_full();
+            let guard = actor.prepare_idle().unwrap();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
+            operation.wait_ready().await.unwrap();
+            let publication = CheckpointPublication::default();
+            if cancel_before {
+                assert!(publication.cancel());
+            }
+            let (entered, entry) = flume::bounded(1);
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |_| {
+                let entered = entered.clone();
+                Box::pin(async move {
+                    entered.send(()).unwrap();
+                    futures_lite::future::pending().await
+                })
+            });
+            let commit = smol::spawn(guard.commit_prepared_held_cancellable(
+                operation,
+                clear_history,
+                checkpoint,
+                publication.clone(),
+            ));
+            if !cancel_before {
+                entry.recv_async().await.unwrap();
+                assert!(publication.cancel());
+            }
+            assert!(matches!(commit.await, Err(ActorError::PolicyCancelled)));
+            drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
+            assert!(!actor.effective_config().unwrap().fast);
+            assert!(Arc::ptr_eq(
+                &history.messages,
+                &actor.inner.history.load().messages
+            ));
+            actor.close();
+            runner.await;
+        });
+    }
+
+    #[test_case(true, true; "cancel_before_queue_with_clear")]
+    #[test_case(false, true; "cancel_before_queue_without_clear")]
+    #[test_case(true, false; "cancel_queued_with_clear")]
+    #[test_case(false, false; "cancel_queued_without_clear")]
+    fn cancellable_prepared_commit_does_not_need_runner(clear_history: bool, cancel_before: bool) {
+        smol::block_on(async {
+            let (start, gate) = flume::bounded(1);
+            let (actor, runner) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                vec![Message::user(CHECKPOINT_ERROR.into())],
+                None,
+                Box::new(IdleBackend),
+                None,
+                None,
+                Some(gate),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let guard = actor.prepare_idle().unwrap();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
+            operation.wait_ready().await.unwrap();
+            let publication = CheckpointPublication::default();
+            if cancel_before {
+                assert!(publication.cancel());
+            }
+            let checkpoint: HistoryEditCheckpoint =
+                Arc::new(|_| panic!("cancelled edit must not checkpoint"));
+            let mut commit = Box::pin(guard.commit_prepared_held_cancellable(
+                operation,
+                clear_history,
+                checkpoint,
+                publication.clone(),
+            ));
+            if !cancel_before {
+                assert!(future::poll_once(commit.as_mut()).await.is_none());
+                assert!(publication.cancel());
+            }
+            let result = future::poll_once(commit.as_mut())
+                .await
+                .expect(CHECKPOINT_ERROR);
+            assert!(matches!(result, Err(ActorError::PolicyCancelled)));
+            assert!(!actor.effective_config().unwrap().fast);
+            assert_eq!(actor.inner.history.load().messages.len(), 1);
+            drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
+            start.send(()).unwrap();
+            actor.close();
+            runner.await;
+        });
+    }
+
+    #[test_case(true, false; "ready_checkpoint_loses_to_cancel")]
+    #[test_case(false, false; "published_checkpoint_succeeds")]
+    #[test_case(false, true; "published_checkpoint_reports_failure")]
+    fn cancellable_prepared_commit_observes_publication(cancel: bool, fail: bool) {
+        smol::block_on(async {
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user(CHECKPOINT_ERROR.into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let history = actor.inner.history.load_full();
+            let guard = actor.prepare_idle().unwrap();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
+            operation.wait_ready().await.unwrap();
+            let publication = CheckpointPublication::default();
+            let checkpoint: HistoryEditCheckpoint = Arc::new({
+                let publication = publication.clone();
+                move |_| {
+                    let publication = publication.clone();
+                    Box::pin(async move {
+                        if cancel {
+                            assert!(publication.cancel());
+                        } else {
+                            assert!(publication.try_publish());
+                            assert!(!publication.cancel());
+                        }
+                        if fail {
+                            Err(CHECKPOINT_ERROR.into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            });
+            let result = guard
+                .commit_prepared_held_cancellable(operation, true, checkpoint, publication)
+                .await;
+            if cancel || fail {
+                assert!(matches!(
+                    result,
+                    Err(ActorError::PolicyCancelled | ActorError::HistoryCheckpoint(_))
+                ));
+                assert!(!actor.effective_config().unwrap().fast);
+                assert!(Arc::ptr_eq(
+                    &history.messages,
+                    &actor.inner.history.load().messages
+                ));
+            } else {
+                let (idle, _, change) = result.unwrap();
+                assert!(actor.effective_config().unwrap().fast);
+                assert!(change.unwrap().messages.is_empty());
+                assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
+                drop(idle);
+            }
+            drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
             actor.close();
             runner.await;
         });

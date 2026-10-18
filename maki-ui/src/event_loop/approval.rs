@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_agent::actor::{
     ActorIdleGuard, ConfigCommit, HistoryChange, HistoryEditCheckpoint, PreparedCommit,
@@ -10,6 +11,7 @@ use maki_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
     ModeDef, SessionDefaults,
 };
+use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::session_lock::ClaimedSessionLock;
 use maki_storage::sessions::{StoredMode, StoredRule};
 use tracing::warn;
@@ -30,8 +32,8 @@ use crate::plan_approval::{
 #[cfg(test)]
 mod tests;
 
-const APPROVAL_COMMIT_PENDING: &str =
-    "Plan approval is still waiting for its checkpoint; it has not been cancelled";
+const APPROVAL_CHECKPOINT_TIMEOUT: &str =
+    "Plan approval timed out before its checkpoint was published";
 
 pub(super) struct PendingPlanApproval {
     pub(super) identity: Arc<()>,
@@ -39,10 +41,14 @@ pub(super) struct PendingPlanApproval {
     pub(super) waiting_for_lock: Option<ApprovalStep>,
     committing: bool,
     child: Option<AgentId>,
+    publication: Option<CheckpointPublication>,
 }
 
 impl Drop for PendingPlanApproval {
     fn drop(&mut self) {
+        if let Some(publication) = &self.publication {
+            publication.cancel();
+        }
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
@@ -54,7 +60,6 @@ pub(super) enum ApprovalStep {
     Fresh(Box<FreshPlanApproval>),
     Child(Box<PreparedChildApproval>),
     ChildCommitted(Box<CommittedChildApproval>),
-    ChildCommitPending,
 }
 
 impl ApprovalStep {
@@ -62,7 +67,7 @@ impl ApprovalStep {
         match self {
             Self::Captured(prepared) => Some(prepared),
             Self::Fresh(fresh) => Some(&fresh.source),
-            Self::Child(_) | Self::ChildCommitted(_) | Self::ChildCommitPending => None,
+            Self::Child(_) | Self::ChildCommitted(_) => None,
         }
     }
 }
@@ -93,7 +98,8 @@ pub(super) struct PreparedChildApproval {
     idle: ActorIdleGuard,
     operation: PreparedOperationTicket,
     clear_context: bool,
-    checkpoint: HistoryEditCheckpoint,
+    checkpoint: Option<HistoryEditCheckpoint>,
+    publication: CheckpointPublication,
 }
 
 pub(super) struct CommittedChildApproval {
@@ -161,6 +167,13 @@ impl SessionRuntime {
             .as_ref()
             .is_some_and(|pending| pending.committing)
         {
+            if let Some(publication) = self
+                .pending_approval
+                .as_ref()
+                .and_then(|pending| pending.publication.as_ref())
+            {
+                publication.cancel();
+            }
             return;
         }
         if let Some(pending) = self.pending_approval.take()
@@ -256,10 +269,6 @@ impl EventLoop<'_> {
         idx: usize,
         result: Result<ApprovalStep, String>,
     ) {
-        if matches!(result, Ok(ApprovalStep::ChildCommitPending)) {
-            self.sessions[idx].app.flash(APPROVAL_COMMIT_PENDING.into());
-            return;
-        }
         if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
             pending.committing = false;
         }
@@ -292,9 +301,6 @@ impl EventLoop<'_> {
             ApprovalStep::Captured(prepared) => self.commit_plan_approval(idx, *prepared),
             ApprovalStep::Fresh(fresh) => self.activate_fresh_plan_approval(idx, *fresh),
             ApprovalStep::Child(child) => self.commit_child_plan_approval(idx, *child),
-            ApprovalStep::ChildCommitPending => {
-                runtime.app.flash(APPROVAL_COMMIT_PENDING.into());
-            }
         }
     }
 
@@ -340,7 +346,8 @@ impl EventLoop<'_> {
             if config.mode.plan_path() != Some(path.as_path()) {
                 return Err(APPROVAL_CHANGED.into());
             }
-            let checkpoint = self.child_history_checkpoint(idx, &target)?;
+            let publication = CheckpointPublication::default();
+            let checkpoint = None;
             let operation = actor
                 .reserve_prepared_operation(Some(PreparedTurn {
                     input: build_input(String::new()),
@@ -348,12 +355,22 @@ impl EventLoop<'_> {
                     correlation: String::new(),
                 }))
                 .map_err(|error| error.to_string())?;
-            Ok((target, config, template, mode, idle, checkpoint, operation))
+            Ok((
+                target,
+                config,
+                template,
+                mode,
+                idle,
+                checkpoint,
+                operation,
+                publication,
+            ))
         })();
-        let (target, config, template, mode, idle, checkpoint, operation) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return self.sessions[idx].abort_plan_approval(error),
-        };
+        let (target, config, template, mode, idle, checkpoint, operation, publication) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return self.sessions[idx].abort_plan_approval(error),
+            };
         let absolute = if path.is_absolute() {
             path
         } else {
@@ -391,6 +408,7 @@ impl EventLoop<'_> {
                 operation,
                 clear_context,
                 checkpoint,
+                publication,
             })))
         });
         if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
@@ -406,7 +424,7 @@ impl EventLoop<'_> {
         &mut self,
         idx: usize,
         child: PreparedChildApproval,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) {
         if self.sessions[idx].session_lock.is_none() {
             return self.sessions[idx].abort_plan_approval(APPROVAL_LOCK_LOST.into());
@@ -426,13 +444,47 @@ impl EventLoop<'_> {
         if let Err(error) = child.operation.set_turn_displayed(true) {
             return self.sessions[idx].abort_plan_approval(error.to_string());
         }
+        let checkpoint: HistoryEditCheckpoint = match child.checkpoint.clone() {
+            Some(checkpoint) => checkpoint,
+            None => {
+                let runtime = &self.sessions[idx];
+                let Some(SessionLockState::Held(lease)) = runtime.session_lock.as_ref() else {
+                    return self.sessions[idx].abort_plan_approval(APPROVAL_LOCK_LOST.into());
+                };
+                let Some(key) = runtime
+                    .app
+                    .chats
+                    .iter()
+                    .find(|chat| chat.agent_id == Some(child.target.id()))
+                    .and_then(|chat| chat.subagent_id.clone())
+                else {
+                    return self.sessions[idx].abort_plan_approval(APPROVAL_CHANGED.into());
+                };
+                let guard = lease.publication_guard();
+                let session = runtime.id();
+                let writer = Arc::clone(&self.ctx.storage_writer);
+                let publication = child.publication.clone();
+                Arc::new(move |history| {
+                    let writer = Arc::clone(&writer);
+                    let publication = publication.clone();
+                    let key = key.clone();
+                    let guard = guard.clone();
+                    Box::pin(async move {
+                        writer
+                            .checkpoint_child_approval(session, key, history, publication, guard)
+                            .await
+                    })
+                })
+            }
+        };
         let runtime = &mut self.sessions[idx];
         let Some(pending) = runtime.pending_approval.as_mut() else {
             return;
         };
         pending.committing = true;
-        // Preparation is cancellable. Once checkpointing starts, completion must be observed.
         pending.cancel.take();
+        let publication = child.publication.clone();
+        pending.publication = Some(publication.clone());
         let request = Arc::clone(&pending.identity);
         let session = runtime.id();
         let identity = runtime.handles.identity();
@@ -445,11 +497,17 @@ impl EventLoop<'_> {
                 idle,
                 operation,
                 clear_context,
-                checkpoint,
+                checkpoint: _,
+                publication: commit_publication,
             } = child;
             let observer = smol::spawn(async move {
                 let (idle, committed, history) = idle
-                    .commit_prepared_held(operation, clear_context, checkpoint)
+                    .commit_prepared_held_cancellable(
+                        operation,
+                        clear_context,
+                        checkpoint,
+                        commit_publication,
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 let ticket = committed
@@ -478,13 +536,13 @@ impl EventLoop<'_> {
                 {
                     Some(result) => result,
                     None => {
-                        let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
-                            session,
-                            runtime: Arc::clone(&identity),
-                            request: Arc::clone(&request),
-                            result: Ok(ApprovalStep::ChildCommitPending),
-                        });
-                        observer.await
+                        let cancelled = publication.cancel();
+                        let result = observer.await;
+                        if cancelled {
+                            Err(APPROVAL_CHECKPOINT_TIMEOUT.into())
+                        } else {
+                            result
+                        }
                     }
                 };
             let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
@@ -656,6 +714,7 @@ impl EventLoop<'_> {
             waiting_for_lock: None,
             committing: false,
             child: None,
+            publication: None,
         });
         let session = runtime.id();
         let runtime_identity = runtime.handles.identity();

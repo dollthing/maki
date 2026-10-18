@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use maki_storage::checkpoint::{
-    CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointVersion,
-    CheckpointWriter,
+    CheckpointAck, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
+    CheckpointVersion, CheckpointWriter,
 };
 use maki_storage::id::MakiId;
 use maki_storage::session_lock::SessionPublicationGuard;
@@ -39,6 +39,7 @@ use maki_providers::Message;
 pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
+const CHECKPOINT_CANCELLED: &str = "child approval checkpoint cancelled";
 #[cfg(not(test))]
 const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
     Duration::from_millis(100),
@@ -73,6 +74,21 @@ struct PendingState {
     config_versions: HashMap<MakiId, (u64, u64)>,
     live_children: HashMap<MakiId, Vec<String>>,
     next_generation: u64,
+    child_approvals: Vec<ChildApprovalSave>,
+    child_publications: HashMap<MakiId, Vec<CheckpointPublication>>,
+    incarnations: HashMap<MakiId, Arc<()>>,
+    #[cfg(test)]
+    child_stage_gate: Option<(flume::Sender<()>, flume::Receiver<()>)>,
+}
+
+struct ChildApprovalSave {
+    session_id: MakiId,
+    child_key: String,
+    history: HistorySnapshot<Message>,
+    publication: CheckpointPublication,
+    guard: SessionPublicationGuard,
+    incarnation: Arc<()>,
+    reply: flume::Sender<Result<(), String>>,
 }
 
 struct CoordinatorPending {
@@ -362,6 +378,7 @@ impl StorageWriter {
         {
             return;
         }
+        cancel_child_publications(&mut state, id);
         state.config_versions.insert(id, (runtime_epoch, 0));
         state.coordinator_pending.remove(&id);
         let generation = next_generation(&mut state);
@@ -382,6 +399,7 @@ impl StorageWriter {
     pub fn seed(&self, session: Arc<AppSession>) {
         let id = session.id;
         let mut state = lock(&self.pending);
+        cancel_child_publications(&mut state, id);
         let generation = next_generation(&mut state);
         state.latest.insert(id, session);
         state.latest_generations.insert(id, generation);
@@ -561,6 +579,43 @@ impl StorageWriter {
         })
     }
 
+    pub async fn checkpoint_child_approval(
+        &self,
+        session_id: MakiId,
+        child_key: String,
+        history: HistorySnapshot<Message>,
+        publication: CheckpointPublication,
+        guard: SessionPublicationGuard,
+    ) -> Result<(), String> {
+        let (reply, response) = flume::bounded(1);
+        {
+            let mut state = lock(&self.pending);
+            if state.closed {
+                return Err(CheckpointError::Closed(session_id).to_string());
+            }
+            let incarnation = Arc::clone(state.incarnations.entry(session_id).or_default());
+            state
+                .child_publications
+                .entry(session_id)
+                .or_default()
+                .push(publication.clone());
+            state.child_approvals.push(ChildApprovalSave {
+                session_id,
+                child_key,
+                history,
+                publication,
+                guard,
+                incarnation,
+                reply,
+            });
+        }
+        self.wake.send(()).map_err(|error| error.to_string())?;
+        response
+            .recv_async()
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     pub fn coordinator_checkpoint(&self) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
         Arc::new(CoordinatorCheckpointWriter {
             pending: Arc::clone(&self.pending),
@@ -639,6 +694,7 @@ impl StorageWriter {
     /// leave one behind every time.
     pub fn forget(&self, id: MakiId) {
         let mut state = lock(&self.pending);
+        cancel_child_publications(&mut state, id);
         state.latest.remove(&id);
         state.latest_generations.remove(&id);
         state.coordinator_pending.remove(&id);
@@ -689,6 +745,7 @@ impl StorageWriter {
             done(Err(writer_gone()));
             return;
         }
+        cancel_child_publications(&mut state, id);
         if forget_snapshot {
             state.latest.remove(&id);
             state.latest_generations.remove(&id);
@@ -733,6 +790,11 @@ impl StorageWriter {
         {
             let mut state = lock(&self.pending);
             state.closed = true;
+            for publications in state.child_publications.values() {
+                for publication in publications {
+                    publication.cancel();
+                }
+            }
             self.stop.store(true, Ordering::Release);
         }
         // Wake it so it observes the flag; the final flush still runs.
@@ -745,6 +807,15 @@ impl StorageWriter {
 
 fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, PendingState> {
     pending.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cancel_child_publications(state: &mut PendingState, id: MakiId) {
+    state.incarnations.insert(id, Arc::new(()));
+    if let Some(publications) = state.child_publications.remove(&id) {
+        for publication in publications {
+            publication.cancel();
+        }
+    }
 }
 
 fn next_generation(state: &mut PendingState) -> u64 {
@@ -925,6 +996,15 @@ fn preserve_newer_child_histories(incoming: &mut Arc<AppSession>, latest: &AppSe
             incoming.adopt_subagent_history(key.clone(), &history);
             incoming.prune_posts(Some(key), history.messages.len());
         }
+    }
+}
+
+fn promote_child_approval(session: &mut Arc<AppSession>, approval: &ChildApprovalSave) {
+    let current = session.subagent_history_snapshot(&approval.child_key);
+    if current.is_none_or(|history| history.epoch <= approval.history.epoch) {
+        let session = Arc::make_mut(session);
+        session.adopt_subagent_history(approval.child_key.clone(), &approval.history);
+        session.prune_posts(Some(&approval.child_key), approval.history.messages.len());
     }
 }
 
@@ -1232,6 +1312,17 @@ impl Writer {
                 }
             }
         }
+        let approvals = mem::take(&mut lock(pending).child_approvals);
+        for approval in approvals {
+            let result = self.write_child_approval(pending, &approval);
+            if let Some(publications) = lock(pending)
+                .child_publications
+                .get_mut(&approval.session_id)
+            {
+                publications.retain(|publication| !publication.same_request(&approval.publication));
+            }
+            let _ = approval.reply.send(result);
+        }
         lock(pending)
             .entries
             .values()
@@ -1240,6 +1331,79 @@ impl Writer {
                 Entry::Delete(_, _, _) => None,
             })
             .min()
+    }
+
+    fn write_child_approval(
+        &mut self,
+        pending: &Pending,
+        approval: &ChildApprovalSave,
+    ) -> Result<(), String> {
+        if approval.publication.is_cancelled() {
+            return Err(CHECKPOINT_CANCELLED.into());
+        }
+        let mut candidate = {
+            let state = lock(pending);
+            if state.closed {
+                return Err(CheckpointError::Closed(approval.session_id).to_string());
+            }
+            state
+                .latest
+                .get(&approval.session_id)
+                .cloned()
+                .ok_or_else(|| CHECKPOINT_REPLACED.to_owned())?
+        };
+        let session = Arc::make_mut(&mut candidate);
+        if !session.adopt_subagent_history(approval.child_key.clone(), &approval.history) {
+            return Err(CHECKPOINT_REPLACED.into());
+        }
+        session.prune_posts(Some(&approval.child_key), approval.history.messages.len());
+        let directory = self
+            .dir
+            .ensure_subdir(SESSIONS_DIR)
+            .map_err(|error| error.to_string())?;
+        let staged = SessionLog::stage_child_history(&directory, session)
+            .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        {
+            let gate = lock(pending).child_stage_gate.clone();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
+        let published = staged
+            .publish(&approval.guard, || {
+                let state = lock(pending);
+                !state.closed
+                    && state
+                        .incarnations
+                        .get(&approval.session_id)
+                        .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &approval.incarnation))
+                    && approval.publication.try_publish()
+            })
+            .map_err(|error| error.to_string())?;
+        if !published {
+            return Err(CHECKPOINT_CANCELLED.into());
+        }
+        self.logs.remove(&approval.session_id);
+        let mut state = lock(pending);
+        if !state
+            .incarnations
+            .get(&approval.session_id)
+            .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &approval.incarnation))
+        {
+            return Ok(());
+        }
+        if let Some(latest) = state.latest.get_mut(&approval.session_id) {
+            promote_child_approval(latest, approval);
+        }
+        if let Some(provisional) = state.coordinator_pending.get_mut(&approval.session_id) {
+            promote_child_approval(&mut provisional.session, approval);
+        }
+        if let Some(Entry::Save(queued)) = state.entries.get_mut(&approval.session_id) {
+            promote_child_approval(&mut queued.session, approval);
+        }
+        Ok(())
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
@@ -1313,6 +1477,7 @@ mod tests {
     };
     use maki_providers::{Effort, Message};
     use maki_storage::id::SessionRef;
+    use maki_storage::session_lock;
     use maki_storage::sessions::{StoredMode, StoredPost, StoredThinking};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2688,6 +2853,227 @@ mod tests {
                 serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap();
             assert_eq!(
                 sibling,
+                serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
+            );
+        });
+    }
+
+    #[test_case(false; "retry_after_child_publish")]
+    #[test_case(true; "cancel_before_root_retry")]
+    fn child_approval_does_not_revert_acknowledged_root_history(cancel: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        let id = session.id;
+        writer.seed(Arc::new(session));
+        let (warn_tx, _warnings) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        let checkpoint = |message: &str, revision| {
+            let mut snapshot = config_checkpoint(1, revision);
+            snapshot.config = None;
+            snapshot.history = Some(Arc::new(vec![Message::user(message.into())]));
+            writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision,
+                        epoch: revision,
+                    },
+                    snapshot: Arc::new(snapshot),
+                })
+        };
+        let accepted = checkpoint(REWOUND_MSG, 1);
+        disk.flush(&writer.pending);
+        smol::block_on(accepted).unwrap();
+        let newer = checkpoint(RESUMED_MSG, 2);
+        let sessions_path = dir.path().join(SESSIONS_DIR);
+        let saved_path = dir.path().join(TITLE);
+        std::fs::rename(&sessions_path, &saved_path).unwrap();
+        block_sessions_dir(&dir);
+        disk.logs.clear();
+        disk.flush(&writer.pending);
+        assert!(disk.failing.contains(&id));
+        std::fs::remove_file(&sessions_path).unwrap();
+        std::fs::rename(&saved_path, &sessions_path).unwrap();
+        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
+            save.retry_at = Some(Instant::now() + DRAIN_TIMEOUT);
+        }
+        let publication = CheckpointPublication::default();
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut child = Box::pin(writer.checkpoint_child_approval(
+            id,
+            TOOL_ID.into(),
+            HistorySnapshot::new(Vec::new()),
+            publication.clone(),
+            lease.publication_guard(),
+        ));
+        assert!(smol::block_on(futures_lite::future::poll_once(child.as_mut())).is_none());
+        if cancel {
+            assert!(publication.cancel());
+        }
+        disk.flush(&writer.pending);
+        assert_eq!(smol::block_on(child).is_err(), cancel);
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.messages()[0].user_text(), Some(REWOUND_MSG));
+        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
+            save.retry_at = None;
+        }
+        disk.flush(&writer.pending);
+        smol::block_on(newer).unwrap();
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.messages()[0].user_text(), Some(RESUMED_MSG));
+        assert_eq!(
+            loaded
+                .subagent_messages()
+                .get(TOOL_ID)
+                .map_or(0, |messages| messages.len()),
+            usize::from(cancel)
+        );
+    }
+
+    #[test_case(false; "without_later_save")]
+    #[test_case(true; "with_later_save")]
+    fn child_approval_cancelled_before_dequeue(interleave: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        let id = session.id;
+        writer.seed(Arc::new(session.clone()));
+        let publication = CheckpointPublication::default();
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let mut checkpoint = Box::pin(writer.checkpoint_child_approval(
+            id,
+            TOOL_ID.into(),
+            HistorySnapshot::new(Vec::new()),
+            publication.clone(),
+            lease.publication_guard(),
+        ));
+        assert!(smol::block_on(futures_lite::future::poll_once(checkpoint.as_mut())).is_none());
+        assert!(publication.cancel());
+        if interleave {
+            session.set_title(TITLE.into());
+        }
+        writer.send(Arc::new(session));
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.flush(&writer.pending);
+        assert_eq!(
+            smol::block_on(checkpoint).unwrap_err(),
+            CHECKPOINT_CANCELLED
+        );
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.subagent_messages()[TOOL_ID].len(), 1);
+        assert!(lock(&writer.pending).coordinator_pending.is_empty());
+        assert!(writer.latest_snapshot(id).unwrap().subagent_messages()[TOOL_ID].len() == 1);
+        if interleave {
+            assert_eq!(loaded.title, TITLE);
+        }
+    }
+
+    #[test_case(false, false, false, false; "publish_rebases_later_save")]
+    #[test_case(true, false, false, false; "cancel_preserves_later_save")]
+    #[test_case(false, true, false, false; "replacement_fences_staged_publication")]
+    #[test_case(false, false, true, false; "runtime_fences_staged_publication")]
+    #[test_case(false, false, false, true; "lock_loss_fences_staged_publication")]
+    fn child_approval_staging_is_isolated(
+        cancel: bool,
+        replace: bool,
+        rebind: bool,
+        lose_lock: bool,
+    ) {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warnings) = writer(&dir);
+            let writer = Arc::new(writer);
+            let mut session = AppSession::new(MODEL, CWD);
+            session.push_message(Message::user(BASE_MSG.into()));
+            session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(BASE_MSG.into())],
+            );
+            session.push_post(stored_post(Some(TOOL_ID), 2));
+            let id = session.id;
+            writer.send(Arc::new(session.clone()));
+            let publication = CheckpointPublication::default();
+            let history = HistorySnapshot::new(Vec::new());
+            let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+                .unwrap()
+                .unwrap();
+            let guard = lease.publication_guard();
+            let (entered, entry) = flume::bounded(1);
+            let (release, gate) = flume::bounded(1);
+            lock(&writer.pending).child_stage_gate = Some((entered, gate));
+            let checkpoint = smol::spawn({
+                let writer = Arc::clone(&writer);
+                let publication = publication.clone();
+                async move {
+                    writer
+                        .checkpoint_child_approval(id, TOOL_ID.into(), history, publication, guard)
+                        .await
+                }
+            });
+            entry.recv_async().await.unwrap();
+            assert!(writer.latest_snapshot(id).unwrap().subagent_messages()[TOOL_ID].len() == 1);
+            assert!(lock(&writer.pending).coordinator_pending.is_empty());
+            session.set_title(TITLE.into());
+            session.push_message(Message::user(RESUMED_MSG.into()));
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(RESUMED_MSG.into())],
+            );
+            if replace {
+                writer.forget(id);
+                writer.seed(Arc::new(session.clone()));
+            }
+            if rebind {
+                writer.bind_config_runtime(id, 2);
+            }
+            if lose_lock {
+                lease.release().unwrap();
+            }
+            writer.send(Arc::new(session));
+            if cancel {
+                assert!(publication.cancel());
+            }
+            let cancelled = cancel || replace || rebind || lose_lock;
+            release.send(()).unwrap();
+            let result = checkpoint.await;
+            assert_eq!(result.is_err(), cancelled);
+            if !cancelled {
+                assert!(!publication.cancel());
+            }
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(loaded.messages().len(), 2);
+            assert_eq!(
+                loaded
+                    .subagent_messages()
+                    .get(TOOL_ID)
+                    .map_or(0, |messages| messages.len()),
+                usize::from(cancelled)
+            );
+            assert_eq!(loaded.posts().len(), usize::from(cancelled));
+            assert_eq!(
+                serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap(),
                 serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
             );
         });
