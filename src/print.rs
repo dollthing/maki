@@ -80,6 +80,37 @@ struct PrintResult {
     usage: TokenUsage,
 }
 
+#[derive(Default)]
+struct PrintTurnState {
+    result_text: String,
+    is_error: bool,
+    num_turns: u32,
+    usage: TokenUsage,
+    stop_reason: Option<DoneReason>,
+}
+
+impl PrintTurnState {
+    fn accept_outcome(&mut self, envelope: &Envelope) -> bool {
+        let AgentEvent::TurnOutcome(outcome) = &envelope.event else {
+            return false;
+        };
+        if envelope.subagent.is_some() {
+            return false;
+        }
+        self.num_turns = outcome.num_turns();
+        self.usage = outcome.usage();
+        match outcome {
+            TurnOutcome::Completed { reason, .. } => self.stop_reason = Some(*reason),
+            TurnOutcome::Failed { failure, .. } => {
+                self.is_error = true;
+                self.result_text = failure.user_message.clone();
+            }
+            TurnOutcome::Cancelled { .. } => self.is_error = true,
+        }
+        true
+    }
+}
+
 #[derive(Serialize)]
 struct InitEvent<'a> {
     #[serde(rename = "type")]
@@ -433,14 +464,10 @@ pub fn run(
                 })?;
             }
 
-            let mut result_text = String::new();
-            let mut is_error = false;
-            let mut num_turns: u32 = 0;
-            let mut usage = TokenUsage::default();
+            let mut state = PrintTurnState::default();
             // Summed as the turns land: rates move mid-run, and only a turn knows the
             // rate it paid.
             let mut cost = None;
-            let mut stop_reason: Option<DoneReason> = None;
 
             let snapshot = HeadlessSnapshot::default();
             snapshot.install(
@@ -478,7 +505,7 @@ pub fn run(
                 match event {
                     AgentEvent::TextDelta { text } => {
                         if parent_tool_use_id.is_none() {
-                            result_text.push_str(text);
+                            state.result_text.push_str(text);
                         }
                     }
                     AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
@@ -551,25 +578,15 @@ pub fn run(
                             })?;
                         }
                     }
-                    AgentEvent::TurnOutcome(outcome) => {
-                        num_turns = outcome.num_turns();
-                        usage = outcome.usage();
-                        match outcome {
-                            TurnOutcome::Completed { reason, .. } => stop_reason = Some(*reason),
-                            TurnOutcome::Failed { failure, .. } => {
-                                is_error = true;
-                                result_text = failure.user_message.clone();
-                            }
-                            TurnOutcome::Cancelled { .. } => {
-                                is_error = true;
-                            }
+                    AgentEvent::TurnOutcome(_) => {
+                        if state.accept_outcome(&envelope) {
+                            break;
                         }
-                        break;
                     }
                     AgentEvent::ControlComplete { .. } => break,
                     AgentEvent::ControlError { message } => {
-                        is_error = true;
-                        result_text = message.clone();
+                        state.is_error = true;
+                        state.result_text = message.clone();
                         break;
                     }
                 }
@@ -577,16 +594,16 @@ pub fn run(
             Ok((
                 PrintResult {
                     result_type: "result",
-                    subtype: if is_error { "error" } else { "success" },
-                    is_error,
+                    subtype: if state.is_error { "error" } else { "success" },
+                    is_error: state.is_error,
                     duration_ms: 0,
-                    num_turns,
-                    result: result_text,
-                    stop_reason,
+                    num_turns: state.num_turns,
+                    result: state.result_text,
+                    stop_reason: state.stop_reason,
                     session_id,
                     // Zero on an unpriced model, which is what its turns reported too.
                     total_cost_usd: cost.unwrap_or_default(),
-                    usage,
+                    usage: state.usage,
                 },
                 verbose_out,
             ))
@@ -647,7 +664,7 @@ mod tests {
     use super::*;
     use flume::{Receiver, Sender};
     use maki_agent::{
-        AgentError, ToolOutput,
+        AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
@@ -667,6 +684,91 @@ mod tests {
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const OUTPUT_ERROR: &str = "print output failed";
+    const ROOT_RESPONSE: &str = "root response";
+
+    #[test_case("completed"; "completed")]
+    #[test_case("failed"; "failed")]
+    #[test_case("cancelled"; "cancelled")]
+    fn subagent_outcomes_preserve_print_state_until_root_outcome(status: &str) {
+        let child_id = AgentId::generate();
+        let turn_id = TurnId::generate();
+        let child_usage = TokenUsage {
+            input: 10,
+            output: 20,
+            ..Default::default()
+        };
+        let outcome = match status {
+            "completed" => {
+                TurnOutcome::completed(child_id, turn_id, child_usage, 2, DoneReason::MaxTurns)
+            }
+            "failed" => TurnOutcome::failed(
+                child_id,
+                turn_id,
+                child_usage,
+                2,
+                TurnFailure::from_agent_error(&AgentError::Config {
+                    message: OUTPUT_ERROR.into(),
+                }),
+            ),
+            "cancelled" => TurnOutcome::cancelled(
+                child_id,
+                turn_id,
+                child_usage,
+                2,
+                TurnCancellationReason::User,
+            ),
+            _ => unreachable!(),
+        };
+        let envelope = Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: Some(SubagentInfo {
+                agent_id: child_id,
+                parent_agent_id: None,
+                parent_is_root: true,
+                auto_deliver: true,
+                parent_tool_use_id: String::new(),
+                name: String::new(),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                cancel: None,
+            }),
+            run_id: 1,
+        };
+        let mut state = PrintTurnState {
+            result_text: ROOT_RESPONSE.into(),
+            ..Default::default()
+        };
+        assert!(!state.accept_outcome(&envelope));
+        assert_eq!(state.result_text, ROOT_RESPONSE);
+        assert!(!state.is_error);
+        assert_eq!(state.num_turns, 0);
+        assert_eq!(state.usage, TokenUsage::default());
+        assert_eq!(state.stop_reason, None);
+
+        let root_usage = TokenUsage {
+            input: 30,
+            output: 40,
+            ..Default::default()
+        };
+        assert!(state.accept_outcome(&Envelope {
+            event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                root_usage,
+                3,
+                DoneReason::EndTurn,
+            )),
+            subagent: None,
+            run_id: 1,
+        }));
+        assert_eq!(state.result_text, ROOT_RESPONSE);
+        assert!(!state.is_error);
+        assert_eq!(state.num_turns, 3);
+        assert_eq!(state.usage, root_usage);
+        assert_eq!(state.stop_reason, Some(DoneReason::EndTurn));
+    }
 
     struct GatedRemoval {
         persistence: Option<(Sender<()>, Receiver<()>)>,
