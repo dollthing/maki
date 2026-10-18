@@ -38,6 +38,8 @@ use crate::{
 };
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(test, feature = "test-util"))]
+const MAX_GRAPH_DRAIN_PASSES: usize = 256;
 static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -494,7 +496,10 @@ impl AgentManagerHandle {
             (**inherited_config).clone(),
             parent_mode.clone(),
         )
-        .with_mode_def(current.mode_def.clone());
+        .with_mode_def(current.mode_def.clone())
+        .with_context(current.context.clone().ok_or_else(|| {
+            ManagerError::Policy("child delegation requires a parent context snapshot".into())
+        })?);
         self.spawn_child_with_config(
             current,
             inherited_config,
@@ -1139,7 +1144,7 @@ impl AgentManagerHandle {
         &self,
     ) -> Result<Vec<(AgentId, crate::actor::ActorRuntimeProbe)>, crate::ActorError> {
         let mut previous = None;
-        for _ in 0..crate::actor::MAX_RETAINED_TURN_RESULTS {
+        for _ in 0..MAX_GRAPH_DRAIN_PASSES {
             let actors: Vec<_> = self
                 .snapshot()
                 .into_iter()
@@ -1151,7 +1156,11 @@ impl AgentManagerHandle {
                 .collect();
             let mut probes = Vec::with_capacity(actors.len());
             for (id, actor) in actors {
-                probes.push((id, actor.runtime_barrier().await?));
+                match actor.runtime_barrier().await {
+                    Ok(probe) => probes.push((id, probe)),
+                    Err(ActorError::Closed | ActorError::Shutdown) => {}
+                    Err(error) => return Err(error),
+                }
             }
             if probes.iter().all(|(_, probe)| probe.is_quiescent())
                 && previous.as_ref() == Some(&probes)
@@ -2252,6 +2261,7 @@ pub(crate) async fn enter_managed_turn(
         policy: None,
         mode: None,
         mode_def: None,
+        context: None,
     };
     Ok((
         ManagedTurnGuard {

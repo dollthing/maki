@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_lite::FutureExt;
-use std::sync::Arc;
 
 use maki_providers::{ContentBlock, Message, MessageKind, Role};
 use maki_storage::sessions::HistorySnapshot;
@@ -43,6 +43,15 @@ pub struct HistoryEditWork {
     checkpoint: HistoryEditCheckpoint,
 }
 
+type PreparedEditResult = Result<
+    (
+        Option<ActorIdleGuard>,
+        PreparedCommit,
+        Option<HistoryChange>,
+    ),
+    ActorError,
+>;
+
 enum HistoryEditAction {
     Rewind {
         boundary: HistoryBoundary,
@@ -51,8 +60,33 @@ enum HistoryEditAction {
     Prepared {
         operation: Box<PreparedOperation>,
         clear_history: bool,
-        completion: flume::Sender<Result<(PreparedCommit, Option<HistoryChange>), ActorError>>,
+        held: bool,
+        completion: flume::Sender<PreparedEditResult>,
     },
+}
+
+pub(super) enum HistoryEditCompletion {
+    Rewind {
+        sender: flume::Sender<Result<HistoryChange, ActorError>>,
+        result: Result<HistoryChange, ActorError>,
+    },
+    Prepared {
+        sender: flume::Sender<PreparedEditResult>,
+        result: PreparedEditResult,
+    },
+}
+
+impl HistoryEditCompletion {
+    pub(super) fn send(self) {
+        match self {
+            Self::Rewind { sender, result } => {
+                let _ = sender.send(result);
+            }
+            Self::Prepared { sender, result } => {
+                let _ = sender.send(result);
+            }
+        }
+    }
 }
 
 impl AgentActorHandle {
@@ -71,19 +105,38 @@ impl AgentActorHandle {
     }
 
     pub fn history_boundaries(&self) -> Result<Vec<HistoryBoundary>, ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(super::lifecycle_error(state.lifecycle));
+        Ok(self
+            .history_boundary_messages()?
+            .into_iter()
+            .map(|(boundary, _)| boundary)
+            .collect())
+    }
+
+    pub fn history_boundary_messages(&self) -> Result<Vec<(HistoryBoundary, Message)>, ActorError> {
+        {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(super::lifecycle_error(state.lifecycle));
+            }
         }
         let history = self.inner.history.load_full();
-        Ok((0..history.messages.len())
-            .filter(|&offset| valid_boundary(&history.messages, offset))
-            .map(|offset| HistoryBoundary {
-                agent_id: self.agent_id(),
-                epoch: history.epoch,
-                offset,
-            })
-            .collect())
+        let mut pending = HashSet::new();
+        let mut valid = true;
+        let mut boundaries = Vec::new();
+        for (offset, message) in history.messages.iter().enumerate() {
+            if valid && pending.is_empty() && is_boundary_message(message) {
+                boundaries.push((
+                    HistoryBoundary {
+                        agent_id: self.agent_id(),
+                        epoch: history.epoch,
+                        offset,
+                    },
+                    message.clone(),
+                ));
+            }
+            valid &= update_pending_tools(message, &mut pending);
+        }
+        Ok(boundaries)
     }
 }
 
@@ -91,11 +144,35 @@ impl ActorIdleGuard {
     /// Starts an actor-owned commit after the caller has revalidated preparation.
     /// Once enqueued, dropping this future does not cancel the transaction.
     pub async fn commit_prepared(
-        mut self,
+        self,
         operation: PreparedOperationTicket,
         clear_history: bool,
         checkpoint: HistoryEditCheckpoint,
     ) -> Result<(PreparedCommit, Option<HistoryChange>), ActorError> {
+        self.commit_prepared_inner(operation, clear_history, checkpoint, false)
+            .await
+            .map(|(_, commit, history)| (commit, history))
+    }
+
+    pub async fn commit_prepared_held(
+        self,
+        operation: PreparedOperationTicket,
+        clear_history: bool,
+        checkpoint: HistoryEditCheckpoint,
+    ) -> Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError> {
+        let (guard, commit, history) = self
+            .commit_prepared_inner(operation, clear_history, checkpoint, true)
+            .await?;
+        Ok((guard.ok_or(ActorError::PolicyCancelled)?, commit, history))
+    }
+
+    async fn commit_prepared_inner(
+        mut self,
+        operation: PreparedOperationTicket,
+        clear_history: bool,
+        checkpoint: HistoryEditCheckpoint,
+        held: bool,
+    ) -> PreparedEditResult {
         if !operation.belongs_to(&self.actor) {
             return Err(ActorError::PolicyCancelled);
         }
@@ -119,6 +196,7 @@ impl ActorIdleGuard {
                 action: HistoryEditAction::Prepared {
                     operation: Box::new(pending),
                     clear_history,
+                    held,
                     completion,
                 },
                 checkpoint,
@@ -170,7 +248,27 @@ impl ActorIdleGuard {
 }
 
 impl HistoryEditWork {
-    pub async fn execute(self, actor: &AgentActorHandle, history: &mut History) {
+    pub(super) fn fail(self, error: ActorError) {
+        match self.action {
+            HistoryEditAction::Rewind { completion, .. } => {
+                let _ = completion.send(Err(error));
+            }
+            HistoryEditAction::Prepared {
+                operation,
+                completion,
+                ..
+            } => {
+                (*operation).fail(error.clone());
+                let _ = completion.send(Err(error));
+            }
+        }
+    }
+
+    pub(super) async fn execute(
+        self,
+        actor: &AgentActorHandle,
+        history: &mut History,
+    ) -> HistoryEditCompletion {
         let mut guard = ActorIdleGuard {
             actor: actor.clone(),
             owner: Arc::clone(&self.owner),
@@ -178,17 +276,21 @@ impl HistoryEditWork {
         };
         match self.action {
             HistoryEditAction::Rewind {
-                ref boundary,
-                ref completion,
+                boundary,
+                completion,
             } => {
                 let result =
-                    Self::apply(&self.owner, boundary, &self.checkpoint, actor, history).await;
-                let _ = completion.send(result);
+                    Self::apply(&self.owner, &boundary, &self.checkpoint, actor, history).await;
                 drop(guard);
+                HistoryEditCompletion::Rewind {
+                    sender: completion,
+                    result,
+                }
             }
             HistoryEditAction::Prepared {
                 operation,
                 clear_history,
+                held,
                 completion,
             } => {
                 let snapshot = clear_history.then(|| {
@@ -220,12 +322,14 @@ impl HistoryEditWork {
                             }
                         });
                         let committed = (*operation).commit_locked(&actor.inner, &mut state);
-                        if let Some(ticket) = &committed.ticket
-                            && let Some(reservation) = state.owned_idle(&self.owner)
-                        {
-                            reservation.permission = Some(ticket.turn_id());
+                        if let Some(reservation) = state.owned_idle(&self.owner) {
                             reservation.committing = false;
-                            guard.release = false;
+                            if held {
+                                guard.release = false;
+                            } else if let Some(ticket) = &committed.ticket {
+                                reservation.permission = Some(ticket.turn_id());
+                                guard.release = false;
+                            }
                         }
                         super::drive_operations(&actor.inner, &mut state);
                         Ok((committed, change))
@@ -261,8 +365,19 @@ impl HistoryEditWork {
                         );
                     }
                 }
-                let _ = completion.send(result);
+                let result = result.map(|(commit, history)| {
+                    let idle = held.then(|| ActorIdleGuard {
+                        actor: actor.clone(),
+                        owner: Arc::clone(&self.owner),
+                        release: true,
+                    });
+                    (idle, commit, history)
+                });
                 drop(guard);
+                HistoryEditCompletion::Prepared {
+                    sender: completion,
+                    result,
+                }
             }
         }
     }
@@ -323,81 +438,270 @@ fn valid_boundary(messages: &[Message], offset: usize) -> bool {
     let Some(message) = messages.get(offset) else {
         return false;
     };
-    if !matches!(message.role, Role::User)
-        || !matches!(message.kind, MessageKind::Turn)
-        || message.content.is_empty()
-        || message
+    let mut pending = HashSet::new();
+    is_boundary_message(message)
+        && messages[..offset]
+            .iter()
+            .all(|message| update_pending_tools(message, &mut pending))
+        && pending.is_empty()
+}
+
+fn is_boundary_message(message: &Message) -> bool {
+    matches!(message.role, Role::User)
+        && matches!(message.kind, MessageKind::Turn)
+        && !message.content.is_empty()
+        && !message
             .content
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-    {
-        return false;
-    }
-    let mut pending = HashSet::new();
-    for message in &messages[..offset] {
-        for block in &message.content {
-            match block {
-                ContentBlock::ToolUse { id, .. } => {
-                    pending.insert(id.as_str());
-                }
-                ContentBlock::ToolResult { tool_use_id, .. }
-                    if !pending.remove(tool_use_id.as_str()) =>
-                {
-                    return false;
-                }
-                _ => {}
+}
+
+fn update_pending_tools<'a>(message: &'a Message, pending: &mut HashSet<&'a str>) -> bool {
+    for block in &message.content {
+        match block {
+            ContentBlock::ToolUse { id, .. } => {
+                pending.insert(id.as_str());
             }
+            ContentBlock::ToolResult { tool_use_id, .. }
+                if !pending.remove(tool_use_id.as_str()) =>
+            {
+                return false;
+            }
+            _ => {}
         }
     }
-    pending.is_empty()
+    true
 }
 
 #[cfg(test)]
 mod tests {
-    use super::valid_boundary;
-    use maki_providers::{ContentBlock, Message, Role};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use futures_lite::future;
+    use maki_providers::{ContentBlock, Message, Role, ThinkingConfig, TokenUsage};
+    use maki_storage::sessions::HistorySnapshot;
+    use test_case::test_case;
+
+    use super::{HistoryEditCheckpoint, valid_boundary};
+    use crate::actor::tests::{ScriptedBackend, input, policy};
+    use crate::actor::{
+        ActorBackend, ActorError, AgentActorHandle, BackendResult, ChildDelivery, ConfigChange,
+        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedTurn, TurnContext, TurnResult,
+        WorkKind,
+    };
+    use crate::{
+        AgentId, AgentInput, AgentMode, DoneReason, History, TurnCancellationReason, TurnId,
+        TurnOutcome,
+    };
+
+    const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
+
+    #[test_case(false, false; "rewind_close")]
+    #[test_case(true, false; "prepared_close")]
+    #[test_case(false, true; "rewind_shutdown")]
+    #[test_case(true, true; "prepared_shutdown")]
+    fn queued_history_edit_resolves_when_actor_closes(prepared: bool, shutdown: bool) {
+        smol::block_on(async {
+            const TEXT: &str = "draft";
+            let (_start, rx) = flume::bounded(1);
+            let (actor, runner) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                vec![Message::user(TEXT.into())],
+                None,
+                Box::new(IdleBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let guard = actor.prepare_idle().unwrap();
+            let checkpoint: HistoryEditCheckpoint =
+                Arc::new(|_| panic!("closed edit must not checkpoint"));
+            let boundary = actor.history_boundaries().unwrap().remove(0);
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let edit = async move {
+                if prepared {
+                    guard
+                        .commit_prepared(operation, true, checkpoint)
+                        .await
+                        .map(|_| ())
+                } else {
+                    drop(operation);
+                    guard.rewind(boundary, checkpoint).await.map(|_| ())
+                }
+            };
+            let mut edit = Box::pin(edit);
+            assert!(future::poll_once(&mut edit).await.is_none());
+            if shutdown {
+                actor.shutdown();
+            } else {
+                actor.close();
+            }
+            runner.await;
+            let result = future::poll_once(edit)
+                .await
+                .expect("queued edit must resolve after close");
+            assert!(matches!(
+                (shutdown, result),
+                (false, Err(ActorError::Closed)) | (true, Err(ActorError::Shutdown))
+            ));
+        });
+    }
+
+    #[test_case(false; "rewind")]
+    #[test_case(true; "prepared_config_only")]
+    fn edit_response_waits_for_runner_cleanup(prepared: bool) {
+        smol::block_on(async {
+            const DRAFT: &str = "draft";
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user(DRAFT.into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let (executed, execution) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            *actor.inner.after_work_execution.lock().unwrap() = Some((executed, released));
+            let guard = actor.prepare_idle().unwrap();
+            let checkpoint: HistoryEditCheckpoint = Arc::new(|_| Box::pin(async { Ok(()) }));
+            let boundary = actor.history_boundaries().unwrap().remove(0);
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let mut edit = Box::pin(async move {
+                if prepared {
+                    guard
+                        .commit_prepared(operation, false, checkpoint)
+                        .await
+                        .map(|_| ())
+                } else {
+                    drop(operation);
+                    guard.rewind(boundary, checkpoint).await.map(|_| ())
+                }
+            });
+            assert!(future::poll_once(&mut edit).await.is_none());
+            execution.recv_async().await.unwrap();
+            let premature = future::poll_once(&mut edit).await;
+            let premature_idle = premature.as_ref().map(|_| actor.prepare_idle().is_ok());
+            release.send(()).unwrap();
+            if premature.is_none() {
+                edit.await.unwrap();
+            }
+            let idle = actor.prepare_idle();
+            let idle_after_response = idle.is_ok();
+            drop(idle);
+            actor.close();
+            runner.await;
+            assert!(
+                premature.is_none(),
+                "edit response must not precede runner cleanup: idle acquisition was {premature_idle:?}"
+            );
+            assert!(idle_after_response);
+        });
+    }
+
+    #[test]
+    fn held_prepared_commit_waits_for_presentation_permission() {
+        smol::block_on(async {
+            const IMPLEMENT: &str = "implement after presentation";
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(ScriptedBackend::new()),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let idle = actor.prepare_idle().unwrap();
+            let operation = actor
+                .reserve_prepared_operation(Some(PreparedTurn {
+                    input: input(IMPLEMENT),
+                    event_sender: None,
+                    correlation: IMPLEMENT.into(),
+                }))
+                .unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let (guard, committed, history) = idle
+                .commit_prepared_held(operation, false, Arc::new(|_| Box::pin(async { Ok(()) })))
+                .await
+                .unwrap();
+            let ticket = committed.ticket.unwrap();
+            assert!(history.is_none());
+            actor.runtime_barrier().await.unwrap();
+            assert!(ticket.peek_result().is_none());
+            assert_eq!(actor.committed_message_count(), 0);
+            guard.allow_turn(&ticket).unwrap();
+            assert!(matches!(
+                ticket.wait().await,
+                crate::TurnOutcome::Completed { .. }
+            ));
+            assert_eq!(actor.committed_message_count(), 1);
+            drop(guard);
+            actor.close();
+            runner.await;
+        });
+    }
 
     struct IdleBackend;
 
-    impl crate::actor::ActorBackend for IdleBackend {
+    impl ActorBackend for IdleBackend {
         fn run_turn<'a>(
             &'a mut self,
-            _: &'a mut crate::History,
-            _: crate::actor::TurnContext,
-            _: crate::AgentInput,
-            _: crate::actor::WorkKind,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::actor::BackendResult> + Send + 'a>,
-        > {
-            Box::pin(async { unreachable!() })
+            history: &'a mut History,
+            context: TurnContext,
+            _: AgentInput,
+            _: WorkKind,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async move {
+                let inbox = context.inbox.unwrap();
+                inbox.commit_completions(&mut |message| history.push(message));
+                assert!(inbox.finish());
+                BackendResult::EnteredRun(TurnOutcome::completed(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    TokenUsage::default(),
+                    0,
+                    DoneReason::EndTurn,
+                ))
+            })
         }
 
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut crate::History,
-            _: crate::actor::TurnContext,
-            _: &'a crate::actor::ControlWork,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::actor::BackendResult> + Send + 'a>,
-        > {
+            _: &'a mut History,
+            _: TurnContext,
+            _: &'a ControlWork,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             Box::pin(async { unreachable!() })
         }
 
         fn run_compact<'a>(
             &'a mut self,
-            _: &'a mut crate::History,
-            _: crate::actor::TurnContext,
+            history: &'a mut History,
+            _: TurnContext,
             _: Option<&'a str>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::actor::BackendResult> + Send + 'a>,
-        > {
-            Box::pin(async { unreachable!() })
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async move {
+                history.replace_compacted(history.as_slice().to_vec());
+                BackendResult::CompactDone
+            })
         }
     }
 
-    #[test_case::test_case(false, false; "preserve_history")]
-    #[test_case::test_case(true, false; "clear_history")]
-    #[test_case::test_case(true, true; "clear_empty_history")]
+    #[test_case(false, false; "preserve_history")]
+    #[test_case(true, false; "clear_history")]
+    #[test_case(true, true; "clear_empty_history")]
     fn prepared_commit_preserves_identity(clear: bool, empty: bool) {
         smol::block_on(async {
             let messages = if empty {
@@ -405,17 +709,10 @@ mod tests {
             } else {
                 vec![Message::user("draft".into())]
             };
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
-                messages,
-                None,
-                Box::new(IdleBackend),
-            );
+            let (actor, runner) =
+                AgentActorHandle::spawn(AgentId::generate(), messages, None, Box::new(IdleBackend));
             actor
-                .initialize_config(crate::actor::EffectiveAgentConfig::new(
-                    super::super::tests::policy(false),
-                    crate::AgentMode::Build,
-                ))
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let original = actor.config_snapshot().unwrap();
             let epoch = actor.inner.history.load().epoch;
@@ -424,7 +721,7 @@ mod tests {
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let (saved, checkpointed) = flume::bounded(1);
-            let checkpoint: super::HistoryEditCheckpoint = std::sync::Arc::new(move |snapshot| {
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |snapshot| {
                 assert!(snapshot.messages.is_empty());
                 saved.send(snapshot).unwrap();
                 Box::pin(async { Ok(()) })
@@ -433,23 +730,17 @@ mod tests {
                 .commit_prepared(operation, clear, checkpoint)
                 .await
                 .unwrap();
-            assert!(std::sync::Arc::ptr_eq(
-                &original.identity,
-                &commit.config.identity
-            ));
+            assert!(Arc::ptr_eq(&original.identity, &commit.config.identity));
             assert_eq!(original.generation, commit.config.generation);
             assert_eq!(change.is_some(), clear);
             if let Some(change) = change {
                 let snapshot = checkpointed.recv().unwrap();
                 assert_eq!(change.epoch, snapshot.epoch);
-                assert!(std::sync::Arc::ptr_eq(&change.messages, &snapshot.messages));
+                assert!(Arc::ptr_eq(&change.messages, &snapshot.messages));
                 let published = actor.inner.history.load();
                 assert_eq!(published.epoch, snapshot.epoch);
                 assert_eq!(published.compacted, snapshot.compacted);
-                assert!(std::sync::Arc::ptr_eq(
-                    &published.messages,
-                    &snapshot.messages
-                ));
+                assert!(Arc::ptr_eq(&published.messages, &snapshot.messages));
                 assert_eq!(change.agent_id, actor.agent_id());
                 assert_ne!(change.epoch, epoch);
                 assert!(change.messages.is_empty());
@@ -467,30 +758,27 @@ mod tests {
     #[test]
     fn prepared_commit_rejects_another_actor() {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 Vec::new(),
                 None,
                 Box::new(IdleBackend),
             );
-            let (other, other_runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (other, other_runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 Vec::new(),
                 None,
                 Box::new(IdleBackend),
             );
             let operation = other.reserve_prepared_operation(None).unwrap();
-            let checkpoint: super::HistoryEditCheckpoint =
-                std::sync::Arc::new(|_| panic!("foreign operation must not checkpoint"));
+            let checkpoint: HistoryEditCheckpoint =
+                Arc::new(|_| panic!("foreign operation must not checkpoint"));
             let result = actor
                 .prepare_idle()
                 .unwrap()
                 .commit_prepared(operation, true, checkpoint)
                 .await;
-            assert!(matches!(
-                result,
-                Err(crate::actor::ActorError::PolicyCancelled)
-            ));
+            assert!(matches!(result, Err(ActorError::PolicyCancelled)));
             assert!(actor.prepare_idle().is_ok());
             assert!(other.prepare_idle().is_ok());
             actor.close();
@@ -500,31 +788,28 @@ mod tests {
         });
     }
 
-    #[test_case::test_case(false, false; "local_cancel")]
-    #[test_case::test_case(true, false; "local_cancel_and_close")]
-    #[test_case::test_case(false, true; "local_cancel_and_shutdown")]
+    #[test_case(false, false; "local_cancel")]
+    #[test_case(true, false; "local_cancel_and_close")]
+    #[test_case(false, true; "local_cancel_and_shutdown")]
     fn prepared_checkpoint_survives_cancel_and_close(close: bool, shutdown: bool) {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
             );
             actor
-                .initialize_config(crate::actor::EffectiveAgentConfig::new(
-                    super::super::tests::policy(false),
-                    crate::AgentMode::Build,
-                ))
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let guard = actor.prepare_idle().unwrap();
-            let turn = (close || shutdown).then(|| super::super::PreparedTurn {
-                input: crate::AgentInput {
+            let turn = (close || shutdown).then(|| PreparedTurn {
+                input: AgentInput {
                     message: String::new(),
-                    mode: crate::AgentMode::Build,
+                    mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: maki_providers::ThinkingConfig::Off,
+                    thinking: ThinkingConfig::Off,
                     fast: false,
                     workflow: false,
                     prompt: None,
@@ -535,13 +820,11 @@ mod tests {
                 correlation: "prepared-close".into(),
             });
             let operation = actor.reserve_prepared_operation(turn).unwrap();
-            operation
-                .resolve(Some(crate::actor::ConfigChange::ToggleFast))
-                .unwrap();
+            operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let checkpoint: super::HistoryEditCheckpoint = std::sync::Arc::new(move |messages| {
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
                 assert!(messages.messages.is_empty());
                 let entered = entered.clone();
                 let released = released.clone();
@@ -555,10 +838,7 @@ mod tests {
             entry.recv_async().await.unwrap();
             assert!(!actor.effective_config().unwrap().fast);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
-            assert!(matches!(
-                actor.prepare_idle(),
-                Err(crate::actor::ActorError::Busy)
-            ));
+            assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
             actor.cancel_local(0);
             if shutdown {
                 actor.shutdown();
@@ -584,37 +864,31 @@ mod tests {
     #[test]
     fn prepared_checkpoint_failure_preserves_config_and_history() {
         smol::block_on(async {
-            const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
             );
             actor
-                .initialize_config(crate::actor::EffectiveAgentConfig::new(
-                    super::super::tests::policy(false),
-                    crate::AgentMode::Build,
-                ))
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let original = actor.config_snapshot().unwrap();
             let epoch = actor.inner.history.load().epoch;
             let guard = actor.prepare_idle().unwrap();
             let operation = actor.reserve_prepared_operation(None).unwrap();
             operation
-                .resolve(Some(crate::actor::ConfigChange::Patch(
-                    crate::actor::ConfigPatch {
-                        fast: Some(true),
-                        ..Default::default()
-                    },
-                )))
+                .resolve(Some(ConfigChange::Patch(ConfigPatch {
+                    fast: Some(true),
+                    ..Default::default()
+                })))
                 .unwrap();
             operation.wait_ready().await.unwrap();
-            let checkpoint: super::HistoryEditCheckpoint =
-                std::sync::Arc::new(|_| Box::pin(async { Err(CHECKPOINT_ERROR.into()) }));
+            let checkpoint: HistoryEditCheckpoint =
+                Arc::new(|_| Box::pin(async { Err(CHECKPOINT_ERROR.into()) }));
             let result = guard.commit_prepared(operation, true, checkpoint).await;
             assert!(
-                matches!(result, Err(crate::actor::ActorError::HistoryCheckpoint(error)) if error == CHECKPOINT_ERROR)
+                matches!(result, Err(ActorError::HistoryCheckpoint(error)) if error == CHECKPOINT_ERROR)
             );
             assert_eq!(
                 actor.config_snapshot().unwrap().generation,
@@ -633,8 +907,8 @@ mod tests {
     #[test]
     fn rewind_checkpoint_is_unpublished_until_ack_and_survives_close() {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("first".into()), Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
@@ -643,7 +917,7 @@ mod tests {
             let epoch = boundary.epoch;
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let checkpoint: super::HistoryEditCheckpoint = std::sync::Arc::new(move |messages| {
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
                 let entered = entered.clone();
                 let released = released.clone();
                 Box::pin(async move {
@@ -658,25 +932,16 @@ mod tests {
             assert_eq!(checkpointed.messages.len(), 1);
             assert_eq!(actor.inner.history.load().epoch, epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 2);
-            assert!(matches!(
-                actor.prepare_idle(),
-                Err(crate::actor::ActorError::Busy)
-            ));
+            assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
             actor.close();
             release.send(()).unwrap();
             let change = edit.await.unwrap();
             assert_eq!(change.epoch, checkpointed.epoch);
-            assert!(std::sync::Arc::ptr_eq(
-                &change.messages,
-                &checkpointed.messages
-            ));
+            assert!(Arc::ptr_eq(&change.messages, &checkpointed.messages));
             let published = actor.inner.history.load();
             assert_eq!(published.epoch, checkpointed.epoch);
             assert_eq!(published.compacted, checkpointed.compacted);
-            assert!(std::sync::Arc::ptr_eq(
-                &published.messages,
-                &checkpointed.messages
-            ));
+            assert!(Arc::ptr_eq(&published.messages, &checkpointed.messages));
             assert_eq!(change.messages.len(), 1);
             assert_ne!(change.epoch, epoch);
             runner.await;
@@ -686,8 +951,8 @@ mod tests {
     #[test]
     fn rewind_serializes_concurrent_child_report() {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
@@ -695,7 +960,7 @@ mod tests {
             let boundary = actor.history_boundaries().unwrap().remove(0);
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let checkpoint: super::HistoryEditCheckpoint = std::sync::Arc::new(move |_| {
+            let checkpoint: HistoryEditCheckpoint = Arc::new(move |_| {
                 let entered = entered.clone();
                 let released = released.clone();
                 Box::pin(async move {
@@ -707,20 +972,20 @@ mod tests {
             let guard = actor.prepare_idle().unwrap();
             let edit = smol::spawn(guard.rewind(boundary, checkpoint));
             entry.recv_async().await.unwrap();
-            let turn_id = crate::TurnId::generate();
-            let report = crate::actor::ChildDelivery {
+            let turn_id = TurnId::generate();
+            let report = ChildDelivery {
                 parent_id: actor.agent_id(),
                 compatibility_id: None,
                 label: None,
                 child_config: None,
                 correlation: "rewind-report".into(),
-                result: crate::actor::TurnResult {
-                    outcome: crate::TurnOutcome::cancelled(
-                        crate::AgentId::generate(),
+                result: TurnResult {
+                    outcome: TurnOutcome::cancelled(
+                        AgentId::generate(),
                         turn_id,
-                        maki_providers::TokenUsage::default(),
+                        TokenUsage::default(),
                         0,
-                        crate::TurnCancellationReason::User,
+                        TurnCancellationReason::User,
                     ),
                     text: "child report".into(),
                     output: Vec::new(),
@@ -728,8 +993,7 @@ mod tests {
                     duration_ms: 0,
                 },
             };
-            super::super::delivery::admit_delivery(&actor.inner, std::sync::Arc::new(report))
-                .unwrap();
+            super::super::delivery::admit_delivery(&actor.inner, Arc::new(report)).unwrap();
             {
                 let mut state = actor.inner.state.lock().unwrap();
                 super::super::delivery::schedule(&actor.inner, &mut state);
@@ -737,9 +1001,17 @@ mod tests {
                 assert!(state.pop_work(&actor.inner.queue).is_none());
             }
             assert_eq!(actor.inner.history.load().messages.len(), 1);
-            assert!(actor.withdraw_child_delivery(turn_id));
             release.send(()).unwrap();
             assert!(edit.await.unwrap().messages.is_empty());
+            actor.runtime_barrier().await.unwrap();
+            assert_eq!(actor.committed_message_count(), 1);
+            assert!(
+                actor.inner.history.load().messages[0]
+                    .first_text_content()
+                    .unwrap()
+                    .contains("child report")
+            );
+            assert!(!actor.withdraw_child_delivery(turn_id));
             actor.close();
             runner.await;
         });
@@ -748,25 +1020,21 @@ mod tests {
     #[test]
     fn rewind_callback_panic_releases_reservation_without_publication() {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
             );
             let boundary = actor.history_boundaries().unwrap().remove(0);
             let epoch = boundary.epoch;
-            let checkpoint: super::HistoryEditCheckpoint =
-                std::sync::Arc::new(|_| panic!("callback panic"));
+            let checkpoint: HistoryEditCheckpoint = Arc::new(|_| panic!("callback panic"));
             let result = actor
                 .prepare_idle()
                 .unwrap()
                 .rewind(boundary, checkpoint)
                 .await;
-            assert!(matches!(
-                result,
-                Err(crate::actor::ActorError::HistoryCheckpoint(_))
-            ));
+            assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
             actor.close();
@@ -777,34 +1045,27 @@ mod tests {
     #[test]
     fn rewind_checkpoint_failure_restores_history() {
         smol::block_on(async {
-            let (actor, runner) = crate::actor::AgentActorHandle::spawn(
-                crate::AgentId::generate(),
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
                 vec![Message::user("first".into()), Message::user("draft".into())],
                 None,
                 Box::new(IdleBackend),
             );
             let boundary = actor.history_boundaries().unwrap().remove(1);
             let original = actor.inner.history.load_full();
-            let checkpoint: super::HistoryEditCheckpoint =
-                std::sync::Arc::new(|_: maki_storage::sessions::HistorySnapshot<Message>| {
-                    Box::pin(async { Err("checkpoint unavailable".to_owned()) }) as _
-                });
+            let checkpoint: HistoryEditCheckpoint = Arc::new(|_: HistorySnapshot<Message>| {
+                Box::pin(async { Err(CHECKPOINT_ERROR.to_owned()) }) as _
+            });
             let result = actor
                 .prepare_idle()
                 .unwrap()
                 .rewind(boundary.clone(), checkpoint)
                 .await;
-            assert!(matches!(
-                result,
-                Err(crate::actor::ActorError::HistoryCheckpoint(_))
-            ));
+            assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, original.epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 2);
-            let checkpoint: super::HistoryEditCheckpoint =
-                std::sync::Arc::new(|_: maki_storage::sessions::HistorySnapshot<Message>| {
-                    Box::pin(async { Ok(()) }) as _
-                });
-            actor.runtime_barrier().await.unwrap();
+            let checkpoint: HistoryEditCheckpoint =
+                Arc::new(|_: HistorySnapshot<Message>| Box::pin(async { Ok(()) }) as _);
             let guard = actor.prepare_idle().unwrap();
             let changed = guard
                 .rewind(boundary.clone(), checkpoint.clone())
@@ -812,12 +1073,109 @@ mod tests {
                 .unwrap();
             assert_eq!(changed.messages.len(), 1);
             assert_ne!(changed.epoch, original.epoch);
-            actor.runtime_barrier().await.unwrap();
             let guard = actor.prepare_idle().unwrap();
             let stale = guard.rewind(boundary, checkpoint).await;
+            assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
+            actor.close();
+            runner.await;
+        });
+    }
+
+    #[test_case(false; "foreign_actor")]
+    #[test_case(true; "invalidated_by_compaction")]
+    fn rewind_rejects_foreign_or_compacted_boundary(compacted: bool) {
+        smol::block_on(async {
+            const DRAFT: &str = "draft";
+            const RUN: u64 = 1;
+            let (actor, runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user(DRAFT.into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            let (other, other_runner) = AgentActorHandle::spawn(
+                AgentId::generate(),
+                vec![Message::user(DRAFT.into())],
+                None,
+                Box::new(IdleBackend),
+            );
+            let boundary = if compacted {
+                actor.history_boundaries().unwrap().remove(0)
+            } else {
+                other.history_boundaries().unwrap().remove(0)
+            };
+            if compacted {
+                actor.push_compact(RUN, None).unwrap();
+                actor.runtime_barrier().await.unwrap();
+                assert!(actor.inner.history.load().compacted);
+                assert_ne!(boundary.epoch, actor.inner.history.load().epoch);
+            }
+            let epoch = actor.inner.history.load().epoch;
+            let result = actor
+                .prepare_idle()
+                .unwrap()
+                .rewind(
+                    boundary,
+                    Arc::new(|_| panic!("stale boundary must not checkpoint")),
+                )
+                .await;
+            assert!(matches!(result, Err(ActorError::StaleHistoryBoundary)));
+            assert_eq!(actor.inner.history.load().epoch, epoch);
+            assert_eq!(actor.committed_message_count(), 1);
+            actor.close();
+            other.close();
+            runner.await;
+            other_runner.await;
+        });
+    }
+
+    #[test]
+    fn boundary_messages_match_one_committed_snapshot() {
+        smol::block_on(async {
+            const FIRST: &str = "first";
+            const NEXT: &str = "next";
+            let messages = vec![
+                Message::user(FIRST.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "answer".into(),
+                    }],
+                    ..Default::default()
+                },
+                Message::user(NEXT.into()),
+            ];
+            let (actor, runner) =
+                AgentActorHandle::spawn(AgentId::generate(), messages, None, Box::new(IdleBackend));
+            let boundaries = actor.history_boundary_messages().unwrap();
+            assert_eq!(
+                boundaries
+                    .iter()
+                    .map(|(boundary, message)| (
+                        boundary.offset,
+                        message.first_text_content().unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(0, FIRST), (2, NEXT)]
+            );
+            assert!(
+                boundaries
+                    .iter()
+                    .all(|(boundary, _)| boundary.agent_id == actor.agent_id()
+                        && boundary.epoch == boundaries[0].0.epoch)
+            );
+            let boundary = boundaries[1].0.clone();
+            actor
+                .prepare_idle()
+                .unwrap()
+                .rewind(boundary.clone(), Arc::new(|_| Box::pin(async { Ok(()) })))
+                .await
+                .unwrap();
+            assert!(actor.prepare_idle().is_ok());
+            assert_eq!(boundaries[1].1.first_text_content(), Some(NEXT));
             assert!(matches!(
-                stale,
-                Err(crate::actor::ActorError::StaleHistoryBoundary)
+                actor.history_boundary_message(&boundary),
+                Err(ActorError::StaleHistoryBoundary)
             ));
             actor.close();
             runner.await;

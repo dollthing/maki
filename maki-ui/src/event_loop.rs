@@ -1342,7 +1342,6 @@ impl SessionRuntime {
             .queue
             .try_push(QueueItem::Message {
                 text,
-                image_count: 0,
                 input,
                 run_id,
                 displayed: false,
@@ -4484,7 +4483,6 @@ impl<'t> EventLoop<'t> {
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Message {
                     text: input.message.clone(),
-                    image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
@@ -5944,7 +5942,6 @@ mod tests {
             );
             runtime.handles.queue.push(QueueItem::Message {
                 text: "after barrier".into(),
-                image_count: 0,
                 input: maki_agent::AgentInput {
                     message: "after barrier".into(),
                     mode: Default::default(),
@@ -6719,7 +6716,6 @@ mod tests {
             );
             runtime.handles.queue.push(QueueItem::Message {
                 text: "queued root".into(),
-                image_count: 0,
                 input: maki_agent::AgentInput {
                     message: "queued root".into(),
                     mode: Default::default(),

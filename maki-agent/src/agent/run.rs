@@ -1152,6 +1152,7 @@ mod tests {
 
     use super::*;
     use crate::Envelope;
+    use crate::actor::{PendingSubmission, SubmissionId};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
 
@@ -1428,6 +1429,24 @@ mod tests {
     }
 
     impl TurnInbox for FinishRaceInbox {
+        fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+            const SUBMISSION: SubmissionId = SubmissionId(1);
+            self.drain_instructions()
+                .into_iter()
+                .map(|input| {
+                    let presentation = PendingSubmission {
+                        id: SUBMISSION,
+                        turn_id: TurnId::generate(),
+                        text: input.message.clone(),
+                        images: input.images.clone(),
+                        already_displayed: true,
+                        mcp_startup_notice: None,
+                    };
+                    (presentation, input)
+                })
+                .collect()
+        }
+
         fn drain_instructions(&self) -> Vec<AgentInput> {
             let inputs = std::mem::take(&mut *self.pending.lock().unwrap());
             if !inputs.is_empty() {
@@ -1560,6 +1579,10 @@ mod tests {
         struct PendingCompletionInbox;
 
         impl TurnInbox for PendingCompletionInbox {
+            fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+                Vec::new()
+            }
+
             fn drain_instructions(&self) -> Vec<AgentInput> {
                 Vec::new()
             }
@@ -1616,6 +1639,10 @@ mod tests {
     }
 
     impl TurnInbox for LateReportInbox {
+        fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+            Vec::new()
+        }
+
         fn drain_instructions(&self) -> Vec<AgentInput> {
             Vec::new()
         }
@@ -1714,6 +1741,24 @@ mod tests {
         }
 
         impl TurnInbox for FreshnessInbox {
+            fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+                const SUBMISSION: SubmissionId = SubmissionId(1);
+                self.drain_instructions()
+                    .into_iter()
+                    .map(|input| {
+                        let presentation = PendingSubmission {
+                            id: SUBMISSION,
+                            turn_id: TurnId::generate(),
+                            text: input.message.clone(),
+                            images: input.images.clone(),
+                            already_displayed: true,
+                            mcp_startup_notice: None,
+                        };
+                        (presentation, input)
+                    })
+                    .collect()
+            }
+
             fn drain_instructions(&self) -> Vec<AgentInput> {
                 self.instruction
                     .lock()

@@ -5,12 +5,13 @@
 //! closure under the queue lock, so a drain publication can never interleave
 //! with a concurrent push, matching the TUI's expectation.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::{ActorInner, ActorWork, TurnAdmission};
+use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission};
 use crate::types::TurnId;
 use crate::{AgentInput, ExtractedCommand};
 
@@ -22,11 +23,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// queue panel without importing UI types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueProjection {
-    Message {
-        text: String,
-        image_count: usize,
-        displayed: bool,
-    },
     Compact(Option<String>),
     Control(String),
     Turn(String),
@@ -85,13 +81,21 @@ impl ActorQueue {
         }
     }
 
-    pub(super) fn remove_compact(&self, run_id: u64) -> Option<Option<String>> {
+    pub(super) fn remove_compact(&self, operation_id: u64) -> Option<PendingQueueEntry> {
         let mut items = lock(&self.items);
         let index = items.iter().position(
-            |work| matches!(work, ActorWork::Compact { run_id: id, .. } if *id == run_id),
+            |work| matches!(work, ActorWork::Compact { operation_id: id, .. } if *id == operation_id),
         )?;
         match items.remove(index)? {
-            ActorWork::Compact { instructions, .. } => Some(instructions),
+            ActorWork::Compact {
+                run_id,
+                instructions,
+                ..
+            } => Some(PendingQueueEntry::Compact {
+                operation_id,
+                run_id,
+                instructions,
+            }),
             _ => None,
         }
     }
@@ -120,20 +124,11 @@ impl ActorQueue {
         Err(Box::new(input))
     }
 
-    /// Removes the item at raw `index` (the same index [`snapshot`](Self::snapshot)
-    /// uses) and returns it. `None` is returned for out-of-bounds indices.
-    pub fn remove_at(&self, index: usize) -> Option<ActorWork> {
-        let mut items = lock(&self.items);
-        items.remove(index)
-    }
-
     /// Turns carry a host correlation; compacts use their canonical `r{run_id}` encoding.
-    fn correlation_of(work: &ActorWork) -> Option<std::borrow::Cow<'_, str>> {
+    fn correlation_of(work: &ActorWork) -> Option<Cow<'_, str>> {
         match work {
-            ActorWork::Turn(a) => Some(std::borrow::Cow::Borrowed(a.correlation.as_str())),
-            ActorWork::Compact { run_id, .. } => {
-                Some(std::borrow::Cow::Owned(super::run_correlation(*run_id)))
-            }
+            ActorWork::Turn(a) => Some(Cow::Borrowed(a.correlation.as_str())),
+            ActorWork::Compact { run_id, .. } => Some(Cow::Owned(super::run_correlation(*run_id))),
             ActorWork::Control(_) | ActorWork::HistoryEdit(_) => None,
         }
     }
@@ -158,48 +153,8 @@ impl ActorQueue {
         removed
     }
 
-    /// Compactions are visible ordered work; pending messages are projected separately.
-    pub fn is_visible(work: &ActorWork) -> bool {
-        match work {
-            ActorWork::Compact { .. } => true,
-            ActorWork::Turn(_) | ActorWork::Control(_) | ActorWork::HistoryEdit(_) => false,
-        }
-    }
-
-    /// Removes the `visible_index`-th item in panel order and returns its
-    /// projection plus the work. `None` when the panel has fewer rows.
-    pub fn remove_visible_at(&self, visible_index: usize) -> Option<(ActorWork, QueueProjection)> {
-        let mut items = lock(&self.items);
-        let mut seen = 0usize;
-        let mut target = None;
-        for (i, w) in items.iter().enumerate() {
-            if Self::is_visible(w) {
-                if seen == visible_index {
-                    target = Some(i);
-                    break;
-                }
-                seen += 1;
-            }
-        }
-        let index = target?;
-        let work = items.remove(index)?;
-        let projection = (&work).into();
-        Some((work, projection))
-    }
-
     pub fn len(&self) -> usize {
         lock(&self.items).len()
-    }
-
-    pub fn has_work_after_generation(&self, generation: u64) -> bool {
-        lock(&self.items).iter().any(|work| match work {
-            ActorWork::Turn(turn) => turn.generation > generation,
-            ActorWork::Compact {
-                generation: queued_generation,
-                ..
-            } => *queued_generation > generation,
-            ActorWork::Control(_) | ActorWork::HistoryEdit(_) => false,
-        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -231,17 +186,19 @@ impl ActorQueue {
     /// A neutral snapshot of the queue for the TUI projection.
     pub(super) fn project_pending(
         &self,
-        messages: &impl Fn(TurnId) -> Vec<super::PendingQueueEntry>,
-    ) -> Vec<super::PendingQueueEntry> {
+        messages: &impl Fn(TurnId) -> Vec<PendingQueueEntry>,
+    ) -> Vec<PendingQueueEntry> {
         lock(&self.items)
             .iter()
             .flat_map(|work| match work {
                 ActorWork::Turn(turn) => messages(turn.turn_id),
                 ActorWork::Compact {
+                    operation_id,
                     run_id,
                     instructions,
                     ..
-                } => vec![super::PendingQueueEntry::Compact {
+                } => vec![PendingQueueEntry::Compact {
+                    operation_id: *operation_id,
                     run_id: *run_id,
                     instructions: instructions.clone(),
                 }],
@@ -350,6 +307,7 @@ mod tests {
 
     fn compact(generation: u64) -> ActorWork {
         ActorWork::Compact {
+            operation_id: generation,
             run_id: generation,
             instructions: Some(INSTRUCTIONS.into()),
             generation,

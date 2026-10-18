@@ -106,7 +106,7 @@ struct ScriptedState {
 /// `run_turn` always polls the interrupt source exactly once (before the
 /// gate), which makes the root-fold and interrupt-extraction tests
 /// deterministic.
-struct ScriptedBackend {
+pub(super) struct ScriptedBackend {
     state: Arc<ScriptedState>,
     gate: Option<Arc<Gate>>,
     outcomes: Mutex<Vec<BackendResult>>,
@@ -147,7 +147,7 @@ impl Gate {
 }
 
 impl ScriptedBackend {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: Arc::new(ScriptedState::default()),
             gate: None,
@@ -410,7 +410,7 @@ impl ActorBackend for CancellableBackend {
     }
 }
 
-fn input(message: &str) -> AgentInput {
+pub(super) fn input(message: &str) -> AgentInput {
     AgentInput {
         message: message.to_owned(),
         mode: AgentMode::Build,
@@ -1070,7 +1070,7 @@ fn presentation_counter_is_actor_owned_and_cancel_fences_late_allocation() {
                 .unwrap(),
             9
         );
-        let (turn, fence) = actor.capture_processing_presentation_cut(9);
+        let (turn, fence) = actor.cancel_local(9);
         assert_eq!(turn, Some(ticket.turn_id()));
         assert_eq!(fence, 10);
         // The cut cancels the run, which may settle before this call; either
@@ -1457,7 +1457,7 @@ fn pending_cancellation_publishes_end_before_single_idle(
             if clear {
                 assert_eq!(actor.clear(), 2);
             } else if remove_index {
-                assert!(actor.remove_at(0).is_some());
+                actor.remove(turn_id).unwrap();
             } else {
                 actor.cancel_turn(turn_id).unwrap();
             }
@@ -3139,15 +3139,7 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
                 .collect::<Vec<_>>(),
             ["removed", "cleared", "root"]
         );
-        let index = snapshot
-            .queue
-            .iter()
-            .position(|work| *work == QueueProjection::Turn("removed".into()))
-            .unwrap();
-        assert_eq!(
-            handle.remove_at(index),
-            Some(QueueProjection::Turn("removed".into()))
-        );
+        handle.remove(removed.turn_id()).unwrap();
         assert!(matches!(
             removed.wait().await,
             TurnOutcome::Cancelled { .. }
@@ -3492,6 +3484,7 @@ fn queue_drain_publication_is_ordered() {
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(*published.lock().unwrap(), 1, "empty queue publishes");
     queue.push(ActorWork::Compact {
+        operation_id: 1,
         run_id: 1,
         instructions: None,
         generation: 0,
@@ -3753,7 +3746,7 @@ fn targeted_cancel_first_reason_wins_vs_close() {
 }
 
 #[test]
-fn remove_at_raw_index_terminalizes_real_turn() {
+fn remove_turn_terminalizes_exact_queued_turn() {
     smol::block_on(async {
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
@@ -3770,8 +3763,10 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("queued2"), None, "r3".into())
             .unwrap();
 
-        let removed = handle.remove_at(0).unwrap();
-        assert!(matches!(removed, QueueProjection::Turn(_)));
+        assert!(matches!(
+            handle.remove(t2.turn_id()).unwrap(),
+            TurnOutcome::Cancelled { .. }
+        ));
         assert!(matches!(
             t2.wait().await,
             TurnOutcome::Cancelled {
@@ -3791,12 +3786,15 @@ fn remove_at_raw_index_terminalizes_real_turn() {
 }
 
 #[test]
-fn remove_at_out_of_bounds_is_none() {
+fn remove_unknown_turn_is_rejected() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let (handle, task) = spawn(backend);
-        assert_eq!(handle.remove_at(0), None);
-        assert_eq!(handle.remove_visible_at(0), None);
+        let turn_id = TurnId::generate();
+        assert_eq!(
+            handle.remove(turn_id),
+            Err(ActorError::UnknownTurn(turn_id))
+        );
         handle.close();
         task.await;
     });
@@ -3847,6 +3845,207 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
             TurnOutcome::Completed { .. }
         ));
         handle.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "close")]
+#[test_case::test_case(true; "shutdown")]
+fn close_cut_wins_over_completed_backend_with_joined_input(shutdown: bool) {
+    smol::block_on(async {
+        const FIRST: &str = "initial task";
+        const JOINED: &str = "joined instruction";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let joined = actor
+            .submit(input(JOINED), None, JOINED.into(), Default::default())
+            .unwrap();
+        assert_eq!(first.turn_id(), joined.turn_id());
+        let (captured, cut) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        *actor.inner.after_close_cut.lock().unwrap() = Some((captured, released));
+        let closing = actor.clone();
+        let thread = std::thread::spawn(move || {
+            if shutdown {
+                closing.shutdown()
+            } else {
+                closing.close()
+            }
+        });
+        cut.recv_async().await.unwrap();
+        gate.open();
+        let outcome = first.wait().await;
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        task.await;
+        let reason = if shutdown {
+            TurnCancellationReason::Shutdown
+        } else {
+            TurnCancellationReason::Closed
+        };
+        assert!(state.folds.lock().unwrap().is_empty());
+        assert!(
+            matches!(outcome, TurnOutcome::Cancelled { reason: actual, .. } if actual == reason)
+        );
+        assert!(
+            matches!(joined.wait().await, TurnOutcome::Cancelled { reason: actual, .. } if actual == reason)
+        );
+    });
+}
+
+#[test]
+fn local_cancel_cut_wins_over_completed_backend_with_joined_input() {
+    smol::block_on(async {
+        const FIRST: &str = "initial task";
+        const JOINED: &str = "joined instruction";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let first = actor
+            .submit(input(FIRST), None, FIRST.into(), Default::default())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let joined = actor
+            .submit(input(JOINED), None, JOINED.into(), Default::default())
+            .unwrap();
+        assert_eq!(first.turn_id(), joined.turn_id());
+        let cut = {
+            let mut state = actor.inner.state.lock().unwrap();
+            actor.capture_local_cancel(&mut state, 0)
+        };
+        gate.open();
+        let outcome = first.wait().await;
+        actor.settle_local_cancel(cut);
+        actor.close();
+        task.await;
+        assert!(state.folds.lock().unwrap().is_empty());
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert!(matches!(joined.wait().await, TurnOutcome::Cancelled { .. }));
+    });
+}
+
+#[test_case::test_case(false; "unresolved")]
+#[test_case::test_case(true; "ready")]
+fn local_cancel_discards_reserved_prepared_turn(ready: bool) {
+    smol::block_on(async {
+        const TEXT: &str = "implementation";
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let operation = actor
+            .reserve_prepared_operation(Some(super::PreparedTurn {
+                input: input(TEXT),
+                event_sender: None,
+                correlation: TEXT.into(),
+            }))
+            .unwrap();
+        if ready {
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+        }
+        actor.cancel_local(0);
+        let result = operation.resolve(None);
+        actor.close();
+        task.await;
+        assert!(matches!(result, Err(ActorError::PolicyCancelled)));
+    });
+}
+
+#[test_case::test_case(false; "cancelled")]
+#[test_case::test_case(true; "equivalent_commit")]
+fn steering_resumes_after_reserved_config_disappears(commit: bool) {
+    smol::block_on(async {
+        const TEXT: &str = "instruction";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let config = actor.reserve_config_update().unwrap();
+        if commit {
+            config.resolve(Ok(fast_change(false))).unwrap();
+            config.wait().await.unwrap();
+        } else {
+            drop(config);
+        }
+        let joined = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        gate.open();
+        first.wait().await;
+        joined.wait().await;
+        actor.close();
+        task.await;
+        assert_eq!(first.turn_id(), joined.turn_id());
+    });
+}
+
+#[test]
+fn shared_submission_preserves_large_images_and_preamble() {
+    smol::block_on(async {
+        const TEXT: &str = "image instruction";
+        const PREAMBLE: &str = "shell output";
+        let (start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let mut request = input(TEXT);
+        request.images = vec![ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from("a".repeat(super::MAX_PENDING_INSTRUCTION_BYTES + 1)),
+        )];
+        request.preamble = vec![Message::user(PREAMBLE.into())];
+        let images = request.images.clone();
+        let ticket = actor.submit(request, None, TEXT.into(), Default::default());
+        if let Ok(ticket) = &ticket {
+            let state = actor.inner.state.lock().unwrap();
+            let inbox = &state.instructions[&ticket.turn_id()];
+            assert_eq!(inbox.initial.as_ref().unwrap().images, images);
+        }
+        start.send(()).unwrap();
+        ticket.unwrap().wait().await;
+        let history = actor.inner.history.load_full();
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .filter_map(Message::first_text_content)
+                .collect::<Vec<_>>(),
+            vec![PREAMBLE, TEXT]
+        );
+        actor.close();
         task.await;
     });
 }
@@ -4020,8 +4219,7 @@ fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
             .unwrap();
         if bytes {
             let initial = input(TEXT);
-            let overhead = serde_json::to_vec(&initial.images).unwrap().len()
-                + serde_json::to_vec(&initial.preamble).unwrap().len();
+            let overhead = serde_json::to_vec(&initial.preamble).unwrap().len();
             let text = "é".repeat(
                 (super::MAX_PENDING_INSTRUCTION_BYTES - TEXT.len() - 2 * overhead) / "é".len(),
             );
@@ -4091,6 +4289,81 @@ fn graph_quiescence_probe_detects_extra_execution() {
     });
 }
 
+#[test_case::test_case(false; "materialized")]
+#[test_case::test_case(true; "reserved")]
+fn compact_removal_uses_unique_operation_id(reserved: bool) {
+    smol::block_on(async {
+        const RUN: u64 = 19;
+        const FIRST: &str = "first compact";
+        const SECOND: &str = "second compact";
+        let (_start, rx) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            Some(rx),
+        );
+        let reservation = reserved.then(|| actor.reserve_config_update().unwrap());
+        actor.push_compact(RUN, Some(FIRST.into())).unwrap();
+        actor.push_compact(RUN, Some(SECOND.into())).unwrap();
+        let entries = actor.pending_queue();
+        let ids: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                super::PendingQueueEntry::Compact { operation_id, .. } => Some(*operation_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(
+            matches!(actor.remove_pending_compact(ids[1]), Some(super::PendingQueueEntry::Compact { instructions: Some(text), .. }) if text == SECOND)
+        );
+        assert!(actor.remove_pending_compact(ids[1]).is_none());
+        assert!(
+            matches!(&actor.pending_queue()[..], [super::PendingQueueEntry::Compact { instructions: Some(text), .. }] if text == FIRST)
+        );
+        drop(reservation);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn committed_message_count_tracks_live_history() {
+    smol::block_on(async {
+        const TEXT: &str = "initial task";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let (actor, task) = spawn(backend);
+        assert_eq!(actor.committed_message_count(), 0);
+        let ticket = actor
+            .submit(input(TEXT), None, TEXT.into(), Default::default())
+            .unwrap();
+        until(|| {
+            actor
+                .inner
+                .history
+                .load()
+                .messages
+                .first()
+                .and_then(Message::first_text_content)
+                == Some(TEXT)
+        })
+        .await;
+        assert!(ticket.peek_result().is_none());
+        assert_eq!(actor.committed_message_count(), 1);
+        gate.open();
+        ticket.wait().await;
+        assert_eq!(actor.committed_message_count(), 1);
+        actor.close();
+        task.await;
+    });
+}
+
 #[test]
 fn pending_queue_preserves_compaction_boundary_order() {
     smol::block_on(async {
@@ -4118,8 +4391,11 @@ fn pending_queue_preserves_compaction_boundary_order() {
         assert!(
             matches!(&entries[..], [super::PendingQueueEntry::Message(first), super::PendingQueueEntry::Compact {run_id: RUN, ..}, super::PendingQueueEntry::Message(next)] if first.text == FIRST && next.text == NEXT)
         );
-        assert!(actor.remove_pending_compact(RUN).is_some());
-        assert!(actor.remove_pending_compact(RUN).is_none());
+        let super::PendingQueueEntry::Compact { operation_id, .. } = entries[1] else {
+            unreachable!()
+        };
+        assert!(actor.remove_pending_compact(operation_id).is_some());
+        assert!(actor.remove_pending_compact(operation_id).is_none());
         actor.close();
         task.await;
     });

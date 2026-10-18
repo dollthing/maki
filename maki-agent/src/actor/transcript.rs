@@ -33,6 +33,10 @@ pub struct TranscriptSnapshot {
 }
 
 impl AgentActorHandle {
+    pub fn committed_message_count(&self) -> usize {
+        self.inner.history.load().messages.len()
+    }
+
     pub fn transcript(&self, request: TranscriptRequest) -> Result<TranscriptSnapshot, ActorError> {
         self.transcript_inner(
             request,

@@ -21,8 +21,8 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use maki_agent::actor::{
-    ActorError, AgentActorHandle, PendingQueueEntry, QueueProjection, TurnAdmissionOptions,
-    TurnOrigin, TurnProvenance,
+    ActorError, AgentActorHandle, PendingQueueEntry, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance,
 };
 use maki_agent::{AgentInput, ImageSource, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
@@ -46,10 +46,14 @@ impl From<Submission> for QueuedMessage {
     }
 }
 
+enum QueueProjection {
+    Message { text: String, displayed: bool },
+    Compact(Option<String>),
+}
+
 pub(crate) enum QueueItem {
     Message {
         text: String,
-        image_count: usize,
         input: AgentInput,
         run_id: u64,
         /// `true` when the UI already drew the bubble (immediate dispatch).
@@ -131,7 +135,7 @@ impl QueueSender {
     pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
         match &self.backend {
             QueueBackend::Actor(actor) => {
-                let cut = actor.capture_processing_presentation_cut(displayed_run_id);
+                let cut = actor.cancel_local(displayed_run_id);
                 self.last_run_id.fetch_max(cut.1, Ordering::Relaxed);
                 cut
             }
@@ -225,8 +229,8 @@ impl QueueSender {
                     Some(PendingQueueEntry::Message(entry)) => {
                         actor.remove_submission(entry.id).is_some()
                     }
-                    Some(PendingQueueEntry::Compact { run_id, .. }) => {
-                        actor.remove_pending_compact(run_id).is_some()
+                    Some(PendingQueueEntry::Compact { operation_id, .. }) => {
+                        actor.remove_pending_compact(operation_id).is_some()
                     }
                     None => false,
                 }
@@ -306,7 +310,6 @@ impl QueueSender {
                 .map(|entry| match entry {
                     PendingQueueEntry::Message(entry) => QueueProjection::Message {
                         text: entry.text,
-                        image_count: entry.images.len(),
                         displayed: entry.already_displayed,
                     },
                     PendingQueueEntry::Compact { instructions, .. } => {
@@ -351,10 +354,7 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
 fn visible_in_panel(entry: &QueueProjection) -> bool {
     match entry {
         QueueProjection::Message { displayed, .. } => !displayed,
-        // Admitted turns project as `Turn`; they are already running or
-        // already drawn, so the panel never reserves a row for them.
         QueueProjection::Compact(_) => true,
-        QueueProjection::Control(_) | QueueProjection::Turn(_) => false,
     }
 }
 
@@ -374,10 +374,6 @@ fn as_queue_entry(entry: &QueueProjection) -> QueueEntry<'static> {
                 .fg
                 .unwrap_or(theme::current().foreground),
         },
-        QueueProjection::Control(name) | QueueProjection::Turn(name) => QueueEntry {
-            text: Cow::Owned(name.clone()),
-            color: theme::current().foreground,
-        },
     }
 }
 
@@ -385,13 +381,9 @@ impl From<&QueueItem> for QueueProjection {
     fn from(item: &QueueItem) -> Self {
         match item {
             QueueItem::Message {
-                text,
-                image_count,
-                displayed,
-                ..
+                text, displayed, ..
             } => QueueProjection::Message {
                 text: text.clone(),
-                image_count: *image_count,
                 displayed: *displayed,
             },
             QueueItem::Compact { instructions, .. } => {
@@ -409,7 +401,6 @@ mod tests {
     fn msg(displayed: bool) -> QueueItem {
         QueueItem::Message {
             text: "t".into(),
-            image_count: 0,
             input: AgentInput {
                 message: String::new(),
                 mode: Default::default(),

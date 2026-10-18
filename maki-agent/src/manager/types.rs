@@ -144,6 +144,7 @@ pub struct CurrentManagedTurn {
     pub(crate) policy: Option<Arc<crate::RunSettings>>,
     pub(crate) mode: Option<crate::AgentMode>,
     pub(crate) mode_def: Option<crate::ModeDef>,
+    pub(crate) context: Option<crate::actor::AgentContextSnapshot>,
 }
 
 impl CurrentManagedTurn {

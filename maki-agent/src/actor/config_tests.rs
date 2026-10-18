@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
     ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
-    QueueProjection,
+    PendingQueueEntry, QueueProjection,
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
@@ -387,7 +387,7 @@ fn prepared_turn_commit_pins_config_and_allocates_one_ticket(displayed: Option<b
 }
 
 #[test_case::test_case("drop")]
-#[test_case::test_case("remove")]
+#[test_case::test_case("cancel")]
 #[test_case::test_case("clear")]
 #[test_case::test_case("close")]
 fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
@@ -408,8 +408,8 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
         successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
         match action {
             "drop" => drop(reservation),
-            "remove" => {
-                assert!(actor.remove_at(0).is_some());
+            "cancel" => {
+                reservation.cancel();
                 assert_eq!(
                     reservation.wait_ready().await,
                     Err(ActorError::PolicyCancelled)
@@ -923,13 +923,13 @@ fn prepared_raw_and_visible_removal_keep_snapshot_reservation() {
                 QueueProjection::Compact(None)
             ]
         );
-        assert_eq!(
-            actor.remove_visible_at(0),
-            Some(QueueProjection::Compact(None))
-        );
-        assert_eq!(actor.remove_at(0), Some(QueueProjection::Turn(WORK.into())));
+        let PendingQueueEntry::Compact { operation_id, .. } = actor.pending_queue()[0] else {
+            unreachable!()
+        };
+        assert!(actor.remove_pending_compact(operation_id).is_some());
+        turn.cancel();
         assert_eq!(turn.wait_ready().await, Err(ActorError::PolicyCancelled));
-        assert!(actor.remove_at(0).is_none());
+        assert!(actor.pending_queue().is_empty());
         snapshot.resolve(None).unwrap();
         snapshot.wait_ready().await.unwrap();
         snapshot.commit().unwrap();
@@ -1130,7 +1130,6 @@ fn control_waits_for_earlier_preparation(root: bool) {
     });
 }
 
-#[test_case::test_case("remove")]
 #[test_case::test_case("clear")]
 #[test_case::test_case("cancel_existing")]
 #[test_case::test_case("close")]
@@ -1159,17 +1158,12 @@ fn deferred_control_queue_operations(action: &str) {
         };
         actor.push_control(control()).unwrap();
         assert!(actor.inner.queue.is_empty());
-        assert_eq!(actor.remove_visible_at(0), None);
+        assert!(
+            matches!(&actor.pending_queue()[..], [PendingQueueEntry::Message(pending)] if pending.turn_id == ticket.turn_id())
+        );
         let (stale_tx, stale_rx) = flume::bounded(1);
         *actor.inner.stale_preparation.lock().unwrap() = Some(stale_tx);
         match action {
-            "remove" => {
-                assert_eq!(
-                    actor.remove_at(1),
-                    Some(QueueProjection::Control(CONTROL.into()))
-                );
-                actor.cancel_turn(ticket.turn_id()).unwrap();
-            }
             "clear" => assert_eq!(actor.clear(), 2),
             "cancel_existing" => actor.cancel_existing(),
             "close" => {

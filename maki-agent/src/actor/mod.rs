@@ -185,6 +185,7 @@ pub enum ActorWork {
     HistoryEdit(HistoryEditWork),
     Control(ControlWork),
     Compact {
+        operation_id: u64,
         run_id: u64,
         instructions: Option<String>,
         generation: u64,
@@ -232,6 +233,10 @@ pub(crate) struct ActorInner {
     prepared_readiness: Option<PreparedReadiness>,
     #[cfg(test)]
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
+    after_close_cut: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
+    after_work_execution: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     pub(crate) after_finalization_retire: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
@@ -383,10 +388,6 @@ impl ActorOperation {
                 Some(QueueProjection::Compact(instructions.clone()))
             }
         }
-    }
-
-    fn visible(&self) -> bool {
-        matches!(self, Self::Compact { .. })
     }
 }
 
@@ -759,9 +760,6 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
 
 fn submission_bytes(input: &AgentInput) -> Result<usize, ActorError> {
     Ok(input.message.len()
-        + serde_json::to_vec(&input.images)
-            .map_err(|_| ActorError::InvalidInstruction)?
-            .len()
         + serde_json::to_vec(&input.preamble)
             .map_err(|_| ActorError::InvalidInstruction)?
             .len())
@@ -820,15 +818,7 @@ fn materialize(
                 .get(&ticket.turn_id())
                 .is_some_and(|inbox| inbox.initial.is_none())
             {
-                state.next_submission_id += 1;
-                let presentation = PendingSubmission {
-                    id: SubmissionId(state.next_submission_id),
-                    turn_id: ticket.turn_id(),
-                    text: input.message.clone(),
-                    images: input.images.clone(),
-                    already_displayed: false,
-                    mcp_startup_notice: None,
-                };
+                let presentation = state.pending_submission(ticket.turn_id(), &input, false, None);
                 state
                     .instructions
                     .get_mut(&ticket.turn_id())
@@ -855,10 +845,11 @@ fn materialize(
             })));
         }
         ActorOperation::Compact {
+            id,
             run_id,
             instructions,
-            ..
         } => inner.queue.push(ActorWork::Compact {
+            operation_id: id,
             run_id,
             instructions,
             generation: state.policy_generation,
@@ -870,6 +861,36 @@ fn materialize(
 }
 
 impl ActorState {
+    fn check_instruction_capacity(&self, bytes: usize) -> Result<(), ActorError> {
+        let (count, total) = self
+            .instructions
+            .values()
+            .map(inbox::InstructionInbox::outstanding)
+            .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
+        if count >= MAX_PENDING_INSTRUCTIONS || total + bytes > MAX_PENDING_INSTRUCTION_BYTES {
+            return Err(ActorError::InstructionOverflow);
+        }
+        Ok(())
+    }
+
+    fn pending_submission(
+        &mut self,
+        turn_id: TurnId,
+        input: &AgentInput,
+        already_displayed: bool,
+        mcp_startup_notice: Option<usize>,
+    ) -> PendingSubmission {
+        self.next_submission_id += 1;
+        PendingSubmission {
+            id: SubmissionId(self.next_submission_id),
+            turn_id,
+            text: input.message.clone(),
+            images: input.images.clone(),
+            already_displayed,
+            mcp_startup_notice,
+        }
+    }
+
     pub(super) fn publish_idle(&mut self, inner: &ActorInner) {
         if self.idle_pending
             && self.lifecycle == ActorLifecycle::Open
@@ -1115,12 +1136,31 @@ impl ActiveCancel {
 fn retire_turn(
     inner: &ActorInner,
     turn_id: TurnId,
-    outcome: &TurnOutcome,
+    outcome: &mut TurnOutcome,
     settle_runner: bool,
     history_ready: bool,
 ) -> Option<Option<TurnTicket>> {
     let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(reason) = state
+        .processing
+        .as_ref()
+        .filter(|processing| processing.turn_id == Some(turn_id))
+        .and_then(|processing| processing.cancellation_reason)
+        && !matches!(outcome, TurnOutcome::Cancelled { .. })
+    {
+        *outcome = TurnOutcome::Cancelled {
+            agent_id: outcome.agent_id(),
+            turn_id,
+            usage: outcome.usage(),
+            num_turns: outcome.num_turns(),
+            reason,
+            cost: outcome.cost(),
+            list_cost: outcome.list_cost(),
+            context_size: outcome.context_size(),
+            context_window: outcome.context_window(),
+        };
+    }
     state.instructions.remove(&turn_id);
     if settle_runner {
         state.settle_runner();
@@ -1217,7 +1257,8 @@ fn retire_and_publish(
     let presentation = admission
         .filter(|_| deliver)
         .and_then(|admission| admission.event_sender.as_ref());
-    if let Some(ticket) = retire_turn(inner, turn_id, &outcome, settle_runner, history_ready) {
+    let mut outcome = outcome;
+    if let Some(ticket) = retire_turn(inner, turn_id, &mut outcome, settle_runner, history_ready) {
         #[cfg(test)]
         if let Some((retired, release)) = inner
             .after_finalization_retire
@@ -1406,6 +1447,10 @@ impl AgentActorHandle {
             #[cfg(test)]
             after_pop: Mutex::new(None),
             #[cfg(test)]
+            after_close_cut: Mutex::new(None),
+            #[cfg(test)]
+            after_work_execution: Mutex::new(None),
+            #[cfg(test)]
             after_finalization_retire: Mutex::new(None),
             #[cfg(test)]
             before_snapshot_state: Mutex::new(None),
@@ -1536,10 +1581,6 @@ impl AgentActorHandle {
             .and_then(|processing| processing.turn_id)
     }
 
-    pub fn capture_processing_presentation_cut(&self, displayed: u64) -> (Option<TurnId>, u64) {
-        self.cancel_local(displayed)
-    }
-
     pub fn cancel_local(&self, displayed: u64) -> (Option<TurnId>, u64) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let cut = self.capture_local_cancel(&mut state, displayed);
@@ -1572,9 +1613,10 @@ impl AgentActorHandle {
         let deliveries: HashSet<_> = state.delivery_runs.keys().copied().collect();
         state.instructions.retain(|id, _| deliveries.contains(id));
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
-        let deferred = state.drain_work_except(|work| {
-            !matches!(work,
-            ActorOperation::Turn { ticket, .. } if !deliveries.contains(&ticket.turn_id()))
+        let deferred = state.drain_work_except(|work| match work {
+            ActorOperation::Turn { ticket, .. } => deliveries.contains(&ticket.turn_id()),
+            ActorOperation::Prepared(pending) => pending.turn.is_none(),
+            _ => true,
         });
         let active = turn_id.and_then(|_| state.active.take());
         let drained = self.inner.queue.drain_except(|work| {
@@ -1655,10 +1697,11 @@ impl AgentActorHandle {
                 .flat_map(|operation| match operation {
                     ActorOperation::Turn { ticket, .. } => messages(ticket.turn_id()),
                     ActorOperation::Compact {
+                        id,
                         run_id,
                         instructions,
-                        ..
                     } => vec![PendingQueueEntry::Compact {
+                        operation_id: *id,
                         run_id: *run_id,
                         instructions: instructions.clone(),
                     }],
@@ -1668,24 +1711,28 @@ impl AgentActorHandle {
         entries
     }
 
-    pub fn remove_pending_compact(&self, run_id: u64) -> Option<PendingQueueEntry> {
+    pub fn remove_pending_compact(&self, operation_id: u64) -> Option<PendingQueueEntry> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = state.operations.iter().position(|operation| matches!(operation, ActorOperation::Compact { run_id: id, .. } if *id == run_id))
-            && let ActorOperation::Compact { instructions, .. } = state.operations.remove(index)?
+        if let Some(index) = state.operations.iter().position(|operation| {
+            operation.id() == operation_id && matches!(operation, ActorOperation::Compact { .. })
+        }) && let ActorOperation::Compact {
+            run_id,
+            instructions,
+            ..
+        } = state.operations.remove(index)?
         {
-            return Some(PendingQueueEntry::Compact { run_id, instructions });
-        }
-        self.inner
-            .queue
-            .remove_compact(run_id)
-            .map(|instructions| PendingQueueEntry::Compact {
+            drive_operations(&self.inner, &mut state);
+            return Some(PendingQueueEntry::Compact {
+                operation_id,
                 run_id,
                 instructions,
-            })
+            });
+        }
+        self.inner.queue.remove_compact(operation_id)
     }
 
     pub fn pending_submissions(&self) -> Vec<PendingSubmission> {
@@ -2060,7 +2107,16 @@ impl AgentActorHandle {
                             && inbox.mergeable
                             && mergeable
                             && inbox.batch_key == batch_key
-                            && inbox.operation == state.next_operation_id
+                            && match (&inbox.policy, &state.policy) {
+                                (Some(active), Some(current)) => Arc::ptr_eq(active, current),
+                                (None, None) => true,
+                                _ => false,
+                            }
+                            && !state
+                                .operations
+                                .iter()
+                                .any(|work| work.id() > inbox.operation)
+                            && self.inner.queue.is_empty()
                     })
                 })
                 .or_else(|| {
@@ -2102,22 +2158,25 @@ impl AgentActorHandle {
                             !inbox.open
                                 || !inbox.mergeable
                                 || inbox.batch_key != batch_key
-                                || inbox.operation != operation_boundary
+                                || (inbox.submit_operation != Some(operation_boundary)
+                                    && (state
+                                        .operations
+                                        .iter()
+                                        .any(|work| work.id() > inbox.operation)
+                                        || !self.inner.queue.is_empty()
+                                        || inbox
+                                            .policy
+                                            .as_ref()
+                                            .zip(state.policy.as_ref())
+                                            .is_some_and(|(active, current)| {
+                                                !Arc::ptr_eq(active, current)
+                                            })))
                         })
                     {
                         continue;
                     }
                 }
-                let (count, total) = state
-                    .instructions
-                    .values()
-                    .map(inbox::InstructionInbox::outstanding)
-                    .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
-                if count >= MAX_PENDING_INSTRUCTIONS
-                    || total + bytes > MAX_PENDING_INSTRUCTION_BYTES
-                {
-                    return Err(ActorError::InstructionOverflow);
-                }
+                state.check_instruction_capacity(bytes)?;
                 if deferred_constraint {
                     let Some(ActorOperation::Turn { policy_constraint, .. }) = state.operations.iter_mut()
                         .find(|work| matches!(work, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == target))
@@ -2139,15 +2198,12 @@ impl AgentActorHandle {
                 {
                     processing.correlations.push(correlation.clone());
                 }
-                state.next_submission_id += 1;
-                let presentation = PendingSubmission {
-                    id: SubmissionId(state.next_submission_id),
-                    turn_id: target,
-                    text: input.message.clone(),
-                    images: input.images.clone(),
-                    already_displayed: options.already_displayed,
-                    mcp_startup_notice: options.mcp_startup_notice,
-                };
+                let presentation = state.pending_submission(
+                    target,
+                    &input,
+                    options.already_displayed,
+                    options.mcp_startup_notice,
+                );
                 let inbox = state
                     .instructions
                     .get_mut(&target)
@@ -2176,14 +2232,7 @@ impl AgentActorHandle {
             {
                 return Err(ActorError::StaleTurn);
             }
-            let (count, total) = state
-                .instructions
-                .values()
-                .map(inbox::InstructionInbox::outstanding)
-                .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
-            if count >= MAX_PENDING_INSTRUCTIONS || total + bytes > MAX_PENDING_INSTRUCTION_BYTES {
-                return Err(ActorError::InstructionOverflow);
-            }
+            state.check_instruction_capacity(bytes)?;
             if self
                 .inner
                 .tickets
@@ -2205,15 +2254,12 @@ impl AgentActorHandle {
             inbox.operation = id;
             inbox.mergeable = mergeable;
             inbox.batch_key = batch_key.clone();
-            state.next_submission_id += 1;
-            inbox.initial = Some(PendingSubmission {
-                id: SubmissionId(state.next_submission_id),
+            inbox.initial = Some(state.pending_submission(
                 turn_id,
-                text: input.message.clone(),
-                images: input.images.clone(),
-                already_displayed: options.already_displayed,
-                mcp_startup_notice: options.mcp_startup_notice,
-            });
+                &input,
+                options.already_displayed,
+                options.mcp_startup_notice,
+            ));
             state.delivery_suspended = false;
             state.instructions.insert(turn_id, inbox);
             self.inner.admit_ticket(turn_id, ticket.clone());
@@ -2227,6 +2273,7 @@ impl AgentActorHandle {
                 policy_constraint: options.policy_constraint,
             };
             if let Some(reason) = reason {
+                state.instructions.remove(&turn_id);
                 drop(state);
                 settle_deferred(&self.inner, vec![work], reason);
             } else {
@@ -2246,14 +2293,7 @@ impl AgentActorHandle {
     ) -> Result<TurnTicket, ActorError> {
         let bytes = submission_bytes(&input)?;
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (count, total) = state
-            .instructions
-            .values()
-            .map(inbox::InstructionInbox::outstanding)
-            .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
-        if count >= MAX_PENDING_INSTRUCTIONS || total + bytes > MAX_PENDING_INSTRUCTION_BYTES {
-            return Err(ActorError::InstructionOverflow);
-        }
+        state.check_instruction_capacity(bytes)?;
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -2286,15 +2326,12 @@ impl AgentActorHandle {
             .insert(turn_id, inbox::InstructionInbox::new(ticket.clone()));
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
-        state.next_submission_id += 1;
-        let presentation = PendingSubmission {
-            id: SubmissionId(state.next_submission_id),
+        let presentation = state.pending_submission(
             turn_id,
-            text: input.message.clone(),
-            images: input.images.clone(),
-            already_displayed: options.already_displayed,
-            mcp_startup_notice: options.mcp_startup_notice,
-        };
+            &input,
+            options.already_displayed,
+            options.mcp_startup_notice,
+        );
         if let Some(inbox) = state.instructions.get_mut(&turn_id) {
             inbox.initial = Some(presentation);
             inbox.drained.push((ticket.provenance().clone(), bytes));
@@ -2496,6 +2533,9 @@ impl AgentActorHandle {
             .position(|admission| matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id))
             .and_then(|index| state.operations.remove(index));
         let queued = self.inner.queue.remove_turn(turn_id);
+        if deferred.is_some() || queued.is_some() {
+            state.instructions.remove(&turn_id);
+        }
         drive_operations(&self.inner, &mut state);
         drop(state);
         if let Some(admission) = deferred {
@@ -2516,114 +2556,6 @@ impl AgentActorHandle {
             true,
         );
         Ok(outcome)
-    }
-
-    /// Removes the queue item at raw `index` (the same index
-    /// [`snapshot`](Self::snapshot) reports) under the queue lock. Admitted
-    /// turns are terminalized exactly once with `User` and delivered; roots,
-    /// compacts, and controls are dropped. Returns the removed item's
-    /// projection, or `None` when the raw index is out of bounds.
-    pub fn remove_at(&self, index: usize) -> Option<QueueProjection> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let queued = self.inner.queue.len();
-        if index >= queued {
-            let raw = state
-                .operations
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.projection().is_some())
-                .nth(index - queued)?
-                .0;
-            let admission = state.operations.remove(raw)?;
-            let projection = admission.projection()?;
-            drive_operations(&self.inner, &mut state);
-            drop(state);
-            settle_deferred(&self.inner, vec![admission], TurnCancellationReason::User);
-            return Some(projection);
-        }
-        let work = self.inner.queue.remove_at(index)?;
-        drop(state);
-        let projection = (&work).into();
-        if let ActorWork::Turn(admission) = work {
-            let outcome = cancelled_outcome(
-                self.inner.agent_id,
-                admission.turn_id,
-                TurnCancellationReason::User,
-            );
-            finalize_turn(
-                &self.inner,
-                admission.turn_id,
-                outcome,
-                Some(&admission),
-                true,
-            );
-        }
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .publish_idle(&self.inner);
-        Some(projection)
-    }
-
-    /// Removes the `visible_index`-th item the TUI panel displays (deferred
-    /// roots and compacts; admitted turns, controls, and already-displayed
-    /// roots are hidden rows), under the queue lock. Returns the projection
-    /// of the removed item, or `None` when the panel has fewer rows.
-    pub fn remove_visible_at(&self, visible_index: usize) -> Option<QueueProjection> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let queued_visible = self
-            .inner
-            .queue
-            .snapshot()
-            .iter()
-            .filter(|work| {
-                matches!(
-                    work,
-                    QueueProjection::Message {
-                        displayed: false,
-                        ..
-                    } | QueueProjection::Compact(_)
-                )
-            })
-            .count();
-        if visible_index >= queued_visible {
-            let index = state
-                .operations
-                .iter()
-                .enumerate()
-                .filter(|(_, admission)| admission.visible())
-                .nth(visible_index - queued_visible)?
-                .0;
-            let admission = state.operations.remove(index)?;
-            let projection = admission.projection()?;
-            drive_operations(&self.inner, &mut state);
-            drop(state);
-            settle_deferred(&self.inner, vec![admission], TurnCancellationReason::User);
-            return Some(projection);
-        }
-        let (work, projection) = self.inner.queue.remove_visible_at(visible_index)?;
-        drop(state);
-        if let ActorWork::Turn(admission) = work {
-            let outcome = cancelled_outcome(
-                self.inner.agent_id,
-                admission.turn_id,
-                TurnCancellationReason::User,
-            );
-            finalize_turn(
-                &self.inner,
-                admission.turn_id,
-                outcome,
-                Some(&admission),
-                true,
-            );
-        }
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .publish_idle(&self.inner);
-        Some(projection)
     }
 
     /// Clears every queued item, terminalizing the admitted turns. Returns
@@ -3002,13 +2934,16 @@ impl AgentActorHandle {
     }
 
     fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
-        let (active, deferred, active_reason) = {
+        let (active, deferred, active_reason, edit) = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             // First terminal lifecycle/reason wins: repeated close/shutdown are
             // idempotent no-ops, so a race cannot overwrite Closed with Shutdown
             // or vice versa.
             if state.lifecycle != ActorLifecycle::Open {
                 return;
+            }
+            if let Some(processing) = &mut state.processing {
+                processing.cancellation_reason.get_or_insert(reason);
             }
             state.instructions.clear();
             delivery::discard(&mut state, reason);
@@ -3041,8 +2976,17 @@ impl AgentActorHandle {
                     .as_ref()
                     .and_then(|processing| processing.cancellation_reason)
                     .unwrap_or(reason),
+                state.idle.take().and_then(|idle| idle.edit),
             )
         };
+        #[cfg(test)]
+        if let Some((captured, release)) = self.inner.after_close_cut.lock().unwrap().take() {
+            let _ = captured.send(());
+            let _ = release.recv();
+        }
+        if let Some(edit) = edit {
+            edit.fail(lifecycle_error(lifecycle));
+        }
         if let Some(active) = active {
             active.fire(active_reason);
         }

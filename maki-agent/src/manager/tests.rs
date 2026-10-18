@@ -301,7 +301,7 @@ enum MatchingSuccessor {
 }
 
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::User, MatchingSuccessor::None; "admitted_user")]
-#[test_case(PoppedWork::Submitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "root_shutdown")]
+#[test_case(PoppedWork::Submitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "shared_submission_shutdown")]
 #[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Admitted; "prepared_matching_admitted")]
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Prepared; "admitted_matching_prepared")]
 fn correlation_cancel_settles_popped_work_without_backend_entry(
@@ -1110,13 +1110,13 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
     );
 }
 
-#[test_case(crate::TurnCancellationReason::User, false; "admitted_user")]
-#[test_case(crate::TurnCancellationReason::Shutdown, false; "admitted_shutdown")]
-#[test_case(crate::TurnCancellationReason::User, true; "root_user")]
-#[test_case(crate::TurnCancellationReason::Shutdown, true; "root_shutdown")]
+#[test_case(crate::TurnCancellationReason::User, false; "exact_admission_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, false; "exact_admission_shutdown")]
+#[test_case(crate::TurnCancellationReason::User, true; "shared_submission_user")]
+#[test_case(crate::TurnCancellationReason::Shutdown, true; "shared_submission_shutdown")]
 fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     reason: crate::TurnCancellationReason,
-    root_work: bool,
+    shared_submission: bool,
 ) {
     const CORRELATION: &str = "reused";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -1127,7 +1127,7 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     let actor = root.actor().unwrap();
     assert_eq!(actor.processing_turn_id(), None);
     let (popped, release) = actor.pause_after_next_pop();
-    let target = if root_work {
+    let target = if shared_submission {
         actor
             .submit(
                 input(),
@@ -1214,9 +1214,9 @@ fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
     assert!(child.validate_live().is_err());
 }
 
-#[test_case(false; "admitted")]
-#[test_case(true; "standalone_root")]
-fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bool) {
+#[test_case(false; "exact_admission")]
+#[test_case(true; "shared_submission")]
+fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submission: bool) {
     const CORRELATION: &str = "reused";
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -1229,7 +1229,7 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bo
         })
         .unwrap();
     let actor = root.actor().unwrap();
-    let first = if root_work {
+    let first = if shared_submission {
         actor
             .submit(
                 input(),
@@ -1256,7 +1256,7 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(root_work: bo
             ..
         }
     ));
-    let successor = if root_work {
+    let successor = if shared_submission {
         actor
             .submit(
                 input(),
@@ -2244,6 +2244,7 @@ fn initialize_delegating_turn(current: &mut crate::CurrentManagedTurn) {
     current.policy = Some(Arc::new(config.settings));
     current.mode = Some(config.mode);
     current.mode_def = config.mode_def;
+    current.context = Some(config.context);
 }
 
 #[test]
@@ -2562,6 +2563,58 @@ fn dropping_pending_managed_execution_closes_lease_and_releases_permit() {
         drop(permit);
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
         assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn child_spawn_inherits_running_turn_cwd_not_later_config() {
+    smol::block_on(async {
+        const ORIGINAL: &str = "/original";
+        const CHANGED: &str = "/changed";
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let initial = config("anthropic/claude-sonnet-4-20250514", false)
+            .with_context(crate::actor::AgentContextSnapshot::new(ORIGINAL.into()));
+        let root = manager
+            .create_root_with_config(Some(initial), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
+            })
+            .unwrap();
+        let actor = root.actor().unwrap();
+        actor.admit_turn(input(), None, ORIGINAL.into()).unwrap();
+        let current = rx.recv_async().await.unwrap();
+        let update = actor.reserve_config_update().unwrap();
+        update
+            .resolve(Ok(crate::actor::ConfigChange::WorkingDirectory(
+                CHANGED.into(),
+            )))
+            .unwrap();
+        update.wait().await.unwrap();
+        assert_eq!(
+            actor.effective_config().unwrap().context.cwd(),
+            std::path::Path::new(CHANGED)
+        );
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        assert_eq!(
+            child.effective_config().unwrap().unwrap().context.cwd(),
+            std::path::Path::new(ORIGINAL)
+        );
+        gate.release(1);
+        assert!(
+            manager
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
     });
 }
 

@@ -3,10 +3,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use maki_providers::Message;
+use maki_providers::{ImageSource, Message};
 
-use super::{ActorInner, ActorLifecycle, AgentActorHandle, TurnProvenance, TurnTicket};
-use crate::{AgentId, AgentInput, CurrentManagedTurn, TurnId};
+use super::{
+    ActorInner, ActorLifecycle, AgentActorHandle, EffectiveAgentConfig, TurnProvenance, TurnTicket,
+};
+use crate::{AgentId, AgentInput, BatchKey, CurrentManagedTurn, TurnId};
 
 pub const MAX_PENDING_INSTRUCTIONS: usize = 64;
 pub const MAX_PENDING_INSTRUCTION_BYTES: usize = 256 * 1024;
@@ -15,22 +17,7 @@ pub const MAX_PENDING_INSTRUCTION_BYTES: usize = 256 * 1024;
 /// and inserting them into history must be one no-await commit path.
 pub trait TurnInbox: Send + Sync {
     fn drain_instructions(&self) -> Vec<AgentInput>;
-    fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
-        self.drain_instructions()
-            .into_iter()
-            .map(|input| {
-                let presentation = PendingSubmission {
-                    id: SubmissionId(0),
-                    turn_id: TurnId::generate(),
-                    text: input.message.clone(),
-                    images: input.images.clone(),
-                    already_displayed: true,
-                    mcp_startup_notice: None,
-                };
-                (presentation, input)
-            })
-            .collect()
-    }
+    fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)>;
     fn take_initial_submission(&self) -> Option<PendingSubmission> {
         None
     }
@@ -69,6 +56,7 @@ pub struct SubmissionId(pub u64);
 pub enum PendingQueueEntry {
     Message(PendingSubmission),
     Compact {
+        operation_id: u64,
         run_id: u64,
         instructions: Option<String>,
     },
@@ -79,7 +67,7 @@ pub struct PendingSubmission {
     pub id: SubmissionId,
     pub turn_id: TurnId,
     pub text: String,
-    pub images: Vec<maki_providers::ImageSource>,
+    pub images: Vec<ImageSource>,
     pub already_displayed: bool,
     pub mcp_startup_notice: Option<usize>,
 }
@@ -93,20 +81,20 @@ pub(super) struct InstructionEntry {
 
 pub(super) struct InstructionInbox {
     pub open: bool,
-    pub ticket: super::TurnTicket,
+    pub ticket: TurnTicket,
     pub pending: VecDeque<InstructionEntry>,
     pub drained: Vec<(TurnProvenance, usize)>,
     pub submit_operation: Option<u64>,
-    pub policy: Option<Arc<super::EffectiveAgentConfig>>,
+    pub policy: Option<Arc<EffectiveAgentConfig>>,
     pub initial: Option<PendingSubmission>,
     pub operation: u64,
     pub mergeable: bool,
-    pub batch_key: Option<crate::BatchKey>,
+    pub batch_key: Option<BatchKey>,
     pub correlations: Vec<String>,
 }
 
 impl InstructionInbox {
-    pub fn new(ticket: super::TurnTicket) -> Self {
+    pub fn new(ticket: TurnTicket) -> Self {
         Self {
             open: true,
             ticket,

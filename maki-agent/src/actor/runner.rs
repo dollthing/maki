@@ -149,7 +149,15 @@ impl Runner {
                 let _ = popped.send(());
                 let _ = release.recv_async().await;
             }
-            self.process(work, cancellation_generation).await;
+            let completion = self.process(work, cancellation_generation).await;
+            #[cfg(test)]
+            {
+                let hook = self.inner.after_work_execution.lock().unwrap().take();
+                if let Some((executed, release)) = hook {
+                    let _ = executed.send(());
+                    let _ = release.recv_async().await;
+                }
+            }
             let mut state = self
                 .inner
                 .state
@@ -159,6 +167,9 @@ impl Runner {
             state.finish_close(&self.inner);
             state.publish_idle(&self.inner);
             drop(state);
+            if let Some(completion) = completion {
+                completion.send();
+            }
             self.backend.on_work_settled();
         }
         #[cfg(any(test, feature = "test-util"))]
@@ -226,7 +237,11 @@ impl Runner {
         }
     }
 
-    async fn process(&mut self, work: ActorWork, cancellation_generation: u64) {
+    async fn process(
+        &mut self,
+        work: ActorWork,
+        cancellation_generation: u64,
+    ) -> Option<super::history_edit::HistoryEditCompletion> {
         match work {
             ActorWork::Turn(admission) => self.run_turn(*admission, cancellation_generation).await,
             ActorWork::Control(control) => self.run_control(control).await,
@@ -235,18 +250,20 @@ impl Runner {
                     inner: Arc::clone(&self.inner),
                     wake: Arc::clone(&self.wake),
                 };
-                edit.execute(&actor, &mut self.history).await;
+                return Some(edit.execute(&actor, &mut self.history).await);
             }
             ActorWork::Compact {
                 run_id,
                 instructions,
                 generation,
                 policy,
+                ..
             } => {
                 self.run_compact(run_id, instructions.as_deref(), generation, policy)
                     .await
             }
         }
+        None
     }
 
     /// Runs one admitted turn. Strictly serial: the runner never starts the
@@ -340,6 +357,10 @@ impl Runner {
                         .policy
                         .as_ref()
                         .map(|config| Arc::new(config.settings.clone()));
+                    current.context = admission
+                        .policy
+                        .as_ref()
+                        .map(|config| config.context.clone());
                     current.mode = admission.policy.as_ref().map(|config| config.mode.clone());
                     current.mode_def = admission
                         .policy

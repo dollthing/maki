@@ -1210,7 +1210,6 @@ mod tests {
                     let input = make_input(text);
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: text.into(),
-                        image_count: 0,
                         input,
                         run_id: RUN_ID - 1,
                         displayed: false,
@@ -1504,7 +1503,6 @@ mod tests {
                     let boundary = actor.reserve_config_update().unwrap();
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: "deferred root".into(),
-                        image_count: 0,
                         input: make_input(),
                         run_id: FIRST_RUN,
                         displayed: false,
@@ -1550,7 +1548,6 @@ mod tests {
                 const PENDING_RUN: u64 = SECOND_RUN + 1;
                 queue.push(crate::agent::shared_queue::QueueItem::Message {
                     text: "pending successor".into(),
-                    image_count: 0,
                     input: make_input(),
                     run_id: PENDING_RUN,
                     displayed: true,
@@ -1601,7 +1598,6 @@ mod tests {
                 let future = if deferred {
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: "future deferred root".into(),
-                        image_count: 0,
                         input: make_input(),
                         run_id: FIRST_RUN,
                         displayed: false,
@@ -1736,7 +1732,6 @@ mod tests {
                 let submitted_run = app.run_id;
                 queue.push(QueueItem::Message {
                     text: INITIAL.into(),
-                    image_count: 0,
                     input: *input,
                     run_id: submitted_run,
                     displayed: true,
@@ -1759,7 +1754,6 @@ mod tests {
                     )];
                     queue.push(QueueItem::Message {
                         text: text.into(),
-                        image_count: images.len(),
                         input: AgentInput::from_defaults(
                             text.into(),
                             AgentMode::Build,
@@ -1930,7 +1924,6 @@ mod tests {
             input.prompt = None;
             let submitted_run = app.run_id;
             let text = input.message.clone();
-            let images = input.images.clone();
             if root_work {
                 actor
                     .submit(
@@ -1946,7 +1939,6 @@ mod tests {
             } else {
                 queue.push(crate::agent::shared_queue::QueueItem::Message {
                     text,
-                    image_count: images.len(),
                     input: *input,
                     run_id: submitted_run,
                     displayed: true,
@@ -2037,7 +2029,6 @@ mod tests {
                 queue
                     .try_push(crate::agent::shared_queue::QueueItem::Message {
                         text: text.into(),
-                        image_count: 0,
                         input: AgentInput::from_defaults(
                             text.into(),
                             AgentMode::Build,

@@ -46,7 +46,7 @@ enum PendingIdentity {
 fn pending_identity(entry: &PendingQueueEntry) -> PendingIdentity {
     match entry {
         PendingQueueEntry::Message(entry) => PendingIdentity::Message(entry.id),
-        PendingQueueEntry::Compact { run_id, .. } => PendingIdentity::Compact(*run_id),
+        PendingQueueEntry::Compact { operation_id, .. } => PendingIdentity::Compact(*operation_id),
     }
 }
 
@@ -428,7 +428,6 @@ impl App {
         shared
             .try_push(QueueItem::Message {
                 text: msg.text,
-                image_count: msg.images.len(),
                 input,
                 run_id: self.run_id,
                 displayed: false,
