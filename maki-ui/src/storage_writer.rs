@@ -1325,6 +1325,7 @@ mod tests {
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
     const TOOL_ID: &str = "tool-1";
+    const SIBLING_AGENT_ID: &str = "sibling";
     const TOOL_TEXT: &str = "tool output";
     const TITLE: &str = "renamed after reload";
     const BASE_MSG: &str = "base";
@@ -2644,11 +2645,14 @@ mod tests {
             let mut session = AppSession::new(MODEL, CWD);
             session.push_message(Message::user(BASE_MSG.into()));
             session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
-            session.set_subagent_messages("sibling".into(), vec![Message::user(BASE_MSG.into())]);
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(BASE_MSG.into())],
+            );
             session.push_post(stored_post(None, 2));
             session.push_post(stored_post(Some(TOOL_ID), 1));
             session.push_post(stored_post(Some(TOOL_ID), 2));
-            session.push_post(stored_post(Some("sibling"), 2));
+            session.push_post(stored_post(Some(SIBLING_AGENT_ID), 2));
             let id = session.id;
             writer.send(Arc::new(session.clone()));
             writer
@@ -2662,13 +2666,15 @@ mod tests {
             let expected_posts = [
                 stored_post(None, 2),
                 stored_post(Some(TOOL_ID), 1),
-                stored_post(Some("sibling"), 2),
+                stored_post(Some(SIBLING_AGENT_ID), 2),
             ];
             assert_eq!(AppSession::load(id, &dir).unwrap().posts(), expected_posts);
             assert_eq!(writer.latest_snapshot(id).unwrap().posts(), expected_posts);
             session.set_title(TITLE.into());
-            session
-                .set_subagent_messages("sibling".into(), vec![Message::user(RESUMED_MSG.into())]);
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(RESUMED_MSG.into())],
+            );
             writer.send(Arc::new(session));
             writer.shutdown(DRAIN_TIMEOUT);
             let loaded = AppSession::load(id, &dir).unwrap();
@@ -2678,7 +2684,8 @@ mod tests {
             let child = serde_json::to_value(&loaded.subagent_messages()[TOOL_ID]).unwrap();
             let expected = serde_json::to_value(vec![Message::user(REWOUND_MSG.into())]).unwrap();
             assert_eq!(child, expected);
-            let sibling = serde_json::to_value(&loaded.subagent_messages()["sibling"]).unwrap();
+            let sibling =
+                serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap();
             assert_eq!(
                 sibling,
                 serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
@@ -2748,7 +2755,10 @@ mod tests {
             let mut session = AppSession::new(MODEL, CWD);
             session.push_message(Message::user(BASE_MSG.into()));
             session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
-            session.set_subagent_messages("sibling".into(), vec![Message::user(BASE_MSG.into())]);
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(BASE_MSG.into())],
+            );
             let id = session.id;
             let original = session.clone();
             writer.send(Arc::new(session.clone()));
@@ -2772,8 +2782,10 @@ mod tests {
             };
             session.adopt_subagent_history(TOOL_ID.into(), &reconstructed);
             session.set_title(TITLE.into());
-            session
-                .set_subagent_messages("sibling".into(), vec![Message::user(REWOUND_MSG.into())]);
+            session.set_subagent_messages(
+                SIBLING_AGENT_ID.into(),
+                vec![Message::user(REWOUND_MSG.into())],
+            );
             writer.send(Arc::new(session.clone()));
             assert_eq!(
                 writer
@@ -2800,7 +2812,7 @@ mod tests {
                 serde_json::to_value(&replacement.messages).unwrap()
             );
             assert_eq!(
-                serde_json::to_value(&loaded.subagent_messages()["sibling"]).unwrap(),
+                serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap(),
                 serde_json::to_value(vec![Message::user(REWOUND_MSG.into())]).unwrap()
             );
         });

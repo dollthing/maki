@@ -114,6 +114,7 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
+const UNSUPPORTED_AGENT_OPTION_PREFIX: &str = "unsupported agent option";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
@@ -5206,7 +5207,7 @@ impl<'t> EventLoop<'t> {
         let change = match id {
             FAST_OPTION_ID => ConfigChange::ToggleFast,
             WORKFLOW_OPTION_ID => ConfigChange::ToggleWorkflow,
-            _ => return Err(format!("unsupported agent option: {id}")),
+            _ => return Err(format!("{UNSUPPORTED_AGENT_OPTION_PREFIX}: {id}")),
         };
         let ticket = actor
             .reserve_config_update()
