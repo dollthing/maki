@@ -328,7 +328,7 @@ impl App {
         };
         let mut msg = msg;
         msg.text = expanded;
-        if self.is_subagent_focused() || self.selected_agent_id().is_some() {
+        if !self.is_main_chat() || self.selected_agent_id().is_some() {
             return self.submit_to_focused_actor(msg);
         }
         if self.status == Status::Streaming {
@@ -353,15 +353,6 @@ impl App {
                 vec![]
             }
         }
-    }
-
-    /// True while a subagent chat tab is focused (rather than the main chat),
-    /// so text goes to that subagent instead of the main agent.
-    fn is_subagent_focused(&self) -> bool {
-        let Some(chat) = self.chats.get(self.active_chat) else {
-            return false;
-        };
-        chat.subagent_id.is_some()
     }
 
     fn submit_to_focused_actor(&mut self, msg: QueuedMessage) -> SubmitOutcome {

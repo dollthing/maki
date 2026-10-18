@@ -2725,6 +2725,55 @@ fn top_bar_hint_excludes_finished_subagents() {
     assert!(bar.contains("1 tasks"), "only running counted: {bar}");
 }
 
+#[test_case(false; "restored_identity")]
+#[test_case(true; "missing_identity")]
+fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) {
+    const INPUT: &str = "hi this is a test";
+    const TASK: &str = "restored-task";
+    let mut app = test_app();
+    app.state.session_mut().set_subagents(vec![StoredSubagent {
+        tool_use_id: TASK.into(),
+        name: "old task".into(),
+        model: None,
+        thinking: None,
+        fast: false,
+    }]);
+    app.state
+        .session_mut()
+        .set_subagent_messages(TASK.into(), vec![Message::user("prior work".into())]);
+    app.restore_display();
+    if missing_identity {
+        app.chats[1].subagent_id = None;
+    }
+    app.update(Msg::Key(kb::TASKS.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.active_chat, 1);
+    assert!(app.active_subagent_closed());
+    let main_messages = app.chats[0].message_count();
+    for character in INPUT.chars() {
+        assert!(
+            app.update(Msg::Key(key(KeyCode::Char(character))))
+                .is_empty()
+        );
+    }
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.chats[0].message_count(), main_messages);
+    assert!(app.queue.root_text_messages().is_empty());
+    assert!(matches!(
+        app.submit_prompt(queued_msg(INPUT)),
+        SubmitOutcome::Rejected(error) if error == queue::NO_SUBAGENT_ERR
+    ));
+    assert!(
+        app.handle_submit(Submission {
+            text: "!pwd".into(),
+            images: Vec::new(),
+        })
+        .is_empty()
+    );
+}
+
 #[test]
 fn restored_subagents_have_no_ago_and_are_finished() {
     let mut app = test_app();
@@ -2744,6 +2793,7 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     assert_eq!(app.chats.len(), 2);
     assert!(app.chats[1].is_finished());
     assert_eq!(app.chats[1].started_at(), None);
+    assert_eq!(app.chats[1].subagent_id.as_deref(), Some(id.as_str()));
 
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
@@ -10096,6 +10146,27 @@ fn duplicate_compatibility_ids_route_by_agent_id() {
     app.handle_cancel();
     assert!(first.validate_live().is_ok());
     assert!(second.validate_live().is_ok());
+}
+
+#[test]
+fn tasks_selection_routes_keyboard_submission_to_child() {
+    const INPUT: &str = "continue child work";
+    let mut app = streaming_app();
+    let (target, input_rx) = spawn_input_child(&mut app, TASK_ID, "research");
+    app.update(Msg::Key(kb::TASKS.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.selected_agent_id(), Some(target.id()));
+    bind_actor_target(&app, target);
+    for character in INPUT.chars() {
+        assert!(
+            app.update(Msg::Key(key(KeyCode::Char(character))))
+                .is_empty()
+        );
+    }
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(received_input(&input_rx).message, INPUT);
+    assert!(app.queue.root_text_messages().is_empty());
 }
 
 #[test]

@@ -975,6 +975,9 @@ impl App {
     }
 
     fn active_subagent_closed(&self) -> bool {
+        if !self.is_main_chat() && self.selected_agent_id().is_none() {
+            return true;
+        }
         self.chats
             .get(self.active_chat)
             .and_then(|chat| chat.agent_id)

@@ -243,6 +243,7 @@ impl App {
                 Arc::clone(&self.theme_provider),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
+            chat.subagent_id = Some(sa.tool_use_id.clone());
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),

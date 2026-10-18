@@ -9334,6 +9334,128 @@ mod tests {
         });
     }
 
+    #[test]
+    fn tasks_selection_routes_keyboard_submission_through_child_actor() {
+        const SPAWNED: &str = "tasks child spawned";
+        const CHILD_NAME: &str = "tasks child";
+        const INPUT: &str = "continue selected child work";
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let app = &mut event_loop.sessions[0].app;
+            app.command_target = command_runtime.bind_target();
+            app.command_runtime = Arc::clone(&command_runtime);
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                command_runtime.registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "tasks_child_input",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-tasks-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, show = false }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            event_loop.sync_orchestration();
+            smol::block_on(command_runtime.registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/spawn-tasks-child".into(),
+            ));
+            assert!(matches!(
+                host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let child = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root))
+                .unwrap()
+                .agent_id;
+            let root_actor = manager.actor(root).unwrap();
+            let child_actor = manager.actor(child).unwrap();
+            let _root_guard = root_actor.prepare_idle().unwrap();
+            let child_guard = child_actor.prepare_idle().unwrap();
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                CHILD_NAME.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child);
+            app.live_chat_index.insert(child, app.chats.len());
+            app.chats.push(chat);
+
+            event_loop.handle_input(Event::Key(
+                crate::components::keybindings::key::TASKS.to_key_event(),
+            ));
+            event_loop.handle_input(Event::Key(crate::components::key(KeyCode::Down)));
+            event_loop.handle_input(Event::Key(crate::components::key(KeyCode::Enter)));
+            assert_eq!(event_loop.sessions[0].app.selected_agent_id(), Some(child));
+            for character in INPUT.chars() {
+                event_loop
+                    .handle_input(Event::Key(crate::components::key(KeyCode::Char(character))));
+            }
+            event_loop.handle_input(Event::Key(crate::components::key(KeyCode::Enter)));
+            let pending = child_actor.pending_submissions();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].text, INPUT);
+            assert!(root_actor.pending_submissions().is_empty());
+            assert!(
+                event_loop.sessions[0]
+                    .app
+                    .queue
+                    .root_text_messages()
+                    .is_empty()
+            );
+
+            drop(child_guard);
+            let deadline = Instant::now() + SESSION_OP_TIMEOUT;
+            loop {
+                let envelope = event_loop.sessions[0]
+                    .handles
+                    .agent_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("child input must reach the production envelope channel");
+                let consumed = matches!(
+                    &envelope.event,
+                    AgentEvent::QueueItemConsumed { text, .. } if text == INPUT
+                );
+                if consumed {
+                    assert_eq!(envelope.subagent.as_ref().unwrap().agent_id, child);
+                }
+                event_loop.handle_agent(0, Box::new(envelope));
+                if consumed {
+                    break;
+                }
+            }
+            let app = &event_loop.sessions[0].app;
+            let child_chat = app
+                .chats
+                .iter()
+                .find(|chat| chat.agent_id == Some(child))
+                .unwrap();
+            assert_eq!(child_chat.last_message_text(), INPUT);
+            assert_ne!(app.chats[0].last_message_text(), INPUT);
+            assert_eq!(app.selected_agent_id(), Some(child));
+            assert!(root_actor.pending_submissions().is_empty());
+            assert!(app.queue.root_text_messages().is_empty());
+        });
+    }
+
     #[test_case(false, false, false ; "direct_action")]
     #[test_case(true, false, false ; "slash_command")]
     #[test_case(false, true, false ; "direct_closed_target")]
