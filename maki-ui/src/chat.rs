@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{DisplayMessage, DisplayRole, RetryInfo, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
@@ -57,7 +57,7 @@ pub struct Chat {
     pub name: String,
     pub cost: Option<f64>,
     pub context_size: u32,
-    pub(crate) retry_info: Option<crate::components::RetryInfo>,
+    pub(crate) retry_info: Option<RetryInfo>,
     pub model_id: Option<String>,
     /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,

@@ -1,17 +1,11 @@
 use std::sync::Arc;
 
-#[cfg(test)]
-use maki_agent::TurnCancellationReason;
 use maki_agent::{AgentId, AgentManagerHandle, CancelMap, CancelTrigger};
 
 use super::AgentCommand;
-#[cfg(test)]
-use super::shared_queue::correlation;
 
 /// Routes commands from the UI to the actor's cancellation APIs.
 ///
-/// `AgentCommand::Cancel` cancels only the captured root work. Descendants
-/// remain live; explicit subtree shutdown uses `CancelAll`.
 /// `CancelAll` cancels the manager's entire root subtree, compatibility
 /// subagents outside that graph, and startup so an early command aborts MCP
 /// readiness.
@@ -29,19 +23,6 @@ pub(super) fn spawn_command_router(
     smol::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
             match cmd {
-                #[cfg(test)]
-                AgentCommand::Cancel { turn_id, run_id } => {
-                    if let Ok(actor) = manager.actor(root_id) {
-                        if let Some(turn_id) = turn_id {
-                            let _ = actor.cancel_turn(turn_id);
-                        } else {
-                            actor.cancel_correlation(
-                                &correlation(run_id),
-                                TurnCancellationReason::User,
-                            );
-                        }
-                    }
-                }
                 AgentCommand::CancelAll => {
                     if let Some(trigger) = init_trigger.take() {
                         trigger.cancel();
@@ -66,8 +47,9 @@ mod tests {
 
     use maki_agent::{
         ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentMetadata,
-        AgentMode, BackendResult, ControlWork, DoneReason, EventSender, History, TurnContext,
-        TurnOutcome, WorkKind,
+        AgentMode, BackendResult, ControlWork, CurrentManagedTurn, DoneReason,
+        EffectiveAgentConfig, EventSender, History, RunSettings, TurnCancellationReason,
+        TurnContext, TurnOutcome, WorkKind,
     };
     use maki_providers::{
         AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -75,11 +57,13 @@ mod tests {
         provider::{BoxFuture, Provider},
     };
     use maki_storage::id::SessionRef;
+    use test_case::test_case;
 
-    use super::*;
+    use super::{AgentCommand, AgentManagerHandle, Arc, CancelMap, spawn_command_router};
+    use crate::agent::shared_queue::correlation;
 
     struct CancellableBackend {
-        current: Option<flume::Sender<maki_agent::CurrentManagedTurn>>,
+        current: Option<flume::Sender<CurrentManagedTurn>>,
         entered: Option<flume::Sender<()>>,
         event_tx: Option<EventSender>,
     }
@@ -137,7 +121,7 @@ mod tests {
     }
 
     struct CancelThenCompleteBackend {
-        currents: flume::Sender<maki_agent::CurrentManagedTurn>,
+        currents: flume::Sender<CurrentManagedTurn>,
         later_release: flume::Receiver<()>,
     }
 
@@ -215,9 +199,9 @@ mod tests {
         }
     }
 
-    fn policy() -> maki_agent::actor::EffectiveAgentConfig {
-        maki_agent::actor::EffectiveAgentConfig::new(
-            maki_agent::RunSettings {
+    fn policy() -> EffectiveAgentConfig {
+        EffectiveAgentConfig::new(
+            RunSettings {
                 provider: Arc::new(StubProvider),
                 model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
                 fast: false,
@@ -243,9 +227,9 @@ mod tests {
         }
     }
 
-    #[test_case::test_case(true; "nominal_turn")]
-    #[test_case::test_case(false; "pre_admit_correlation_fallback")]
-    fn cancel_preserves_managed_descendants_and_root_reuse(nominal: bool) {
+    #[test_case(true; "manager")]
+    #[test_case(false; "actor")]
+    fn local_cancel_preserves_managed_descendants_and_root_reuse(managed: bool) {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let (current_tx, current_rx) = flume::bounded(2);
@@ -290,22 +274,13 @@ mod tests {
                 AgentEvent::TextDelta { .. }
             ));
 
-            let (cmd_tx, cmd_rx) = flume::unbounded();
-            let (init_trigger, _) = maki_agent::CancelToken::new();
-            spawn_command_router(
-                cmd_rx,
-                manager.clone(),
-                root.id(),
-                Arc::new(CancelMap::new()),
-                init_trigger,
-            );
-            cmd_tx
-                .send_async(AgentCommand::Cancel {
-                    turn_id: nominal.then(|| root_ticket.turn_id()),
-                    run_id: 1,
-                })
-                .await
-                .unwrap();
+            let (turn_id, fence) = if managed {
+                manager.local_cancel(root.id(), 1).unwrap()
+            } else {
+                root_actor.cancel_local(1)
+            };
+            assert_eq!(turn_id, Some(root_ticket.turn_id()));
+            assert!(fence > 1);
 
             assert!(matches!(
                 root_ticket.wait().await,
@@ -327,7 +302,6 @@ mod tests {
             assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
             assert_eq!(root_actor.snapshot().lifecycle, ActorLifecycle::Open);
 
-            drop(cmd_tx);
             let report = manager.shutdown(Duration::from_secs(1)).await;
             assert!(report.timed_out.is_empty());
         });

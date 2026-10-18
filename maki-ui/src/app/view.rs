@@ -469,11 +469,7 @@ impl App {
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),
-            retry_info: if render_chat == 0 {
-                self.retry_info.as_ref()
-            } else {
-                chat.retry_info.as_ref()
-            },
+            retry_info: chat.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: config

@@ -30,12 +30,15 @@ pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId};
+use maki_agent::actor::HistoryBoundary;
+use maki_agent::{
+    AgentId, AgentInput, AgentRef, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId,
+};
 use maki_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -204,14 +207,12 @@ pub struct SessionReplacementRequest {
     pub(crate) kind: SessionReplacementKind,
 }
 
-use std::path::PathBuf;
-
 pub enum Action {
     SendMessage(Box<AgentInput>),
     RunKeybind(u64),
     ManualExit,
     ShellCommand {
-        target: Option<maki_agent::AgentId>,
+        target: Option<AgentId>,
         cwd: PathBuf,
         id: String,
         command: String,
@@ -226,12 +227,12 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     RewindAgent {
-        target: maki_agent::AgentRef,
-        boundary: maki_agent::actor::HistoryBoundary,
+        target: AgentRef,
+        boundary: HistoryBoundary,
     },
     ChangeModel(String),
     ChangePinnedModel {
-        target: maki_agent::AgentRef,
+        target: AgentRef,
         spec: String,
     },
     SelectModel(maki_commands::ModelSelection),
@@ -249,7 +250,7 @@ pub enum Action {
         id: &'static str,
     },
     /// `/cd`, adopted through the coordinator off the event-loop thread.
-    ChangeDirectory(std::path::PathBuf),
+    ChangeDirectory(PathBuf),
     RefreshProvider {
         slug: String,
     },

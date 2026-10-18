@@ -39,7 +39,7 @@ use crate::app::mode::{Mode, PlanState};
 use crate::components::keybindings::key;
 use crate::components::{self, Action, Status};
 use crate::plan_approval::{
-    APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message,
+    APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message, read_plan,
 };
 use crate::storage_writer::{SAVE_FAILED_PREFIX, StorageWriter};
 
@@ -358,10 +358,16 @@ fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
     });
 }
 
-#[test_case(false, false; "keep_context")]
-#[test_case(true, false; "clear_context")]
-#[test_case(true, true; "checkpoint_failure")]
-fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) {
+#[test_case(false, false, false; "keep_context")]
+#[test_case(true, false, false; "clear_context")]
+#[test_case(true, true, false; "checkpoint_failure")]
+#[test_case(true, false, true; "checkpoint_deadline_then_success")]
+#[test_case(true, true, true; "checkpoint_deadline_then_failure")]
+fn managed_child_approval_is_pinned(
+    clear_context: bool,
+    fail_checkpoint: bool,
+    delay_checkpoint: bool,
+) {
     const CHECKPOINT_FAILURE: &str = "child approval checkpoint failed";
     const CHECKPOINT_FLASH: &str = "history checkpoint failed: child approval checkpoint failed";
     with_event_loop(|event_loop| {
@@ -437,6 +443,59 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
             .unwrap()
             .agent_id;
         let child = manager.actor(child_id).unwrap();
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index]
+                .app
+                .chats
+                .iter()
+                .any(|chat| chat.agent_id == Some(child_id))
+        });
+        let committed_messages = child.committed_message_count();
+        assert!(committed_messages > 0);
+        let child_chat = event_loop.sessions[index]
+            .app
+            .chats
+            .iter()
+            .find(|chat| chat.agent_id == Some(child_id))
+            .unwrap();
+        let child_key = child_chat.subagent_id.clone().unwrap();
+        let info = maki_agent::SubagentInfo {
+            agent_id: child_id,
+            parent_agent_id: Some(root),
+            parent_is_root: true,
+            auto_deliver: true,
+            parent_tool_use_id: child_key.clone(),
+            name: CHILD_TOOL_NAME.into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            cancel: None,
+        };
+        event_loop.handle_agent(
+            index,
+            Box::new(maki_agent::Envelope {
+                event: maki_agent::AgentEvent::Post(maki_domain::Post {
+                    text: CHILD_PROMPT.into(),
+                    level: maki_domain::PostLevel::Info,
+                    agent: None,
+                }),
+                subagent: Some(info),
+                run_id: 0,
+            }),
+        );
+        assert_eq!(
+            event_loop.sessions[index]
+                .app
+                .state
+                .session
+                .posts()
+                .iter()
+                .find(|post| post.chat.as_deref() == Some(child_key.as_str()))
+                .unwrap()
+                .after_message,
+            committed_messages,
+        );
         release.send(()).unwrap();
         let settled_deadline = Instant::now() + WAIT;
         pump_until(event_loop, |event_loop| {
@@ -480,7 +539,7 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
             clear_context,
             Some(TARGET_MODEL.into()),
             false,
-            path,
+            path.clone(),
         );
         assert!(
             event_loop.sessions[index].pending_approval.is_some(),
@@ -488,7 +547,11 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
             event_loop.sessions[index].app.status_bar.flash_text()
         );
         let mut ready = next_ready(event_loop);
-        if fail_checkpoint {
+        while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+            event_loop.handle_agent(index, Box::new(envelope));
+        }
+        let (checkpoint_release, checkpoint_gate) = flume::bounded(1);
+        if fail_checkpoint || delay_checkpoint {
             let InternalEvent::PlanApprovalReady {
                 result: Ok(ApprovalStep::Child(prepared)),
                 ..
@@ -496,10 +559,50 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
             else {
                 panic!("child preparation failed");
             };
-            prepared.checkpoint = Arc::new(|_| Box::pin(async { Err(CHECKPOINT_FAILURE.into()) }));
+            prepared.checkpoint = Arc::new(move |_| {
+                let checkpoint_gate = checkpoint_gate.clone();
+                Box::pin(async move {
+                    if delay_checkpoint {
+                        checkpoint_gate
+                            .recv_async()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if fail_checkpoint {
+                        Err(CHECKPOINT_FAILURE.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
         }
         event_loop.sessions[index].app.active_chat = 0;
-        event_loop.handle_internal(ready);
+        if delay_checkpoint {
+            let InternalEvent::PlanApprovalReady {
+                result: Ok(ApprovalStep::Child(prepared)),
+                ..
+            } = ready
+            else {
+                panic!("child preparation failed");
+            };
+            event_loop.commit_child_plan_approval_with_timeout(index, *prepared, Duration::ZERO);
+            let deadline = next_ready(event_loop);
+            assert!(matches!(
+                &deadline,
+                InternalEvent::PlanApprovalReady {
+                    result: Ok(ApprovalStep::ChildCommitPending),
+                    ..
+                }
+            ));
+            event_loop.handle_internal(deadline);
+            assert!(event_loop.sessions[index].pending_approval.is_some());
+            assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
+            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert!(requests.is_empty());
+            checkpoint_release.send(()).unwrap();
+        } else {
+            event_loop.handle_internal(ready);
+        }
         assert!(
             event_loop.sessions[index]
                 .pending_approval
@@ -510,9 +613,27 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
         event_loop.sessions[index].end_plan_approval();
         assert!(event_loop.sessions[index].pending_approval.is_some());
         let committed = next_ready(event_loop);
+        if !fail_checkpoint {
+            assert!(requests.is_empty());
+            assert!(matches!(child.snapshot().status, ActorStatus::Idle));
+            while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+                assert!(!matches!(
+                    envelope.event,
+                    maki_agent::AgentEvent::TextDelta { .. }
+                        | maki_agent::AgentEvent::TurnComplete(_)
+                        | maki_agent::AgentEvent::ToolStart(_)
+                ));
+                event_loop.handle_agent(index, Box::new(envelope));
+            }
+            assert!(requests.is_empty());
+        }
         event_loop.handle_internal(committed);
         assert!(event_loop.sessions[index].pending_approval.is_none());
         if fail_checkpoint {
+            let idle = child
+                .prepare_idle()
+                .expect("failed checkpoint must release actor reservation");
+            drop(idle);
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
             assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
             assert!(requests.is_empty());
@@ -521,6 +642,10 @@ fn managed_child_approval_is_pinned(clear_context: bool, fail_checkpoint: bool) 
                 Some(CHECKPOINT_FLASH)
             );
         } else {
+            assert_eq!(
+                event_loop.sessions[index].app.chats[child_chat].last_message_text(),
+                read_plan(path.clone(), false).unwrap().message,
+            );
             pump_until(event_loop, |_| !requests.is_empty());
             let (model, _, messages, _) = requests.recv_timeout(WAIT).unwrap();
             assert_eq!(model, TARGET_MODEL);

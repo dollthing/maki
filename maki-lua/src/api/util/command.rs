@@ -585,8 +585,10 @@ pub enum BuiltinAction {
 }
 
 pub enum UiAction {
-    SetMode {
+    SetAgentMode {
+        target: AgentRef,
         id: String,
+        reply_tx: flume::Sender<Result<(), String>>,
     },
     GetMode {
         reply_tx: flume::Sender<String>,

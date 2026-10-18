@@ -62,6 +62,7 @@ pub(crate) enum QueueItem {
         /// for `QueueItemConsumed` before drawing.
         displayed: bool,
     },
+    #[cfg(test)]
     Compact {
         run_id: u64,
         instructions: Option<String>,
@@ -71,7 +72,9 @@ pub(crate) enum QueueItem {
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. } | Self::Compact { run_id, .. } => *run_id,
+            Self::Message { run_id, .. } => *run_id,
+            #[cfg(test)]
+            Self::Compact { run_id, .. } => *run_id,
         }
     }
 }
@@ -344,6 +347,7 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
             )?;
             Ok(())
         }
+        #[cfg(test)]
         QueueItem::Compact {
             run_id,
             instructions,
@@ -386,6 +390,7 @@ impl From<&QueueItem> for QueueProjection {
                 text: text.clone(),
                 displayed: *displayed,
             },
+            #[cfg(test)]
             QueueItem::Compact { instructions, .. } => {
                 QueueProjection::Compact(instructions.clone())
             }

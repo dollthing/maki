@@ -5,7 +5,7 @@ use maki_agent::actor::{
     AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use maki_agent::{AgentInput, TurnId};
+use maki_agent::{AgentId, AgentInput, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
 use std::borrow::Cow;
 
@@ -30,7 +30,7 @@ pub(crate) enum SubmitOutcome {
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
     target: Option<AgentActorHandle>,
-    target_id: Option<maki_agent::AgentId>,
+    target_id: Option<AgentId>,
     child_selected: bool,
     focused_submission: Option<PendingIdentity>,
     focus: Option<usize>,
@@ -64,7 +64,7 @@ fn visible_pending(actor: &AgentActorHandle) -> Vec<PendingQueueEntry> {
 impl MessageQueue {
     pub(crate) fn select(
         &mut self,
-        id: Option<maki_agent::AgentId>,
+        id: Option<AgentId>,
         child: bool,
         actor: Option<AgentActorHandle>,
     ) {
@@ -141,8 +141,8 @@ impl MessageQueue {
                     Some(PendingIdentity::Message(id)) => {
                         actor.remove_submission(id);
                     }
-                    Some(PendingIdentity::Compact(run_id)) => {
-                        actor.remove_pending_compact(run_id);
+                    Some(PendingIdentity::Compact(operation_id)) => {
+                        actor.remove_pending_compact(operation_id);
                     }
                     None => {}
                 }
@@ -223,8 +223,8 @@ impl MessageQueue {
                 Some(PendingIdentity::Message(id)) => {
                     actor.remove_submission(id);
                 }
-                Some(PendingIdentity::Compact(run_id)) => {
-                    actor.remove_pending_compact(run_id);
+                Some(PendingIdentity::Compact(operation_id)) => {
+                    actor.remove_pending_compact(operation_id);
                 }
                 None => {}
             }
@@ -311,9 +311,8 @@ impl MessageQueue {
 }
 
 impl App {
-    /// The one queue-or-start decision, shared by the keyboard and Lua
-    /// paths so they cannot drift. Expects raw text: interpretation (slash
-    /// commands, `exit`, `!`) is the caller's job, or skipped on purpose.
+    /// Submits raw keyboard input to the focused actor after reference expansion.
+    /// The caller handles slash commands, `exit`, and shell prefixes.
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR.into());
@@ -377,9 +376,11 @@ impl App {
             input.fast = config.settings.fast;
             input.workflow = config.settings.workflow;
         }
-        input.preamble = self.shell.drain_results_for(Some(target.id()));
+        input.preamble = self.shell.results_for(Some(target.id())).to_vec();
         if self.is_main_chat() {
-            input.preamble.extend(self.shell.drain_results());
+            input
+                .preamble
+                .extend_from_slice(self.shell.results_for(None));
         }
         let root = self.is_main_chat();
         let starting = root && !self.focused_streaming();
@@ -408,6 +409,10 @@ impl App {
             },
         ) {
             Ok(_) => {
+                self.shell.drain_results_for(Some(target.id()));
+                if root {
+                    self.shell.drain_results();
+                }
                 if starting {
                     self.record_run_start(run_id);
                 }
@@ -450,17 +455,6 @@ impl App {
                 images: Vec::new(),
             });
         }
-    }
-
-    pub(super) fn queue_compact(&mut self, instructions: Option<String>) -> bool {
-        let Some(ref shared) = self.queue.shared else {
-            return false;
-        };
-        shared.push(QueueItem::Compact {
-            run_id: self.run_id,
-            instructions,
-        });
-        true
     }
 
     /// Agent reached a deferred message: time to draw the bubble. Restored

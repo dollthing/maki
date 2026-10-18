@@ -3425,13 +3425,16 @@ fn trusted_legacy_session_survives_commands_but_not_plugin_reload() {
     });
 }
 
-#[test]
-fn delegated_legacy_session_expires_after_creating_managed_turn() {
+#[test_case::test_case(false; "other_plugins")]
+#[test_case::test_case(true; "owner_reload")]
+fn delegated_legacy_session_expires_after_creating_managed_turn(reload: bool) {
     smol::block_on(async {
         const TOOL: &str = "pr6_delegated_legacy_session";
         const CHECK: &str = "/pr6_delegated_legacy_expired";
         const REPLY: &str = "delegated legacy reply";
         const CHECKPOINT: &str = "delegated legacy status checkpoint";
+        const OTHER_PLUGIN: &str = "pr6_delegated_unrelated_plugin";
+        const SESSION_GENERATION_ERROR: &str = "session belongs to another plugin generation";
         let checker_source = format!(
             r#"
             maki.api.register_command({{
@@ -3449,7 +3452,8 @@ fn delegated_legacy_session_expires_after_creating_managed_turn() {
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
-                plugin_source: checker_source,
+                plugin_source: checker_source.clone(),
+                bundled_tasks: true,
                 ..Default::default()
             },
             &format!(
@@ -3501,15 +3505,37 @@ fn delegated_legacy_session_expires_after_creating_managed_turn() {
             .await,
             TurnOutcome::Completed { turn_id, .. } if turn_id == fixture.root_ticket.turn_id()
         ));
-        assert_eq!(
+        fixture
+            ._host
+            .load_source(
+                OTHER_PLUGIN,
+                r#"
+                local retained = assert(maki.store.collect("pr6_delegated_sessions").retained)
+                maki.store.register("pr6_delegated_sessions", "across_reload", retained)
+                "#,
+            )
+            .unwrap();
+        let run = || {
             fixture
                 ._host
                 .event_handle()
                 .run_command_for_test(Arc::from(TOOL), Arc::from(CHECK), String::new(), 0)
                 .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
-            Ok(())
-        );
+                .unwrap()
+        };
+        assert_eq!(run(), Ok(()));
+        if reload {
+            fixture
+                ._host
+                .load_source(
+                    TOOL,
+                    &checker_source
+                        .replace(MANAGED_AUTHORITY_INACTIVE, SESSION_GENERATION_ERROR)
+                        .replace(".retained)", ".across_reload)"),
+                )
+                .unwrap();
+            assert_eq!(run(), Ok(()));
+        }
         assert!(
             fixture.requests.is_empty(),
             "expired Session admitted a request"

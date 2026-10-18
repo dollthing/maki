@@ -34,6 +34,7 @@ const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const TASK_SPAWN_TOOL: &str = "task_spawn";
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";
+const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
 const PLAIN_TEXT: &str = "plain text result";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
@@ -926,7 +927,7 @@ fn despawn_releases_permit_and_clears_task() {
 
     // Unknown task after despawn.
     let err = exec_tool(&reg, "task_despawn", json!({ "task_id": task_id })).unwrap_err();
-    assert!(err.contains("unknown task_id"), "got: {err}");
+    assert!(err.contains(UNKNOWN_TASK_ERR), "got: {err}");
 
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
@@ -955,7 +956,7 @@ fn unknown_task_errors_across_lifecycle_tools() {
             _ => json!({ "task_id": "missing" }),
         };
         let err = exec_tool(&reg, tool, input).unwrap_err();
-        assert!(err.contains("unknown task_id"), "{tool} got: {err}");
+        assert!(err.contains(UNKNOWN_TASK_ERR), "{tool} got: {err}");
     }
 }
 
@@ -1229,7 +1230,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
 fn assert_task_input(message: &Message, original: &str, interrupted: bool) {
     let text = message.first_text_content().expect("task input has text");
     if interrupted {
-        assert!(text.starts_with("<user-interrupt>\n"), "{text}");
+        assert!(text.starts_with(USER_INTERRUPT_PREFIX), "{text}");
         assert!(
             text.ends_with(&format!("\n\n{original}\n</user-interrupt>")),
             "{text}"
@@ -1244,11 +1245,13 @@ fn assert_task_input(message: &Message, original: &str, interrupted: bool) {
 #[test]
 fn task_docs_describe_same_turn_submission() {
     for contract in [
-        "Compatible sends join eligible open work and return the same turn_id",
-        "Pending messages drain in order before the next eligible model request",
-        "without cancelling the child",
-        "a successor never retargets an existing wait",
-        "batched idle continuation",
+        "Compatible messages join open work and share its turn_id",
+        "Messages wait for the next model request",
+        "the wait never follows a later turn",
+        "Timeout returns running without cancelling work",
+        "The caller releases its turn capacity while waiting",
+        "/docs/agent-work/#task-waits",
+        "/docs/agent-work/#messages-and-turns",
     ] {
         assert!(
             TASK_PLUGIN_SRC.contains(contract),

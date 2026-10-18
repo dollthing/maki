@@ -185,7 +185,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 
 ### `task_wait` {#task_wait}
 
-Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn once, including a turn it ran to handle results from its own subagents. Non-main agents join reporting children before completing, subject to execution limits; the main agent may complete while children run. Late child reports can wake an idle or locally cancelled agent. Resumed work produces a new immutable turn result that can report upward to its parent; earlier completed or cancelled tickets do not change. Later messages accepted into this same turn extend its work; a successor never retargets an existing wait. Child reports arrive at safe request boundaries for active shared-actor parents, or in a batched idle continuation. Returns {status, result?, error?}, with per-turn usage and duration_ms. Each task retains up to 64 turn tickets; settled tickets are evicted oldest-first when admitting new turns. Evicted or unavailable IDs return turn_result_unavailable. At 64 unresolved unique tickets, new turns reject without cancelling accepted work; further messages may reuse an open ticket. Timeout only stops observation, never cancels the child. The waiting agent releases its turn capacity while it waits. Also callable from code_execution.
+Wait for one exact task turn. Omit turn_id to select the latest turn once. Messages joining that turn extend its work; the wait never follows a later turn. Returns {status, result?, error?}, with per-turn usage and duration_ms. Timeout returns running without cancelling work; zero checks without waiting. Unavailable or evicted turn IDs return turn_result_unavailable. The caller releases its turn capacity while waiting. Also callable from code_execution. See [Agent work](/docs/agent-work/#task-waits) for completion and retention rules.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -195,11 +195,11 @@ Wait for one exact task turn. Omitted turn_id snapshots the task's latest turn o
 
 ### `task_send` {#task_send}
 
-Submit instructions to a background subagent and return immediately. Compatible sends join eligible open work and return the same turn_id. Idle, admission-closed, or boundary-separated sends receive a successor ID. Queued configuration, working-directory changes, control operations, and exact-work boundaries prevent merging across them. Pending messages drain in order before the next eligible model request, after current model/tool work completes, without interrupting an in-flight request or tool. Acceptance is not proof of processing. The bounded inbox rejects overflow without cancelling the child or earlier instructions. Returns { queued = true, turn_id }, or an admission error. Also callable from a code_execution script as a Python async function.
+Submit follow-up instructions to a background subagent and return { queued = true, turn_id }, or an admission error. Compatible messages join open work and share its turn_id; otherwise they start a new turn. Messages wait for the next model request, without interrupting a running request or tool. Acceptance does not mean processing. Overflow rejects only the new message. Also callable from code_execution. See [Agent work](/docs/agent-work/#messages-and-turns) for queue rules.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message` | string | yes | Instructions for the subagent. Compatible sends join eligible open work; idle or boundary-separated sends receive a successor turn. |
+| `message` | string | yes | Follow-up instructions for the subagent. |
 | `task_id` | string | yes | Task id returned by task_spawn. |
 
 ### `task_despawn` {#task_despawn}

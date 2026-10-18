@@ -68,8 +68,9 @@ use maki_agent::actor::{TranscriptRequest, TurnAdmissionOptions, TurnOrigin, Tur
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, Post,
-    SharedBuf, SharedMessages, SubagentInfo, TurnCompleteEvent, TurnId,
+    AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType, ImageSource,
+    McpConfigErrors, McpPromptRef, McpSnapshotReader, ModeId, Post, SharedBuf, SharedMessages,
+    SubagentInfo, TurnCompleteEvent, TurnId,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -107,7 +108,7 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
-pub(crate) use queue::{MessageQueue, SubmitOutcome};
+pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
@@ -353,7 +354,7 @@ pub struct App {
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     model_picker_purpose: ModelPickerPurpose,
-    pub(crate) model_picker_target: Option<maki_agent::AgentRef>,
+    pub(crate) model_picker_target: Option<AgentRef>,
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -385,7 +386,6 @@ pub struct App {
     /// the running turn is not using.
     pub(crate) run_model: Option<String>,
     pub(crate) run_context_window: Option<u32>,
-    pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
     middle_scroll: Option<MiddleScroll>,
@@ -581,7 +581,6 @@ impl App {
             run_id: 0,
             run_model: None,
             run_context_window: None,
-            retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
             middle_scroll: None,
@@ -696,12 +695,12 @@ impl App {
     pub(super) fn focused_mode(&self) -> Mode {
         self.focused_config()
             .map(|config| match &config.mode {
-                maki_agent::AgentMode::Build => Mode::Build,
-                maki_agent::AgentMode::Plan(_) => Mode::Plan,
-                maki_agent::AgentMode::Custom(id) => match id {
-                    maki_agent::ModeId::Build => Mode::Build,
-                    maki_agent::ModeId::Plan => Mode::Plan,
-                    maki_agent::ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
+                AgentMode::Build => Mode::Build,
+                AgentMode::Plan(_) => Mode::Plan,
+                AgentMode::Custom(id) => match id {
+                    ModeId::Build => Mode::Build,
+                    ModeId::Plan => Mode::Plan,
+                    ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
                 },
             })
             .unwrap_or_else(|| {
@@ -714,11 +713,7 @@ impl App {
     }
 
     pub(super) fn focused_retry(&self) -> Option<&RetryInfo> {
-        if self.is_main_chat() {
-            self.retry_info.as_ref()
-        } else {
-            self.chats[self.active_chat].retry_info.as_ref()
-        }
+        self.chats[self.active_chat].retry_info.as_ref()
     }
 
     pub(crate) fn focused_cwd(&self) -> PathBuf {
@@ -1402,7 +1397,7 @@ impl App {
 
     pub(crate) fn open_pinned_model_picker(
         &mut self,
-        target: maki_agent::AgentRef,
+        target: AgentRef,
     ) -> Result<(), CommandError> {
         target
             .validate_live()
@@ -2018,7 +2013,6 @@ impl App {
                 self.run_id = fence;
                 self.queue.fence_cancelled_presentations(fence);
                 self.status = Status::Idle;
-                self.retry_info = None;
                 self.recoverable_queue.clear();
             }
             return Vec::new();
@@ -2032,7 +2026,7 @@ impl App {
     }
 
     fn finish_cancel(&mut self, turn_id: Option<TurnId>, run_id: u64) -> Vec<Action> {
-        self.retry_info = None;
+        self.chats[0].retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.input_queue.clear();
@@ -2087,7 +2081,7 @@ impl App {
         }
         // Posts belong to no run, so the stale-run filter below must not see them.
         if let AgentEvent::Post(post) = envelope.event {
-            self.push_post(envelope.subagent.as_ref(), post);
+            self.push_post(envelope.subagent.as_ref(), post, None);
             return vec![];
         }
         self.adopt_actor_presentation(&envelope);
@@ -2112,9 +2106,9 @@ impl App {
         if envelope.subagent.is_none()
             && let AgentEvent::ModelSwitched { spec } = &envelope.event
         {
-            self.retry_info = None;
+            self.chats[0].retry_info = None;
             self.run_model = Some(spec.clone());
-            if let Ok(model) = maki_providers::Model::from_spec(spec) {
+            if let Ok(model) = Model::from_spec(spec) {
                 self.run_context_window = Some(model.context_window);
             }
             return vec![];
@@ -2311,19 +2305,11 @@ impl App {
                 message,
                 deadline: Instant::now() + Duration::from_millis(delay_ms),
             };
-            if chat_idx == 0 {
-                self.retry_info = Some(retry);
-            } else {
-                self.chats[chat_idx].retry_info = Some(retry);
-            }
+            self.chats[chat_idx].retry_info = Some(retry);
             return vec![];
         }
 
-        if chat_idx == 0 {
-            self.retry_info = None;
-        } else {
-            self.chats[chat_idx].retry_info = None;
-        }
+        self.chats[chat_idx].retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.account_turn_complete(Some(chat_idx), tc);
@@ -2480,7 +2466,12 @@ impl App {
         !defer
     }
 
-    fn push_post(&mut self, subagent: Option<&SubagentInfo>, post: Post) {
+    pub(crate) fn push_post(
+        &mut self,
+        subagent: Option<&SubagentInfo>,
+        post: Post,
+        committed_messages: Option<usize>,
+    ) {
         let (chat_idx, chat) = match subagent {
             Some(subagent) => (
                 self.resolve_or_create_chat(subagent),
@@ -2490,13 +2481,13 @@ impl App {
         };
         self.chats[chat_idx].push_post(&post.text, post.level);
         let session = &self.state.session;
-        let after_message = match &chat {
+        let after_message = committed_messages.unwrap_or_else(|| match &chat {
             Some(id) => session
                 .subagent_messages()
                 .get(id)
                 .map_or(0, |messages| messages.len()),
             None => session.messages().len(),
-        };
+        });
         self.state.session_mut().push_post(StoredPost {
             chat,
             after_message,
@@ -2723,13 +2714,9 @@ impl App {
                             .collect::<Vec<_>>()
                             .into(),
                     ),
-                    HostContextRequest::WorkingDirectory => HostContextResponse::WorkingDirectory(
-                        PathBuf::from(&self.state.session.cwd),
-                    ),
-                    HostContextRequest::FastModeSupported => {
-                        HostContextResponse::FastModeSupported(
-                            self.state.model.supports_fast() || self.state.model.fast_pending(),
-                        )
+                    HostContextRequest::WorkingDirectory
+                    | HostContextRequest::FastModeSupported => {
+                        return Err(CommandError::StaleTarget);
                     }
                     HostContextRequest::SessionId => {
                         HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
@@ -2744,19 +2731,10 @@ impl App {
                 self.open_tasks();
                 vec![]
             }
-            BuiltinOperation::Compact(instructions) => {
-                if self.status == Status::Streaming {
-                    if !self.queue_compact(instructions) {
-                        return Err(CommandError::Producer(Arc::from(
-                            "agent queue is unavailable",
-                        )));
-                    }
-                    vec![]
-                } else {
-                    self.status = Status::Streaming;
-                    vec![Action::Compact(instructions)]
-                }
-            }
+            BuiltinOperation::Compact(_)
+            | BuiltinOperation::ChangeDirectory { .. }
+            | BuiltinOperation::ToggleFast
+            | BuiltinOperation::ToggleWorkflow => return Err(CommandError::StaleTarget),
             BuiltinOperation::ResetSession => self.reset_session(),
             BuiltinOperation::ToggleHelp => {
                 self.help_modal.toggle();
@@ -2802,7 +2780,6 @@ impl App {
                 self.login_picker.open(self.storage.clone());
                 vec![]
             }
-            BuiltinOperation::ChangeDirectory { path } => self.change_directory(path),
             BuiltinOperation::QuickQuestion {
                 question,
                 attachments,
@@ -2810,9 +2787,9 @@ impl App {
                 let images = attachments
                     .iter()
                     .filter_map(|attachment| {
-                        maki_agent::ImageMediaType::from_mime(&attachment.media_type).map(
-                            |media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)),
-                        )
+                        ImageMediaType::from_mime(&attachment.media_type).map(|media_type| {
+                            ImageSource::new(media_type, Arc::clone(&attachment.data))
+                        })
                     })
                     .collect();
                 vec![Action::Btw(question.to_string(), images)]
@@ -2820,14 +2797,6 @@ impl App {
             BuiltinOperation::ToggleYolo => self.toggle_coordinator_option(
                 maki_agent::session_options::YOLO_OPTION_ID,
                 self.permissions.is_yolo(),
-            ),
-            BuiltinOperation::ToggleFast => self.toggle_coordinator_option(
-                maki_agent::session_options::FAST_OPTION_ID,
-                self.state.fast_intent(),
-            ),
-            BuiltinOperation::ToggleWorkflow => self.toggle_coordinator_option(
-                maki_agent::session_options::WORKFLOW_OPTION_ID,
-                self.state.workflow,
             ),
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
@@ -2878,7 +2847,7 @@ impl App {
             .attachments
             .iter()
             .filter_map(|attachment| {
-                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                ImageMediaType::from_mime(&attachment.media_type)
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
@@ -2938,20 +2907,20 @@ impl App {
             .attachments
             .iter()
             .filter_map(|attachment| {
-                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                ImageMediaType::from_mime(&attachment.media_type)
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        let mut input = maki_agent::AgentInput {
+        let mut input = AgentInput {
             message: turn.content.text.to_string(),
             images,
             mode: admission.template.mode.clone(),
             thinking: admission.template.opts.thinking,
             fast: admission.template.opts.fast,
             workflow: admission.template.workflow,
-            preamble: self.shell.drain_results_for(Some(admission.target.id())),
+            preamble: self.shell.results_for(Some(admission.target.id())).to_vec(),
             prompt: turn.prompt.map(|prompt| {
-                Box::new(maki_agent::McpPromptRef {
+                Box::new(McpPromptRef {
                     qualified_name: prompt.qualified_name.to_string(),
                     arguments: prompt
                         .arguments
@@ -2966,7 +2935,9 @@ impl App {
         let root = self.chats[0].agent_id == Some(admission.target.id());
         let starting = root && self.status != Status::Streaming;
         let correlation = if root {
-            input.preamble.extend(self.shell.drain_results());
+            input
+                .preamble
+                .extend_from_slice(self.shell.results_for(None));
             let run_id = if starting {
                 actor.reserve_presentation(self.run_id)
             } else {
@@ -2989,6 +2960,10 @@ impl App {
             },
         ) {
             Ok(_) => {
+                self.shell.drain_results_for(Some(admission.target.id()));
+                if root {
+                    self.shell.drain_results();
+                }
                 if starting {
                     self.record_run_start(actor.presentation_id());
                 }
@@ -3001,28 +2976,6 @@ impl App {
     pub(crate) fn open_startup_session_picker(&self) {
         self.lua_event_handle
             .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
-    }
-
-    /// Adoption goes through the event loop for the same reason a toggle does:
-    /// awaiting the coordinator on this thread blocks every frame behind a
-    /// running turn's lease.
-    fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
-        if self.coordinator.is_some() {
-            return vec![Action::ChangeDirectory(path)];
-        }
-        let result = path
-            .canonicalize()
-            .and_then(|path| {
-                path.is_dir()
-                    .then_some(path)
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
-            })
-            .map_err(|error| error.to_string());
-        match result {
-            Ok(path) => self.apply_directory_change(path),
-            Err(error) => self.flash(format!("cd: {error}")),
-        }
-        vec![]
     }
 
     /// The app-side half of `/cd`, run once the coordinator has adopted the

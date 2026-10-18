@@ -145,7 +145,8 @@ async fn wait_unmanaged(ticket: TurnTicket, timeout: Option<u64>) -> Result<(), 
     race(settled, expired).await
 }
 
-/// Cancel only this admitted turn.
+/// Cancel this admitted turn. For a managed turn, also close the child
+/// subtrees it delegated. UI cancellation leaves those child subtrees open.
 /// @param ctx LuaCtx Invocation context.
 /// @return (boolean?, string?) Success or error.
 #[lua_fn(name = "cancel")]

@@ -1561,7 +1561,7 @@ and tool set.
   - `show` (`boolean|string?`) post a row for the session in its parent's
     chat; a string adds a description. Default: `true` for trusted parents,
     `false` otherwise. Silent sessions and sessions opened by a tool call,
-    which already have its row, cannot be shown.
+    which already have a tool row, cannot be shown.
   - `auto_deliver` (`boolean?`) for managed children, queue a structured
     lifecycle observation per settled turn to the recorded parent, independently
     of `prompt()` or ticket waits. Nested children notify their own parent,
@@ -1709,7 +1709,7 @@ Unmanaged children use the current host task's authority, not a managed graph.
   - `show` (`boolean|string`) post a row for the child in its parent's chat;
     a string adds a description. Defaults to true for trusted parents and
     false otherwise. Silent children and children spawned by a tool call,
-    which already have its row, cannot be shown.
+    which already have a tool row, cannot be shown.
   - `auto_deliver` (`boolean`) defaults to true; managed children notify their
     recorded parent once per settled turn. A wait in the
     parent's own turn returns the result directly and withdraws the
@@ -2359,7 +2359,8 @@ child-result delivery for that turn.
 AgentTurn:cancel({ctx})
 ```
 
-Cancel only this admitted turn.
+Cancel this admitted turn. For a managed turn, also close the child
+subtrees it delegated. UI cancellation leaves those child subtrees open.
 
 **Parameters:**
 
@@ -4133,8 +4134,8 @@ maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write
 maki.api.mode.get()
 ```
 
-Returns the id of the currently active mode ("build", "plan", or a custom
-name).
+Returns the mode id ("build", "plan", or a custom name) of the invocation's
+agent, or the focused agent when called outside an invocation.
 
 **Returns:** (`string|nil`, `string|nil`) Mode id, or nil and an error.
 
@@ -4152,8 +4153,10 @@ local mode = maki.api.mode.get()
 maki.api.mode.set({name})
 ```
 
-Enters a mode by name; fails when it is not defined. Success means the actor
-committed the mode for subsequent admissions, not that saving has finished.
+Enters a mode by name on the invocation's agent, or the focused agent when
+called outside an invocation. Fails when the mode is not defined. Success
+means the actor committed the mode for subsequent admissions, not that
+saving has finished.
 See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
@@ -6620,7 +6623,8 @@ option.
 - `{text}` (`string`) Row text. Must not be blank.
 - `{opts?}` (`table?`) Optional fields:
   - `level` (`string?`) "info" (default), "warn" or "error".
-  - `agent` (`Agent?`) a child spawned from Lua that the post is about.
+  - `agent` (`Agent?`) a child spawned from Lua that the post is about. Keeps
+    that child's transcript when this post survives a rewind.
 
   Any other option key is an error.
 

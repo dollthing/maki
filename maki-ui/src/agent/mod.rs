@@ -11,8 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
-#[cfg(test)]
-use maki_agent::TurnId;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
@@ -242,15 +240,8 @@ pub(crate) struct SystemPromptOverride {
 }
 
 pub(crate) enum AgentCommand {
-    #[cfg(test)]
-    Cancel {
-        turn_id: Option<TurnId>,
-        run_id: u64,
-    },
     CancelAll,
-    CancelSubagent {
-        tool_use_id: String,
-    },
+    CancelSubagent { tool_use_id: String },
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old

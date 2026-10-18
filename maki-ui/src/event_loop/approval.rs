@@ -6,7 +6,10 @@ use maki_agent::actor::{
     PreparedOperationTicket, PreparedTurn, TurnTicket,
 };
 use maki_agent::session_coordinator::IdleSessionLease;
-use maki_agent::{AgentInput, AgentMode, CancelToken, EventSender, ModeDef, SessionDefaults};
+use maki_agent::{
+    AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
+    ModeDef, SessionDefaults,
+};
 use maki_storage::session_lock::ClaimedSessionLock;
 use maki_storage::sessions::{StoredMode, StoredRule};
 use tracing::warn;
@@ -27,12 +30,15 @@ use crate::plan_approval::{
 #[cfg(test)]
 mod tests;
 
+const APPROVAL_COMMIT_PENDING: &str =
+    "Plan approval is still waiting for its checkpoint; it has not been cancelled";
+
 pub(super) struct PendingPlanApproval {
     pub(super) identity: Arc<()>,
     pub(super) cancel: Option<maki_agent::CancelTrigger>,
     pub(super) waiting_for_lock: Option<ApprovalStep>,
     committing: bool,
-    child: Option<maki_agent::AgentId>,
+    child: Option<AgentId>,
 }
 
 impl Drop for PendingPlanApproval {
@@ -48,6 +54,7 @@ pub(super) enum ApprovalStep {
     Fresh(Box<FreshPlanApproval>),
     Child(Box<PreparedChildApproval>),
     ChildCommitted(Box<CommittedChildApproval>),
+    ChildCommitPending,
 }
 
 impl ApprovalStep {
@@ -55,7 +62,7 @@ impl ApprovalStep {
         match self {
             Self::Captured(prepared) => Some(prepared),
             Self::Fresh(fresh) => Some(&fresh.source),
-            Self::Child(_) | Self::ChildCommitted(_) => None,
+            Self::Child(_) | Self::ChildCommitted(_) | Self::ChildCommitPending => None,
         }
     }
 }
@@ -80,8 +87,8 @@ pub(super) struct FreshPlanApproval {
 }
 
 pub(super) struct PreparedChildApproval {
-    target: maki_agent::AgentRef,
-    config: Arc<maki_agent::EffectiveAgentConfig>,
+    target: AgentRef,
+    config: Arc<EffectiveAgentConfig>,
     plan: ApprovedPlan,
     idle: ActorIdleGuard,
     operation: PreparedOperationTicket,
@@ -90,9 +97,42 @@ pub(super) struct PreparedChildApproval {
 }
 
 pub(super) struct CommittedChildApproval {
-    target: maki_agent::AgentRef,
+    target: AgentRef,
     plan: ApprovedPlan,
     history: Option<HistoryChange>,
+    presentation: ChildPresentation,
+}
+
+struct ChildPresentation {
+    idle: Option<ActorIdleGuard>,
+    ticket: TurnTicket,
+    target: AgentRef,
+}
+
+impl ChildPresentation {
+    fn release(mut self) -> Result<(), String> {
+        let idle = self
+            .idle
+            .take()
+            .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+        if let Err(error) = idle.allow_turn(&self.ticket) {
+            if let Ok(actor) = self.target.actor() {
+                let _ = actor.cancel_turn(self.ticket.turn_id());
+            }
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChildPresentation {
+    fn drop(&mut self) {
+        if self.idle.is_some()
+            && let Ok(actor) = self.target.actor()
+        {
+            let _ = actor.cancel_turn(self.ticket.turn_id());
+        }
+    }
 }
 
 struct PlanApprovalRequest {
@@ -216,12 +256,10 @@ impl EventLoop<'_> {
         idx: usize,
         result: Result<ApprovalStep, String>,
     ) {
-        let result = match result {
-            Ok(ApprovalStep::ChildCommitted(committed)) => {
-                return self.finish_child_plan_approval(idx, *committed);
-            }
-            result => result,
-        };
+        if matches!(result, Ok(ApprovalStep::ChildCommitPending)) {
+            self.sessions[idx].app.flash(APPROVAL_COMMIT_PENDING.into());
+            return;
+        }
         if let Some(pending) = self.sessions[idx].pending_approval.as_mut() {
             pending.committing = false;
         }
@@ -240,6 +278,9 @@ impl EventLoop<'_> {
             Err(error) => return runtime.abort_plan_approval(error),
         };
         match step {
+            ApprovalStep::ChildCommitted(committed) => {
+                self.finish_child_plan_approval(idx, *committed);
+            }
             ApprovalStep::Captured(prepared) if prepared.request.clear_context => {
                 self.prepare_fresh_plan_approval(idx, *prepared);
             }
@@ -251,7 +292,9 @@ impl EventLoop<'_> {
             ApprovalStep::Captured(prepared) => self.commit_plan_approval(idx, *prepared),
             ApprovalStep::Fresh(fresh) => self.activate_fresh_plan_approval(idx, *fresh),
             ApprovalStep::Child(child) => self.commit_child_plan_approval(idx, *child),
-            ApprovalStep::ChildCommitted(_) => unreachable!(),
+            ApprovalStep::ChildCommitPending => {
+                runtime.app.flash(APPROVAL_COMMIT_PENDING.into());
+            }
         }
     }
 
@@ -297,26 +340,7 @@ impl EventLoop<'_> {
             if config.mode.plan_path() != Some(path.as_path()) {
                 return Err(APPROVAL_CHANGED.into());
             }
-            let key = self.sessions[idx]
-                .app
-                .chats
-                .iter()
-                .find(|chat| chat.agent_id == Some(target.id()))
-                .and_then(|chat| chat.subagent_id.clone())
-                .ok_or_else(|| "child history storage identity is unavailable".to_owned())?;
-            let writer = Arc::clone(&self.ctx.storage_writer);
-            let session = self.sessions[idx].id();
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
-                let writer = Arc::clone(&writer);
-                let key = key.clone();
-                Box::pin(async move {
-                    writer
-                        .checkpoint_child_history(session, key, messages)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                })
-            });
+            let checkpoint = self.child_history_checkpoint(idx, &target)?;
             let operation = actor
                 .reserve_prepared_operation(Some(PreparedTurn {
                     input: build_input(String::new()),
@@ -375,6 +399,15 @@ impl EventLoop<'_> {
     }
 
     fn commit_child_plan_approval(&mut self, idx: usize, child: PreparedChildApproval) {
+        self.commit_child_plan_approval_with_timeout(idx, child, SESSION_OP_TIMEOUT);
+    }
+
+    fn commit_child_plan_approval_with_timeout(
+        &mut self,
+        idx: usize,
+        child: PreparedChildApproval,
+        timeout: std::time::Duration,
+    ) {
         if self.sessions[idx].session_lock.is_none() {
             return self.sessions[idx].abort_plan_approval(APPROVAL_LOCK_LOST.into());
         }
@@ -389,6 +422,9 @@ impl EventLoop<'_> {
         });
         if let Err(error) = valid {
             return self.sessions[idx].abort_plan_approval(error);
+        }
+        if let Err(error) = child.operation.set_turn_displayed(true) {
+            return self.sessions[idx].abort_plan_approval(error.to_string());
         }
         let runtime = &mut self.sessions[idx];
         let Some(pending) = runtime.pending_approval.as_mut() else {
@@ -411,17 +447,46 @@ impl EventLoop<'_> {
                 clear_context,
                 checkpoint,
             } = child;
-            let result = idle
-                .commit_prepared(operation, clear_context, checkpoint)
-                .await
-                .map(|(_, history)| {
-                    ApprovalStep::ChildCommitted(Box::new(CommittedChildApproval {
+            let observer = smol::spawn(async move {
+                let (idle, committed, history) = idle
+                    .commit_prepared_held(operation, clear_context, checkpoint)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let ticket = committed
+                    .ticket
+                    .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+                Ok(ApprovalStep::ChildCommitted(Box::new(
+                    CommittedChildApproval {
+                        presentation: ChildPresentation {
+                            idle: Some(idle),
+                            ticket,
+                            target: target.clone(),
+                        },
                         target,
                         plan,
                         history,
-                    }))
+                    },
+                )))
+            });
+            let mut observer = Box::pin(observer);
+            let result =
+                match futures_lite::future::or(async { Some(observer.as_mut().await) }, async {
+                    smol::Timer::after(timeout).await;
+                    None
                 })
-                .map_err(|error| error.to_string());
+                .await
+                {
+                    Some(result) => result,
+                    None => {
+                        let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
+                            session,
+                            runtime: Arc::clone(&identity),
+                            request: Arc::clone(&request),
+                            result: Ok(ApprovalStep::ChildCommitPending),
+                        });
+                        observer.await
+                    }
+                };
             let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
                 session,
                 runtime: identity,
@@ -439,6 +504,7 @@ impl EventLoop<'_> {
             target,
             plan,
             history,
+            presentation,
         } = committed;
         if let Some(history) = history {
             let draft = runtime.app.input_box.buffer.value().to_owned();
@@ -455,8 +521,12 @@ impl EventLoop<'_> {
                 plan.content,
                 plan.path.display().to_string(),
             ));
+            chat.show_user_message(plan.message, Vec::new());
         }
         runtime.app.finish_child_plan_approval(target.id());
+        if let Err(error) = presentation.release() {
+            runtime.app.flash(error);
+        }
     }
 
     fn commit_plan_approval(&mut self, idx: usize, prepared: PreparedPlanApproval) {
@@ -606,6 +676,7 @@ impl EventLoop<'_> {
     }
 
     fn prepare_fresh_plan_approval(&mut self, idx: usize, source: PreparedPlanApproval) {
+        self.sessions[idx].app.sync_live_children();
         let result = (|| -> Result<_, String> {
             let config = source
                 .operation

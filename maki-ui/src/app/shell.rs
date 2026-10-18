@@ -80,11 +80,6 @@ pub(crate) struct ShellState {
 }
 
 impl ShellState {
-    #[cfg(test)]
-    pub fn reserve_id(&mut self) -> String {
-        self.reserve_for(None)
-    }
-
     pub(crate) fn reserve_for(&mut self, target: Option<AgentId>) -> String {
         self.id_counter += 1;
         let id = format!("shell-{}", self.id_counter);
@@ -119,6 +114,10 @@ impl ShellState {
                 trigger.cancel();
             }
         }
+    }
+
+    pub fn results_for(&self, target: Option<AgentId>) -> &[Message] {
+        self.pending_results.get(&target).map_or(&[], Vec::as_slice)
     }
 
     pub fn drain_results_for(&mut self, target: Option<AgentId>) -> Vec<Message> {

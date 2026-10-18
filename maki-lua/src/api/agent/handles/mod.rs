@@ -286,6 +286,7 @@ lua_class! {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use futures_lite::future::race;
@@ -295,31 +296,51 @@ mod tests {
         AgentEvent, AgentLimits, AgentMode, EffectiveAgentConfig, EventSender, Post, PostLevel,
         RunSettings,
     };
+    use maki_commands::{
+        CommandError, CommandFuture, CommandHost, HostRequest, HostResponse, TargetCapabilities,
+    };
     use maki_config::ModelPolicy;
     use maki_providers::{RequestOptions, TokenUsage};
     use mlua::{AnyUserData, Table};
     use smol::Timer;
+    use test_case::test_case;
 
     use super::authority::validate_unmanaged;
     use super::*;
-    use crate::agent_errors::OTHER_PLUGIN_GENERATION;
+    use crate::UiAction;
+    use crate::agent_errors::{
+        BLANK_POST, OTHER_PLUGIN_GENERATION, SHOW_SILENT_AGENT, SHOW_TOOL_AGENT,
+        UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION,
+    };
     use crate::api::agent::structured_output::{StructuredOutput, TOOL_NAME};
     use crate::api::agent::tests::{
         StreamOnceProvider, canned_reply_with_usage, session_with_provider,
         session_with_provider_for_agent,
     };
     use crate::api::agent::{LuaActorBackend, create_agent_table};
+    use crate::api::ui::create_ui_table;
+    use crate::api::util::command::WinView;
     use crate::api::util::ctx::LuaCtx;
     use crate::orchestration::{
         HostRootServicesSlot, OrchestrationServices, OrchestrationServicesSlot, TrustedTarget,
         revoke_plugin,
     };
     use crate::runtime::{TaskScope, lock_cell};
+    use crate::test_support::spawn_host_for_tests;
 
     pub(super) const REPLY: &str = "retained reply";
     pub(super) const RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
     const PLUGIN: &str = "agent-test";
     const FOREIGN_PLUGIN: &str = "foreign-agent-test";
+    const EDITOR_PATH: &str = "plan.md";
+
+    struct EditorCommandHost;
+
+    impl CommandHost for EditorCommandHost {
+        fn request(&self, _: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Err(CommandError::Producer("unexpected host request".into())) })
+        }
+    }
 
     fn plugin_scope(lua: &Lua, plugin: &str) -> TaskScope {
         let scope = TaskScope::detached(lua);
@@ -600,8 +621,8 @@ mod tests {
         });
     }
 
-    #[test_case::test_case(false; "cancel_keeps_descendants_open")]
-    #[test_case::test_case(true; "close_permanently_closes_descendants")]
+    #[test_case(false; "cancel_keeps_descendants_open")]
+    #[test_case(true; "close_permanently_closes_descendants")]
     fn standalone_nested_subtree_lifecycle(close: bool) {
         smol::block_on(async {
             let lua = Lua::new();
@@ -703,12 +724,12 @@ mod tests {
         });
     }
 
-    #[test_case::test_case(false ; "focus_changes_after_dispatch")]
-    #[test_case::test_case(true ; "target_closes_after_dispatch")]
-    fn editor_request_retains_the_invocation_agent(close_target: bool) {
+    #[test_case(false, false ; "legacy_focus_changes_after_dispatch")]
+    #[test_case(false, true ; "legacy_target_closes_after_dispatch")]
+    #[test_case(true, false ; "registry_focus_changes_after_dispatch")]
+    #[test_case(true, true ; "registry_target_closes_after_dispatch")]
+    fn editor_request_retains_the_invocation_agent(registry_dispatch: bool, close_target: bool) {
         smol::block_on(async {
-            let lua = Lua::new();
-            let scope = plugin_scope(&lua, PLUGIN);
             let context = stub_ctx(&AgentMode::Build);
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let replacement_manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -725,56 +746,286 @@ mod tests {
             };
             let original = create(&manager);
             let replacement = create(&replacement_manager);
-            let pinned = TrustedTarget {
+            let (handle, host) = spawn_host_for_tests(&[]);
+            handle.install_orchestration_services(Arc::new(TestServices(TrustedTarget {
                 target: original.clone(),
                 template: context.clone(),
-            };
-            lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
-                pinned.clone(),
-            )))));
-            lock_cell(scope.handle()).pinned_target = Some(pinned);
-            let (tx, rx) = flume::unbounded();
-            lua.globals()
-                .set(
-                    "ui",
-                    crate::api::ui::create_ui_table(&lua, Some(tx), Arc::from(PLUGIN), None)
-                        .unwrap(),
+            })));
+            host.host()
+                .load_source(
+                    PLUGIN,
+                    r#"
+                    maki.api.register_command({
+                        name = "/editor", tui_only = false,
+                        handler = function(_, ctx)
+                            local agent = assert(maki.agent.current(ctx))
+                            local code = maki.ui.open_editor("plan.md")
+                            maki.ui.flash(agent:id() .. "|" .. tostring(code))
+                        end,
+                    })
+                    maki.api.register_command({
+                        name = "/edit", tui_only = false,
+                        handler = function() assert(maki.api.run_command("/editor")) end,
+                    })
+                    "#,
                 )
                 .unwrap();
-            let request = scope.scope_future(
-                lua.load("return ui.open_editor('plan.md')")
-                    .eval_async::<i32>(),
-            );
-            let consume = async {
-                let crate::api::util::command::UiAction::OpenEditor {
-                    target,
-                    path,
-                    reply_tx,
-                } = rx.recv_async().await.unwrap()
-                else {
-                    panic!("expected editor request");
-                };
-                lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
-                    TrustedTarget {
-                        target: replacement.clone(),
-                        template: context,
-                    },
-                )))));
-                if close_target {
-                    manager.close_subtree(original.id()).unwrap();
-                }
-                let target = target.unwrap();
-                assert_eq!(target.id(), original.id());
-                assert_ne!(target.id(), replacement.id());
-                assert_eq!(target.validate_live().is_err(), close_target);
-                assert_eq!(path, std::path::PathBuf::from("plan.md"));
-                reply_tx.send(if close_target { -1 } else { 0 }).unwrap();
+            if registry_dispatch {
+                let commands = host.host().command_registry();
+                let target =
+                    commands.bind_target(TargetCapabilities::ALL, Arc::new(EditorCommandHost));
+                commands.dispatch_input(&target, "/edit".into()).await;
+            } else {
+                handle.run_command(Arc::from(PLUGIN), Arc::from("/editor"), String::new(), 0);
+            }
+            let actions = host.host().ui_action_rx();
+            let UiAction::OpenEditor {
+                target,
+                path,
+                reply_tx,
+            } = actions.recv_timeout(RETIRE_TIMEOUT).unwrap()
+            else {
+                panic!("expected editor request");
             };
-            let (code, ()) = futures_lite::future::zip(request, consume).await;
-            assert_eq!(code.unwrap(), if close_target { -1 } else { 0 });
+            handle.install_orchestration_services(Arc::new(TestServices(TrustedTarget {
+                target: replacement.clone(),
+                template: context,
+            })));
+            host.host().wait_for_worker_barrier_for_test();
+            if close_target {
+                manager.close_subtree(original.id()).unwrap();
+            }
+            let target = target.unwrap();
+            assert_eq!(target.id(), original.id());
+            assert_ne!(target.id(), replacement.id());
+            assert_eq!(target.validate_live().is_err(), close_target);
+            assert_eq!(path, PathBuf::from(EDITOR_PATH));
+            let code = if close_target { -1 } else { 0 };
+            reply_tx.send(code).unwrap();
+            let UiAction::Flash(message) = actions.recv_timeout(RETIRE_TIMEOUT).unwrap() else {
+                panic!("expected editor result");
+            };
+            assert_eq!(message, format!("{}|{code}", original.id()));
             manager.shutdown(RETIRE_TIMEOUT).await;
             replacement_manager.shutdown(RETIRE_TIMEOUT).await;
             drop(fixtures);
+        });
+    }
+
+    #[test]
+    fn mode_requests_retain_the_command_agent() {
+        smol::block_on(async {
+            let context = stub_ctx(&AgentMode::Build);
+            let mut fixtures = Vec::new();
+            let mut create = |mode| {
+                let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+                let target = manager
+                    .create_root_with_config(
+                        Some(EffectiveAgentConfig::new(
+                            RunSettings {
+                                provider: context.provider.clone(),
+                                model: (*context.model).clone(),
+                                thinking: context.opts.thinking,
+                                fast: context.opts.fast,
+                                workflow: context.workflow,
+                            },
+                            mode,
+                        )),
+                        Vec::new(),
+                        None,
+                        |id| {
+                            let (_, state, session, _) =
+                                session_with_provider_for_agent(context.provider.clone(), id);
+                            fixtures.push(session);
+                            Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                        },
+                    )
+                    .unwrap();
+                (manager, target)
+            };
+            let (manager, original) = create(AgentMode::Build);
+            let (replacement_manager, replacement) = create(AgentMode::Plan(EDITOR_PATH.into()));
+            let (handle, host) = spawn_host_for_tests(&[]);
+            handle.install_orchestration_services(Arc::new(TestServices(TrustedTarget {
+                target: original.clone(),
+                template: context.clone(),
+            })));
+            host.host()
+                .load_source(
+                    PLUGIN,
+                    r#"
+                maki.api.register_command({
+                    name = "/mode_target", tui_only = false,
+                    handler = function()
+                        assert(maki.ui.open_editor("plan.md") == 0)
+                        assert(maki.api.mode.get() == "build")
+                        assert(maki.api.mode.set("plan"))
+                        maki.ui.flash("mode updated")
+                    end,
+                })
+            "#,
+                )
+                .unwrap();
+            let completed = handle.run_command_for_test(
+                Arc::from(PLUGIN),
+                Arc::from("/mode_target"),
+                String::new(),
+                0,
+            );
+            let actions = host.host().ui_action_rx();
+            let UiAction::OpenEditor { reply_tx, .. } =
+                actions.recv_timeout(RETIRE_TIMEOUT).unwrap()
+            else {
+                panic!("expected command pause");
+            };
+            handle.install_orchestration_services(Arc::new(TestServices(TrustedTarget {
+                target: replacement,
+                template: context,
+            })));
+            host.host().wait_for_worker_barrier_for_test();
+            reply_tx.send(0).unwrap();
+            let UiAction::SetAgentMode {
+                target,
+                id,
+                reply_tx,
+            } = actions.recv_timeout(RETIRE_TIMEOUT).unwrap()
+            else {
+                panic!("expected pinned mode update");
+            };
+            assert_eq!(target.id(), original.id());
+            assert_eq!(id, "plan");
+            reply_tx.send(Ok(())).unwrap();
+            assert!(
+                matches!(actions.recv_timeout(RETIRE_TIMEOUT).unwrap(), UiAction::Flash(message) if message == "mode updated")
+            );
+            assert_eq!(completed.recv_timeout(RETIRE_TIMEOUT).unwrap(), Ok(()));
+            manager.shutdown(RETIRE_TIMEOUT).await;
+            replacement_manager.shutdown(RETIRE_TIMEOUT).await;
+            drop(fixtures);
+        });
+    }
+
+    #[test_case(false; "registered_command")]
+    #[test_case(true; "keybind_callback")]
+    fn mode_requests_preserve_absent_admission(keybind: bool) {
+        struct AbsentAdmissionServices(Mutex<Option<TrustedTarget>>);
+
+        impl OrchestrationServices for AbsentAdmissionServices {
+            fn resolve_target(
+                &self,
+                invocation: Option<&maki_commands::CommandInvocation>,
+            ) -> Result<Option<TrustedTarget>, String> {
+                if invocation.is_some() {
+                    Ok(None)
+                } else {
+                    Ok(self.0.lock().unwrap().clone())
+                }
+            }
+
+            fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|current| current.target.id() == target.id())
+                    .map(|current| current.template.clone())
+                    .ok_or_else(|| "unknown test target".into())
+            }
+        }
+
+        const COMMAND: &str = "/mode_without_admission";
+        const KEY: &str = "<C-y>";
+        const FINISHED: &str = "mode requests rejected";
+        smol::block_on(async {
+            let context = stub_ctx(&AgentMode::Build);
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let mut session = None;
+            let root = manager
+                .create_root_with_config(
+                    Some(EffectiveAgentConfig::new(
+                        RunSettings {
+                            provider: context.provider.clone(),
+                            model: (*context.model).clone(),
+                            thinking: context.opts.thinking,
+                            fast: context.opts.fast,
+                            workflow: context.workflow,
+                        },
+                        AgentMode::Build,
+                    )),
+                    Vec::new(),
+                    None,
+                    |id| {
+                        let (_, state, fixture, _) =
+                            session_with_provider_for_agent(context.provider.clone(), id);
+                        session = Some(fixture);
+                        Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                    },
+                )
+                .unwrap();
+            let (handle, host) = spawn_host_for_tests(&[]);
+            let services = Arc::new(AbsentAdmissionServices(Mutex::new(None)));
+            handle.install_orchestration_services(services.clone());
+            host.host()
+                .load_source(
+                    PLUGIN,
+                    &format!(
+                        r#"
+                    local function check_mode()
+                        assert(maki.fn.winsaveview())
+                        local mode, get_err = maki.api.mode.get()
+                        local changed, set_err = maki.api.mode.set("plan")
+                        assert(mode == nil and get_err == {no_agent:?}, tostring(get_err))
+                        assert(changed == nil and set_err == {no_agent:?}, tostring(set_err))
+                        maki.ui.flash({FINISHED:?})
+                    end
+                    maki.api.register_command({{
+                        name = {COMMAND:?}, tui_only = false, handler = check_mode,
+                    }})
+                    maki.keymap.set("n", {KEY:?}, check_mode)
+                    "#,
+                        no_agent = crate::agent_errors::NO_FOCUSED_AGENT
+                    ),
+                )
+                .unwrap();
+            if keybind {
+                let id = host.host().keymap_reader().load().entries[0].id;
+                assert!(handle.run_keybind_callback(id, None));
+            } else {
+                let commands = host.host().command_registry();
+                let target =
+                    commands.bind_target(TargetCapabilities::ALL, Arc::new(EditorCommandHost));
+                commands.dispatch_input(&target, COMMAND.into()).await;
+            }
+            let actions = host.host().ui_action_rx();
+            let UiAction::WinSaveView { reply_tx } = actions.recv_timeout(RETIRE_TIMEOUT).unwrap()
+            else {
+                panic!("expected command gate");
+            };
+            *services.0.lock().unwrap() = Some(TrustedTarget {
+                target: root.clone(),
+                template: context,
+            });
+            reply_tx
+                .send(WinView {
+                    scroll_top: 0,
+                    line_count: 0,
+                    height: 0,
+                    auto_scroll: true,
+                })
+                .unwrap();
+            let next = actions.recv_timeout(RETIRE_TIMEOUT).unwrap();
+            if let UiAction::SetAgentMode { reply_tx, .. } = next {
+                let _ = reply_tx.send(Err("unexpected mode update".into()));
+                panic!("mode request retargeted the newly focused root");
+            }
+            assert!(matches!(next, UiAction::Flash(message) if message == FINISHED));
+            assert!(actions.is_empty());
+            assert!(matches!(
+                root.effective_config().unwrap().unwrap().mode,
+                AgentMode::Build
+            ));
+            manager.shutdown(RETIRE_TIMEOUT).await;
+            drop(session);
         });
     }
 
@@ -819,7 +1070,7 @@ mod tests {
             lua.globals()
                 .set(
                     "ui",
-                    crate::api::ui::create_ui_table(&lua, None, Arc::from(PLUGIN), None).unwrap(),
+                    create_ui_table(&lua, None, Arc::from(PLUGIN), None).unwrap(),
                 )
                 .unwrap();
             let result: String = scope
@@ -839,9 +1090,9 @@ mod tests {
         })
     }
 
-    #[test_case::test_case("nil", Some(CHILD_NAME) ; "shown_by_default")]
-    #[test_case::test_case("'the pending diff'", Some("reviewer: the pending diff") ; "with_description")]
-    #[test_case::test_case("false", None ; "hidden")]
+    #[test_case("nil", Some(CHILD_NAME) ; "shown_by_default")]
+    #[test_case("'the pending diff'", Some("reviewer: the pending diff") ; "with_description")]
+    #[test_case("false", None ; "hidden")]
     fn spawn_posts_a_row_for_shown_children(show: &str, expected: Option<&str>) {
         let (transcript, posts) = run_trusted(&format!(
             r#"
@@ -875,12 +1126,12 @@ mod tests {
             return err
         "#,
         );
-        assert_eq!(error, crate::agent_errors::SHOW_SILENT_AGENT);
+        assert_eq!(error, SHOW_SILENT_AGENT);
         assert!(posts.is_empty());
     }
 
-    #[test_case::test_case("nil", None ; "hidden_by_default")]
-    #[test_case::test_case("true", Some(crate::agent_errors::SHOW_TOOL_AGENT) ; "explicit_show_refused")]
+    #[test_case("nil", None ; "hidden_by_default")]
+    #[test_case("true", Some(SHOW_TOOL_AGENT) ; "explicit_show_refused")]
     fn tool_spawned_children_keep_their_tool_row(show: &str, expected: Option<&str>) {
         const TOOL_USE_ID: &str = "call_review";
         smol::block_on(async {
@@ -945,9 +1196,9 @@ mod tests {
         );
     }
 
-    #[test_case::test_case("'  '", "nil", crate::agent_errors::BLANK_POST ; "blank_text")]
-    #[test_case::test_case("'text'", "{ level = 'fatal' }", crate::agent_errors::UNKNOWN_POST_LEVEL ; "unknown_level")]
-    #[test_case::test_case("'text'", "{ colour = 'red' }", crate::agent_errors::UNKNOWN_POST_OPTION ; "unknown_option")]
+    #[test_case("'  '", "nil", BLANK_POST ; "blank_text")]
+    #[test_case("'text'", "{ level = 'fatal' }", UNKNOWN_POST_LEVEL ; "unknown_level")]
+    #[test_case("'text'", "{ colour = 'red' }", UNKNOWN_POST_OPTION ; "unknown_option")]
     fn invalid_posts_return_errors(text: &str, opts: &str, expected: &str) {
         let (error, posts) = run_trusted(&format!(
             r#"

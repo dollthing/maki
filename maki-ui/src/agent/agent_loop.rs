@@ -1039,7 +1039,10 @@ mod tests {
 
     use futures_lite::future::poll_once;
     use maki_agent::actor::{ActorEvent, DeliveryStatus};
-    use maki_agent::{AgentMode, McpPromptRef, ReasonedCancelToken};
+    use maki_agent::{
+        AgentManagerHandle, AgentMode, AgentRef, EffectiveAgentConfig, McpPromptRef,
+        ReasonedCancelToken, RunSettings, TurnAdmissionOptions,
+    };
     use maki_config::PermissionsConfig;
     use maki_providers::ContentBlock;
     use test_case::test_case;
@@ -1117,7 +1120,7 @@ mod tests {
                         make_input("successor"),
                         None,
                         format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
-                        maki_agent::TurnAdmissionOptions {
+                        TurnAdmissionOptions {
                             already_displayed: true,
                             ..Default::default()
                         },
@@ -1136,7 +1139,7 @@ mod tests {
                         make_input("folded user input"),
                         None,
                         format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
-                        maki_agent::TurnAdmissionOptions {
+                        TurnAdmissionOptions {
                             already_displayed: false,
                             ..Default::default()
                         },
@@ -1191,7 +1194,7 @@ mod tests {
                     input,
                     None,
                     String::new(),
-                    maki_agent::actor::TurnAdmissionOptions {
+                    TurnAdmissionOptions {
                         provenance: maki_agent::actor::TurnProvenance {
                             origin: maki_agent::actor::TurnOrigin::Plugin,
                             ..Default::default()
@@ -1426,7 +1429,6 @@ mod tests {
         const FIRST_RUN: u64 = 7;
         const SECOND_RUN: u64 = FIRST_RUN + 1;
         const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        const ROUTER_BARRIER: &str = "cancel-router-barrier";
         const SHARED_CORRELATION: &str = "plugin-shared-correlation";
 
         smol::block_on(futures_lite::future::or(
@@ -1479,16 +1481,6 @@ mod tests {
                 );
                 let mut app =
                     crate::app::tests::actor_presentation_app(queue.clone(), FIRST_RUN - 1);
-                let (cmd_tx, cmd_rx) = flume::unbounded();
-                let subagent_cancels = Arc::new(CancelMap::new());
-                let (init_trigger, _) = CancelToken::new();
-                super::super::command_router::spawn_command_router(
-                    cmd_rx,
-                    manager.clone(),
-                    root.id(),
-                    Arc::clone(&subagent_cancels),
-                    init_trigger,
-                );
                 let first = actor.admit_turn(make_input(), None, String::new()).unwrap();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
@@ -1571,15 +1563,8 @@ mod tests {
                 };
                 assert_eq!(*turn_id, Some(second.turn_id()));
                 assert_eq!(*run_id, FIRST_RUN);
-                let cancelled_turn_id = *turn_id;
-                let cancelled_run_id = *run_id;
+                let cancelled_turn_id = turn_id.unwrap();
                 assert_eq!(app.run_id, PENDING_RUN + 1);
-                cmd_tx
-                    .send(crate::agent::AgentCommand::Cancel {
-                        turn_id: cancelled_turn_id,
-                        run_id: cancelled_run_id,
-                    })
-                    .unwrap();
                 assert!(matches!(
                     second.wait().await,
                     TurnOutcome::Cancelled {
@@ -1626,24 +1611,10 @@ mod tests {
                 });
                 assert_eq!(app.run_id, PENDING_RUN + 2);
                 assert_eq!(app.status, crate::components::Status::Streaming);
-                let (barrier_trigger, barrier) = CancelToken::new();
-                subagent_cancels.insert(ROUTER_BARRIER.into(), barrier_trigger);
-                cmd_tx
-                    .send(crate::agent::AgentCommand::Cancel {
-                        turn_id: cancelled_turn_id,
-                        run_id: cancelled_run_id,
-                    })
-                    .unwrap();
-                cmd_tx
-                    .send(crate::agent::AgentCommand::CancelSubagent {
-                        tool_use_id: ROUTER_BARRIER.into(),
-                    })
-                    .unwrap();
-                barrier.cancelled().await;
+                assert!(actor.cancel_turn(cancelled_turn_id).is_err());
                 assert!(future.peek().is_none());
                 release.send(()).unwrap();
                 assert!(matches!(future.wait().await, TurnOutcome::Completed { .. }));
-                drop(cmd_tx);
                 actor.close();
                 assert!(
                     manager
@@ -1669,6 +1640,13 @@ mod tests {
                 const INITIAL: &str = "initial user instruction";
                 const FOLLOWUPS: [&str; 2] =
                     ["first deferred instruction", "second deferred instruction"];
+                const IMAGE_BYTES: usize = 256 * 1024 + 1;
+                const SHELL_CONTEXT: &str = "shell preamble output";
+                const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYIIA";
+                let image = maki_agent::ImageSource::new(
+                    maki_agent::ImageMediaType::Png,
+                    Arc::from(format!("{PNG}{}", "AAAA".repeat(IMAGE_BYTES / 4))),
+                );
                 let (mut backend, _, events) = failing_backend();
                 let (requests_tx, requests) = flume::unbounded();
                 let (release, released) = flume::bounded(1);
@@ -1729,6 +1707,8 @@ mod tests {
                     panic!("expected initial user submission");
                 };
                 input.prompt = None;
+                input.images = vec![image.clone()];
+                input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {INITIAL}"))];
                 let submitted_run = app.run_id;
                 queue.push(QueueItem::Message {
                     text: INITIAL.into(),
@@ -1746,20 +1726,16 @@ mod tests {
                     maki_agent::actor::TurnOrigin::User
                 );
                 for text in FOLLOWUPS {
-                    let images = vec![maki_agent::ImageSource::new(
-                        maki_agent::ImageMediaType::Png,
-                        Arc::from(
-                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
-                        ),
-                    )];
+                    let mut input = AgentInput::from_defaults(
+                        text.into(),
+                        AgentMode::Build,
+                        vec![image.clone()],
+                        Default::default(),
+                    );
+                    input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {text}"))];
                     queue.push(QueueItem::Message {
                         text: text.into(),
-                        input: AgentInput::from_defaults(
-                            text.into(),
-                            AgentMode::Build,
-                            images,
-                            Default::default(),
-                        ),
+                        input,
                         run_id: submitted_run,
                         displayed: false,
                     });
@@ -1768,13 +1744,49 @@ mod tests {
                 release.send(()).unwrap();
                 let next = requests.recv_async().await.unwrap();
                 let serialized = serde_json::to_string(&next).unwrap();
-                for text in FOLLOWUPS {
-                    assert!(
-                        serialized.contains(text),
-                        "missing {text} from next request"
-                    );
+                let mut previous = 0;
+                for text in [INITIAL, FOLLOWUPS[0], FOLLOWUPS[1]] {
+                    let preamble = format!("{SHELL_CONTEXT}: {text}");
+                    assert_eq!(serialized.matches(&preamble).count(), 1);
+                    let preamble_index = next
+                        .iter()
+                        .position(|message| {
+                            message
+                                .first_text_content()
+                                .is_some_and(|content| content.contains(&preamble))
+                        })
+                        .unwrap();
+                    let (index, message) = next
+                        .iter()
+                        .enumerate()
+                        .find(|(_, message)| {
+                            message
+                                .content
+                                .iter()
+                                .any(|block| matches!(block, ContentBlock::Image { .. }))
+                                && message
+                                    .first_text_content()
+                                    .is_some_and(|content| content.contains(text))
+                        })
+                        .expect("image prompt missing from the follow-up request");
+                    assert_eq!(index, preamble_index + 1);
+                    assert!(index > previous);
+                    previous = index;
+                    if text != INITIAL {
+                        let wrapped = message.first_text_content().unwrap();
+                        assert!(wrapped.starts_with("<user-interrupt>\n"));
+                        assert!(wrapped.ends_with("\n</user-interrupt>"));
+                        assert_eq!(message.display_text.as_deref(), Some(text));
+                    }
                 }
-                assert!(serialized.contains("image/png"));
+                assert_eq!(serialized.matches(image.data.as_ref()).count(), 3);
+                assert_eq!(
+                    serde_json::to_string(&first)
+                        .unwrap()
+                        .matches(image.data.as_ref())
+                        .count(),
+                    1
+                );
                 assert_eq!(actor.snapshot().active_turn, Some(ticket.turn_id()));
                 assert!(queue.is_empty());
                 release.send(()).unwrap();
@@ -1806,6 +1818,272 @@ mod tests {
             async {
                 smol::Timer::after(std::time::Duration::from_secs(10)).await;
                 panic!("production queue folding timed out");
+            },
+        ));
+    }
+
+    fn provider_target(
+        manager: &AgentManagerHandle,
+        mut backend: TuiActorBackend,
+        provider: Arc<dyn maki_providers::provider::Provider>,
+        child: bool,
+    ) -> AgentRef {
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider,
+                model: crate::components::test_model(),
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            AgentMode::Build,
+        )
+        .with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
+        if child {
+            let (parent_backend, _, _) = failing_backend();
+            let parent = manager
+                .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend))
+                })
+                .unwrap();
+            manager
+                .spawn_child_trusted_with_config(
+                    &parent,
+                    config,
+                    Default::default(),
+                    Vec::new(),
+                    None,
+                    |id| {
+                        backend.agent_id = id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    },
+                )
+                .unwrap()
+        } else {
+            manager
+                .create_root_with_config(Some(config), Vec::new(), None, |id| {
+                    backend.agent_id = id;
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                })
+                .unwrap()
+        }
+    }
+
+    #[test_case(false, false; "root_provider_error")]
+    #[test_case(true, false; "child_provider_error")]
+    #[test_case(false, true; "root_request_budget")]
+    #[test_case(true, true; "child_request_budget")]
+    fn shared_instruction_failure_and_budget_outcomes(child: bool, budget: bool) {
+        const INITIAL: &str = "request before steering";
+        const STEERING: &str = "accepted but omitted steering";
+        const FAILURE: &str = "gated provider failure";
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        smol::block_on(futures_lite::future::or(
+            async {
+                let (mut backend, mut input, events) = failing_backend();
+                if budget {
+                    backend.config.max_turns = Some(1);
+                }
+                input.prompt = None;
+                input.message = INITIAL.into();
+                let (requests_tx, requests) = flume::unbounded();
+                let (release, released) = flume::bounded(1);
+                let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+                let target = provider_target(
+                    &manager,
+                    backend,
+                    Arc::new(FailingQueueProvider {
+                        requests: requests_tx,
+                        release: released,
+                        fail: !budget,
+                    }),
+                    child,
+                );
+                let actor = target.actor().unwrap();
+                let first = actor
+                    .submit(input, None, String::new(), Default::default())
+                    .unwrap();
+                let request = requests.recv_async().await.unwrap();
+                assert!(serde_json::to_string(&request).unwrap().contains(INITIAL));
+                let joined = actor
+                    .submit(
+                        AgentInput::from_defaults(
+                            STEERING.into(),
+                            AgentMode::Build,
+                            Vec::new(),
+                            Default::default(),
+                        ),
+                        None,
+                        String::new(),
+                        Default::default(),
+                    )
+                    .unwrap();
+                assert_eq!(joined.turn_id(), first.turn_id());
+                assert!(!serde_json::to_string(&request).unwrap().contains(STEERING));
+                release.send(()).unwrap();
+                let outcome = first.wait().await;
+                assert!(matches!(&outcome, TurnOutcome::Failed { failure, .. }
+                if if budget { failure.diagnostic.contains("request budget") }
+                   else { failure.diagnostic.contains(FAILURE) }));
+                assert_eq!(joined.wait().await, outcome);
+                assert!(requests.try_recv().is_err());
+                let outcomes: Vec<_> = events
+                    .try_iter()
+                    .filter_map(|envelope| match envelope.event {
+                        AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(outcomes, [outcome]);
+                assert!(manager.shutdown(TIMEOUT).await.timed_out.is_empty());
+            },
+            async {
+                smol::Timer::after(TIMEOUT).await;
+                panic!("accepted steering failure did not settle");
+            },
+        ));
+
+        struct FailingQueueProvider {
+            requests: flume::Sender<Vec<Message>>,
+            release: flume::Receiver<()>,
+            fail: bool,
+        }
+        impl maki_providers::provider::Provider for FailingQueueProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _: &'a Model,
+                messages: &'a [Message],
+                _: &'a str,
+                _: &'a serde_json::Value,
+                _: &'a flume::Sender<maki_providers::ProviderEvent>,
+                _: maki_providers::RequestOptions,
+                _: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<maki_providers::StreamResponse, AgentError>,
+            > {
+                Box::pin(async move {
+                    self.requests.send(messages.to_vec()).unwrap();
+                    self.release.recv_async().await.unwrap();
+                    if self.fail {
+                        return Err(AgentError::Config {
+                            message: FAILURE.into(),
+                        });
+                    }
+                    Ok(maki_providers::StreamResponse {
+                        message: Message {
+                            role: maki_providers::Role::Assistant,
+                            content: vec![ContentBlock::Text {
+                                text: EXPLICIT_RESPONSE.into(),
+                            }],
+                            ..Default::default()
+                        },
+                        usage: Default::default(),
+                        stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    })
+                })
+            }
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+    }
+
+    #[test_case(false; "main_does_not_join")]
+    #[test_case(true; "nonmain_joins")]
+    fn completion_policy_main_vs_nonmain(child: bool) {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        smol::block_on(futures_lite::future::or(
+            async {
+                let manager = maki_agent::AgentManagerHandle::new(maki_agent::AgentLimits {
+                    max_concurrent_agent_turns: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+                let (backend, mut input, _events) = failing_backend();
+                input.prompt = None;
+                let (release, released) = flume::bounded(1);
+                let (requests_tx, requests) = flume::unbounded();
+                let target = provider_target(
+                    &manager,
+                    backend,
+                    Arc::new(CompletionProvider {
+                        inner: ExplicitProvider { release: released },
+                        requests: requests_tx,
+                    }),
+                    child,
+                );
+                let actor = target.actor().unwrap();
+                let ticket = actor
+                    .submit(input, None, String::new(), Default::default())
+                    .unwrap();
+                requests.recv_async().await.unwrap();
+                let (mut reporter_backend, mut reporter_input, _reporter_events) =
+                    failing_backend();
+                reporter_input.prompt = None;
+                let (report_release, report_released) = flume::bounded(1);
+                let (report_requests_tx, report_requests) = flume::unbounded();
+                let mut config = (*actor.effective_config().unwrap()).clone();
+                config.settings.provider = Arc::new(CompletionProvider {
+                    inner: ExplicitProvider {
+                        release: report_released,
+                    },
+                    requests: report_requests_tx,
+                });
+                let reporter = manager
+                    .spawn_child_trusted_with_config(
+                        &target,
+                        config,
+                        Default::default(),
+                        Vec::new(),
+                        None,
+                        |id| {
+                            reporter_backend.agent_id = id;
+                            Ok::<Box<dyn ActorBackend>, String>(Box::new(reporter_backend))
+                        },
+                    )
+                    .unwrap();
+                let reporter_actor = reporter.actor().unwrap();
+                reporter_actor
+                    .configure_parent_delivery(true, None)
+                    .unwrap();
+                let report_ticket = reporter_actor
+                    .submit(reporter_input, None, String::new(), Default::default())
+                    .unwrap();
+                assert!(report_requests.try_recv().is_err());
+                release.send(()).unwrap();
+                report_requests.recv_async().await.unwrap();
+                assert!(report_ticket.peek().is_none());
+                if child {
+                    assert!(
+                        ticket.peek().is_none(),
+                        "non-main settled before its reporting child"
+                    );
+                } else {
+                    assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+                }
+                report_release.send(()).unwrap();
+                assert!(matches!(
+                    report_ticket.wait().await,
+                    TurnOutcome::Completed { .. }
+                ));
+                let continuation = requests.recv_async().await.unwrap();
+                let serialized = serde_json::to_string(&continuation).unwrap();
+                assert!(serialized.contains(&report_ticket.turn_id().to_string()));
+                assert!(serialized.contains(EXPLICIT_RESPONSE));
+                release.send(()).unwrap();
+                assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+                assert!(manager.shutdown(TIMEOUT).await.timed_out.is_empty());
+                assert!(requests.try_recv().is_err());
+            },
+            async {
+                smol::Timer::after(TIMEOUT).await;
+                panic!("main/non-main completion policy did not settle");
             },
         ));
     }
@@ -1930,7 +2208,7 @@ mod tests {
                         *input,
                         None,
                         format!("{ROOT_CORRELATION_PREFIX}{submitted_run}"),
-                        maki_agent::TurnAdmissionOptions {
+                        TurnAdmissionOptions {
                             already_displayed: true,
                             ..Default::default()
                         },
@@ -2484,12 +2762,13 @@ mod tests {
         });
     }
 
-    #[test]
-    fn child_completion_mid_tool_batch_reaches_next_request_of_same_turn() {
+    #[test_case(false; "root")]
+    #[test_case(true; "child")]
+    fn shared_consumption_wrapper_and_request_order(child: bool) {
         smol::block_on(async {
             const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             futures_lite::future::or(async {
-                let (mut backend, mut input, _events) = failing_backend();
+                let (backend, mut input, _events) = failing_backend();
                 input.prompt = None;
                 let (release, released) = flume::unbounded();
                 let (requests, request_rx) = flume::unbounded();
@@ -2501,16 +2780,16 @@ mod tests {
                     }, AgentMode::Build,
                 ).with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build));
                 let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
-                let root = manager.create_root_with_config(
-                    Some(config.clone()), Vec::new(), None, |agent_id| {
-                        backend.agent_id = agent_id;
-                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
-                    },
-                ).unwrap();
+                let root = provider_target(&manager, backend, Arc::clone(&config.settings.provider), child);
                 let actor = root.actor().unwrap();
                 let actor_events = actor.subscribe_events();
-                let parent = actor.admit_turn(input, None, String::new()).unwrap();
+                let parent = actor.submit(input, None, String::new(), Default::default()).unwrap();
                 request_rx.recv_async().await.unwrap();
+                const STEERING: &str = "steering during tool batch";
+                let steering = actor.submit(AgentInput::from_defaults(
+                    STEERING.into(), AgentMode::Build, Vec::new(), Default::default(),
+                ), None, String::new(), Default::default()).unwrap();
+                assert_eq!(steering.turn_id(), parent.turn_id());
 
                 let (mut child_backend, mut child_input, _child_events) = failing_backend();
                 child_input.prompt = None;
@@ -2548,9 +2827,20 @@ mod tests {
                     let serialized = serde_json::to_string(message).unwrap();
                     serialized.contains(&child_turn) && serialized.contains(EXPLICIT_RESPONSE)
                 }).expect("child observation missing from the follow-up request");
-                assert!(observation > tool_result, "observation must follow the tool result: {request:?}");
+                let wrapped: Vec<_> = request.iter().enumerate().filter(|(_, message)| {
+                    message.display_text.as_deref() == Some(STEERING)
+                }).collect();
+                let [(steering_index, steering_message)] = wrapped.as_slice() else {
+                    panic!("steering was not delivered exactly once");
+                };
+                let text = steering_message.first_text_content().unwrap();
+                assert!(text.starts_with("<user-interrupt>\n"));
+                assert!(text.ends_with("\n</user-interrupt>"));
+                assert!(tool_result < *steering_index);
+                assert!(observation > *steering_index, "observation must follow tool results and steering: {request:?}");
 
                 assert!(matches!(parent.wait().await, TurnOutcome::Completed { .. }));
+                assert!(matches!(steering.wait().await, TurnOutcome::Completed { .. }));
                 manager.shutdown(TIMEOUT).await;
                 assert!(request_rx.try_recv().is_err(), "parent made an extra provider request");
                 seen.extend(actor_events.try_iter());

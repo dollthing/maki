@@ -269,7 +269,7 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
 ///   show (boolean|string): post a row for the child in its parent's chat;
 ///     a string adds a description. Defaults to true for trusted parents and
 ///     false otherwise. Silent children and children spawned by a tool call,
-///     which already have its row, cannot be shown.
+///     which already have a tool row, cannot be shown.
 ///   auto_deliver (boolean): defaults to true; managed children notify their
 ///     recorded parent once per settled turn. A wait in the
 ///     parent's own turn returns the result directly and withdraws the

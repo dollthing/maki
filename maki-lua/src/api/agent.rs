@@ -23,12 +23,11 @@ use handles::{
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
-    ActorBackend, ActorLifecycle, ActorStatus, AdmissionPolicyConstraint, BackendResult,
-    EffectiveAgentConfig, TurnContext, WorkKind,
+    ActorBackend, ActorLifecycle, ActorStatus, AdmissionPolicyConstraint, AdmissionPreparation,
+    AgentContextSnapshot, BackendResult, EffectiveAgentConfig, ModeCeiling, TurnContext, WorkKind,
 };
 use maki_agent::agent::{
-    ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, load_instructions,
-    tool_dispatch,
+    Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
 };
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::template::env_vars_for;
@@ -71,10 +70,14 @@ use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::host_root::HostRootServices;
 use crate::orchestration::TrustedContext;
-use crate::runtime::CANCELLED_MSG;
+use crate::runtime::{CANCELLED_MSG, Request};
 
 const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
 const SESSION_CLOSED_ERR: &str = "session closed";
+const COMPACT_PARAMS_MISSING_ERR: &str = "compaction requires initialized agent parameters";
+const COMPACT_CONFIG_MISSING_ERR: &str =
+    "compaction was admitted without an effective agent configuration";
+const INVALID_SHOW_OPTION: &str = "show must be a boolean or string";
 const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const PROMPT_SLOTS_CLOSED: &str = "prompt slots channel closed";
@@ -152,7 +155,7 @@ struct LuaActorState {
     children: Arc<Mutex<StandaloneChildren>>,
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
-    prompt_requests: Option<flume::Sender<crate::runtime::Request>>,
+    prompt_requests: Option<flume::Sender<Request>>,
     custom_system: String,
     tools: RequestTools,
     opts: RequestOptions,
@@ -373,7 +376,7 @@ impl ActorBackend for LuaActorBackend {
         })
     }
 
-    fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
         let state = Arc::clone(&self.state);
         Some(Arc::new(move |_input, mode, config| {
             let params = state
@@ -394,11 +397,9 @@ impl ActorBackend for LuaActorBackend {
                 .map(|config| config.context.cwd().to_path_buf())
                 .or_else(|| state.template.get().map(|template| template.cwd.clone()))
                 .unwrap_or_else(|| ".".into());
-            let instructions = load_instructions(&cwd.to_string_lossy());
             let (resolved, ready) = if let Some(requests) = &state.prompt_requests {
                 let (slot_tx, slot_rx) = flume::bounded(1);
-                let _ =
-                    requests.send(crate::runtime::Request::CollectPromptSlots { reply: slot_tx });
+                let _ = requests.send(Request::CollectPromptSlots { reply: slot_tx });
                 let (tx, rx) = flume::bounded(1);
                 smol::spawn(async move {
                     let (slots, slots_error) = match slot_rx.recv_async().await {
@@ -427,7 +428,7 @@ impl ActorBackend for LuaActorBackend {
                 mode_def,
                 prompt_inputs: Some(Arc::new(TurnPromptInputs {
                     cwd,
-                    instructions,
+                    instructions: Instructions::default(),
                     mcp_prompt: None,
                     resolved,
                     ready,
@@ -675,14 +676,13 @@ impl ActorBackend for LuaActorBackend {
                 .with_output(context.output.clone());
             let Some(params) = state.params.get() else {
                 let _ = event_tx.send(AgentEvent::ControlError {
-                    message: "compaction requires initialized agent parameters".into(),
+                    message: COMPACT_PARAMS_MISSING_ERR.into(),
                 });
                 return BackendResult::ControlFailed;
             };
             let Some(settings) = context.policy.as_deref().map(|config| &config.settings) else {
                 let _ = event_tx.send(AgentEvent::ControlError {
-                    message: "compaction was admitted without an effective agent configuration"
-                        .into(),
+                    message: COMPACT_CONFIG_MISSING_ERR.into(),
                 });
                 return BackendResult::ControlFailed;
             };
@@ -1226,7 +1226,7 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
 ///   `show` (boolean|string?) - post a row for the session in its parent's
 ///     chat; a string adds a description. Default: `true` for trusted parents,
 ///     `false` otherwise. Silent sessions and sessions opened by a tool call,
-///     which already have its row, cannot be shown.
+///     which already have a tool row, cannot be shown.
 ///   `auto_deliver` (boolean?) - for managed children, queue a structured
 ///     lifecycle observation per settled turn to the recorded parent, independently
 ///     of `prompt()` or ticket waits. Nested children notify their own parent,
@@ -1473,7 +1473,7 @@ impl SessionOptions {
             }
             other => {
                 return Err(mlua::Error::runtime(format!(
-                    "show must be a boolean or string, got {}",
+                    "{INVALID_SHOW_OPTION}, got {}",
                     other.type_name()
                 )));
             }
@@ -1837,38 +1837,21 @@ impl ChildSettings {
                         .snapshot()
                         .ok()
                         .filter(|node| node.parent_id.is_none())
-                        .map(|_| maki_agent::actor::ModeCeiling::default())
+                        .map(|_| ModeCeiling::default())
                 })
                 .unwrap_or_else(|| {
-                    maki_agent::actor::ModeCeiling::from_mode(
-                        &parent.context.mode,
-                        parent.context.mode_def.as_deref(),
-                    )
+                    ModeCeiling::from_mode(&parent.context.mode, parent.context.mode_def.as_deref())
                 })
         } else {
-            maki_agent::actor::ModeCeiling::from_mode(
-                &self.mode,
-                Some(&self.mode_definition(parent)),
-            )
+            ModeCeiling::from_mode(&self.mode, Some(&self.mode_definition(parent)))
         })
         .with_context(
             parent
                 .trusted
                 .as_ref()
                 .and_then(|trusted| trusted.target.effective_config().ok().flatten())
-                .or_else(|| {
-                    parent.managed_turn.as_ref().and_then(|current| {
-                        current
-                            .manager()
-                            .actor(current.agent_id())
-                            .ok()?
-                            .effective_config()
-                    })
-                })
                 .map(|config| config.context.clone())
-                .unwrap_or_else(|| {
-                    maki_agent::actor::AgentContextSnapshot::new(parent.context.cwd.clone())
-                }),
+                .unwrap_or_else(|| AgentContextSnapshot::new(parent.context.cwd.clone())),
         )
     }
 }
@@ -2700,9 +2683,7 @@ fn session_policy_constraint(
 fn mode_policy_is_within(ceiling: &EffectiveAgentConfig, current: &EffectiveAgentConfig) -> bool {
     ceiling
         .mode_authority()
-        .unwrap_or_else(|| {
-            maki_agent::actor::ModeCeiling::from_mode(&ceiling.mode, ceiling.mode_def.as_ref())
-        })
+        .unwrap_or_else(|| ModeCeiling::from_mode(&ceiling.mode, ceiling.mode_def.as_ref()))
         .validate(&current.mode, current.mode_def.as_ref())
         .is_ok()
 }
@@ -4490,12 +4471,8 @@ mod tests {
     }
 
     #[test]
-    fn lua_admission_pins_cwd_instructions_and_tool_inheritance() {
-        const BEFORE: &str = "instructions before admission";
-        const AFTER: &str = "instructions after admission";
+    fn lua_admission_pins_cwd_and_tool_inheritance() {
         let directory = tempfile::tempdir().unwrap();
-        let instructions_path = directory.path().join("AGENTS.md");
-        std::fs::write(&instructions_path, BEFORE).unwrap();
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
         let (actor, state, session, _events) = session_with_provider(provider, None, None);
         let params = state.params.get().unwrap();
@@ -4509,9 +4486,7 @@ mod tests {
             },
             AgentMode::Build,
         )
-        .with_context(maki_agent::actor::AgentContextSnapshot::new(
-            directory.path().into(),
-        ));
+        .with_context(AgentContextSnapshot::new(directory.path().into()));
         let input = AgentInput::from_defaults(
             "queued".into(),
             AgentMode::Build,
@@ -4522,20 +4497,8 @@ mod tests {
             .admission_preparation()
             .unwrap();
         let admitted = prepare(&input, &input.mode, Some(&config));
-        std::fs::write(&instructions_path, AFTER).unwrap();
         let inputs = admitted.prompt_inputs.as_ref().unwrap();
         assert_eq!(inputs.cwd, directory.path());
-        assert!(inputs.instructions.text.contains(BEFORE));
-        assert!(!inputs.instructions.text.contains(AFTER));
-        assert!(
-            prepare(&input, &input.mode, Some(&config))
-                .prompt_inputs
-                .as_ref()
-                .unwrap()
-                .instructions
-                .text
-                .contains(AFTER)
-        );
         let mut history = History::new(Vec::new());
         let agent = Agent::new(
             params.clone(),

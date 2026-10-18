@@ -1,3 +1,4 @@
+use super::shell::ShellEvent;
 use super::*;
 use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
@@ -10,14 +11,18 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::actor::HistoryChange;
+use maki_agent::agent::estimate_message_tokens;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::TASK_SPAWN_TOOL_NAME;
+use maki_agent::session_options::{FAST_OPTION_ID, WORKFLOW_OPTION_ID};
+use maki_agent::tools::{TASK_SPAWN_TOOL_NAME, cli_tool_ctx};
 use maki_agent::{
-    AgentId, AgentInput, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo,
-    McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel, ToolDoneEvent,
-    ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId,
-    TurnOutcome,
+    ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
+    DoneReason, EffectiveAgentConfig, History, HistorySnapshot, ImageMediaType, McpConfigErrors,
+    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnContext, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_commands::ModelSelection;
 use maki_config::{PermissionsConfig, UiConfig};
@@ -51,13 +56,13 @@ const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
-const CD_ERROR_PREFIX: &str = "cd:";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
-const FAST_UNSUPPORTED_COMMAND_ERROR: &str = "command failed: Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
+const REJECTED_COMMAND_SHELL_COMMAND: &str = "pwd";
+const REJECTED_COMMAND_SHELL_OUTPUT: &str = "command shell cwd";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -849,8 +854,8 @@ fn toggle_mode_emits_change_mode_without_mutating_state() {
     assert_eq!(app.state.mode, Mode::Build);
 }
 
-#[test_case(maki_agent::session_options::FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
-#[test_case(maki_agent::session_options::WORKFLOW_OPTION_ID, "workflow applies when this turn finishes" ; "workflow")]
+#[test_case(FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
+#[test_case(WORKFLOW_OPTION_ID, "workflow applies when this turn finishes" ; "workflow")]
 fn deferred_policy_toggle_shows_applies_notice(id: &str, expected: &str) {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -3090,30 +3095,6 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 const COMPACT_GUIDANCE: &str = "keep the failing test names";
 const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
 
-#[test_case("/compact", None ; "no_guidance")]
-#[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
-fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
-    let mut app = test_app();
-    let actions = app.execute_command(cmd(cmdline), 0);
-    assert!(
-        matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
-    );
-    assert_eq!(app.status, Status::Streaming);
-}
-
-#[test_case("/compact" ; "bare")]
-#[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
-fn compact_during_streaming_queues_item(cmdline: &str) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    let actions = app.execute_command(cmd(cmdline), 0);
-    assert!(actions.is_empty());
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, cmdline);
-}
-
 #[test]
 fn cancel_clears_pending_input() {
     let mut app = test_app();
@@ -4154,7 +4135,7 @@ fn status_bar_motion_reaches_app_cadence(
     app.status = status;
     app.restoring.store(restoring, Ordering::Relaxed);
     if retrying {
-        app.retry_info = Some(RetryInfo {
+        app.chats[0].retry_info = Some(RetryInfo {
             attempt: 1,
             message: RETRY_MESSAGE.into(),
             deadline: Instant::now() + RETRY_DELAY,
@@ -4871,36 +4852,6 @@ fn yolo_toggle() {
 }
 
 #[test]
-fn cd_command_behavior() {
-    let mut app = test_app();
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: "/tmp".into(),
-        },
-        0,
-    );
-    let flash = app.status_bar.flash_text().unwrap();
-    // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
-    // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
-    // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
-    // returns the resolved form, so the test expectation must match.
-    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
-    assert_eq!(flash, format!("cd {}", resolved.display()));
-    assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/cd".into(),
-            args: "/nonexistent_path_12345".into(),
-        },
-        0,
-    );
-    let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd: "), "error flash={flash:?}");
-}
-
-#[test]
 fn typed_slash_command_executes() {
     let mut app = test_app();
     let actions = type_and_submit(&mut app, "/help");
@@ -5464,15 +5415,15 @@ fn slash_escape_sends_literal_input(text: &str, expected: &str) {
     ));
 }
 
-fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> maki_agent::AgentRef {
-    let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
+    let manager = AgentManagerHandle::new(Default::default()).unwrap();
     let (tx, _) = flume::unbounded();
-    let shared = Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::new(
+    let shared = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         messages.clone(),
     )));
     let target = manager
         .create_root_with_config(None, messages.clone(), Some(Arc::clone(&shared)), |_| {
-            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn maki_agent::ActorBackend>)
+            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
         })
         .unwrap();
     app.chats[0].agent_id = Some(target.id());
@@ -5508,7 +5459,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
     })));
     assert_eq!(app.focused_retry().unwrap().message, RETRY_MESSAGE);
     if child {
-        assert!(app.retry_info.is_none());
+        assert!(app.chats[0].retry_info.is_none());
     }
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
@@ -5530,7 +5481,7 @@ fn focused_plan_state_is_isolated() {
         &mut app,
         TASK_ID,
         "planner",
-        maki_agent::AgentMode::Plan("child-plan.md".into()),
+        AgentMode::Plan("child-plan.md".into()),
     );
     app.active_chat = 1;
     bind_actor_target(&app, target);
@@ -5602,6 +5553,108 @@ fn root_error_recovery_does_not_follow_child_queue_focus() {
     assert_eq!(app.queue.text_messages(), ["child pending"]);
     assert_eq!(app.queue.focus(), Some(0));
     assert_eq!(app.build_meta().queued_messages, ["root pending"]);
+}
+
+#[test]
+fn rejected_focused_submission_retains_pending_shell_results() {
+    const SHELL_COMMAND: &str = "pwd";
+    const SHELL_OUTPUT: &str = "shell cwd";
+    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
+    let target = app.selected_agent_id().unwrap();
+    let id = app.shell.reserve_for(Some(target));
+    app.handle_shell_event(ShellEvent::Done {
+        id,
+        command: SHELL_COMMAND.into(),
+        output: SHELL_OUTPUT.into(),
+        is_error: false,
+        visible: true,
+    });
+    let before = serde_json::to_value(app.shell.results_for(Some(target))).unwrap();
+    let message_count = app.chats[app.active_chat].message_count();
+    assert!(!app.shell.results_for(Some(target)).is_empty());
+    let result = app.submit_prompt(queued_msg(&"x".repeat(256 * 1024 + 1)));
+    assert!(matches!(result, super::queue::SubmitOutcome::Rejected(_)));
+    assert_eq!(app.chats[app.active_chat].message_count(), message_count);
+    assert!(app.queue.text_messages().is_empty());
+    assert!(input_rx.is_empty());
+    assert_eq!(
+        serde_json::to_value(app.shell.results_for(Some(target))).unwrap(),
+        before
+    );
+}
+
+#[test_case(false; "child")]
+#[test_case(true; "main")]
+fn rejected_command_turn_retains_pending_shell_results(root: bool) {
+    let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
+    let target = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap();
+    if root {
+        app.chats[0].agent_id = Some(target.id());
+    }
+    for scope in [Some(target.id()), None]
+        .into_iter()
+        .take(if root { 2 } else { 1 })
+    {
+        let id = app.shell.reserve_for(scope);
+        app.handle_shell_event(ShellEvent::Done {
+            id,
+            command: REJECTED_COMMAND_SHELL_COMMAND.into(),
+            output: REJECTED_COMMAND_SHELL_OUTPUT.into(),
+            is_error: false,
+            visible: true,
+        });
+    }
+    let target_before = serde_json::to_value(app.shell.results_for(Some(target.id()))).unwrap();
+    let root_before = serde_json::to_value(app.shell.results_for(None)).unwrap();
+    let admission = maki_lua::orchestration::TrustedTarget {
+        target: target.clone(),
+        template: cli_tool_ctx(),
+    };
+    let turn = maki_commands::AgentTurn {
+        content: maki_commands::CommandContent {
+            text: "x".repeat(256 * 1024 + 1).into(),
+            ..Default::default()
+        },
+        prompt: None,
+    };
+    app.submit_command_turn(turn, Some(&admission));
+    assert_eq!(
+        serde_json::to_value(app.shell.results_for(Some(target.id()))).unwrap(),
+        target_before
+    );
+    assert_eq!(
+        serde_json::to_value(app.shell.results_for(None)).unwrap(),
+        root_before
+    );
+    assert!(app.status_bar.flash_text().is_some());
+}
+
+#[test]
+fn focused_queue_removes_the_selected_compact_with_a_shared_run_id() {
+    const FIRST: &str = "first compact";
+    const SECOND: &str = "second compact";
+    let (mut app, rx) = app_with_subagent_actor(TASK_ID);
+    type_and_submit(&mut app, "active");
+    received_input(&rx);
+    let actor = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap()
+        .actor()
+        .unwrap();
+    actor.push_compact(app.run_id, Some(FIRST.into())).unwrap();
+    actor.push_compact(app.run_id, Some(SECOND.into())).unwrap();
+    app.sync_focused_queue();
+    app.queue.set_focus_at(1);
+    app.queue.remove_focused();
+    let entries = actor.pending_queue();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        matches!(&entries[0], maki_agent::actor::PendingQueueEntry::Compact { instructions: Some(text), .. } if text == FIRST)
+    );
 }
 
 #[test]
@@ -5686,6 +5739,85 @@ fn build_rewind_app() -> App {
     app
 }
 
+#[test_case(false; "main")]
+#[test_case(true; "child")]
+fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(child: bool) {
+    const REMOVED_POST: &str = "removed review";
+    const OTHER_POST: &str = "other chat review";
+    let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
+    if !child {
+        bind_history_actor(&mut app, Vec::new());
+    }
+    app.sync_subagents();
+    let index = usize::from(child);
+    let messages = vec![Message::user("kept prompt".into())];
+    let chat = child.then_some(TASK_ID.to_owned());
+    let other_chat = (!child).then_some(TASK_ID.to_owned());
+    let retained = StoredPost {
+        chat: chat.clone(),
+        after_message: 1,
+        post: Post {
+            text: POST_TEXT.into(),
+            level: PostLevel::Error,
+            agent: None,
+        },
+    };
+    let other = StoredPost {
+        chat: other_chat,
+        after_message: 2,
+        post: Post {
+            text: OTHER_POST.into(),
+            level: PostLevel::Info,
+            agent: None,
+        },
+    };
+    for post in [
+        retained.clone(),
+        StoredPost {
+            chat,
+            after_message: 2,
+            post: Post {
+                text: REMOVED_POST.into(),
+                level: PostLevel::Warn,
+                agent: None,
+            },
+        },
+        other.clone(),
+    ] {
+        app.state.session_mut().push_post(post);
+    }
+    let snapshot = HistorySnapshot::new(messages);
+    app.apply_history_change(HistoryChange {
+        agent_id: app.chats[index].agent_id.unwrap(),
+        epoch: snapshot.epoch,
+        messages: snapshot.messages,
+        draft: Message::user("next prompt".into()),
+    });
+    assert_eq!(app.state.session.posts(), [retained, other]);
+    assert_last_is_post(&app.chats[index]);
+    let displayed: Vec<_> = (0..app.chats[index].message_count())
+        .map(|offset| app.chats[index].message_at(offset).unwrap().text.clone())
+        .collect();
+    assert!(!displayed.iter().any(|text| text == REMOVED_POST));
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    let restored = AppSession::load(id, &dir).unwrap();
+    assert_eq!(restored.posts(), app.state.session.posts());
+    app.state.session = Arc::new(restored);
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert!((0..app.chats[index].message_count()).any(|offset| {
+        let message = app.chats[index].message_at(offset).unwrap();
+        message.text == POST_TEXT && message.role == DisplayRole::Post(PostLevel::Error)
+    }));
+    assert!(
+        !(0..app.chats[index].message_count())
+            .any(|offset| { app.chats[index].message_at(offset).unwrap().text == REMOVED_POST })
+    );
+}
+
 #[test]
 fn rewind_to_middle_truncates_and_populates_input() {
     let mut app = build_rewind_app();
@@ -5693,7 +5825,6 @@ fn rewind_to_middle_truncates_and_populates_input() {
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 2,
         prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
     };
     let actions = app.rewind_to(entry);
 
@@ -5712,13 +5843,13 @@ fn rewind_to_middle_truncates_and_populates_input() {
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
+    let baseline = 100_000 - estimate_message_tokens(app.state.session.messages());
     app.state.context_size = 100_000;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 0,
         prompt_preview: "1: first".into(),
-        prompt_text: "first prompt".into(),
     };
     let actions = app.rewind_to(entry);
 
@@ -5729,7 +5860,8 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.context_size, 100_000);
     apply_rewind_action(&mut app, actions);
     assert!(app.state.session.messages().is_empty());
-    assert_eq!(app.state.context_size, 0);
+    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
+    assert_eq!(app.state.context_size, baseline);
     assert_eq!(app.input_box.buffer.value(), "first prompt");
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
@@ -5764,7 +5896,7 @@ fn retry_clears_in_progress_tools() {
         delay_ms: 1000,
     }));
     assert_eq!(app.chats[0].in_progress_count(), 0);
-    assert!(app.retry_info.is_some());
+    assert!(app.chats[0].retry_info.is_some());
 }
 
 #[test]
@@ -5793,7 +5925,7 @@ fn retry_clears_subagent_in_progress_tools() {
         Some("research"),
     ));
     assert_eq!(app.chats[1].in_progress_count(), 0);
-    assert!(app.retry_info.is_none());
+    assert!(app.chats[0].retry_info.is_none());
 }
 
 fn auth_retry_enter(app: &mut App) -> Vec<Action> {
@@ -6318,7 +6450,7 @@ fn parent_error_preserves_running_and_completed_children() {
 #[test]
 fn reserved_shell_survives_parent_done_until_shell_done() {
     let mut app = streaming_app_with_history();
-    let id = app.shell.reserve_id();
+    let id = app.shell.reserve_for(None);
 
     app.update(done_event());
     assert!(app.shell.active_ids().contains(&id));
@@ -6342,7 +6474,7 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
 #[test]
 fn agent_error_preserves_shell_and_child_tools() {
     let mut app = streaming_app_with_history();
-    let shell_id = app.shell.reserve_id();
+    let shell_id = app.shell.reserve_for(None);
     app.handle_shell_event(shell::ShellEvent::Start {
         id: shell_id.clone(),
         command: "true".into(),
@@ -6394,7 +6526,7 @@ fn agent_error_preserves_shell_and_child_tools() {
 #[test]
 fn parent_done_preserves_shell_and_same_id_child_tool() {
     let mut app = streaming_app_with_history();
-    let id = app.shell.reserve_id();
+    let id = app.shell.reserve_for(None);
     app.handle_shell_event(shell::ShellEvent::Start {
         id: id.clone(),
         command: "true".into(),
@@ -7299,11 +7431,11 @@ fn fast_toggle_on_off_on_opus() {
     set_opus_model(&mut app);
     assert!(!app.state.fast);
 
-    app.execute_command(cmd("/fast"), 0);
+    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
     assert!(app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_ON_MSG));
 
-    app.execute_command(cmd("/fast"), 0);
+    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, false);
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
@@ -7376,8 +7508,8 @@ fn model_switch_updates_active_run_status() {
 #[test]
 fn fast_command_flashes_pending_while_discovery_runs() {
     let mut app = pending_app();
-    for expected in [FAST_PENDING_MSG, FAST_OFF_MSG] {
-        app.execute_command(cmd("/fast"), 0);
+    for (enabled, expected) in [(true, FAST_PENDING_MSG), (false, FAST_OFF_MSG)] {
+        app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, enabled);
         assert_eq!(app.status_bar.flash_text(), Some(expected));
         assert!(!app.state.fast);
     }
@@ -7393,11 +7525,11 @@ fn workflow_toggle_flows_into_agent_input() {
     };
     assert!(!app.build_agent_input(&msg).workflow);
 
-    app.execute_command(cmd("/workflow"), 0);
+    app.apply_toggled_option(maki_agent::session_options::WORKFLOW_OPTION_ID, true);
     assert!(app.build_agent_input(&msg).workflow);
     assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
 
-    app.execute_command(cmd("/workflow"), 0);
+    app.apply_toggled_option(maki_agent::session_options::WORKFLOW_OPTION_ID, false);
     assert!(!app.build_agent_input(&msg).workflow);
     assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
 }
@@ -7689,12 +7821,8 @@ fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
     app.state.model = maki_providers::Model::from_spec(spec).unwrap();
 
-    app.execute_command(cmd("/fast"), 0);
+    assert!(app.set_fast(true).is_err());
     assert!(!app.state.fast);
-    assert_eq!(
-        app.status_bar.flash_text(),
-        Some(FAST_UNSUPPORTED_COMMAND_ERROR)
-    );
 }
 
 #[test]
@@ -8376,10 +8504,10 @@ fn tool_text(id: &str) -> String {
     format!("output of {id}")
 }
 
-fn attach_live_history(app: &mut App, messages: Vec<Message>) -> maki_agent::History {
+fn attach_live_history(app: &mut App, messages: Vec<Message>) -> History {
     let mirror: maki_agent::SharedMessages =
-        Arc::new(ArcSwap::from_pointee(maki_agent::HistorySnapshot::default()));
-    let history = maki_agent::History::new(messages).with_mirror(Arc::clone(&mirror));
+        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    let history = History::new(messages).with_mirror(Arc::clone(&mirror));
     app.shared_history = Some(mirror);
     history
 }
@@ -8450,7 +8578,6 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 1,
         prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
     };
     let actions = app.rewind_to(entry);
     assert!(
@@ -9085,10 +9212,8 @@ fn cd_completion_filters_directories_and_accepts_before_execution() {
     assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(
-        app.state.session.cwd,
-        tmp.path().join("alpha").to_string_lossy()
-    );
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test_case("release notes", "release" ; "spaces")]
@@ -9112,7 +9237,8 @@ fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
     assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.state.session.cwd, path.to_string_lossy());
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -9145,7 +9271,8 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    assert_eq!(app.state.session.cwd, child.to_string_lossy());
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test_case(KeyCode::Right, 1 ; "right")]
@@ -9230,10 +9357,8 @@ fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
     assert_eq!(app.input_box.buffer.value(), "/cd alpha/bravo/charlie/");
     assert!(!app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(
-        app.state.session.cwd,
-        tmp.path().join("alpha/bravo/charlie").to_string_lossy()
-    );
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -9248,10 +9373,8 @@ fn cd_completion_escape_preserves_partial_for_execution() {
     let _ = app.tick();
     assert!(!app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(
-        app.state.session.cwd,
-        tmp.path().join("alpha").to_string_lossy()
-    );
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test_case(KeyCode::Esc, "/cd ./alpha"; "dismissed")]
@@ -9273,15 +9396,13 @@ fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expec
     assert!(!app.command_palette.is_active());
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(
-        app.state.session.cwd,
-        tmp.path().join("alpha").to_string_lossy()
-    );
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
-#[test_case("./missing", false ; "no_match")]
-#[test_case("./empty/", true ; "empty_directory")]
-fn cd_completion_no_match_tab_preserves_input_enter_executes(query: &str, exists: bool) {
+#[test_case("./missing" ; "no_match")]
+#[test_case("./empty/" ; "empty_directory")]
+fn cd_completion_no_match_tab_preserves_input_enter_submits(query: &str) {
     let (tmp, mut app, _backend) = completion_app();
     std::fs::create_dir(tmp.path().join("empty")).unwrap();
     let input = format!("/cd {query}");
@@ -9297,20 +9418,7 @@ fn cd_completion_no_match_tab_preserves_input_enter_executes(query: &str, exists
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
     assert!(!app.command_palette.is_active());
-    let expected = if exists {
-        tmp.path().join("empty")
-    } else {
-        tmp.path().to_path_buf()
-    };
-    assert_eq!(app.state.session.cwd, expected.to_string_lossy());
-    if !exists {
-        assert!(
-            app.status_bar
-                .flash_text()
-                .unwrap()
-                .starts_with(CD_ERROR_PREFIX)
-        );
-    }
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test_case(false ; "command_name_tab")]
@@ -9427,7 +9535,7 @@ fn cd_completion_cwd_change_refreshes_typed_popup(dismissed: bool) {
         app.update(Msg::Key(key(KeyCode::Esc)));
     }
 
-    app.change_directory(next.path().to_path_buf());
+    app.apply_directory_change(next.path().canonicalize().unwrap());
     if !dismissed {
         converge_completion(&mut app);
     }
@@ -9461,7 +9569,7 @@ fn cd_completion_cwd_change_refreshes_reference_popup(dismissed: bool) {
         app.update(Msg::Key(key(KeyCode::Esc)));
     }
 
-    app.change_directory(next.path().to_path_buf());
+    app.apply_directory_change(next.path().canonicalize().unwrap());
 
     assert_eq!(
         app.state.session.cwd,
@@ -9492,12 +9600,6 @@ fn cd_completion_ctrl_a_enter_executes_original_partial() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
     assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
-    assert!(
-        app.status_bar
-            .flash_text()
-            .unwrap()
-            .starts_with(CD_ERROR_PREFIX)
-    );
 }
 
 #[test]
@@ -9527,12 +9629,6 @@ fn cd_completion_click_command_name_closes_popup_before_enter() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
     assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
-    assert!(
-        app.status_bar
-            .flash_text()
-            .unwrap()
-            .starts_with(CD_ERROR_PREFIX)
-    );
 }
 
 #[test]
@@ -9568,10 +9664,8 @@ fn cd_completion_ctrl_left_requeries_before_accepting() {
     assert_eq!(app.input_box.buffer.value(), "/cd \"./release apple/\"");
     assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(
-        app.state.session.cwd,
-        tmp.path().join("release apple").to_string_lossy()
-    );
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -9996,15 +10090,14 @@ fn child_mcp_command_preserves_full_input_while_root_busy() {
 
 struct FocusedInputBackend(flume::Sender<AgentInput>);
 
-impl maki_agent::ActorBackend for FocusedInputBackend {
+impl ActorBackend for FocusedInputBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut maki_agent::History,
-        context: maki_agent::TurnContext,
+        _: &'a mut History,
+        context: TurnContext,
         input: AgentInput,
         _: maki_agent::WorkKind,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             if let Some(inbox) = &context.inbox {
                 inbox.take_initial_submission();
@@ -10016,31 +10109,29 @@ impl maki_agent::ActorBackend for FocusedInputBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut maki_agent::History,
-        _: maki_agent::TurnContext,
+        _: &'a mut History,
+        _: TurnContext,
         _: &'a maki_agent::ControlWork,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
-    {
-        Box::pin(async { maki_agent::BackendResult::ControlDone })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
     }
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut maki_agent::History,
-        _: maki_agent::TurnContext,
+        _: &'a mut History,
+        _: TurnContext,
         _: Option<&'a str>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = maki_agent::BackendResult> + Send + 'a>>
-    {
-        Box::pin(async { maki_agent::BackendResult::CompactDone })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
     }
 }
 
-fn bind_actor_target(app: &App, target: maki_agent::AgentRef) {
+fn bind_actor_target(app: &App, target: AgentRef) {
     app.command_runtime.sync_admissions(HashMap::from([(
         app.command_target.id(),
         maki_lua::orchestration::TrustedTarget {
             target,
-            template: maki_agent::tools::cli_tool_ctx(),
+            template: cli_tool_ctx(),
         },
     )]));
 }
@@ -10049,18 +10140,18 @@ fn spawn_input_child(
     app: &mut App,
     id: &str,
     name: &str,
-) -> (maki_agent::AgentRef, flume::Receiver<AgentInput>) {
-    spawn_input_child_with_mode(app, id, name, maki_agent::AgentMode::Build)
+) -> (AgentRef, flume::Receiver<AgentInput>) {
+    spawn_input_child_with_mode(app, id, name, AgentMode::Build)
 }
 
 fn spawn_input_child_with_mode(
     app: &mut App,
     id: &str,
     name: &str,
-    mode: maki_agent::AgentMode,
-) -> (maki_agent::AgentRef, flume::Receiver<AgentInput>) {
-    let template = maki_agent::tools::cli_tool_ctx();
-    let config = maki_agent::EffectiveAgentConfig::new(
+    mode: AgentMode,
+) -> (AgentRef, flume::Receiver<AgentInput>) {
+    let template = cli_tool_ctx();
+    let config = EffectiveAgentConfig::new(
         maki_agent::RunSettings {
             provider: template.provider,
             model: (*template.model).clone(),
@@ -10070,7 +10161,7 @@ fn spawn_input_child_with_mode(
         },
         mode,
     );
-    let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+    let manager = AgentManagerHandle::new(Default::default()).unwrap();
     let (unused_tx, _) = flume::unbounded();
     let root = manager
         .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
@@ -10183,14 +10274,52 @@ fn submit_in_subagent_chat_routes_to_subagent_queue() {
     assert!(app.queue.text_messages().is_empty());
 }
 
-#[test]
-fn shared_submission_preserves_images() {
-    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
+#[test_case(false; "main")]
+#[test_case(true; "child")]
+fn shared_submission_preserves_images_and_preamble(child: bool) {
+    const IMAGE_BYTES: usize = 300 * 1024;
+    const SHELL_COMMAND: &str = "pwd";
+    const SHELL_OUTPUT: &str = "attachment cwd";
+    let (mut app, input_rx) = if child {
+        app_with_subagent_actor(TASK_ID)
+    } else {
+        let mut app = test_app();
+        let manager = AgentManagerHandle::new(Default::default()).unwrap();
+        let (tx, rx) = flume::unbounded();
+        let root = manager
+            .create_root_with_config(None, Vec::new(), None, |_| {
+                Ok::<_, String>(
+                    Box::new(FocusedInputBackend(tx)) as Box<dyn maki_agent::ActorBackend>
+                )
+            })
+            .unwrap();
+        app.chats[0].agent_id = Some(root.id());
+        bind_actor_target(&app, root);
+        (app, rx)
+    };
+    let target = app.selected_agent_id().unwrap();
+    let id = app.shell.reserve_for(Some(target));
+    app.handle_shell_event(ShellEvent::Done {
+        id,
+        command: SHELL_COMMAND.into(),
+        output: SHELL_OUTPUT.into(),
+        is_error: false,
+        visible: true,
+    });
+    let expected_preamble = serde_json::to_value(app.shell.results_for(Some(target))).unwrap();
+    let data: Arc<str> = Arc::from("A".repeat(IMAGE_BYTES));
     let mut msg = queued_msg("hi");
     msg.images
-        .push(ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA==")));
+        .push(ImageSource::new(ImageMediaType::Png, Arc::clone(&data)));
     assert!(matches!(app.submit_prompt(msg), SubmitOutcome::Queued));
-    assert_eq!(received_input(&input_rx).images.len(), 1);
+    let input = received_input(&input_rx);
+    assert_eq!(input.images.len(), 1);
+    assert_eq!(input.images[0].data, data);
+    assert_eq!(
+        serde_json::to_value(input.preamble).unwrap(),
+        expected_preamble
+    );
+    assert!(app.shell.results_for(Some(target)).is_empty());
 }
 
 #[test]
@@ -10502,14 +10631,14 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
-    let earlier = maki_agent::HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
-    let latest = maki_agent::HistorySnapshot::new(Vec::new());
+    let earlier = HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
+    let latest = HistorySnapshot::new(Vec::new());
     assert!(
         app.state
             .session_mut()
             .adopt_subagent_history(TASK_ID.into(), &earlier)
     );
-    app.apply_history_change(maki_agent::actor::HistoryChange {
+    app.apply_history_change(HistoryChange {
         agent_id,
         epoch: latest.epoch,
         messages: Arc::clone(&latest.messages),

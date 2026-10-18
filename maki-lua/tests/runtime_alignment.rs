@@ -1,13 +1,15 @@
 use std::{
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use maki_agent::{
-    ActorBackend, AgentInput, AgentManagerHandle, AgentMode, BackendResult, ControlWork,
-    DoneReason, History, RunSettings, ToolOutput, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, AgentContextSnapshot, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
+    ConfigChange, ConfigPatch, ControlWork, DoneReason, History, PreparedModel, RunSettings,
+    ToolOutput, TurnContext, TurnOutcome, WorkKind,
     actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, graph_quiescence_barrier},
     cancel::CancelTrigger,
     tools::{ToolContext, ToolRegistry, TurnToolBindings},
@@ -18,8 +20,8 @@ use maki_lua::{
     orchestration::{OrchestrationServices, TrustedTarget},
 };
 use maki_providers::{
-    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions,
-    StreamResponse,
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StreamResponse, TokenUsage,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::id::{MakiId, SessionRef};
@@ -30,16 +32,42 @@ mod common;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL: &str = "alignment initial";
 const STEERING: &str = "alignment steering";
+const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
+const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 const REPLY: &str = "alignment complete";
+const PROVIDER_FAILURE: &str = "alignment provider failure";
+const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
+const INSTRUCTION_BUDGET_EXHAUSTED: &str =
+    "The request budget was exhausted before all accepted instructions reached the provider.";
+const REQUEST_USAGE: TokenUsage = TokenUsage {
+    input: 11,
+    output: 7,
+    cache_creation: 3,
+    cache_read: 5,
+};
 const PROMPTS: [&str; 3] = ["alignment A", "alignment B", "alignment C"];
 const TASK_SPAWN: &str = "task_spawn";
 const TASK_SEND: &str = "task_send";
 const TASK_WAIT: &str = "task_wait";
 const TASK_DESPAWN: &str = "task_despawn";
+const ECHO_TOOL: &str = "alignment_echo";
+const ECHO_REPLY: &str = "alignment tool complete";
+const CONTEXT_TOOL: &str = "alignment_context";
+const CHILD_CONTEXT: &str = "alignment inherited cwd";
+const AUTHORITY_TOOL: &str = "alignment_authority";
+const TRUSTED_MESSAGE: &str = "alignment trusted sender";
+const DELEGATED_MESSAGE: &str = "alignment delegated sender";
 const PRELUDE: &str = r#"
 local handlers = {}
 local register_tool = maki.api.register_tool
 maki.api.register_tool = function(spec)
+    if spec.name == "task_wait" then
+        local handler = spec.handler
+        spec.handler = function(input, ctx)
+            alignment_wait_entered = true
+            return handler(input, ctx)
+        end
+    end
     handlers[spec.name] = spec.handler
     return register_tool(spec)
 end
@@ -53,10 +81,68 @@ maki.api.register_command({
         alignment_result = output.llm_output
     end,
 })
+maki.api.register_command({
+    name = "/alignment_submit", tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx)
+        local input = maki.json.decode(opts.args)
+        alignment_ancestor = assert(maki.agent.current(ctx))
+        local target = assert(maki.agent.get(ctx, assert(maki.agent.root(ctx))))
+        for _, reference in ipairs(assert(maki.agent.list(ctx))) do
+            if reference:id() == input.agent_id then target = assert(maki.agent.get(ctx, reference)) end
+        end
+        assert(target:id() == input.agent_id)
+        alignment_trusted = assert(target:submit(ctx, input.message))
+    end,
+})
+maki.api.register_tool({
+    name = "alignment_authority", description = "check mixed sender authority",
+    schema = { type = "object", properties = {} },
+    audiences = { "main", "general_sub" },
+    handler = function(_, ctx)
+        local current = assert(maki.agent.current(ctx))
+        local changed, err = alignment_ancestor:set_mode(ctx, "plan")
+        assert(changed == nil and err ~= nil)
+        local closed, close_err = alignment_ancestor:close(ctx)
+        assert(closed == nil and close_err ~= nil)
+        return maki.json.encode({ agent_id = current:id(), mode = assert(ctx:mode()), denied = err })
+    end,
+})
+maki.api.register_tool({
+    name = "alignment_context", description = "read admitted cwd and inherit it",
+    schema = { type = "object", properties = { spawn_child = { type = "boolean" } } },
+    audiences = { "main", "general_sub" },
+    handler = function(input, ctx)
+        local cwd = assert(ctx:resolve_path("."))
+        local job = maki.fn.jobstart({ "sh", "-c", "pwd; printf '%s\\n' \"$PWD\"" }, { cwd = cwd })
+        local process = assert(maki.fn.jobwait(job))
+        assert(process.exit_code == 0)
+        local output = {}
+        for line in process.stdout:gmatch("[^\n]+") do output[#output + 1] = line end
+        local child_reply
+        if input.spawn_child then
+            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+            child_reply = assert(child:prompt(ctx, "alignment inherited cwd")).text
+            assert(child:close(ctx))
+        end
+        return maki.json.encode({ cwd = cwd, output = output, child = child_reply })
+    end,
+})
+maki.api.register_tool({
+    name = "alignment_wait_entered", description = "read task wait checkpoint",
+    schema = { type = "object", properties = {} },
+    handler = function() return maki.json.encode(alignment_wait_entered == true) end,
+})
 maki.api.register_tool({
     name = "alignment_result", description = "read command result",
     schema = { type = "object", properties = {} },
     handler = function() return alignment_result end,
+})
+maki.api.register_tool({
+    name = "alignment_echo", description = "complete an alignment tool group",
+    schema = { type = "object", properties = {} },
+    audiences = { "main", "general_sub" },
+    handler = function() return "alignment tool complete" end,
 })
 local real_spawn = maki.agent.spawn
 maki.agent.spawn = function(ctx, opts)
@@ -71,11 +157,16 @@ maki.agent.tools = function()
     return {
         { name = "task_spawn", description = "spawn", input_schema = { type = "object" } },
         { name = "task_wait", description = "wait", input_schema = { type = "object" } },
+        { name = "alignment_echo", description = "echo", input_schema = { type = "object" } },
+        { name = "alignment_authority", description = "authority", input_schema = { type = "object" } },
+        { name = "alignment_context", description = "cwd", input_schema = { type = "object" } },
     }
 end
 "#;
 
 struct Request {
+    system: String,
+    model: String,
     messages: Vec<Message>,
     reply: flume::Sender<Result<StreamResponse, AgentError>>,
 }
@@ -121,9 +212,9 @@ struct GatedProvider {
 impl Provider for GatedProvider {
     fn stream_message<'a>(
         &'a self,
-        _: &'a Model,
+        model: &'a Model,
         messages: &'a [Message],
-        _: &'a str,
+        system: &'a str,
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
@@ -133,6 +224,8 @@ impl Provider for GatedProvider {
             let (reply, response) = flume::bounded(1);
             self.requests
                 .send(Request {
+                    system: system.into(),
+                    model: model.spec(),
                     messages: messages.to_vec(),
                     reply,
                 })
@@ -188,6 +281,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_max_turns(None)
+    }
+
+    fn with_max_turns(max_turns: Option<u32>) -> Self {
+        Self::with_context(max_turns, None)
+    }
+
+    fn with_context(max_turns: Option<u32>, cwd: Option<&Path>) -> Self {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         host.load_source_with_opts(
@@ -201,6 +302,19 @@ impl Fixture {
             requests: requests_tx,
         }));
         context.tool_use_id = None;
+        context.config.max_turns = max_turns;
+        if let Some(cwd) = cwd {
+            context.cwd = cwd.to_path_buf();
+            context
+                .modes
+                .define(maki_agent::ModeDefSpec {
+                    name: "build".into(),
+                    system_prompt: Some("alignment cwd {cwd}".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            context.mode_def = Some(Arc::new(context.modes.current(&context.mode)));
+        }
         context.registry = Arc::clone(&registry);
         context.turn_bindings = Arc::new(TurnToolBindings::capture(
             &registry,
@@ -275,6 +389,16 @@ impl Fixture {
         }
     }
 
+    fn trusted_submit(&self, actor: &maki_agent::AgentActorHandle, message: &str) {
+        let result = self._host.event_handle().run_command_for_test(
+            Arc::from("runtime_alignment"),
+            Arc::from("/alignment_submit"),
+            json!({ "agent_id": actor.agent_id(), "message": message }).to_string(),
+            0,
+        );
+        assert_eq!(result.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), Ok(()));
+    }
+
     fn close(&self, task: &Value) {
         assert_eq!(
             self.tool(TASK_DESPAWN, json!({ "task_id": task["task_id"] }))["ok"],
@@ -295,6 +419,7 @@ fn policy(context: &ToolContext) -> EffectiveAgentConfig {
         context.mode.clone(),
     )
     .with_mode_def(Some(context.modes.current(&context.mode)))
+    .with_context(AgentContextSnapshot::new(context.cwd.clone()))
 }
 
 fn spawn_input(prompt: &str) -> Value {
@@ -362,6 +487,533 @@ fn runtime_gate_controls_real_transition() {
             fixture.tool(TASK_WAIT, wait_input(&successor))["status"],
             "done"
         );
+        fixture.close(&task);
+    });
+}
+
+#[test_case::test_case(false; "delegated_starts")]
+#[test_case::test_case(true; "trusted_starts")]
+fn lua_mixed_sender_submission_preserves_authority(trusted_starts: bool) {
+    smol::block_on(async {
+        let fixture = Fixture::new();
+        let task = fixture.spawn(INITIAL);
+        fixture.request().await.respond(common::canned_reply(REPLY));
+        fixture.tool(TASK_WAIT, wait_input(&task));
+        let root = fixture.manager.root().unwrap();
+        let actor = ActorProbe::child(&fixture.manager, root.id()).actor;
+        if trusted_starts {
+            fixture.trusted_submit(&actor, TRUSTED_MESSAGE);
+        } else {
+            fixture.tool(
+                TASK_SEND,
+                json!({ "task_id": task["task_id"], "message": DELEGATED_MESSAGE }),
+            );
+        }
+        let request = fixture.request().await;
+        let ticket = actor.latest_ticket().unwrap();
+        let provenance = ticket.provenance().clone();
+        assert_eq!(
+            provenance.source_agent,
+            (!trusted_starts).then_some(root.id())
+        );
+        if trusted_starts {
+            let sent = fixture.tool(
+                TASK_SEND,
+                json!({ "task_id": task["task_id"], "message": DELEGATED_MESSAGE }),
+            );
+            assert_eq!(sent["turn_id"], json!(ticket.turn_id()));
+        } else {
+            fixture.trusted_submit(&actor, TRUSTED_MESSAGE);
+        }
+        assert_eq!(actor.latest_ticket().unwrap().turn_id(), ticket.turn_id());
+        assert_eq!(actor.latest_ticket().unwrap().provenance(), &provenance);
+        request.respond(common::canned_tool_use(AUTHORITY_TOOL, json!({})));
+        let request = fixture.request().await;
+        assert!(request.contains(TRUSTED_MESSAGE));
+        assert!(request.contains(DELEGATED_MESSAGE));
+        let authority = request.last_tool_result();
+        assert_eq!(authority["agent_id"], json!(actor.agent_id()));
+        assert_eq!(authority["mode"], "build");
+        assert!(
+            authority["denied"]
+                .as_str()
+                .unwrap()
+                .contains("not a descendant")
+        );
+        assert_eq!(
+            root.actor().unwrap().effective_config().unwrap().mode,
+            AgentMode::Build
+        );
+        request.respond(common::canned_reply(REPLY));
+        let result = common::bounded(ticket.wait_result()).await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(result.provenance, provenance);
+        assert!(root.actor().is_ok());
+        fixture.close(&task);
+    });
+}
+
+#[test_case::test_case(false; "prompt_and_tool_environment")]
+#[test_case::test_case(true; "new_child_inheritance")]
+fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
+    const QUEUED: &str = "alignment queued old cwd";
+    const AFTER: &str = "alignment queued new cwd";
+    smol::block_on(async {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let fixture = Fixture::with_context(None, Some(old.path()));
+        let task = fixture.spawn(INITIAL);
+        let first = fixture.request().await;
+        let root = fixture.manager.root().unwrap();
+        let actor = ActorProbe::child(&fixture.manager, root.id()).actor;
+        let queued = actor
+            .admit_turn(ordinary_input(QUEUED), None, QUEUED.into())
+            .unwrap();
+        let change = actor.reserve_config_update().unwrap();
+        change
+            .resolve(Ok(ConfigChange::WorkingDirectory(new.path().to_path_buf())))
+            .unwrap();
+        let after = actor
+            .submit(
+                ordinary_input(AFTER),
+                None,
+                AFTER.into(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_ne!(queued.turn_id(), after.turn_id());
+        let mut request = first;
+        for (prompt, cwd) in [
+            (INITIAL, old.path()),
+            (QUEUED, old.path()),
+            (AFTER, new.path()),
+        ] {
+            assert!(request.contains(prompt));
+            assert!(
+                request.system.contains(cwd.to_str().unwrap()),
+                "{}",
+                request.system
+            );
+            request.respond(common::canned_tool_use(
+                CONTEXT_TOOL,
+                json!({ "spawn_child": spawn_child }),
+            ));
+            if spawn_child {
+                let child = fixture.request().await;
+                assert!(
+                    child.contains(CHILD_CONTEXT),
+                    "expected nested child request, got {:?}",
+                    child.messages
+                );
+                assert!(
+                    child.system.contains(cwd.to_str().unwrap()),
+                    "child spawned during {prompt} must inherit {}, got {}",
+                    cwd.display(),
+                    child.system
+                );
+                child.respond(common::canned_reply(REPLY));
+            }
+            let followup = fixture.request_for(prompt).await;
+            let context = followup.last_tool_result();
+            assert_eq!(PathBuf::from(context["cwd"].as_str().unwrap()), cwd);
+            assert_eq!(context["output"], json!([cwd, cwd]));
+            if spawn_child {
+                assert_eq!(context["child"], REPLY);
+            }
+            followup.respond(common::canned_reply(REPLY));
+            if prompt != AFTER {
+                request = fixture.request().await;
+            } else {
+                break;
+            }
+        }
+        common::bounded(change.wait()).await.unwrap();
+        for ticket in [queued, after] {
+            assert!(matches!(
+                common::bounded(ticket.wait()).await,
+                TurnOutcome::Completed { .. }
+            ));
+        }
+        assert_eq!(actor.effective_config().unwrap().context.cwd(), new.path());
+        assert_eq!(
+            root.actor()
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .context
+                .cwd(),
+            old.path()
+        );
+        assert!(fixture.requests.is_empty());
+        fixture.close(&task);
+    });
+}
+
+#[test]
+fn lua_local_cancel_releases_task_wait_and_preserves_child_config_and_input() {
+    const BEFORE_CUT: &str = "alignment discarded before cancel";
+    const AFTER_CUT: &str = "alignment preserved after cancel";
+    smol::block_on(async {
+        let fixture = Fixture::new();
+        let task = fixture.spawn(PROMPTS[0]);
+        fixture
+            .request_for(PROMPTS[0])
+            .await
+            .respond(common::canned_tool_use(TASK_SPAWN, spawn_input(PROMPTS[1])));
+        let request = fixture.request_for(PROMPTS[0]).await;
+        let child = request.last_tool_result();
+        let root = fixture.manager.root().unwrap();
+        let actor = ActorProbe::child(&fixture.manager, root.id()).actor;
+        let child_actor = ActorProbe::child(&fixture.manager, actor.agent_id()).actor;
+        let original = actor.latest_ticket().unwrap();
+        let child_ticket = child_actor.latest_ticket().unwrap();
+        request.respond(common::canned_tool_use(TASK_WAIT, wait_input(&child)));
+        let child_request = fixture.request_for(PROMPTS[1]).await;
+        common::bounded(async {
+            while fixture.tool("alignment_wait_entered", json!({})) != json!(true) {
+                smol::future::yield_now().await;
+            }
+        })
+        .await;
+        let joined = actor
+            .submit(
+                ordinary_input(BEFORE_CUT),
+                None,
+                BEFORE_CUT.into(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(joined.turn_id(), original.turn_id());
+        let change = actor.reserve_config_update().unwrap();
+        change
+            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+                model: Some(PreparedModel {
+                    provider: Arc::clone(&fixture.context.provider),
+                    model: Model::from_spec(UPDATED_MODEL).unwrap(),
+                }),
+                ..Default::default()
+            })))
+            .unwrap();
+        actor.cancel_local(0);
+        let after = actor
+            .submit(
+                ordinary_input(AFTER_CUT),
+                None,
+                AFTER_CUT.into(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_ne!(after.turn_id(), original.turn_id());
+        let cancelled = common::bounded(original.wait_result()).await;
+        assert!(matches!(cancelled.outcome, TurnOutcome::Cancelled { .. }));
+        assert!(child_ticket.peek_result().is_none());
+        assert!(!child_request.reply.is_disconnected());
+        assert!(child_actor.snapshot().active_turn.is_some());
+        common::bounded(change.wait()).await.unwrap();
+        let resumed = fixture.request_for(PROMPTS[0]).await;
+        assert_eq!(resumed.model, UPDATED_MODEL);
+        assert!(resumed.contains(AFTER_CUT));
+        assert!(!resumed.contains(BEFORE_CUT));
+        child_request.respond(common::canned_reply(REPLY));
+        assert!(matches!(
+            common::bounded(child_ticket.wait()).await,
+            TurnOutcome::Completed { .. }
+        ));
+        resumed.respond(common::canned_reply(REPLY));
+        let reported = fixture.request_for(PROMPTS[0]).await;
+        assert_eq!(reported.model, UPDATED_MODEL);
+        assert!(reported.messages.iter().any(Message::is_observation));
+        assert!(reported.contains(AFTER_CUT));
+        reported.respond(common::canned_reply(REPLY));
+        assert!(matches!(
+            common::bounded(after.wait()).await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            common::bounded(original.wait_result()).await.outcome,
+            cancelled.outcome
+        );
+        assert_eq!(
+            actor.effective_config().unwrap().model.spec(),
+            UPDATED_MODEL
+        );
+        assert_eq!(
+            child_actor.effective_config().unwrap().model.spec(),
+            common::default_model().spec()
+        );
+        let drained = common::bounded(graph_quiescence_barrier(&[child_actor, actor]))
+            .await
+            .unwrap();
+        assert!(drained.iter().all(|probe| probe.is_quiescent()));
+        assert!(fixture.requests.is_empty());
+        fixture.close(&task);
+    });
+}
+
+#[test]
+fn lua_submission_preserves_exact_and_configuration_boundaries() {
+    const EXACT: &str = "alignment exact boundary";
+    const BEFORE_CHANGE: &str = "alignment before configuration";
+    const AFTER_CHANGE: &str = "alignment after configuration";
+    smol::block_on(async {
+        let fixture = Fixture::new();
+        let task = fixture.spawn(INITIAL);
+        let first_request = fixture.request().await;
+        let root = fixture.manager.root().unwrap();
+        let actor = ActorProbe::child(&fixture.manager, root.id()).actor;
+        let first = actor.latest_ticket().unwrap();
+        let exact = actor
+            .admit_turn(ordinary_input(EXACT), None, EXACT.into())
+            .unwrap();
+        let before = actor
+            .submit(
+                ordinary_input(BEFORE_CHANGE),
+                None,
+                BEFORE_CHANGE.into(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_ne!(before.turn_id(), first.turn_id());
+        assert_ne!(before.turn_id(), exact.turn_id());
+        let change = actor.reserve_config_update().unwrap();
+        change
+            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+                model: Some(PreparedModel {
+                    provider: Arc::clone(&fixture.context.provider),
+                    model: Model::from_spec(UPDATED_MODEL).unwrap(),
+                }),
+                ..Default::default()
+            })))
+            .unwrap();
+        let after = actor
+            .submit(
+                ordinary_input(AFTER_CHANGE),
+                None,
+                AFTER_CHANGE.into(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_ne!(after.turn_id(), before.turn_id());
+        assert_eq!(first_request.model, common::default_model().spec());
+        assert!(!first_request.contains(EXACT));
+        assert!(!first_request.contains(BEFORE_CHANGE));
+        assert!(!first_request.contains(AFTER_CHANGE));
+        first_request.respond(common::canned_reply(REPLY));
+        for prompt in [EXACT, BEFORE_CHANGE, AFTER_CHANGE] {
+            let request = fixture.request().await;
+            assert_eq!(
+                request.messages.last().unwrap().first_text_content(),
+                Some(prompt)
+            );
+            assert_eq!(
+                request.model,
+                if prompt == AFTER_CHANGE {
+                    UPDATED_MODEL.to_owned()
+                } else {
+                    common::default_model().spec()
+                }
+            );
+            if prompt != AFTER_CHANGE {
+                assert!(!request.contains(AFTER_CHANGE));
+            }
+            if prompt == EXACT {
+                assert!(!request.contains(BEFORE_CHANGE));
+            }
+            request.respond(common::canned_reply(REPLY));
+        }
+        common::bounded(change.wait()).await.unwrap();
+        for ticket in [first, exact, before, after] {
+            assert!(matches!(
+                common::bounded(ticket.wait()).await,
+                TurnOutcome::Completed { .. }
+            ));
+        }
+        assert_eq!(
+            actor.effective_config().unwrap().model.spec(),
+            UPDATED_MODEL
+        );
+        assert_eq!(
+            root.actor()
+                .unwrap()
+                .effective_config()
+                .unwrap()
+                .model
+                .spec(),
+            common::default_model().spec()
+        );
+        let drained = common::bounded(graph_quiescence_barrier(&[actor]))
+            .await
+            .unwrap();
+        assert!(drained.iter().all(|probe| probe.is_quiescent()));
+        assert!(fixture.requests.is_empty());
+        fixture.close(&task);
+    });
+}
+
+#[test]
+fn lua_shared_turn_preserves_tool_group_wrapper_and_usage_once() {
+    smol::block_on(async {
+        let fixture = Fixture::new();
+        let task = fixture.spawn(INITIAL);
+        fixture.request().await.respond(common::canned_reply(REPLY));
+        let original = fixture.tool(TASK_WAIT, wait_input(&task));
+        let root = fixture.manager.root().unwrap();
+        let mut probe = ActorProbe::child(&fixture.manager, root.id());
+        let mut successor = fixture.tool(
+            TASK_SEND,
+            json!({ "task_id": task["task_id"], "message": INITIAL }),
+        );
+        successor["task_id"] = task["task_id"].clone();
+        assert_ne!(successor["turn_id"], task["turn_id"]);
+        let request = fixture.request().await;
+        let initial = request.messages.last().unwrap();
+        assert!(matches!(initial.role, Role::User));
+        assert_eq!(initial.first_text_content(), Some(INITIAL));
+        assert_eq!(initial.display_text, None);
+        let joined = fixture.tool(
+            TASK_SEND,
+            json!({ "task_id": task["task_id"], "message": STEERING }),
+        );
+        assert_eq!(joined["turn_id"], successor["turn_id"]);
+        let mut response = common::canned_tool_use(ECHO_TOOL, json!({}));
+        response.usage = REQUEST_USAGE;
+        request.respond(response);
+
+        let request = fixture.request().await;
+        let tail = &request.messages[request.messages.len() - 3..];
+        let tool_id = tail[0]
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } if name == ECHO_TOOL => Some(id),
+                _ => None,
+            })
+            .expect("assistant tool group must precede results and steering");
+        assert!(matches!(tail[0].role, Role::Assistant));
+        assert!(tail[1].content.iter().any(|block| matches!(block,
+            ContentBlock::ToolResult { tool_use_id, content, is_error }
+                if tool_use_id == tool_id && content == ECHO_REPLY && !is_error
+        )));
+        assert!(matches!(tail[2].role, Role::User));
+        let steering = tail[2].first_text_content().unwrap();
+        assert!(steering.starts_with(USER_INTERRUPT_PREFIX), "{steering}");
+        assert!(steering.ends_with(&format!("\n\n{STEERING}\n</user-interrupt>")));
+        assert_eq!(tail[2].display_text.as_deref(), Some(STEERING));
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| { message.display_text.as_deref() == Some(STEERING) })
+                .count(),
+            1
+        );
+        let mut response = common::canned_reply(REPLY);
+        response.usage = REQUEST_USAGE;
+        request.respond(response);
+        probe.idle_after_end().await;
+        let result = common::bounded(probe.actor.latest_ticket().unwrap().wait_result()).await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(result.outcome.num_turns(), 2);
+        assert_eq!(
+            result.outcome.usage(),
+            TokenUsage {
+                input: REQUEST_USAGE.input * 2,
+                output: REQUEST_USAGE.output * 2,
+                cache_creation: REQUEST_USAGE.cache_creation * 2,
+                cache_read: REQUEST_USAGE.cache_read * 2,
+            }
+        );
+        assert_eq!(
+            probe
+                .observed
+                .iter()
+                .filter(|event| matches!(event,
+                    ActorEvent::Start { turn_id, .. } if *turn_id == result.outcome.turn_id()
+                ))
+                .count(),
+            1
+        );
+        let ends: Vec<_> = probe
+            .observed
+            .iter()
+            .filter_map(|event| match event {
+                ActorEvent::End(ended) if ended.outcome.turn_id() == result.outcome.turn_id() => {
+                    Some(ended)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].outcome, result.outcome);
+        assert_eq!(
+            fixture.tool(TASK_WAIT, wait_input(&successor))["result"]["text"],
+            REPLY
+        );
+        assert_eq!(fixture.tool(TASK_WAIT, wait_input(&task)), original);
+        assert_eq!(
+            fixture.tool(TASK_WAIT, wait_input(&successor))["result"]["text"],
+            REPLY
+        );
+        let drained = common::bounded(graph_quiescence_barrier(&[probe.actor.clone()]))
+            .await
+            .unwrap();
+        assert!(drained.iter().all(|probe| probe.is_quiescent()));
+        assert!(fixture.requests.is_empty());
+        fixture.close(&task);
+    });
+}
+
+#[test_case::test_case(false; "provider_failure")]
+#[test_case::test_case(true; "accepted_input_exhausts_request_budget")]
+fn lua_shared_turn_failure_never_completes_omitted_steering(budget: bool) {
+    smol::block_on(async {
+        let fixture = Fixture::with_max_turns(budget.then_some(1));
+        let task = fixture.spawn(INITIAL);
+        let request = fixture.request().await;
+        let root = fixture.manager.root().unwrap();
+        let actor = ActorProbe::child(&fixture.manager, root.id()).actor;
+        let ticket = actor.latest_ticket().unwrap();
+        let joined = fixture.tool(
+            TASK_SEND,
+            json!({ "task_id": task["task_id"], "message": STEERING }),
+        );
+        assert_eq!(joined["turn_id"], task["turn_id"]);
+        assert!(!request.contains(STEERING));
+        if budget {
+            request.respond(common::canned_reply(REPLY));
+        } else {
+            request
+                .reply
+                .send(Err(AgentError::Config {
+                    message: PROVIDER_FAILURE.into(),
+                }))
+                .unwrap();
+        }
+        let result = common::bounded(ticket.wait_result()).await;
+        let TurnOutcome::Failed { failure, .. } = &result.outcome else {
+            panic!(
+                "omitted steering must not be reported completed: {:?}",
+                result.outcome
+            );
+        };
+        assert!(
+            failure.diagnostic.contains(if budget {
+                INSTRUCTION_BUDGET_EXHAUSTED
+            } else {
+                PROVIDER_FAILURE
+            }),
+            "{failure:?}"
+        );
+        let waited = fixture.tool(TASK_WAIT, wait_input(&task));
+        assert_eq!(waited["status"], "done");
+        assert_eq!(waited["result"]["status"], "failed");
+        assert_eq!(waited["result"]["turn_id"], task["turn_id"]);
+        assert_eq!(fixture.tool(TASK_WAIT, wait_input(&task)), waited);
+        let drained = common::bounded(graph_quiescence_barrier(&[actor]))
+            .await
+            .unwrap();
+        assert!(drained.iter().all(|probe| probe.is_quiescent()));
+        assert!(fixture.requests.is_empty());
         fixture.close(&task);
     });
 }
@@ -636,6 +1288,8 @@ fn automatic_graph_continuations(extra_continuation: bool) {
         request.respond(common::canned_reply(REPLY));
         a.idle_after_end().await;
         let original_a = a.actor.latest_ticket().unwrap();
+        let original_a_result = common::bounded(original_a.wait_result()).await;
+        let original_b_result = common::bounded(original_b.wait_result()).await;
 
         leaf.respond(common::canned_reply(REPLY));
         c.idle_after_end().await;
@@ -661,6 +1315,12 @@ fn automatic_graph_continuations(extra_continuation: bool) {
             original_b.peek(),
             Some(TurnOutcome::Cancelled { .. })
         ));
+        let retained_a = common::bounded(original_a.wait_result()).await;
+        let retained_b = common::bounded(original_b.wait_result()).await;
+        assert_eq!(retained_a.outcome, original_a_result.outcome);
+        assert_eq!(retained_a.text, original_a_result.text);
+        assert_eq!(retained_b.outcome, original_b_result.outcome);
+        assert_eq!(retained_b.text, original_b_result.text);
         let baseline = graph_probe(&mut [&mut c, &mut b, &mut a]).await;
         assert_eq!(baseline, [0, 1, 2]);
         if extra_continuation {
@@ -670,15 +1330,32 @@ fn automatic_graph_continuations(extra_continuation: bool) {
                 .unwrap();
             let request = fixture.request().await;
             assert!(request.contains(PROMPTS[2]));
+            let actors = [c.actor.clone(), b.actor.clone(), a.actor.clone()];
+            let barrier = graph_quiescence_barrier(&actors);
+            futures_lite::pin!(barrier);
+            assert!(
+                futures_lite::future::poll_once(&mut barrier)
+                    .await
+                    .is_none()
+            );
+            assert!(leaf_turn.peek_result().is_none());
             request.respond(common::canned_reply(REPLY));
             c.idle_after_end().await;
             common::bounded(leaf_turn.wait()).await;
             for probe in [&mut b, &mut a] {
                 let request = fixture.request().await;
                 assert!(request.messages.iter().any(Message::is_observation));
+                assert!(
+                    futures_lite::future::poll_once(&mut barrier)
+                        .await
+                        .is_none()
+                );
+                assert!(probe.actor.latest_ticket().unwrap().peek_result().is_none());
                 request.respond(common::canned_reply(REPLY));
                 probe.idle_after_end().await;
             }
+            let drained = common::bounded(barrier).await.unwrap();
+            assert!(drained.iter().all(|probe| probe.is_quiescent()));
             let extra = graph_probe(&mut [&mut c, &mut b, &mut a]).await;
             assert_ne!(
                 extra, baseline,
@@ -718,7 +1395,10 @@ enum SettledState {
     Failed,
 }
 
-fn task_send_after_settlement(state: SettledState) {
+#[test_case::test_case(SettledState::Done; "done")]
+#[test_case::test_case(SettledState::Cancelled; "cancel")]
+#[test_case::test_case(SettledState::Failed; "provider_failure")]
+fn task_send_after_settlement_starts_successor(state: SettledState) {
     smol::block_on(async {
         let fixture = Fixture::new();
         let task = fixture.spawn(INITIAL);
@@ -736,7 +1416,7 @@ fn task_send_after_settlement(state: SettledState) {
             SettledState::Failed => request
                 .reply
                 .send(Err(AgentError::Config {
-                    message: "alignment provider failure".into(),
+                    message: PROVIDER_FAILURE.into(),
                 }))
                 .unwrap(),
         }
@@ -768,21 +1448,6 @@ fn task_send_after_settlement(state: SettledState) {
 }
 
 #[test]
-fn task_send_after_done_starts_successor() {
-    task_send_after_settlement(SettledState::Done);
-}
-
-#[test]
-fn task_send_after_cancel_starts_successor() {
-    task_send_after_settlement(SettledState::Cancelled);
-}
-
-#[test]
-fn task_send_after_provider_failure_starts_successor() {
-    task_send_after_settlement(SettledState::Failed);
-}
-
-#[test]
 fn task_send_after_despawn_rejects() {
     smol::block_on(async {
         let fixture = Fixture::new();
@@ -797,7 +1462,7 @@ fn task_send_after_despawn_rejects() {
             json!({ "task_id": task["task_id"], "message": STEERING }),
         )
         .unwrap_err();
-        assert!(error.contains("unknown task_id"));
+        assert!(error.contains(UNKNOWN_TASK_ERR));
         assert!(fixture.requests.is_empty());
     });
 }

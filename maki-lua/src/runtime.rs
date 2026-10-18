@@ -77,6 +77,7 @@ use crate::api::util::setup::ConfigStore;
 use crate::api::{PluginLoadContext, create_maki_global};
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -592,7 +593,7 @@ pub(crate) struct TaskCell {
     pub(crate) command_invocation: Option<CommandTaskInvocation>,
     /// The agent a keymap or event callback was pinned to, so nested
     /// `run_command` calls address it rather than current focus.
-    pub(crate) pinned_target: Option<crate::orchestration::TrustedTarget>,
+    pub(crate) pinned_target: Option<TrustedTarget>,
 }
 
 impl TaskCell {
@@ -1171,16 +1172,22 @@ async fn run_awaited<F: Future>(
 pub(crate) async fn run_command_legacy_scoped<F: Future>(
     lua: &Lua,
     depth: u8,
+    target: Option<TrustedTarget>,
     fut: F,
 ) -> F::Output {
     let scope = TaskScope::detached(lua);
-    lock_cell(scope.handle()).command_depth = depth;
+    {
+        let mut cell = lock_cell(scope.handle());
+        cell.command_depth = depth;
+        cell.pinned_target = target;
+    }
     run_scoped(lua, scope, fut).await
 }
 
 pub(crate) async fn run_command_scoped<F: Future>(
     lua: &Lua,
     invocation: CommandInvocation,
+    target: Option<TrustedTarget>,
     fut: F,
 ) -> F::Output {
     let scope = TaskScope::detached(lua);
@@ -1188,6 +1195,7 @@ pub(crate) async fn run_command_scoped<F: Future>(
         let mut cell = lock_cell(scope.handle());
         cell.command_depth = invocation.depth as u8;
         cell.command_invocation = Some(CommandTaskInvocation { invocation });
+        cell.pinned_target = target;
     }
     run_scoped(lua, scope, fut).await
 }
@@ -1814,7 +1822,7 @@ pub(crate) struct PendingAsyncTask {
     pub delegated_tool: Option<DelegatedTool>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
-    pub pinned_target: Option<crate::orchestration::TrustedTarget>,
+    pub pinned_target: Option<TrustedTarget>,
     /// Timer fires pass their id as the first callback argument.
     pub timer_id: Option<u64>,
 }
@@ -4541,8 +4549,9 @@ async fn run_tool_call(
     cell.delegated_tool = Some(ctx.delegated_tool());
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
-    cell.plugin_origin = Some((plugin.clone(), generation));
-    cell.plugin_owner = Some(crate::orchestration::plugin_authority(&lua, plugin.clone()));
+    let owner = crate::orchestration::plugin_authority(&lua, plugin.clone());
+    cell.plugin_origin = Some((plugin.clone(), owner.generation()));
+    cell.plugin_owner = Some(owner);
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
     ctx.pin_host_root(&lua);
@@ -5097,6 +5106,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             if let Some((func, typed, parsed)) = command_data {
                                 let args = args.trim().to_owned();
                                 let target = crate::orchestration::resolve_target(&rt.lua, None);
+                                let pinned = target.as_ref().ok().cloned().flatten();
                                 let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
@@ -5124,7 +5134,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
-                                    let result = run_command_legacy_scoped(&lua, depth, run)
+                                    let result = run_command_legacy_scoped(&lua, depth, pinned, run)
                                         .await
                                         .map_err(|error| error.to_string());
                                     if let Err(error) = &result {
@@ -5199,6 +5209,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             );
                             if let Some(func) = handler_fn {
                                 let target = crate::orchestration::resolve_target(&rt.lua, Some(&invocation));
+                                let pinned = target.as_ref().ok().cloned().flatten();
                                 let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
@@ -5215,7 +5226,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
-                                    if let Err(e) = run_command_scoped(&lua, invocation, run).await {
+                                    if let Err(e) = run_command_scoped(&lua, invocation, pinned, run).await {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
                                 })

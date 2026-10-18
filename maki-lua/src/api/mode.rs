@@ -4,15 +4,39 @@
 
 use std::sync::Arc;
 
-use maki_agent::{ModeDefSpec, ModeError, ModeId, ModeRegistry};
+use maki_agent::{AgentRef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::agent_errors::DELEGATED_HOST_MUTATION;
+use crate::agent_errors::{DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, NO_FOCUSED_AGENT};
 use crate::api::util::command::{SessionRequest, UiAction, ui_send};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const NO_REGISTRY_ERR: &str = "mode registry not available";
+const MODE_CONFIG_UNAVAILABLE: &str = "agent mode configuration is unavailable";
+
+fn target(lua: &Lua) -> Result<Option<AgentRef>, String> {
+    if let Some(target) = crate::runtime::pinned_target(lua) {
+        target.target.actor().map_err(|error| error.to_string())?;
+        return Ok(Some(target.target));
+    }
+    let invocation = crate::runtime::command_invocation(lua);
+    if invocation.is_none()
+        && crate::runtime::current_plugin(lua).is_some()
+        && crate::orchestration::services(lua).is_some()
+    {
+        return Err(NO_FOCUSED_AGENT.into());
+    }
+    let target = crate::orchestration::resolve_target(
+        lua,
+        invocation.as_ref().map(|current| &current.invocation),
+    )?
+    .map(|target| target.target);
+    if target.is_none() && crate::orchestration::services(lua).is_some() {
+        return Err(NO_FOCUSED_AGENT.into());
+    }
+    Ok(target)
+}
 
 fn registry(lua: &Lua) -> Result<Arc<ModeRegistry>, mlua::Error> {
     lua.app_data_ref::<Arc<ModeRegistry>>()
@@ -93,14 +117,23 @@ fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
     }
 }
 
-/// Returns the id of the currently active mode ("build", "plan", or a custom
-/// name).
+/// Returns the mode id ("build", "plan", or a custom name) of the invocation's
+/// agent, or the focused agent when called outside an invocation.
 ///
 /// @return (string|nil, string|nil) Mode id, or nil and an error.
 /// @example
 /// local mode = maki.api.mode.get()
 #[lua_fn]
-async fn get(_lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_FOCUS));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
+    if let Some(target) = try_pair!(target(&lua)) {
+        let config = try_pair!(target.effective_config().map_err(|error| error.to_string()));
+        let config = try_pair!(config.ok_or(MODE_CONFIG_UNAVAILABLE));
+        return Ok((Some(config.mode.id().key().to_owned()), None));
+    }
     let (reply_tx, reply_rx) = flume::bounded(1);
     match ui_send(tx.as_ref(), UiAction::GetMode { reply_tx }) {
         Ok(()) => match reply_rx.recv_async().await {
@@ -111,8 +144,10 @@ async fn get(_lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     }
 }
 
-/// Enters a mode by name; fails when it is not defined. Success means the actor
-/// committed the mode for subsequent admissions, not that saving has finished.
+/// Enters a mode by name on the invocation's agent, or the focused agent when
+/// called outside an invocation. Fails when the mode is not defined. Success
+/// means the actor committed the mode for subsequent admissions, not that
+/// saving has finished.
 /// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param name string Mode id ("build", "plan", or a custom name).
@@ -141,6 +176,24 @@ async fn set_inner(
     let reg = registry(lua)?;
     if !reg.contains(id.key()) {
         return Ok(err_pair(mode_err(ModeError::Unknown(name))));
+    }
+    if let Some(target) = try_pair!(target(lua)) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        try_pair!(ui_send(
+            tx.as_ref(),
+            UiAction::SetAgentMode {
+                target,
+                id: id.key().to_owned(),
+                reply_tx,
+            },
+        ));
+        try_pair!(try_pair!(
+            reply_rx
+                .recv_async()
+                .await
+                .map_err(|_| "ui dropped the mode update")
+        ));
+        return Ok((Some(true), None));
     }
     let (reply_tx, reply_rx) = flume::bounded(1);
     match ui_send(

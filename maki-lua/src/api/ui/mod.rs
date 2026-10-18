@@ -7,7 +7,7 @@ use humantime::format_duration;
 use jiff::{Timestamp, tz::TimeZone};
 use maki_config::ClockFormat;
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, UserDataRef};
 use strum::VariantNames;
 
 use maki_agent::{POST_LEVELS, Post, PostLevel};
@@ -34,6 +34,8 @@ use crate::runtime::{
     current_managed_turn, in_delegated_tool, pinned_target, validate_plugin_effect, with_task_bufs,
 };
 use win::WinHandle;
+
+const POST_OPTIONS: &[&str] = &["agent", "level"];
 
 pub(crate) struct StatusContentStore {
     content: BTreeMap<Arc<str>, StatusContent>,
@@ -722,8 +724,6 @@ fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
     Ok((Some(try_pair!(focused_agent_ref(lua))), None))
 }
 
-const POST_OPTIONS: &[&str] = &["agent", "level"];
-
 /// Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
 /// is for the user only: it never reaches the model, and later focus changes
 /// do not move it. It is saved with the session and comes back on restore.
@@ -737,7 +737,8 @@ const POST_OPTIONS: &[&str] = &["agent", "level"];
 /// @param text string Row text. Must not be blank.
 /// @param opts table? Optional fields:
 ///   `level` (string?) - "info" (default), "warn" or "error".
-///   `agent` (Agent?) - a child spawned from Lua that the post is about.
+///   `agent` (Agent?) - a child spawned from Lua that the post is about. Keeps
+///     that child's transcript when this post survives a rewind.
 /// Any other option key is an error.
 /// @return (boolean?, string?) True once sent, or nil and an error.
 /// @example
@@ -748,7 +749,7 @@ const POST_OPTIONS: &[&str] = &["agent", "level"];
 #[lua_fn]
 fn post(
     lua: &Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
+    ctx: UserDataRef<LuaCtx>,
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
@@ -778,7 +779,7 @@ fn post(
                 POST_LEVELS.join(", ")
             )));
         }
-        if let Some(agent) = opts.get::<Option<mlua::UserDataRef<LuaAgent>>>("agent")? {
+        if let Some(agent) = opts.get::<Option<UserDataRef<LuaAgent>>>("agent")? {
             post.agent =
                 Some(try_pair!(agent.transcript_id().ok_or(UNLINKABLE_POST_AGENT)).to_owned());
         }
@@ -1089,6 +1090,7 @@ mod tests {
     use mlua::Lua;
     use test_case::test_case;
 
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
 
@@ -1240,7 +1242,7 @@ mod tests {
                 release_tx.send(()).unwrap();
                 ticket.wait().await;
             }
-            manager.shutdown(Duration::from_secs(5)).await;
+            manager.shutdown(SHUTDOWN_TIMEOUT).await;
         });
     }
 
