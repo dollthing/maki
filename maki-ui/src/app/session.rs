@@ -70,7 +70,27 @@ impl App {
         self.checkpoint_with(Duration::ZERO);
     }
 
+    pub(crate) fn sync_live_children(&self) {
+        self.storage_writer
+            .set_live_children(self.state.session.id, self.live_child_keys());
+    }
+
+    fn live_child_keys(&self) -> Vec<String> {
+        self.chats
+            .iter()
+            .filter(|chat| {
+                chat.agent_id.is_some_and(|id| {
+                    self.subagent_channels
+                        .get(&id)
+                        .is_some_and(|channels| !channels.closed)
+                })
+            })
+            .filter_map(|chat| chat.subagent_id.clone())
+            .collect()
+    }
+
     pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
+        self.sync_live_children();
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let meta = self.build_meta();
         AppSession::checkpoint(
