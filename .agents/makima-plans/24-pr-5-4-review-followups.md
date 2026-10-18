@@ -190,3 +190,46 @@ Conventions (AGENTS.md; FQN only for single use):
 No need to re-review these: approval targeting and stale `PlanApprovalReady` filtering, child approvals across `settle_plan_approval`, key blocking during approvals, the `waiting_for_lock` resume; agent-loop setup failure sealing; respawn ordering in `apply_to_app`; foreign prepared ops refused by `belongs_to`; rewind agent/epoch checks; mode ceiling on both config paths; checkpoint failure/panic leaving history and config unchanged; deferred terminal outcomes for both backends; outcome immutability across continuations; presentation failure keeping drained instructions in history; `local_cancel` lock order and nonce-guarded `active_turns` removal; headless/SDK/ACP unaffected (`Post` ignored by design); `show` validation and defaults, `ui.post` option validation, spawn-time post routing from Lua-child parents; removal of `spawn_ui_input_relay`; child cwd inheritance for TUI roots; `checkpoint_child_history` stale-epoch handling; d956a5b1's typed-text, shell, cancel and rewind guards; `just gen-docs-check` passes; no em-dashes in added docs; no trivial comments in the diff.
 
 `code_review.lua` (user dotfiles, not in this repo) was also checked: the command ctx stays valid across `ticket:wait`, a wait outside a turn does not withdraw `auto_deliver`, and every termination path posts a row or notifies.
+
+## Implementation verification, 2026-10-18
+
+The follow-up changes cover H1-H4, M5-M12, L1-L5, and the cleanup list. The earlier runtime plan now contains an assertion-level AC.1-AC.14 map. That map records the remaining limits of the original broad interaction/backend matrices rather than treating matching test names as proof.
+
+Deterministic regressions reproduced the actor close/shutdown completion cut, history-edit response-before-idle race, divergent checkpoint false acknowledgement, and acknowledged in-flight history rollback before fixes. Storage re-review exposed metadata-candidate and rebased-history interleavings; both also failed before their fixes. Real Lua-provider tests exposed child cwd inheritance from a later queued configuration. Registered command/keybind tests exposed absent-admission mode calls adopting later focus. Those assertions pass after the corresponding source changes.
+
+Independent targeted re-reviews approve the actor cancellation/history scope, storage checkpoint ownership/promotion, and Lua mode admission fixes. The proposed physical-terminal-frame gate is not required: M9 requires history and prompt installation before child output extends chat state. The held prepared-commit guard enforces that ordering. The reviewer accepted this clarification and withdrew the frame-gating finding. A checkpoint deadline retains the definitive observer and reports that approval is still pending; it does not claim that dropping a storage waiter cancels an enqueued write.
+
+Executed checks on the cumulative implementation:
+
+- `OPENSSL_NO_VENDOR=1 NEXTEST_TEST_THREADS=4 just ci`: passed, 7,474 tests passed with none skipped. This includes Rust/Lua formatting, Clippy for tests and benches with warnings denied, Python checks, generated references, and unused-dependency checks.
+- `cargo nextest run -p maki-lua --test runtime_alignment`: 17 passed, none skipped, including the strict child cwd inheritance case.
+- Scoped actor/manager tests: 280 and 103 passed. Writer tests: 53 passed. Scoped EventLoop tests: 183 passed. These runs preceded the cumulative run above.
+- `OPENSSL_NO_VENDOR=1 just build`: passed.
+- `just gen-docs`: regenerated references; the cumulative generated-doc check passed.
+- The prefixed docs site build completed with Zola 0.22.1.
+- Nix built the full package from a source-only snapshot containing tracked changes and new source files. The snapshot's `git-dep-hashes` and `fmt` checks passed.
+- `git diff --check`: passed.
+
+The checkout has no `AGENTS.local.md` or `.ssh/remote-ci.sh`, so verification ran locally. Windows CI was not executed on this Linux host. No ready native Windows runner was identified. Cross-compilation and Wine tooling do not reproduce the workflow's native Windows filesystem checks. The operator explicitly permits completion without Windows verification and requires the existing CI errors to be fixed. Earlier suppressed permission prompts did not supply that consent. No push is authorized. Commit hooks remain enabled; intermediate commits run their full checks in a clean checkout to exclude unfinished changes. The first snapshot attempt included changing build artifacts and failed before evaluation; the source-only retry passed.
+
+The working branch contains these implementation commits:
+
+- `f9591eb3`: record the review follow-up plan.
+- `9005db9a`: derive post levels from their enum variants.
+- `d94e9f66`: ignore child outcomes in print mode.
+- `e8e48529`: persist posts incrementally and prune orphaned chat state.
+- `3fdb665e`: make actor cancellation and history edits settle atomically.
+- `d50e3834`: preserve durable history across coalesced checkpoint writes.
+- `c3969c3e`: keep focused controls and Lua work on their admitted agents. Its hooks passed all 7,474 tests with none skipped, plus the full local CI checks.
+- `18f571a4`: remove the redundant actor projection closure borrow reported by CI.
+- `ac2337b7`: isolate bulk highlighting from script boundary tests. Both CI-fix commits' hooks pass all 7,475 tests with none skipped on Rust 1.99.
+
+The operator waives native Windows verification. The implementation commits above include the generated references.
+
+### Existing CI failures
+
+The PR's failed Rust workflow runs, `39086633915` and `39086629937`, test `d956a5b1`, before these local commits. Both Linux and Windows lint report `needless_borrows_for_generic_args` for the same actor closure argument. CI uses Rust 1.99; the earlier local checks use Rust 1.95. Passing the immutable, copyable closure by value removes the redundant borrow. Workspace lint and the native Linux build pass on Rust 1.99 after that fix.
+
+The failed test run reports `code_execution_policy::restore_expanded_shows_full_script_beyond_cap` losing its snapshot sender after 61.4 seconds. The preview boundary cases also exceed 60 seconds in that run. Restore waits for syntax highlighting before returning its buffer and has a 60-second execution deadline. The unchanged cases pass locally in 1.1 to 1.4 seconds, so the CI slowdown is not locally reproduced. The test correction retains the production plugin, its 2,000-line cap, and the 2,000/2,001-line fixtures. A test-local highlighter supplies deterministic styled lines only for the large boundary cases. A separate small restore test checks the real syntax highlighter and colored output. No production deadline, timeout, or retry changes. Removing click replay still makes the expanded-restore assertion fail. All 1,710 Lua tests pass on Rust 1.99 with four test threads after the correction.
+
+Independent review approves both CI corrections. `OPENSSL_NO_VENDOR=1 RUSTUP_TOOLCHAIN=1.99.0 just ci` passes with the repository's default 64 test threads: 7,475 tests pass with none skipped, plus formatting, workspace Clippy, Python checks, generated references, and unused-dependency checks. The prefixed documentation site build also passes after the final wording correction. Nix rebuilds the final source-only snapshot's package and passes its hash and format checks. No current-state hosted CI result is claimed because these commits have not been pushed. Native Windows remains explicitly unverified under the operator's waiver.

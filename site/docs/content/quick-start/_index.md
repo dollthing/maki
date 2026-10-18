@@ -93,22 +93,14 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Models.** `/model` switches mid-session. Type `@` in the input to reference a file, skill, subagent, or model inline; see [References](/docs/references/).
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `makima -l` resumes where you left off, `makima sessions --json` lists stored sessions, and `makima -c` opens the session picker for this directory (or `makima -c <ID>` jumps straight in).
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
-- Cancellation. `Esc Esc` stops the viewed agent's current work and clears its pending ordinary messages. Descendants continue. When idle, it opens rewind instead. See [Agent input and cancellation](#agent-input-and-cancellation).
+- **Cancellation.** `Esc Esc` stops the viewed agent's current work and clears its pending messages. Its subagents continue. When idle, it opens rewind instead. See [Agent work](/docs/agent-work/#cancellation).
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
 Middle-click the conversation transcript to start continuous scrolling, then release the button. A marker shows the starting position. Move above it to scroll up or below it to scroll down; greater vertical distance increases speed, while the starting row and one row on either side pause scrolling. Scrolling continues when the pointer stops. Middle-click again or press Escape to stop; other key presses, paste, mouse clicks and wheel scrolling also stop it and retain their usual action. This works only in the transcript, not input fields, pickers or overlays. The terminal must report middle-clicks and pointer movement without a held button; some terminals or multiplexers paste on middle-click or do not report these events.
 
 ## Agent input and cancellation
 
-Main and subagent views share the same input, queue, status, and controls. The subagent label identifies the viewed agent. The draft, attachments, and input history remain shared when the view changes.
-
-Ordinary messages start idle work or join compatible open work. Pending messages drain in order before the next eligible model request, after current model/tool work completes. Sending a message does not interrupt an in-flight provider request or tool. Configuration changes, working-directory changes, control operations, and explicitly queued turns prevent messages from joining earlier work across those boundaries. Pending messages can be recalled or removed individually before consumption. Removing one message does not cancel its whole turn.
-
-Model, mode, plan, compact, rewind, shell commands, reference expansion, and file completion target the viewed agent. Each agent has its own working directory. A new child inherits the parent's committed directory; later directory changes affect only the target agent and are ordered with message admission. Commands and pickers keep the target captured when they start, even if the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply. Reset/new-session remains session-wide.
-
-UI cancellation stops the viewed agent's captured current work and clears only its ordinary messages accepted before cancellation. Descendants, siblings, pending child reports, configuration/control work, and later submissions survive. Explicit close through `task_despawn` instead retires the selected task and its descendants.
-
-The main agent may finish while children run. Non-main agents join reporting children before completing, subject to execution limits. Late child reports can resume an idle or locally cancelled agent. Resumed work produces a new immutable turn result and may report it to its parent. Earlier completed or cancelled results remain unchanged. Exact task waits stay attached to their original turn; they do not follow a successor. See [Task tools](/docs/tools/#task_wait) for wait and retention rules.
+Main and subagent views use the same input and controls. Messages sent during work wait for the next model request; they do not interrupt a running request or tool. [Agent work](/docs/agent-work/) explains message queues, focused controls, cancellation, and child reports.
 
 ## Default model (optional)
 

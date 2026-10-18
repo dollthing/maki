@@ -28,8 +28,8 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 
 17. Explicit admission allocates and registers the ticket before work can finalize. Exact waits must handle both finalization-before-wait and wait-before-finalization.
 18. Removing, clearing, closing, or shutting down must terminalize every affected queued explicit admission and resolve its waiter. Never drop accepted turn work silently.
-19. Root queue work is a deliberate compatibility exception: it has no external `TurnId` or ticket before execution and may fold into the active root turn.
-20. Root input folded by `InterruptSource` belongs to the active turn. It must not create another ticket, retained outcome, or terminal event.
+19. Main input, child input, and Lua ordinary submissions use `AgentActorHandle::submit`. Compatible submissions share the ticket for their execution; a closed admission or intervening operation requires a new turn.
+20. A pending ordinary message has a stable `SubmissionId` distinct from its `TurnId`. Consumption or removal addresses that submission without changing another message or creating an extra terminal result for a shared turn.
 21. Controls and compaction are not turns. They have no `TurnId`, no managed turn admission, and no retained `TurnOutcome`.
 22. `AgentInput` has one ownership transfer from queue to backend. Do not clone input payloads to avoid fixing ownership or lifetime design.
 23. Each actor orders configuration and admission through one operation FIFO and executes materialized work through its execution queue. UI queue projections and interrupt extraction must use actor-owned work, not a shadow deque.

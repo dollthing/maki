@@ -30,7 +30,7 @@ read main.rs                 index main.rs
                              + read offset=812 limit=40
 ```
 
-A subagent started with `task_spawn` has its own context. Its tool results stay there; the parent receives a result report rather than the full tool transcript. Later continuations can produce additional reports. Model tiers allow searches to use a cheaper model while the main agent uses a stronger model. See [Agent input and cancellation](/docs/quick-start/#agent-input-and-cancellation) for completion and resumed-result behavior.
+**Subagents as garbage collectors.** A subagent started with `task_spawn` has its own context. Its tool results stay there; the parent receives a report rather than the full tool transcript. Model tiers allow searches to use a cheaper model while the main agent uses a stronger model. [Agent work](/docs/agent-work/#child-reports-and-completion) explains when reports arrive and how later work can produce another result.
 
 ```
 main context                separate subagent context
@@ -58,7 +58,7 @@ MCP results go through the same limit only when a session has a place to save th
 
 Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonblank long lines tolerate indentation changes. A long whitespace-only line requires a byte-identical line in `old_string` for each occurrence. An empty, shorter, or differently spaced blank line does not cover it. Exact substring edits remain available.
 
-Tools can preserve partial output on cancellation or deadline expiry: bash retains streamed lines and `code_execution` retains script output. UI cancellation is local to the viewed agent; it does not cancel its descendants or copy their partial transcripts into the parent context. A later child result can resume the parent in a new turn. See [Agent input and cancellation](/docs/quick-start/#agent-input-and-cancellation).
+**Interrupted work is not wasted.** Tools can preserve partial output on cancellation or deadline expiry: bash retains streamed lines and `code_execution` retains script output. Subagent transcripts stay in their own contexts. [Agent work](/docs/agent-work/#cancellation) explains which work continues after cancellation and how later child reports reach the parent.
 
 Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#maki-api-register_tool).
 

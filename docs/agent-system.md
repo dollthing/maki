@@ -94,19 +94,21 @@ Outcomes remain queryable with `outcome(turn_id)`. `wait_outcome(turn_id)` eithe
 
 The actor returns to `Idle` before publishing the retained outcome and resolving its ticket. Therefore completion of a ticket means the actor is immediately reusable.
 
-### Root queue compatibility path
+### Shared ordinary-message submission
 
-The TUI root uses `rush(RootWork)` rather than explicit admission. A queued root input has no externally visible `TurnId` or ticket. When idle, the scheduler assigns an internal turn id and starts it. While another root turn is active, the same queue is exposed as an `InterruptSource`, allowing the input to fold into the active turn instead of creating an orphan turn.
+TUI main input, child input, and Lua `Agent:submit` use `AgentActorHandle::submit`. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn; each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal.
 
-For this compatibility path, `Agent::run` still emits the authoritative terminal event, but the actor does not retain a separately waitable root outcome. Do not convert root queue entries into explicit admissions without redesigning interrupt and queue-panel semantics.
+The actor orders submissions with configuration, working-directory changes, controls, and explicit turns. Those operations prevent later messages from joining earlier work across the operation. Both backends consume pending inputs before an eligible model request, preserving separate messages, images, preambles, and presentation metadata. Admission and finish share actor-state synchronization so an input joins the open turn or receives a new ticket.
 
-Controls and compact requests also use the FIFO, but never become turns.
+`admit_turn` still queues a distinct turn, and idle-only admission rejects a busy actor. These policies do not require a separate root scheduler. Controls and compact requests use the FIFO but never become turns.
+
+`CompletionPolicy::Independent` lets the main agent finish while children run. `CompletionPolicy::JoinReportingChildren` makes non-main agents wait for reporting children before completing. Both policies use the same submission mechanism. See [Agent work](../site/docs/content/agent-work/_index.md) for user-visible queue, cancellation, and late-report behavior.
 
 ### Backend contract
 
 `ActorBackend` has three methods:
 
-- `run_turn`: execute an explicit admission or started root against actor-owned history.
+- `run_turn`: execute an admitted turn against actor-owned history.
 - `run_control`: execute a standalone control with no turn identity.
 - `run_compact`: compact history with no turn identity.
 
