@@ -1688,7 +1688,7 @@ impl AgentActorHandle {
             .processing
             .as_ref()
             .and_then(|work| work.turn_id)
-            .map_or_else(Vec::new, &messages);
+            .map_or_else(Vec::new, messages);
         entries.extend(self.inner.queue.project_pending(&messages));
         entries.extend(
             state
