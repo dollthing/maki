@@ -2883,6 +2883,7 @@ version = "0.5.5-makima"
 dependencies = [
  "serde",
  "serde_json",
+ "strum 0.27.2",
  "test-case",
  "thiserror 2.0.20",
 ]

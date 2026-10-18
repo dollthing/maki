@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
+use strum::{EnumString, VariantNames};
 
-pub const POST_LEVELS: &[&str] = &["info", "warn", "error"];
+pub const POST_LEVELS: &[&str] = PostLevel::VARIANTS;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, EnumString, VariantNames,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PostLevel {
     #[default]
     Info,
@@ -13,12 +17,7 @@ pub enum PostLevel {
 
 impl PostLevel {
     pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "info" => Some(Self::Info),
-            "warn" => Some(Self::Warn),
-            "error" => Some(Self::Error),
-            _ => None,
-        }
+        name.parse().ok()
     }
 }
 
@@ -39,7 +38,7 @@ fn is_info(level: &PostLevel) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{POST_LEVELS, PostLevel};
     use test_case::test_case;
 
     #[test_case("info", Some(PostLevel::Info) ; "info")]
