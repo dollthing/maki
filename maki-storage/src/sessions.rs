@@ -407,6 +407,8 @@ enum LogRecord<M, U, T> {
     Out { id: String, d: T },
     #[serde(rename = "sub_msg")]
     SubMsg { sub: String, d: M },
+    #[serde(rename = "post")]
+    Post { d: StoredPost },
     #[serde(rename = "meta")]
     Meta {
         title: String,
@@ -414,8 +416,10 @@ enum LogRecord<M, U, T> {
         updated_at: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        posts: Vec<StoredPost>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        posts: Option<Vec<StoredPost>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_count: Option<usize>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
@@ -436,6 +440,7 @@ pub struct SessionLog {
     /// truncated, deleted or wrote it, and an append would corrupt it.
     saved_len: u64,
     saved_msg_count: usize,
+    saved_post_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
@@ -691,6 +696,10 @@ impl SessionLog {
             }
         }
 
+        for post in &session.posts[self.saved_post_count..] {
+            append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
+        }
+
         let meta = meta_record(session)?;
         if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
@@ -712,6 +721,7 @@ impl SessionLog {
         self.saved_len += buf.len() as u64;
         self.appends += 1;
         self.saved_msg_count = new_msg_count;
+        self.saved_post_count = session.posts.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
@@ -735,6 +745,7 @@ impl SessionLog {
             saved_rewrites: session.rewrites,
             saved_len,
             saved_msg_count: session.messages.len(),
+            saved_post_count: session.posts.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
@@ -776,6 +787,7 @@ impl SessionLog {
 
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
         self.saved_msg_count > session.messages.len()
+            || self.saved_post_count > session.posts.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -803,7 +815,8 @@ where
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
-            posts: session.posts.clone(),
+            posts: None,
+            post_count: Some(session.posts.len()),
             usage_by_model: session.usage_by_model.clone(),
             meta: session.meta.clone(),
         },
@@ -853,6 +866,9 @@ where
                 },
             )?;
         }
+    }
+    for post in &session.posts {
+        append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
     }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
@@ -932,12 +948,14 @@ where
             LogRecord::SubMsg { sub, d } => {
                 subagent_messages.entry(sub).or_default().push(d);
             }
+            LogRecord::Post { d } => posts.push(d),
             LogRecord::Meta {
                 title: m_title,
                 token_usage: m_usage,
                 updated_at: m_updated,
                 subagents: m_subagents,
                 posts: m_posts,
+                post_count,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
             } => {
@@ -945,7 +963,9 @@ where
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
-                posts = m_posts;
+                if post_count.is_none() {
+                    posts = m_posts.unwrap_or_default();
+                }
                 usage_by_model = m_usage_by_model;
                 meta = m_meta;
             }
@@ -1623,6 +1643,15 @@ where
         self.touch();
     }
 
+    pub fn prune_posts(&mut self, chat: Option<&str>, new_len: usize) {
+        let previous_len = self.posts.len();
+        self.posts
+            .retain(|stored| stored.chat.as_deref() != chat || stored.after_message <= new_len);
+        if self.posts.len() != previous_len {
+            self.rewrite();
+        }
+    }
+
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
     }
@@ -1666,48 +1695,84 @@ where
         self.touch();
     }
 
-    /// After `messages` is truncated (rewind), state keyed by tool_use_id can
-    /// point at calls that no longer exist. On restore that shows up as ghost
-    /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`.
-    ///
-    /// If you add another field keyed by tool_use_id, prune it here too.
+    /// Removes state unreachable from the main history, its posts, or live
+    /// children. Child messages and posts can retain further descendants.
+    /// Call only for explicit history edits, not compaction.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let message_count = self.messages.len();
-        self.posts
-            .retain(|stored| stored.chat.is_some() || stored.after_message <= message_count);
-        let main_ids: HashSet<String> = self
+        self.prune_orphans_preserving(tool_ids, &[]);
+    }
+
+    pub fn prune_orphans_preserving(
+        &mut self,
+        tool_ids: impl Fn(&M) -> Vec<String>,
+        live_ids: &[String],
+    ) {
+        self.prune_posts(None, self.messages.len());
+        let previous_counts = (
+            self.subagent_messages.len(),
+            self.subagent_history_epochs.len(),
+            self.subagents.len(),
+            self.posts.len(),
+            self.tool_outputs.len(),
+        );
+        let mut post_agents: HashMap<Option<&str>, Vec<&str>> = HashMap::new();
+        for stored in &self.posts {
+            if let Some(agent) = stored.post.agent.as_deref() {
+                post_agents
+                    .entry(stored.chat.as_deref())
+                    .or_default()
+                    .push(agent);
+            }
+        }
+        let mut pending: Vec<String> = self
             .messages
             .iter()
             .flat_map(&tool_ids)
+            .chain(live_ids.iter().cloned())
             .chain(
-                self.posts
-                    .iter()
-                    .filter(|stored| stored.chat.is_none())
-                    .filter_map(|stored| stored.post.agent.clone()),
+                post_agents
+                    .get(&None)
+                    .into_iter()
+                    .flatten()
+                    .map(|id| (*id).to_owned()),
             )
             .collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        let mut reachable = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(messages) = self.subagent_messages.get(&id) {
+                pending.extend(messages.iter().flat_map(&tool_ids));
+            }
+            if let Some(agents) = post_agents.get(&Some(id.as_str())) {
+                pending.extend(agents.iter().map(|id| (*id).to_owned()));
+            }
+        }
+        self.subagent_messages
+            .retain(|id, _| reachable.contains(id));
         self.subagent_history_epochs
-            .retain(|id, _| main_ids.contains(id));
+            .retain(|id, _| reachable.contains(id));
         self.subagents
-            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+            .retain(|sa| reachable.contains(&sa.tool_use_id));
         self.posts.retain(|stored| {
             stored
                 .chat
                 .as_ref()
-                .is_none_or(|chat| main_ids.contains(chat))
+                .is_none_or(|chat| reachable.contains(chat))
         });
-
-        let live: HashSet<String> = self
-            .subagent_messages
-            .values()
-            .flat_map(|msgs| msgs.iter())
-            .flat_map(&tool_ids)
-            .chain(main_ids)
-            .collect();
-        self.tool_outputs.retain(|id, _| live.contains(id));
-        self.rewrite();
+        self.tool_outputs.retain(|id, _| reachable.contains(id));
+        if previous_counts
+            != (
+                self.subagent_messages.len(),
+                self.subagent_history_epochs.len(),
+                self.subagents.len(),
+                self.posts.len(),
+                self.tool_outputs.len(),
+            )
+        {
+            self.rewrite();
+        }
     }
 
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
@@ -1904,6 +1969,11 @@ mod tests {
     const PENDING_DRAFT: &str = "half typed thought";
     const POST_TEXT: &str = "reviewer has findings";
     const POST_AGENT: &str = "session-reviewer";
+    const POST_APPEND_COUNT: usize = 64;
+    const POST_DESCENDANT: &str = "post-descendant";
+    const MESSAGE_DESCENDANT: &str = "message-descendant";
+    const LIVE_CHILD: &str = "live-child";
+    const ORPHAN_CHILD: &str = "orphan-child";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
@@ -2262,6 +2332,163 @@ mod tests {
                 agent: agent.map(str::to_owned),
             },
         }
+    }
+
+    #[test_case(None; "main")]
+    #[test_case(Some(POST_AGENT); "child")]
+    fn prune_posts_only_changes_the_selected_chat(chat: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("m", "/project");
+        for selected in [None, Some(POST_AGENT)] {
+            session.push_post(stored_post(selected, 1, None));
+            session.push_post(stored_post(selected, 2, None));
+        }
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        session.prune_posts(chat, 1);
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        let expected: Vec<_> = [None, Some(POST_AGENT)]
+            .into_iter()
+            .flat_map(|selected| {
+                let mut posts = vec![stored_post(selected, 1, None)];
+                if selected != chat {
+                    posts.push(stored_post(selected, 2, None));
+                }
+                posts
+            })
+            .collect();
+        assert_eq!(session.posts(), expected);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.posts(), expected);
+    }
+
+    #[test]
+    fn posts_are_written_once_instead_of_repeated_in_meta() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("m", "/project");
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        for _ in 0..POST_APPEND_COUNT {
+            session.push_post(stored_post(None, 0, None));
+            log.append(&session).unwrap();
+        }
+        let data = fs::read_to_string(jsonl_path(tmp.path(), session.id)).unwrap();
+        let records: Vec<Value> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["t"] == "post")
+                .count(),
+            POST_APPEND_COUNT
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|record| record["t"] == "meta")
+                .all(|record| record.get("posts").is_none())
+        );
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.posts(), session.posts());
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let rewritten = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(rewritten.posts(), session.posts());
+    }
+
+    #[test]
+    fn legacy_post_snapshots_mix_with_incremental_post_records() {
+        let tmp = TempDir::new().unwrap();
+        let session = TestSession::new("m", "/project");
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let first = stored_post(None, 0, None);
+        let second = stored_post(Some(POST_AGENT), 0, None);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(jsonl_path(tmp.path(), session.id))
+            .unwrap();
+        for posts in [vec![first.clone(), second.clone()], vec![first.clone()]] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "t": "meta", "title": DEFAULT_TITLE, "token_usage": null,
+                    "updated_at": 0, "posts": posts,
+                })
+            )
+            .unwrap();
+        }
+        writeln!(file, "{}", serde_json::json!({"t": "post", "d": second})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "t": "meta", "title": DEFAULT_TITLE, "token_usage": null,
+                "updated_at": 0, "post_count": 2,
+            })
+        )
+        .unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.posts(), [first, second]);
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "t": "meta", "title": DEFAULT_TITLE, "token_usage": null, "updated_at": 0,
+            })
+        )
+        .unwrap();
+        let cleared = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(cleared.posts().is_empty());
+    }
+
+    #[test]
+    fn prune_orphans_retains_live_children_and_recursive_message_and_post_references() {
+        fn ids(message: &Value) -> Vec<String> {
+            message
+                .as_str()
+                .map(|id| vec![id.to_owned()])
+                .unwrap_or_default()
+        }
+        let mut session = TestSession::new("m", "/project");
+        session.push_message(Value::String(POST_AGENT.into()));
+        for (id, references) in [
+            (POST_AGENT, vec![Value::String(MESSAGE_DESCENDANT.into())]),
+            (MESSAGE_DESCENDANT, vec![Value::String(POST_AGENT.into())]),
+            (POST_DESCENDANT, Vec::new()),
+            (LIVE_CHILD, Vec::new()),
+            (ORPHAN_CHILD, Vec::new()),
+        ] {
+            session.set_subagent_messages(id.into(), references);
+            session.insert_tool_output(id.into(), Value::Null);
+        }
+        session.push_post(stored_post(
+            Some(MESSAGE_DESCENDANT),
+            0,
+            Some(POST_DESCENDANT),
+        ));
+        session.push_post(stored_post(Some(ORPHAN_CHILD), 0, Some(ORPHAN_CHILD)));
+        session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
+        for id in [POST_AGENT, MESSAGE_DESCENDANT, POST_DESCENDANT, LIVE_CHILD] {
+            assert!(session.subagent_messages().contains_key(id));
+            assert!(session.tool_outputs().contains_key(id));
+        }
+        assert!(!session.subagent_messages().contains_key(ORPHAN_CHILD));
+        assert!(!session.tool_outputs().contains_key(ORPHAN_CHILD));
+        assert_eq!(
+            session.posts(),
+            [stored_post(
+                Some(MESSAGE_DESCENDANT),
+                0,
+                Some(POST_DESCENDANT)
+            )]
+        );
+        let revision = session.revision();
+        session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
+        assert_eq!(session.revision(), revision);
     }
 
     #[test]
