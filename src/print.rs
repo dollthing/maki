@@ -371,6 +371,13 @@ pub fn run(
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
     let runner = |input: AgentInput| {
+        // What this run reports to Lua, read before the input moves.
+        let meta_fast = input.fast && model.supports_fast();
+        let meta_thinking = if model.supports_thinking() {
+            input.thinking
+        } else {
+            maki_agent::ThinkingConfig::Off
+        };
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
             config,
@@ -435,8 +442,8 @@ pub fn run(
                     id: session_id.to_string(),
                     cwd: cwd.clone(),
                     model: model.spec(),
-                    fast: false,
-                    thinking: String::new(),
+                    fast: meta_fast,
+                    thinking: meta_thinking.to_string(),
                 },
                 // `makima --print` always runs the agent in build mode
                 // (`headless::spawn` hardcodes `AgentMode::Build`).
@@ -631,6 +638,7 @@ pub fn run(
 mod tests {
     use super::*;
     use flume::{Receiver, Sender};
+    use maki_agent::ThinkingConfig;
     use maki_agent::{
         AgentError, ToolOutput,
         tools::{
@@ -644,7 +652,7 @@ mod tests {
         StreamResponse, TokenUsage,
         provider::{BoxFuture, Provider},
     };
-    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use maki_storage::sessions::{Effort, SESSIONS_DIR, StoredThinking, offload_dir};
     use std::borrow::Cow;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -789,9 +797,7 @@ mod tests {
         }
     }
 
-    struct RecordingPrintProvider(
-        flume::Sender<(String, String, bool, maki_agent::ThinkingConfig)>,
-    );
+    struct RecordingPrintProvider(flume::Sender<(String, String, bool, ThinkingConfig)>);
 
     impl maki_providers::provider::Provider for RecordingPrintProvider {
         fn stream_message<'a>(
@@ -1019,8 +1025,20 @@ mod tests {
         let registry = CommandRegistry::new();
         let target = target(&registry);
         let (requests, received) = flume::unbounded();
-        let mut literal = input("print request");
-        literal.fast = true;
+        // Built the way `print::run` builds it, so a literal (non-command)
+        // turn must keep every `always_*` knob.
+        let literal = AgentInput::from_defaults(
+            "print request".into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults {
+                fast: true,
+                workflow: false,
+                thinking: Some(StoredThinking::Effort {
+                    level: Effort::XHigh,
+                }),
+            },
+        );
         drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
             let cwd = std::env::temp_dir();
             let handle = maki_agent::headless::spawn_with_provider(
@@ -1051,63 +1069,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             received.try_recv().unwrap(),
-            (SPEC.into(), SYSTEM.into(), true, Default::default())
+            (
+                SPEC.into(),
+                SYSTEM.into(),
+                true,
+                ThinkingConfig::Effort(Effort::XHigh)
+            )
         );
         assert!(received.try_recv().is_err());
-    }
-
-    /// `-p` builds its literal from the config's `SessionDefaults`; a prompt
-    /// that is not a command must still carry its `always_thinking` level.
-    #[test]
-    fn print_literal_turn_keeps_always_thinking() {
-        const SPEC: &str = "anthropic/claude-opus-4-8";
-        let registry = CommandRegistry::new();
-        let target = target(&registry);
-        let (requests, received) = flume::unbounded();
-        let defaults = SessionDefaults {
-            thinking: Some(maki_storage::sessions::StoredThinking::Effort {
-                level: maki_storage::sessions::Effort::XHigh,
-            }),
-            ..Default::default()
-        };
-        let literal = AgentInput::from_defaults(
-            "print request".into(),
-            AgentMode::Build,
-            Vec::new(),
-            defaults,
-        );
-        drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
-            let cwd = std::env::temp_dir();
-            let handle = maki_agent::headless::spawn_with_provider(
-                HeadlessParams {
-                    model: Model::from_spec(SPEC).unwrap(),
-                    config: AgentConfig::default(),
-                    permissions_config: PermissionsConfig::default(),
-                    timeouts: Default::default(),
-                    input,
-                    prompt_slots: Default::default(),
-                    excluded_tools: Vec::new(),
-                    mcp_handle: None,
-                    initial_wd: cwd.clone(),
-                    system_prompt_override: None,
-                    append_system_prompt: None,
-                    model_policy: Arc::default(),
-                    plugin_rules: Arc::default(),
-                    project_config: ProjectConfig::for_project(&cwd),
-                    modes: Arc::default(),
-                    session_options: Default::default(),
-                    state_dir: None,
-                },
-                Arc::new(RecordingPrintProvider(requests)),
-            )?;
-            smol::block_on(handle.task);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            received.try_recv().unwrap().3,
-            maki_agent::ThinkingConfig::Effort(maki_storage::sessions::Effort::XHigh)
-        );
     }
 
     fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {

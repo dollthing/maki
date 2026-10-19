@@ -743,15 +743,15 @@ pub fn run(params: SdkParams) -> Result<()> {
     };
     // `always_thinking` seeds a session that has no stored choice of its own;
     // a resumed session's explicit setting (including off) still wins.
-    let stored_thinking = restored
-        .meta
-        .thinking
-        .or(defaults.thinking)
-        .filter(|_| model.supports_thinking());
+    let thinking = maki_agent::ThinkingConfig::from(
+        restored
+            .meta
+            .thinking
+            .or(defaults.thinking)
+            .filter(|_| model.supports_thinking()),
+    );
     defaults.fast = fast;
     defaults.workflow = workflow;
-    defaults.thinking = stored_thinking;
-    let thinking = maki_agent::ThinkingConfig::from(stored_thinking);
     let persisted_options = restored.meta.session_options;
     let session_id = restored.id;
     let initial_history = restored.history;
