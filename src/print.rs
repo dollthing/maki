@@ -232,7 +232,7 @@ fn drive_print(
             mode: literal.mode.clone(),
             images: command_attachments::into_images(&content.attachments)?,
             preamble: Vec::new(),
-            thinking: Default::default(),
+            thinking: literal.thinking,
             fast: literal.fast,
             workflow: literal.workflow,
             prompt: None,
@@ -789,7 +789,9 @@ mod tests {
         }
     }
 
-    struct RecordingPrintProvider(flume::Sender<(String, String, bool)>);
+    struct RecordingPrintProvider(
+        flume::Sender<(String, String, bool, maki_agent::ThinkingConfig)>,
+    );
 
     impl maki_providers::provider::Provider for RecordingPrintProvider {
         fn stream_message<'a>(
@@ -807,7 +809,12 @@ mod tests {
         > {
             Box::pin(async move {
                 self.0
-                    .send((model.spec(), system.to_owned(), options.fast))
+                    .send((
+                        model.spec(),
+                        system.to_owned(),
+                        options.fast,
+                        options.thinking,
+                    ))
                     .unwrap();
                 Ok(maki_providers::StreamResponse {
                     message: maki_providers::Message {
@@ -1044,9 +1051,63 @@ mod tests {
         .unwrap();
         assert_eq!(
             received.try_recv().unwrap(),
-            (SPEC.into(), SYSTEM.into(), true)
+            (SPEC.into(), SYSTEM.into(), true, Default::default())
         );
         assert!(received.try_recv().is_err());
+    }
+
+    /// `-p` builds its literal from the config's `SessionDefaults`; a prompt
+    /// that is not a command must still carry its `always_thinking` level.
+    #[test]
+    fn print_literal_turn_keeps_always_thinking() {
+        const SPEC: &str = "anthropic/claude-opus-4-8";
+        let registry = CommandRegistry::new();
+        let target = target(&registry);
+        let (requests, received) = flume::unbounded();
+        let defaults = SessionDefaults {
+            thinking: Some(maki_storage::sessions::StoredThinking::Effort {
+                level: maki_storage::sessions::Effort::XHigh,
+            }),
+            ..Default::default()
+        };
+        let literal = AgentInput::from_defaults(
+            "print request".into(),
+            AgentMode::Build,
+            Vec::new(),
+            defaults,
+        );
+        drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
+            let cwd = std::env::temp_dir();
+            let handle = maki_agent::headless::spawn_with_provider(
+                HeadlessParams {
+                    model: Model::from_spec(SPEC).unwrap(),
+                    config: AgentConfig::default(),
+                    permissions_config: PermissionsConfig::default(),
+                    timeouts: Default::default(),
+                    input,
+                    prompt_slots: Default::default(),
+                    excluded_tools: Vec::new(),
+                    mcp_handle: None,
+                    initial_wd: cwd.clone(),
+                    system_prompt_override: None,
+                    append_system_prompt: None,
+                    model_policy: Arc::default(),
+                    plugin_rules: Arc::default(),
+                    project_config: ProjectConfig::for_project(&cwd),
+                    modes: Arc::default(),
+                    session_options: Default::default(),
+                    state_dir: None,
+                },
+                Arc::new(RecordingPrintProvider(requests)),
+            )?;
+            smol::block_on(handle.task);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            received.try_recv().unwrap().3,
+            maki_agent::ThinkingConfig::Effort(maki_storage::sessions::Effort::XHigh)
+        );
     }
 
     fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {
