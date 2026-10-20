@@ -220,7 +220,6 @@ impl CurrentManagedTurn {
 
     pub fn same_authority(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.token.manager.0, &other.token.manager.0)
-            && self.token.generation == other.token.generation
             && self.token.agent_id == other.token.agent_id
             && self.token.turn_id == other.token.turn_id
             && self.token.nonce == other.token.nonce
@@ -230,7 +229,6 @@ impl CurrentManagedTurn {
 #[derive(Clone)]
 pub(crate) struct ManagedTurnToken {
     pub(crate) manager: super::AgentManagerHandle,
-    pub(crate) generation: u64,
     pub(crate) agent_id: AgentId,
     pub(crate) turn_id: TurnId,
     pub(crate) nonce: u64,

@@ -2204,13 +2204,24 @@ mod tests {
 
     #[test]
     fn spawn_registers_a_resolvable_coordinator() {
-        let handle = spawn(test_params()).unwrap();
+        let (entered, received) = flume::bounded(1);
+        let (_release, release) = flume::bounded(1);
+        let handle = spawn_with_provider(
+            test_params(),
+            Arc::new(GatedHeadlessProvider {
+                entered,
+                release,
+                exit: ProviderExit::Pending,
+            }),
+        )
+        .unwrap();
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
         let session_id = handle.session_id.id();
         let coordinator = SessionCoordinatorHandle::resolve(session_id).unwrap();
         assert_eq!(coordinator.read().session_id(), session_id);
         SessionMailbox::notify(session_id, "ping".into(), true).unwrap();
-        smol::block_on(handle.task.cancel());
         smol::block_on(coordinator.close()).unwrap();
+        smol::block_on(handle.task.cancel());
     }
 
     #[test]

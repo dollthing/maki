@@ -2896,9 +2896,26 @@ fn child_spawn_inherits_running_turn_cwd_not_later_config() {
 #[test]
 fn root_and_nested_children_use_one_factory() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let (tx, rx) = flume::bounded(1);
+    let child_gate = Gate::new();
     let child = manager
         .spawn_child(
             &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::reporting(tx, Some(Arc::clone(&child_gate))),
+        )
+        .unwrap();
+    child
+        .actor()
+        .unwrap()
+        .admit_turn(input(), None, "child".into())
+        .unwrap();
+    let child_turn = smol::block_on(rx.recv_async()).unwrap();
+    let grandchild = manager
+        .spawn_child(
+            &child_turn,
             AgentMetadata::default(),
             Vec::new(),
             None,
@@ -2907,14 +2924,21 @@ fn root_and_nested_children_use_one_factory() {
         .unwrap();
     let root_node = root.snapshot().unwrap();
     let child_node = child.snapshot().unwrap();
+    let grandchild_node = grandchild.snapshot().unwrap();
     assert_eq!(root_node.parent_id, None);
     assert_eq!(root_node.root_id, root.id());
     assert_eq!(root_node.children, vec![child.id()]);
     assert_eq!(child_node.parent_id, Some(root.id()));
     assert_eq!(child_node.root_id, root.id());
     assert_eq!(child_node.depth, 1);
+    assert_eq!(child_node.children, vec![grandchild.id()]);
+    assert_eq!(grandchild_node.parent_id, Some(child.id()));
+    assert_eq!(grandchild_node.root_id, root.id());
+    assert_eq!(grandchild_node.depth, 2);
     gate.release(1);
-    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    child_gate.release(1);
+    let shutdown = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(shutdown.timed_out.is_empty());
 }
 
 #[test]

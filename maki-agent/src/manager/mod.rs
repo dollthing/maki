@@ -683,9 +683,7 @@ impl AgentManagerHandle {
     }
 
     fn validate_manager(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
-        if Arc::ptr_eq(&self.0, &current.token.manager.0)
-            && current.token.generation == self.0.generation
-        {
+        if Arc::ptr_eq(&self.0, &current.token.manager.0) {
             Ok(())
         } else {
             Err(ManagerError::WrongManager)
@@ -2238,7 +2236,6 @@ pub(crate) async fn enter_managed_turn(
     }
     let token = types::ManagedTurnToken {
         manager: AgentManagerHandle(Arc::clone(&inner)),
-        generation: inner.generation,
         agent_id,
         turn_id,
         nonce,
