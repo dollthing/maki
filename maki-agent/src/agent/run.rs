@@ -17,7 +17,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::{StreamError, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
-use crate::actor::TurnInbox;
+use crate::actor::{TurnContext, TurnInbox};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -251,6 +251,37 @@ pub struct Agent<'h> {
 }
 
 impl<'h> Agent<'h> {
+    pub fn for_actor_turn(
+        mut params: AgentParams,
+        mut run: AgentRunParams<'h>,
+        context: &TurnContext,
+        input: &mut AgentInput,
+        loaded: LoadedInstructions,
+    ) -> Self {
+        params.agent_id = context.agent_id;
+        params.managed_turn = context.managed_turn.clone();
+        if let Some(policy) = &context.policy {
+            params.provider = Arc::clone(&policy.provider);
+            params.model = policy.model.clone();
+            input.mode = policy.mode.clone();
+            input.thinking = policy.thinking;
+            input.fast = policy.fast;
+            input.workflow = policy.workflow;
+        }
+        run.event_tx = run.event_tx.with_output(context.output.clone());
+        let mut agent = Self::new(params, run)
+            .with_loaded_instructions(loaded)
+            .with_turn_inbox(context.inbox.clone())
+            .with_cancel(context.cancel.clone())
+            .with_cancel_reason_source(context.cancel_reason.clone())
+            .with_admission(context.admission.clone())
+            .with_deferred_outcome();
+        if let Some(interrupt) = &context.interrupt {
+            agent = agent.with_interrupt_source(Arc::clone(interrupt));
+        }
+        agent
+    }
+
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         Self {
             agent_id: params.agent_id,

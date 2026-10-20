@@ -521,16 +521,6 @@ impl ActorBackend for LuaActorBackend {
                 .get()
                 .expect("session parameters must be initialized before admission")
                 .clone();
-            if let Some(config) = &context.policy {
-                params.provider = Arc::clone(&config.provider);
-                params.model = config.model.clone();
-                input.mode = config.mode.clone();
-                input.thinking = config.thinking;
-                input.fast = config.fast;
-                input.workflow = config.workflow;
-            }
-            params.agent_id = context.agent_id;
-            params.managed_turn = context.managed_turn.clone();
             let prompt_inputs = context
                 .admission
                 .as_ref()
@@ -592,7 +582,10 @@ impl ActorBackend for LuaActorBackend {
                 }
                 system.push_str(&state.custom_system);
             }
-            let mut agent = Agent::new(
+            let loaded = prompt_inputs
+                .map(|inputs| inputs.instructions.loaded.clone())
+                .unwrap_or_default();
+            let mut agent = Agent::for_actor_turn(
                 params,
                 AgentRunParams {
                     history,
@@ -600,22 +593,14 @@ impl ActorBackend for LuaActorBackend {
                     event_tx,
                     tools: state.tools.clone(),
                 },
+                &context,
+                &mut input,
+                loaded,
             )
             .with_user_response_rx(Arc::clone(&state.answer_rx))
-            .with_cancel(context.cancel.clone())
-            .with_turn_inbox(context.inbox)
-            .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
-            .with_local_tool_capture(Arc::clone(&state.commit))
-            .with_admission(context.admission.clone())
-            .with_deferred_outcome();
-            if let Some(inputs) = prompt_inputs {
-                agent = agent.with_loaded_instructions(inputs.instructions.loaded.clone());
-            }
-            if let Some(interrupt) = context.interrupt {
-                agent = agent.with_interrupt_source(interrupt);
-            }
+            .with_local_tool_capture(Arc::clone(&state.commit));
             let commit = Arc::clone(&state.commit);
             let structured = state.structured.clone();
             agent = agent.with_instruction_consumed_callback(Arc::new(move || {

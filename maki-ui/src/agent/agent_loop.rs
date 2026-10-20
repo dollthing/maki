@@ -499,7 +499,7 @@ impl TuiActorBackend {
             Err(_) => return Some(self.cancel_setup(context, turn_id, run_id)),
         };
         self.run_id.fetch_max(run_id, Ordering::Relaxed);
-        let mut agent = Agent::new(
+        let mut agent = Agent::for_actor_turn(
             AgentParams {
                 agent_id: self.agent_id,
                 provider,
@@ -526,20 +526,15 @@ impl TuiActorBackend {
             AgentRunParams {
                 history,
                 system,
-                event_tx: EventSender::new(self.agent_tx.clone(), run_id)
-                    .with_output(context.output.clone()),
+                event_tx: EventSender::new(self.agent_tx.clone(), run_id),
                 tools,
             },
+            context,
+            &mut input,
+            self.instructions.loaded.clone(),
         )
-        .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
-        .with_interrupt_source(context.interrupt.clone().unwrap_or_else(noop_interrupt))
-        .with_turn_inbox(context.inbox.clone())
-        .with_cancel(context.cancel.clone())
-        .with_cancel_reason_source(context.cancel_reason.clone())
-        .with_mcp(self.mcp.clone())
-        .with_admission(context.admission.clone())
-        .with_deferred_outcome();
+        .with_mcp(self.mcp.clone());
 
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
@@ -973,18 +968,6 @@ fn compaction_source(
     settings: &maki_agent::RunSettings,
 ) -> (Arc<dyn maki_providers::provider::Provider>, Model) {
     (Arc::clone(&settings.provider), settings.model.clone())
-}
-
-/// A no-op interrupt source used when the actor provides none (standalone
-/// control or compact execution).
-fn noop_interrupt() -> Arc<dyn maki_agent::InterruptSource> {
-    struct Noop;
-    impl maki_agent::InterruptSource for Noop {
-        fn poll(&self) -> Option<maki_agent::ExtractedCommand> {
-            None
-        }
-    }
-    Arc::new(Noop)
 }
 
 fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
