@@ -20,8 +20,8 @@ use crate::actor::EffectiveAgentConfig;
 use crate::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
     SessionOptionCategory, SessionOptionDefinition, SessionOptionError, SessionOptionOwner,
-    SessionOptionValue, SessionOptions, SessionOptionsSnapshot, SessionOptionsSubscription,
-    THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    SessionOptionValue, SessionOptions, SessionOptionsReservation, SessionOptionsSnapshot,
+    SessionOptionsSubscription, THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
 
 #[derive(Default)]
@@ -341,13 +341,14 @@ pub struct SessionCoordinatorParams {
 struct PreparedPluginOptions {
     session_id: MakiId,
     generation: u64,
-    options: Arc<SessionOptions>,
+    reservation: Arc<SessionOptionsReservation>,
     previous: SessionOptionsSnapshot,
     candidate: crate::session_options::SessionOptionsCandidate,
 }
 
 enum PluginOptionDecision {
     Commit(flume::Sender<Result<(), SessionCoordinatorError>>),
+    Complete(flume::Sender<Result<(), SessionCoordinatorError>>),
     Abort(flume::Sender<Result<(), SessionCoordinatorError>>),
 }
 
@@ -526,7 +527,7 @@ impl SessionOptionCatalog {
                 } else {
                     let candidates = prepared
                         .iter()
-                        .map(|(staged, _)| (Arc::clone(&staged.options), staged.candidate.clone()))
+                        .map(|(staged, _)| (staged.reservation.as_ref(), staged.candidate.clone()))
                         .collect();
                     Some(SessionOptions::commit_batch(candidates).map(|snapshots| {
                         let previous_definitions = if definitions.is_empty() {
@@ -550,49 +551,86 @@ impl SessionOptionCatalog {
                 }
             }
         };
-        let restore = prepared
-            .iter()
-            .zip(&snapshots)
-            .map(|((prepared, _), snapshot)| {
-                (
-                    Arc::clone(&prepared.options),
-                    snapshot.version,
-                    prepared.previous.clone(),
-                )
-            })
-            .collect();
-        let mut committed = Vec::with_capacity(prepared.len());
-        let mut commit_error = None;
-        for ((prepared, decision), snapshot) in prepared.into_iter().zip(snapshots) {
-            let (reply, response) = flume::bounded(1);
-            let result =
-                if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
-                    Err(SessionCoordinatorError::StaleSession(prepared.session_id))
-                } else {
-                    response.recv_async().await.unwrap_or(Err(
-                        SessionCoordinatorError::StaleSession(prepared.session_id),
-                    ))
-                };
-            if let Err(error) = result {
-                commit_error.get_or_insert(error);
-            }
-            committed.push((prepared.session_id, snapshot));
-        }
-        if let Some(error) = commit_error {
-            if SessionOptions::restore_batch_if_versions(restore) {
-                let mut state = lock(&self.state);
-                if let Some(definitions) = previous_definitions {
-                    state.definitions.insert(Arc::clone(&plugin), definitions);
-                } else {
-                    state.definitions.remove(plugin.as_ref());
+        let catalog = self.clone();
+        let (finished, response) = flume::bounded(1);
+        smol::spawn(async move {
+            let result = async move {
+                let mut committed = Vec::with_capacity(prepared.len());
+                let mut commit_error = None;
+                for ((staged, decision), snapshot) in prepared.iter().zip(&snapshots) {
+                    let (reply, response) = flume::bounded(1);
+                    let result = if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
+                        Err(SessionCoordinatorError::StaleSession(staged.session_id))
+                    } else {
+                        response.recv_async().await.unwrap_or(Err(
+                            SessionCoordinatorError::StaleSession(staged.session_id),
+                        ))
+                    };
+                    if let Err(error) = result {
+                        commit_error.get_or_insert(error);
+                    }
+                    committed.push((staged.session_id, snapshot.clone()));
                 }
-                state.revision += 1;
-            } else {
-                tracing::warn!(%plugin, "session options advanced before plugin rollback");
+                if let Some(error) = commit_error {
+                    let restore = prepared
+                        .iter()
+                        .zip(&snapshots)
+                        .map(|((staged, _), snapshot)| {
+                            (
+                                staged.reservation.as_ref(),
+                                snapshot.version,
+                                staged.previous.clone(),
+                            )
+                        })
+                        .collect();
+                    if SessionOptions::restore_reserved_batch_if_versions(restore) {
+                        let mut state = lock(&catalog.state);
+                        if let Some(definitions) = previous_definitions {
+                            state.definitions.insert(Arc::clone(&plugin), definitions);
+                        } else {
+                            state.definitions.remove(plugin.as_ref());
+                        }
+                        state.revision += 1;
+                    } else {
+                        tracing::warn!(%plugin, "session options advanced before plugin rollback");
+                    }
+                    if let Err(abort_error) = abort_plugin_options(prepared).await {
+                        tracing::warn!(%abort_error, "failed to abort session option commit");
+                    }
+                    return Err(error);
+                }
+                let mut release_error = None;
+                for (staged, decision) in prepared {
+                    let session_id = staged.session_id;
+                    drop(staged);
+                    let (reply, response) = flume::bounded(1);
+                    let result = if decision
+                        .send(PluginOptionDecision::Complete(reply))
+                        .is_err()
+                    {
+                        Err(SessionCoordinatorError::StaleSession(session_id))
+                    } else {
+                        response
+                            .recv_async()
+                            .await
+                            .unwrap_or(Err(SessionCoordinatorError::StaleSession(session_id)))
+                    };
+                    if let Err(error) = result {
+                        release_error.get_or_insert(error);
+                    }
+                }
+                release_error.map_or(Ok(committed), Err)
             }
-            return Err(error);
-        }
-        Ok(committed)
+            .await;
+            let _ = finished.send(result);
+        })
+        .detach();
+        response.recv_async().await.unwrap_or_else(|_| {
+            Err(
+                SessionOptionError::CallbackFailed(Arc::from("catalog decision task stopped"))
+                    .into(),
+            )
+        })
     }
 }
 
@@ -1367,7 +1405,6 @@ async fn handle_operation(
             prepared,
             decision,
         } => {
-            let previous = ctx.read.options.snapshot();
             let result = ctx
                 .read
                 .options
@@ -1383,6 +1420,14 @@ async fn handle_operation(
                     return ControlFlow::Continue(());
                 }
             };
+            let reservation = match ctx.read.options.reserve(&candidate) {
+                Ok(reservation) => Arc::new(reservation),
+                Err(error) => {
+                    let _ = prepared.send(Err(error.into()));
+                    return ControlFlow::Continue(());
+                }
+            };
+            let previous = ctx.read.options.snapshot();
             let candidate_snapshot = SessionOptions::candidate_snapshot(&candidate);
             let (model, cwd) = {
                 let state = lock(&ctx.read.state);
@@ -1398,13 +1443,14 @@ async fn handle_operation(
             )
             .await
             {
+                drop(reservation);
                 let _ = prepared.send(Err(error.into()));
                 return ControlFlow::Continue(());
             }
             let staged = PreparedPluginOptions {
                 session_id: ctx.session_id,
                 generation: ctx.generation,
-                options: Arc::clone(&ctx.read.options),
+                reservation: Arc::clone(&reservation),
                 previous: previous.clone(),
                 candidate,
             };
@@ -1412,18 +1458,28 @@ async fn handle_operation(
                 let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous).await;
                 return ControlFlow::Continue(());
             }
-            match decision.recv_async().await {
-                Ok(PluginOptionDecision::Commit(reply)) => {
-                    let _ = reply.send(Ok(()));
-                }
-                Ok(PluginOptionDecision::Abort(reply)) => {
-                    let result = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous)
-                        .await
-                        .map_err(Into::into);
-                    let _ = reply.send(result);
-                }
-                Err(_) => {
-                    let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous).await;
+            loop {
+                match decision.recv_async().await {
+                    Ok(PluginOptionDecision::Commit(reply)) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Ok(PluginOptionDecision::Complete(reply)) => {
+                        drop(reservation);
+                        let _ = reply.send(Ok(()));
+                        break;
+                    }
+                    Ok(PluginOptionDecision::Abort(reply)) => {
+                        let result = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous)
+                            .await
+                            .map_err(Into::into);
+                        drop(reservation);
+                        let _ = reply.send(result);
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous).await;
+                        break;
+                    }
                 }
             }
         }
@@ -1764,7 +1820,7 @@ fn reconcile_options(
             &plugin,
             definitions.get(&plugin).cloned().unwrap_or_default(),
         )? {
-            options.commit(candidate)?;
+            options.reserve(&candidate)?.commit(candidate);
         }
     }
     Ok(())
@@ -1776,11 +1832,13 @@ async fn abort_plugin_options(
     let mut responses = Vec::with_capacity(prepared.len());
     let mut first_error = None;
     for (staged, decision) in prepared {
+        let session_id = staged.session_id;
+        drop(staged);
         let (reply, response) = flume::bounded(1);
         if decision.send(PluginOptionDecision::Abort(reply)).is_err() {
-            first_error.get_or_insert(SessionCoordinatorError::StaleSession(staged.session_id));
+            first_error.get_or_insert(SessionCoordinatorError::StaleSession(session_id));
         } else {
-            responses.push((staged.session_id, response));
+            responses.push((session_id, response));
         }
     }
     for (session_id, response) in responses {
@@ -2847,8 +2905,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn replacement_reprepares_session_activated_during_validator() {
+    #[test_case::test_case(false; "replacement")]
+    #[test_case::test_case(true; "caller_dropped")]
+    fn replacement_reprepares_session_activated_during_validator(cancel: bool) {
         smol::block_on(async {
             let catalog = SessionOptionCatalog::default();
             let id = MakiId::generate();
@@ -2885,6 +2944,31 @@ mod tests {
             });
 
             validator_started_rx.recv_async().await.unwrap();
+            for value in [ENABLED_VALUE, DISABLED_VALUE] {
+                assert!(matches!(
+                    current.read.options.set(YOLO_OPTION_ID, value),
+                    Err(SessionOptionError::Busy)
+                ));
+            }
+            if cancel {
+                assert!(replace.cancel().await.is_none());
+                current
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+                assert!(catalog.plugin_definitions("test").is_empty());
+                assert!(
+                    current
+                        .read()
+                        .options()
+                        .options
+                        .iter()
+                        .all(|option| { option.definition.id.as_ref() != "test.choice" })
+                );
+                drop(current.read.options.try_reserve(None).unwrap());
+                current.close().await.unwrap();
+                return;
+            }
             let activated = replacement.activate_replacing(&current).unwrap();
             validator_release_tx.send_async(()).await.unwrap();
             let committed = replace.await.unwrap();
@@ -2934,6 +3018,15 @@ mod tests {
             let second = register_with_catalog(ids[1], writer(true), &catalog);
             let before_first = first.read().options();
             let before_second = second.read().options();
+            let reservation = first.read.options.try_reserve(None).unwrap();
+            assert!(matches!(
+                catalog
+                    .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
+                    .await,
+                Err(SessionCoordinatorError::Option(SessionOptionError::Busy))
+            ));
+            assert!(lock(&saved).is_empty());
+            drop(reservation);
 
             assert!(matches!(
                 catalog
@@ -2956,6 +3049,119 @@ mod tests {
                 .unwrap();
             second.close().await.unwrap();
             first.close().await.unwrap();
+        });
+    }
+
+    #[test_case::test_case(false; "complete")]
+    #[test_case::test_case(true; "abort")]
+    fn dropped_catalog_caller_settles_before_queued_checkpoint(abort: bool) {
+        smol::block_on(async {
+            let mut ids = [MakiId::generate(), MakiId::generate()];
+            ids.sort_by_key(ToString::to_string);
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let saved = Arc::clone(&saved);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    lock(&saved).push(request.snapshot.clone());
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                }
+            });
+            let catalog = SessionOptionCatalog::default();
+            let first = register_with_catalog(ids[0], Arc::clone(&checkpoint), &catalog);
+            let second = register_with_catalog(ids[1], checkpoint, &catalog);
+            let before = first.read().options();
+            let (gate_tx, gate_rx) = flume::unbounded();
+            lock(&catalog.state).sessions.get_mut(&ids[1]).unwrap().tx = gate_tx;
+            let replacement = smol::spawn({
+                let catalog = catalog.clone();
+                async move {
+                    catalog
+                        .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
+                        .await
+                }
+            });
+            let Operation::PreparePluginOptions {
+                plugin,
+                definitions,
+                prepared,
+                decision,
+            } = gate_rx.recv_async().await.unwrap()
+            else {
+                unreachable!();
+            };
+            let (forward, forwarded) = flume::unbounded();
+            second
+                .tx
+                .send(Operation::PreparePluginOptions {
+                    plugin,
+                    definitions,
+                    prepared,
+                    decision: forwarded,
+                })
+                .unwrap();
+            let PluginOptionDecision::Commit(reply) = decision.recv_async().await.unwrap() else {
+                unreachable!();
+            };
+            let (ack, acknowledged) = flume::bounded(1);
+            forward.send(PluginOptionDecision::Commit(ack)).unwrap();
+            acknowledged.recv_async().await.unwrap().unwrap();
+            assert_eq!(lock(&saved).len(), 2);
+            for coordinator in [&first, &second] {
+                for value in [ENABLED_VALUE, DISABLED_VALUE] {
+                    assert!(matches!(
+                        coordinator.read.options.set(YOLO_OPTION_ID, value),
+                        Err(SessionOptionError::Busy)
+                    ));
+                }
+            }
+            let mut queued = Box::pin(first.set_option(YOLO_OPTION_ID, ENABLED_VALUE));
+            assert!(
+                futures_lite::future::poll_once(queued.as_mut())
+                    .await
+                    .is_none()
+            );
+            assert_eq!(lock(&saved).len(), 2);
+            assert!(replacement.cancel().await.is_none());
+            reply
+                .send(if abort {
+                    Err(SessionCoordinatorError::StaleSession(ids[1]))
+                } else {
+                    Ok(())
+                })
+                .unwrap();
+            let final_decision = decision.recv_async().await.unwrap();
+            let (ack, acknowledged) = flume::bounded(1);
+            let reply = match final_decision {
+                PluginOptionDecision::Complete(reply) if !abort => {
+                    forward.send(PluginOptionDecision::Complete(ack)).unwrap();
+                    reply
+                }
+                PluginOptionDecision::Abort(reply) if abort => {
+                    forward.send(PluginOptionDecision::Abort(ack)).unwrap();
+                    reply
+                }
+                _ => unreachable!(),
+            };
+            acknowledged.recv_async().await.unwrap().unwrap();
+            reply.send(Ok(())).unwrap();
+            queued.await.unwrap();
+            drop(first.read.options.try_reserve(None).unwrap());
+            drop(second.read.options.try_reserve(None).unwrap());
+            if abort {
+                assert!(catalog.plugin_definitions("test").is_empty());
+                assert_eq!(second.read().options(), before);
+                assert_eq!(lock(&saved).len(), 5);
+            } else {
+                assert_eq!(catalog.plugin_definitions("test").len(), 1);
+                assert_eq!(lock(&saved).len(), 3);
+            }
+            first.close().await.unwrap();
+            second.close().await.unwrap();
         });
     }
 
