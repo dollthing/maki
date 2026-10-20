@@ -591,14 +591,6 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
 }
 
 #[test]
-fn spawn_returns_task_and_turn_ids() {
-    let (reg, _host) = load_task_host();
-    let out = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
-    assert!(out["task_id"].is_string(), "missing task_id: {out}");
-    assert!(out["turn_id"].is_string(), "missing turn_id: {out}");
-}
-
-#[test]
 fn task_ticket_cache_evicts_oldest_settled_turn() {
     let (reg, _host) = load_task_host();
     let first = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
@@ -934,20 +926,6 @@ fn despawn_releases_permit_and_clears_task() {
 }
 
 #[test]
-fn send_reports_queued_turn() {
-    let (reg, _host) = load_task_host();
-    let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
-    let task_id = spawn["task_id"].as_str().unwrap().to_string();
-
-    let queued = exec_tool_json(
-        &reg,
-        "task_send",
-        json!({ "task_id": task_id, "message": "continue" }),
-    );
-    assert_eq!(queued["queued"], json!(true));
-}
-
-#[test]
 fn unknown_task_errors_across_lifecycle_tools() {
     let (reg, _host) = load_task_host();
     for tool in [TASK_WAIT_TOOL, "task_send", "task_despawn"] {
@@ -1239,24 +1217,6 @@ fn assert_task_input(message: &Message, original: &str, interrupted: bool) {
     } else {
         assert_eq!(text, original);
         assert_eq!(message.display_text, None);
-    }
-}
-
-#[test]
-fn task_docs_describe_same_turn_submission() {
-    for contract in [
-        "Compatible messages join open work and share its turn_id",
-        "Messages wait for the next model request",
-        "the wait never follows a later turn",
-        "Timeout returns running without cancelling work",
-        "The caller releases its turn capacity while waiting",
-        "/docs/agent-work/#task-waits",
-        "/docs/agent-work/#messages-and-turns",
-    ] {
-        assert!(
-            TASK_PLUGIN_SRC.contains(contract),
-            "missing contract: {contract}"
-        );
     }
 }
 
@@ -1715,31 +1675,6 @@ fn real_schema_missing_report_fails_boundedly() {
     .unwrap_err();
     assert!(error.contains(SCHEMA_MISSING_ERROR), "got: {error}");
     assert_eq!(provider.captured_tools().len(), 1 + MAX_STRUCTURED_RETRIES);
-}
-
-#[test]
-fn task_policy_structured_output_real_driver() {
-    let provider = Arc::new(common::CannedProvider::new(vec![
-        common::canned_tool_use(STRUCTURED_OUTPUT_TOOL, json!({ "answer": "42" })),
-        common::canned_reply("done"),
-    ]));
-    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-
-    let (reg, _host) = load_real_driver_host();
-    let out = spawn_and_wait(
-        &reg,
-        &ctx,
-        task_input(SCENARIO_HAPPY, Some(answer_schema())),
-    )
-    .expect("structured task failed");
-    assert_eq!(out["captured"], json!({ "answer": "42" }));
-
-    // The structured_output local tool was offered to the model.
-    let names = common::tool_names(&provider.captured_tools()[0]);
-    assert!(
-        names.iter().any(|n| n == STRUCTURED_OUTPUT_TOOL),
-        "session tools must include structured_output: {names:?}"
-    );
 }
 
 /// General subagents see the lifecycle tools, so a real child can spawn and

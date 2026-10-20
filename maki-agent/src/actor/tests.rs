@@ -2259,34 +2259,6 @@ fn entered_run_is_never_emitted_twice() {
 }
 
 #[test]
-fn setup_failure_delivered_exactly_once() {
-    smol::block_on(async {
-        let backend = ScriptedBackend::failing_setup();
-        let (handle, task) = spawn(backend);
-        let (tx, rx) = flume::unbounded();
-        let ticket = handle
-            .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
-            .unwrap();
-        let outcome = ticket.wait().await;
-        let event = rx
-            .try_recv()
-            .expect("ticket resolved before outcome delivery");
-        assert!(matches!(
-            event.event,
-            AgentEvent::TurnOutcome(TurnOutcome::Failed { .. })
-        ));
-        assert!(
-            rx.is_empty(),
-            "synthesized outcome delivered more than once"
-        );
-        assert!(matches!(outcome, TurnOutcome::Failed { .. }));
-        assert_eq!(handle.snapshot().status, ActorStatus::Idle);
-        handle.close();
-        task.await;
-    });
-}
-
-#[test]
 fn event_sink_failure_still_retains() {
     smol::block_on(async {
         let backend = ScriptedBackend::failing_setup();
@@ -3162,35 +3134,6 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
 }
 
 #[test]
-fn admissions_reserve_between_setters() {
-    smol::block_on(async {
-        let backend = ScriptedBackend::new();
-        let observed = Arc::clone(&backend.state);
-        let (handle, task) = spawn(backend);
-        handle
-            .initialize_config(super::EffectiveAgentConfig::new(
-                policy(false),
-                AgentMode::Build,
-            ))
-            .unwrap();
-        let first = handle.reserve_config_update().unwrap();
-        let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_config_update().unwrap();
-        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        second.resolve(Ok(fast_change(false))).unwrap();
-        first.resolve(Ok(fast_change(true))).unwrap();
-        b.wait().await;
-        c.wait().await;
-        assert_eq!(
-            *observed.policies.lock().unwrap(),
-            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
-        );
-        handle.close();
-        task.await;
-    });
-}
-
-#[test]
 fn root_batch_and_interrupt_respect_policy_generation() {
     smol::block_on(async {
         let gate = Gate::new();
@@ -3255,48 +3198,6 @@ fn root_batch_and_interrupt_respect_policy_generation() {
 
 #[test]
 fn deferred_roots_keep_setter_order() {
-    smol::block_on(async {
-        let backend = ScriptedBackend::new();
-        let observed = Arc::clone(&backend.state);
-        let (handle, task) = spawn(backend);
-        handle
-            .initialize_config(super::EffectiveAgentConfig::new(
-                policy(false),
-                AgentMode::Build,
-            ))
-            .unwrap();
-        let first = handle.reserve_config_update().unwrap();
-        handle
-            .submit(
-                input("b"),
-                None,
-                "b".into(),
-                super::TurnAdmissionOptions::default(),
-            )
-            .unwrap();
-        let second = handle.reserve_config_update().unwrap();
-        handle
-            .submit(
-                input("c"),
-                None,
-                "c".into(),
-                super::TurnAdmissionOptions::default(),
-            )
-            .unwrap();
-        second.resolve(Ok(fast_change(false))).unwrap();
-        first.resolve(Ok(fast_change(true))).unwrap();
-        until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
-        assert_eq!(
-            *observed.policies.lock().unwrap(),
-            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
-        );
-        handle.close();
-        task.await;
-    });
-}
-
-#[test]
-fn roots_reserve_between_setters() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);

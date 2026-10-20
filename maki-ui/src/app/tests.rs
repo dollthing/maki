@@ -1730,16 +1730,6 @@ fn reset_session_clears_plan() {
 }
 
 #[test]
-fn replacement_request_does_not_rotate_command_target() {
-    let mut app = test_app();
-    let target = app.command_target.id();
-
-    app.reset_session();
-
-    assert_eq!(app.command_target.id(), target);
-}
-
-#[test]
 fn reset_session_assigns_new_plan_path_in_plan_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;

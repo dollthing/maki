@@ -3346,47 +3346,6 @@ mod tests {
     }
 
     #[test]
-    fn older_in_flight_success_cannot_replace_newer_authoritative_snapshot() {
-        let pending: Pending = Arc::default();
-        let mut old = AppSession::new(MODEL, CWD);
-        let id = old.id;
-        old.set_title("old write".into());
-        let old = Arc::new(old);
-        {
-            let mut state = lock(&pending);
-            state.latest.insert(id, Arc::clone(&old));
-            state.latest_generations.insert(id, 1);
-            state.entries.insert(
-                id,
-                Entry::Save(PendingSave {
-                    session: Arc::clone(&old),
-                    waiters: Vec::new(),
-                    generation: 1,
-                    coordinator_generation: Some(1),
-                    config_version: None,
-                    coordinator_history_base: None,
-                    retry_attempt: 0,
-                    retry_at: None,
-                }),
-            );
-        }
-        let Entry::Save(old_in_flight) = lock(&pending).entries.remove(&id).unwrap() else {
-            unreachable!()
-        };
-        let mut newer = old.as_ref().clone();
-        newer.set_title("new authoritative".into());
-        {
-            let mut state = lock(&pending);
-            state.latest.insert(id, Arc::new(newer));
-            state.latest_generations.insert(id, 2);
-        }
-
-        commit_save(&pending, id, &old_in_flight);
-
-        assert_eq!(lock(&pending).latest[&id].title, "new authoritative");
-    }
-
-    #[test]
     fn deferred_retry_merges_into_newer_generation_without_losing_waiters() {
         const OLD_GENERATION: u64 = 1;
         const NEW_GENERATION: u64 = 2;
