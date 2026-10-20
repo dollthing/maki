@@ -437,14 +437,17 @@ impl AgentActorHandle {
     }
 }
 
-pub(super) fn discard(state: &mut super::ActorState, reason: TurnCancellationReason) {
+pub(super) fn take_pending(state: &mut super::ActorState) -> Vec<Arc<ChildDelivery>> {
     state.delivery_order.clear();
-    let pending: Vec<_> = state
+    state
         .deliveries
         .drain()
         .map(|(_, pending)| pending.delivery)
-        .collect();
-    for delivery in pending {
+        .collect()
+}
+
+pub(super) fn discard(state: &mut super::ActorState, reason: TurnCancellationReason) {
+    for delivery in take_pending(state) {
         state.emit(ActorEvent::Delivery(DeliveryEvent {
             delivery,
             status: DeliveryStatus::Discarded(reason),
@@ -555,6 +558,7 @@ pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn 
 /// until the model loop inserts them into history at a safe request boundary.
 pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     if state.lifecycle != ActorLifecycle::Open
+        || state.idle.is_some()
         || state.delivery_suspended
         || state.deliveries.is_empty()
         || !state.delivery_runs.is_empty()

@@ -31,7 +31,7 @@ use event_listener::Event;
 use maki_providers::Message;
 use tracing::{info, warn};
 
-use crate::actor::{ActorIdleGuard, ManagedTurnAdmission};
+use crate::actor::{ActorCloseCut, ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
     ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
     SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
@@ -1230,16 +1230,16 @@ impl AgentManagerHandle {
 
     pub fn close_subtree(&self, agent_id: AgentId) -> Result<(), ManagerError> {
         let actors = self.capture_subtree(agent_id, true)?;
-        for actor in actors {
-            actor.close();
+        for (actor, cut) in actors {
+            actor.settle_close(cut);
         }
         Ok(())
     }
 
     pub fn close_descendants(&self, agent_id: AgentId) -> Result<(), ManagerError> {
         let actors = self.capture_subtree(agent_id, false)?;
-        for actor in actors {
-            actor.close();
+        for (actor, cut) in actors {
+            actor.settle_close(cut);
         }
         Ok(())
     }
@@ -1284,8 +1284,8 @@ impl AgentManagerHandle {
                     let descendants =
                         Self::capture_turn_children(&mut graph, agent_id, Some(turn_id));
                     drop(graph);
-                    for descendant in descendants {
-                        descendant.close();
+                    for (descendant, close) in descendants {
+                        descendant.settle_close(close);
                     }
                     return Err(ManagerError::InactiveTurn { agent_id, turn_id });
                 }
@@ -1297,8 +1297,8 @@ impl AgentManagerHandle {
         #[cfg(test)]
         self.wait_at_descendant_cut_gate();
         actor.settle_turn_cancel(cut, reason);
-        for descendant in descendants {
-            descendant.close();
+        for (descendant, close) in descendants {
+            descendant.settle_close(close);
         }
         Ok(())
     }
@@ -1336,8 +1336,8 @@ impl AgentManagerHandle {
         #[cfg(test)]
         self.wait_at_descendant_cut_gate();
         actor.settle_correlation_cancel(cut, correlation, reason);
-        for descendant in descendants {
-            descendant.close();
+        for (descendant, close) in descendants {
+            descendant.settle_close(close);
         }
         Ok(())
     }
@@ -1345,8 +1345,6 @@ impl AgentManagerHandle {
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
         let (ids, actors, finished_tombstone_tasks) = {
             let mut graph = self.lock_graph();
-            graph.shutting_down = true;
-            self.0.shutdown.store(true, Ordering::Release);
             let ids: Vec<_> = graph
                 .nodes
                 .iter()
@@ -1357,6 +1355,16 @@ impl AgentManagerHandle {
                     .then_some(id)
                 })
                 .collect();
+            let actors = ids
+                .iter()
+                .filter_map(|id| {
+                    let actor = graph.nodes[id].actor.clone()?;
+                    let cut = actor.capture_close(true)?;
+                    Some((actor, cut))
+                })
+                .collect::<Vec<_>>();
+            graph.shutting_down = true;
+            self.0.shutdown.store(true, Ordering::Release);
             for id in &ids {
                 if let Some(node) = graph.nodes.get_mut(id)
                     && node.lifecycle.consumes_capacity()
@@ -1364,10 +1372,6 @@ impl AgentManagerHandle {
                     node.lifecycle = GraphLifecycle::Closing;
                 }
             }
-            let actors = ids
-                .iter()
-                .filter_map(|id| graph.nodes[id].actor.clone())
-                .collect::<Vec<_>>();
             let finished_tombstone_tasks = graph
                 .nodes
                 .values_mut()
@@ -1380,8 +1384,8 @@ impl AgentManagerHandle {
                 .collect::<Vec<_>>();
             (ids, actors, finished_tombstone_tasks)
         };
-        for actor in &actors {
-            actor.shutdown();
+        for (actor, cut) in actors {
+            actor.settle_close(cut);
         }
         for task in finished_tombstone_tasks {
             task.await;
@@ -1610,7 +1614,7 @@ impl AgentManagerHandle {
         &self,
         agent_id: AgentId,
         include_root: bool,
-    ) -> Result<Vec<AgentActorHandle>, ManagerError> {
+    ) -> Result<Vec<(AgentActorHandle, ActorCloseCut)>, ManagerError> {
         let mut graph = self.lock_graph();
         Self::capture_subtree_locked(&mut graph, agent_id, include_root)
     }
@@ -1619,7 +1623,7 @@ impl AgentManagerHandle {
         graph: &mut GraphState,
         agent_id: AgentId,
         include_root: bool,
-    ) -> Result<Vec<AgentActorHandle>, ManagerError> {
+    ) -> Result<Vec<(AgentActorHandle, ActorCloseCut)>, ManagerError> {
         let node = graph
             .nodes
             .get(&agent_id)
@@ -1639,11 +1643,13 @@ impl AgentManagerHandle {
                 if !node.lifecycle.consumes_capacity() {
                     return None;
                 }
+                let actor = node.actor.clone();
+                let cut = actor.as_ref().and_then(|actor| actor.capture_close(false));
                 if node.lifecycle != GraphLifecycle::Closing {
                     node.lifecycle = GraphLifecycle::Closing;
                     transitioned = true;
                 }
-                node.actor.clone()
+                actor.zip(cut)
             })
             .collect();
         graph.revision += u64::from(transitioned);
@@ -1654,7 +1660,7 @@ impl AgentManagerHandle {
         graph: &mut GraphState,
         agent_id: AgentId,
         turn_id: Option<TurnId>,
-    ) -> Vec<AgentActorHandle> {
+    ) -> Vec<(AgentActorHandle, ActorCloseCut)> {
         let Some(turn_id) = turn_id else {
             return Vec::new();
         };

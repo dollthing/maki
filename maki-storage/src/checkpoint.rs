@@ -66,6 +66,11 @@ impl CheckpointPublication {
     }
 }
 
+/// Validates captured authority and claims publication synchronously at replacement.
+/// The callback must not acquire actor, manager, or option-catalog locks.
+pub type CheckpointClaim =
+    Arc<dyn Fn(&CheckpointPublication) -> Result<(), Arc<str>> + Send + Sync + 'static>;
+
 pub type CheckpointFuture =
     Pin<Box<dyn Future<Output = Result<CheckpointAck, CheckpointError>> + Send + 'static>>;
 
@@ -101,6 +106,21 @@ pub enum CheckpointError {
 
 pub trait CheckpointWriter<S>: Send + Sync + 'static {
     fn checkpoint(&self, request: CheckpointRequest<S>) -> CheckpointFuture;
+
+    fn checkpoint_guarded(
+        &self,
+        request: CheckpointRequest<S>,
+        _publication: CheckpointPublication,
+        _claim: CheckpointClaim,
+    ) -> CheckpointFuture {
+        let session_id = request.session_id;
+        Box::pin(async move {
+            Err(CheckpointError::Save {
+                session_id,
+                message: Arc::from("checkpoint writer does not support guarded publication"),
+            })
+        })
+    }
 }
 
 impl<S, F> CheckpointWriter<S> for F

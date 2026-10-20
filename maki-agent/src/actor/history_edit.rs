@@ -10,10 +10,10 @@ use maki_providers::{ContentBlock, Message, MessageKind, Role};
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 
-use super::prepared::PreparedOperation;
+use super::prepared::{CancelPublication, PreparedOperation};
 use super::{
     ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
-    PreparedOperationTicket,
+    PreparedOperationTicket, PreparedTransaction,
 };
 use crate::{AgentId, History};
 
@@ -41,10 +41,12 @@ pub type HistoryEditCheckpoint = Arc<
 pub struct HistoryEditWork {
     owner: Arc<()>,
     action: HistoryEditAction,
-    checkpoint: HistoryEditCheckpoint,
 }
 
-type PreparedEditResult = Result<
+type PreparedEditResult =
+    Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError>;
+
+type LegacyPreparedEditResult = Result<
     (
         Option<ActorIdleGuard>,
         PreparedCommit,
@@ -56,14 +58,22 @@ type PreparedEditResult = Result<
 enum HistoryEditAction {
     Rewind {
         boundary: HistoryBoundary,
+        checkpoint: HistoryEditCheckpoint,
         completion: flume::Sender<Result<HistoryChange, ActorError>>,
     },
     Prepared {
         operation: Box<PreparedOperation>,
+        replacement: Option<HistorySnapshot<Message>>,
+        transaction: PreparedTransaction,
+        completion: flume::Sender<PreparedEditResult>,
+    },
+    LegacyPrepared {
+        operation: Box<PreparedOperation>,
         clear_history: bool,
         held: bool,
         publication: Option<CheckpointPublication>,
-        completion: flume::Sender<PreparedEditResult>,
+        checkpoint: HistoryEditCheckpoint,
+        completion: flume::Sender<LegacyPreparedEditResult>,
     },
 }
 
@@ -76,6 +86,10 @@ pub(super) enum HistoryEditCompletion {
         sender: flume::Sender<PreparedEditResult>,
         result: PreparedEditResult,
     },
+    LegacyPrepared {
+        sender: flume::Sender<LegacyPreparedEditResult>,
+        result: LegacyPreparedEditResult,
+    },
 }
 
 impl HistoryEditCompletion {
@@ -85,6 +99,9 @@ impl HistoryEditCompletion {
                 let _ = sender.send(result);
             }
             Self::Prepared { sender, result } => {
+                let _ = sender.send(result);
+            }
+            Self::LegacyPrepared { sender, result } => {
                 let _ = sender.send(result);
             }
         }
@@ -143,6 +160,35 @@ impl AgentActorHandle {
 }
 
 impl ActorIdleGuard {
+    /// Retained for approval callers that have not moved to durable transactions.
+    pub fn commit_prepared_in_memory(
+        &self,
+        operation: PreparedOperationTicket,
+    ) -> Result<PreparedCommit, ActorError> {
+        if !operation.belongs_to(&self.actor) {
+            return Err(ActorError::PolicyCancelled);
+        }
+        let mut state = self
+            .actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(super::lifecycle_error(state.lifecycle));
+        }
+        state
+            .owned_idle(&self.owner)
+            .filter(|reservation| {
+                !reservation.committing
+                    && reservation.permission.is_none()
+                    && reservation.edit.is_none()
+            })
+            .ok_or(ActorError::Busy)?;
+        let pending = operation.take_ready_locked(&mut state)?;
+        Ok(pending.commit_locked(&self.actor.inner, &mut state, Box::new(|_| {})))
+    }
+
     /// Starts an actor-owned commit after the caller has revalidated preparation.
     /// Once enqueued, dropping this future does not cancel the transaction.
     pub async fn commit_prepared(
@@ -194,7 +240,7 @@ impl ActorIdleGuard {
         checkpoint: HistoryEditCheckpoint,
         held: bool,
         publication: Option<CheckpointPublication>,
-    ) -> PreparedEditResult {
+    ) -> LegacyPreparedEditResult {
         if !operation.belongs_to(&self.actor)
             || publication
                 .as_ref()
@@ -220,14 +266,14 @@ impl ActorIdleGuard {
             state.owned_idle(&self.owner).unwrap().committing = true;
             state.owned_idle(&self.owner).unwrap().edit = Some(HistoryEditWork {
                 owner: Arc::clone(&self.owner),
-                action: HistoryEditAction::Prepared {
+                action: HistoryEditAction::LegacyPrepared {
                     operation: Box::new(pending),
                     clear_history,
                     held,
                     publication,
+                    checkpoint,
                     completion,
                 },
-                checkpoint,
             });
             self.release = false;
             actor.inner.queue.notify();
@@ -242,6 +288,78 @@ impl ActorIdleGuard {
                         state
                             .owned_idle(&self.owner)
                             .and_then(|idle| idle.edit.take())
+                    };
+                    if let Some(edit) = edit {
+                        edit.fail(ActorError::PolicyCancelled);
+                        self.release = true;
+                    }
+                    None
+                },
+                async { Some(response.recv_async().await) },
+            )
+            .await;
+            if let Some(result) = result {
+                return result.map_err(|_| ActorError::Closed)?;
+            }
+        }
+        response
+            .recv_async()
+            .await
+            .map_err(|_| ActorError::Closed)?
+    }
+
+    pub async fn commit_prepared_transaction_held(
+        mut self,
+        operation: PreparedOperationTicket,
+        replacement: Option<HistorySnapshot<Message>>,
+        transaction: PreparedTransaction,
+    ) -> PreparedEditResult {
+        if !operation.belongs_to(&self.actor) || transaction.publication.is_cancelled() {
+            return Err(ActorError::PolicyCancelled);
+        }
+        let publication = transaction.publication.clone();
+        let _cancellation = CancelPublication(publication.clone());
+        let (completion, response) = flume::bounded(1);
+        let actor = self.actor.clone();
+        {
+            let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(super::lifecycle_error(state.lifecycle));
+            }
+            state
+                .owned_idle(&self.owner)
+                .filter(|reservation| {
+                    reservation.permission.is_none() && reservation.edit.is_none()
+                })
+                .ok_or(ActorError::Busy)?;
+            let pending = operation.take_ready_locked(&mut state)?;
+            state.begin_prepared_publication(&pending, publication.clone());
+            state.owned_idle(&self.owner).unwrap().committing = true;
+            state.owned_idle(&self.owner).unwrap().edit = Some(HistoryEditWork {
+                owner: Arc::clone(&self.owner),
+                action: HistoryEditAction::Prepared {
+                    operation: Box::new(pending),
+                    replacement,
+                    transaction,
+                    completion,
+                },
+            });
+            self.release = false;
+            actor.inner.queue.notify();
+        }
+        {
+            let result = futures_lite::future::or(
+                async {
+                    publication.cancelled().await;
+                    let edit = {
+                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let edit = state
+                            .owned_idle(&self.owner)
+                            .and_then(|idle| idle.edit.take());
+                        if edit.is_some() {
+                            state.end_prepared_publication(operation.operation_id());
+                        }
+                        edit
                     };
                     if let Some(edit) = edit {
                         edit.fail(ActorError::PolicyCancelled);
@@ -285,9 +403,9 @@ impl ActorIdleGuard {
                 owner: Arc::clone(&self.owner),
                 action: HistoryEditAction::Rewind {
                     boundary,
+                    checkpoint,
                     completion,
                 },
-                checkpoint,
             });
             actor.inner.queue.notify();
         }
@@ -299,12 +417,28 @@ impl ActorIdleGuard {
 }
 
 impl HistoryEditWork {
+    pub(super) fn prepared_id(&self) -> Option<u64> {
+        match &self.action {
+            HistoryEditAction::Prepared { operation, .. }
+            | HistoryEditAction::LegacyPrepared { operation, .. } => Some(operation.id),
+            HistoryEditAction::Rewind { .. } => None,
+        }
+    }
+
     pub(super) fn fail(self, error: ActorError) {
         match self.action {
             HistoryEditAction::Rewind { completion, .. } => {
                 let _ = completion.send(Err(error));
             }
             HistoryEditAction::Prepared {
+                operation,
+                completion,
+                ..
+            } => {
+                (*operation).fail(error.clone());
+                let _ = completion.send(Err(error));
+            }
+            HistoryEditAction::LegacyPrepared {
                 operation,
                 completion,
                 ..
@@ -328,10 +462,10 @@ impl HistoryEditWork {
         match self.action {
             HistoryEditAction::Rewind {
                 boundary,
+                checkpoint,
                 completion,
             } => {
-                let result =
-                    Self::apply(&self.owner, &boundary, &self.checkpoint, actor, history).await;
+                let result = Self::apply(&self.owner, &boundary, &checkpoint, actor, history).await;
                 drop(guard);
                 HistoryEditCompletion::Rewind {
                     sender: completion,
@@ -340,9 +474,99 @@ impl HistoryEditWork {
             }
             HistoryEditAction::Prepared {
                 operation,
+                replacement,
+                transaction,
+                completion,
+            } => {
+                let snapshot = replacement
+                    .clone()
+                    .unwrap_or_else(|| (*actor.inner.history.load_full()).clone());
+                let snapshot = {
+                    let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                    operation.transaction_snapshot(&actor.inner, &state, snapshot)
+                };
+                let result = transaction.publish(snapshot).await;
+                let id = operation.id;
+                let result = match result {
+                    Err(error) => {
+                        (*operation).fail(error.clone());
+                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.end_prepared_publication(id);
+                        super::drive_operations(&actor.inner, &mut state);
+                        Err(error)
+                    }
+                    Ok(finalize) => {
+                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let change = replacement.map(|snapshot| {
+                            history.replace_snapshot(snapshot.clone());
+                            HistoryChange {
+                                agent_id: actor.agent_id(),
+                                epoch: snapshot.epoch,
+                                messages: snapshot.messages,
+                                draft: Message::user(String::new()),
+                            }
+                        });
+                        let committed =
+                            (*operation).commit_locked(&actor.inner, &mut state, finalize);
+                        state.end_prepared_publication(id);
+                        if let Some(reservation) = state.owned_idle(&self.owner) {
+                            reservation.committing = false;
+                            guard.release = false;
+                        }
+                        super::drive_operations(&actor.inner, &mut state);
+                        Ok((committed, change))
+                    }
+                };
+                if let Ok((committed, _)) = &result
+                    && let Some(ticket) = &committed.ticket
+                {
+                    let cancelled = {
+                        let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let reason = match state.lifecycle {
+                            ActorLifecycle::Open => None,
+                            ActorLifecycle::Closed => Some(crate::TurnCancellationReason::Closed),
+                            ActorLifecycle::Shutdown => {
+                                Some(crate::TurnCancellationReason::Shutdown)
+                            }
+                        };
+                        if let Some(reason) = reason {
+                            actor
+                                .inner
+                                .queue
+                                .remove_turn(ticket.turn_id())
+                                .zip(Some(reason))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((admission, reason)) = cancelled {
+                        super::terminalize_work(
+                            &actor.inner,
+                            vec![super::ActorWork::Turn(Box::new(admission))],
+                            reason,
+                        );
+                    }
+                }
+                let result = result.map(|(commit, history)| {
+                    let idle = ActorIdleGuard {
+                        actor: actor.clone(),
+                        owner: Arc::clone(&self.owner),
+                        release: true,
+                    };
+                    (idle, commit, history)
+                });
+                drop(guard);
+                HistoryEditCompletion::Prepared {
+                    sender: completion,
+                    result,
+                }
+            }
+            HistoryEditAction::LegacyPrepared {
+                operation,
                 clear_history,
                 held,
                 publication,
+                checkpoint: checkpoint_fn,
                 completion,
             } => {
                 let snapshot = clear_history.then(|| {
@@ -355,7 +579,7 @@ impl HistoryEditWork {
                         Err(ActorError::PolicyCancelled)
                     } else if let Some(snapshot) = &snapshot {
                         futures_lite::future::or(
-                            checkpoint(&self.checkpoint, snapshot.clone()),
+                            checkpoint(&checkpoint_fn, snapshot.clone()),
                             async {
                                 publication.cancelled().await;
                                 Err(ActorError::PolicyCancelled)
@@ -375,7 +599,7 @@ impl HistoryEditWork {
                         Err(ActorError::PolicyCancelled)
                     }
                 } else if let Some(snapshot) = &snapshot {
-                    checkpoint(&self.checkpoint, snapshot.clone()).await
+                    checkpoint(&checkpoint_fn, snapshot.clone()).await
                 } else {
                     Ok(())
                 };
@@ -397,7 +621,8 @@ impl HistoryEditWork {
                                 draft: Message::user(String::new()),
                             }
                         });
-                        let committed = (*operation).commit_locked(&actor.inner, &mut state);
+                        let committed =
+                            (*operation).commit_locked(&actor.inner, &mut state, Box::new(|_| {}));
                         if let Some(reservation) = state.owned_idle(&self.owner) {
                             reservation.committing = false;
                             if held {
@@ -450,7 +675,7 @@ impl HistoryEditWork {
                     (idle, commit, history)
                 });
                 drop(guard);
-                HistoryEditCompletion::Prepared {
+                HistoryEditCompletion::LegacyPrepared {
                     sender: completion,
                     result,
                 }
@@ -553,7 +778,7 @@ fn update_pending_tools<'a>(message: &'a Message, pending: &mut HashSet<&'a str>
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use futures_lite::future;
     use maki_providers::{ContentBlock, Message, Role, ThinkingConfig, TokenUsage};
@@ -565,8 +790,8 @@ mod tests {
     use crate::actor::tests::{ScriptedBackend, input, policy};
     use crate::actor::{
         ActorBackend, ActorError, AgentActorHandle, BackendResult, ChildDelivery, ConfigChange,
-        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedTurn, TurnContext, TurnResult,
-        WorkKind,
+        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedTransaction, PreparedTurn,
+        TurnContext, TurnResult, WorkKind,
     };
     use crate::{
         AgentId, AgentInput, AgentMode, DoneReason, History, TurnCancellationReason, TurnId,
@@ -604,10 +829,19 @@ mod tests {
             operation.wait_ready().await.unwrap();
             let edit = async move {
                 if prepared {
+                    let transaction = PreparedTransaction {
+                        publication: CheckpointPublication::default(),
+                        publish: Box::new(|_, _| panic!("closed edit must not publish")),
+                        finalize: Box::new(|_| panic!("closed edit must not finalize")),
+                    };
                     guard
-                        .commit_prepared(operation, true, checkpoint)
+                        .commit_prepared_transaction_held(
+                            operation,
+                            Some(HistorySnapshot::new(Vec::new())),
+                            transaction,
+                        )
                         .await
-                        .map(|_| ())
+                        .map(|(held, _, _)| drop(held))
                 } else {
                     drop(operation);
                     guard.rewind(boundary, checkpoint).await.map(|_| ())
@@ -656,10 +890,21 @@ mod tests {
             operation.wait_ready().await.unwrap();
             let mut edit = Box::pin(async move {
                 if prepared {
+                    let transaction = PreparedTransaction {
+                        publication: CheckpointPublication::default(),
+                        publish: Box::new(|snapshot, publication| {
+                            Box::pin(async move {
+                                assert_eq!(snapshot.history.messages.len(), 1);
+                                assert!(publication.try_publish());
+                                Ok(())
+                            })
+                        }),
+                        finalize: Box::new(|_| {}),
+                    };
                     guard
-                        .commit_prepared(operation, false, checkpoint)
+                        .commit_prepared_transaction_held(operation, None, transaction)
                         .await
-                        .map(|_| ())
+                        .map(|(held, _, _)| drop(held))
                 } else {
                     drop(operation);
                     guard.rewind(boundary, checkpoint).await.map(|_| ())
@@ -709,8 +954,21 @@ mod tests {
                 .unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
+            let (published, publication) = flume::bounded(1);
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(move |snapshot, token| {
+                    Box::pin(async move {
+                        assert!(snapshot.history.messages.is_empty());
+                        assert!(token.try_publish());
+                        published.send(()).unwrap();
+                        Ok(())
+                    })
+                }),
+                finalize: Box::new(move |_| publication.try_recv().unwrap()),
+            };
             let (guard, committed, history) = idle
-                .commit_prepared_held(operation, false, Arc::new(|_| Box::pin(async { Ok(()) })))
+                .commit_prepared_transaction_held(operation, None, transaction)
                 .await
                 .unwrap();
             let ticket = committed.ticket.unwrap();
@@ -791,22 +1049,66 @@ mod tests {
             actor
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
-            let original = actor.config_snapshot().unwrap();
             let epoch = actor.inner.history.load().epoch;
+            let earlier = actor.reserve_config_update().unwrap();
+            assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
+            earlier.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+            earlier.wait().await.unwrap();
             let guard = actor.prepare_idle().unwrap();
+            let source = guard.source_snapshot().unwrap();
+            let between = actor.reserve_config_update().unwrap();
+            between.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+            assert!(matches!(
+                actor.reserve_prepared_operation(None),
+                Err(ActorError::Busy)
+            ));
+            assert!(Arc::ptr_eq(
+                &source.config.config,
+                &guard.source_snapshot().unwrap().config.config
+            ));
+            drop(guard);
+            between.wait().await.unwrap();
+            let original = actor.config_snapshot().unwrap();
+            let guard = actor.prepare_idle().unwrap();
+            let source = guard.source_snapshot().unwrap();
             let operation = actor.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
+            let later = actor.reserve_config_update().unwrap();
+            later.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+            assert!(Arc::ptr_eq(
+                &source.config.config,
+                &guard.source_snapshot().unwrap().config.config
+            ));
             let (saved, checkpointed) = flume::bounded(1);
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |snapshot| {
-                assert!(snapshot.messages.is_empty());
-                saved.send(snapshot).unwrap();
-                Box::pin(async { Ok(()) })
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(move |snapshot, publication| {
+                    Box::pin(async move {
+                        assert_eq!(snapshot.history.messages.is_empty(), clear || empty);
+                        assert!(publication.try_publish());
+                        saved.send(snapshot.history).unwrap();
+                        Ok(())
+                    })
+                }),
+                finalize: Box::new(|_| {}),
+            };
+            let replacement = clear.then(|| {
+                let mut snapshot = HistorySnapshot::new(Vec::new());
+                snapshot.compacted = actor.inner.history.load().compacted;
+                snapshot
             });
-            let (commit, change) = guard
-                .commit_prepared(operation, clear, checkpoint)
+            let (held, commit, change) = guard
+                .commit_prepared_transaction_held(operation, replacement, transaction)
                 .await
                 .unwrap();
+            assert!(Arc::ptr_eq(
+                &source.config.config,
+                &held.source_snapshot().unwrap().config.config
+            ));
+            drop(held);
+            let later = later.wait().await.unwrap();
+            assert!(later.config.settings.workflow);
             assert!(Arc::ptr_eq(&original.identity, &commit.config.identity));
             assert_eq!(original.generation, commit.config.generation);
             assert_eq!(change.is_some(), clear);
@@ -848,12 +1150,19 @@ mod tests {
                 Box::new(IdleBackend),
             );
             let operation = other.reserve_prepared_operation(None).unwrap();
-            let checkpoint: HistoryEditCheckpoint =
-                Arc::new(|_| panic!("foreign operation must not checkpoint"));
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(|_, _| panic!("foreign operation must not publish")),
+                finalize: Box::new(|_| panic!("foreign operation must not finalize")),
+            };
             let result = actor
                 .prepare_idle()
                 .unwrap()
-                .commit_prepared(operation, true, checkpoint)
+                .commit_prepared_transaction_held(
+                    operation,
+                    Some(HistorySnapshot::new(Vec::new())),
+                    transaction,
+                )
                 .await;
             assert!(matches!(result, Err(ActorError::PolicyCancelled)));
             assert!(actor.prepare_idle().is_ok());
@@ -901,17 +1210,25 @@ mod tests {
             operation.wait_ready().await.unwrap();
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
-                assert!(messages.messages.is_empty());
-                let entered = entered.clone();
-                let released = released.clone();
-                Box::pin(async move {
-                    entered.send(()).unwrap();
-                    released.recv_async().await.unwrap();
-                    Ok(())
-                })
-            });
-            let commit = smol::spawn(guard.commit_prepared(operation, true, checkpoint));
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(move |snapshot, publication| {
+                    Box::pin(async move {
+                        assert!(snapshot.config.fast);
+                        assert!(snapshot.history.messages.is_empty());
+                        assert!(publication.try_publish());
+                        entered.send(()).unwrap();
+                        released.recv_async().await.unwrap();
+                        Ok(())
+                    })
+                }),
+                finalize: Box::new(|commit| assert!(commit.config.fast)),
+            };
+            let commit = smol::spawn(guard.commit_prepared_transaction_held(
+                operation,
+                Some(HistorySnapshot::new(Vec::new())),
+                transaction,
+            ));
             entry.recv_async().await.unwrap();
             assert!(!actor.effective_config().unwrap().fast);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
@@ -923,7 +1240,8 @@ mod tests {
                 actor.close();
             }
             release.send(()).unwrap();
-            let (committed, change) = commit.await.unwrap();
+            let (held, committed, change) = commit.await.unwrap();
+            drop(held);
             assert!(committed.config.config.fast);
             assert!(actor.effective_config().unwrap().fast);
             assert!(change.unwrap().messages.is_empty());
@@ -939,8 +1257,9 @@ mod tests {
     }
 
     #[test_case(true, true; "cancel_before_checkpoint")]
-    #[test_case(true, false; "cancel_permanently_gated_checkpoint")]
-    #[test_case(false, true; "cancel_without_history_checkpoint")]
+    #[test_case(true, false; "cancel_gated_checkpoint")]
+    #[test_case(false, true; "cancel_before_keep_checkpoint")]
+    #[test_case(false, false; "cancel_gated_keep_checkpoint")]
     fn cancellable_prepared_commit_releases_reservation(clear_history: bool, cancel_before: bool) {
         smol::block_on(async {
             let (actor, runner) = AgentActorHandle::spawn(
@@ -962,40 +1281,48 @@ mod tests {
                 assert!(publication.cancel());
             }
             let (entered, entry) = flume::bounded(1);
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |_| {
-                let entered = entered.clone();
-                Box::pin(async move {
-                    entered.send(()).unwrap();
-                    futures_lite::future::pending().await
-                })
-            });
-            let commit = smol::spawn(guard.commit_prepared_held_cancellable(
+            let transaction = PreparedTransaction {
+                publication: publication.clone(),
+                publish: Box::new(move |snapshot, publication| {
+                    Box::pin(async move {
+                        assert!(snapshot.config.fast);
+                        assert_eq!(snapshot.history.messages.is_empty(), clear_history);
+                        entered.send(()).unwrap();
+                        publication.cancelled().await;
+                        Err(CHECKPOINT_ERROR.into())
+                    })
+                }),
+                finalize: Box::new(|_| panic!("cancelled transaction must not finalize")),
+            };
+            let replacement = clear_history.then(|| HistorySnapshot::new(Vec::new()));
+            let commit = smol::spawn(guard.commit_prepared_transaction_held(
                 operation,
-                clear_history,
-                checkpoint,
-                publication.clone(),
+                replacement,
+                transaction,
             ));
             if !cancel_before {
                 entry.recv_async().await.unwrap();
                 assert!(publication.cancel());
             }
-            assert!(matches!(commit.await, Err(ActorError::PolicyCancelled)));
+            assert!(matches!(
+                commit.await,
+                Err(ActorError::PolicyCancelled | ActorError::HistoryCheckpoint(_))
+            ));
             drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
             assert!(!actor.effective_config().unwrap().fast);
             assert!(Arc::ptr_eq(
                 &history.messages,
                 &actor.inner.history.load().messages
             ));
+            assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 0);
             actor.close();
             runner.await;
         });
     }
 
-    #[test_case(true, true; "cancel_before_queue_with_clear")]
-    #[test_case(false, true; "cancel_before_queue_without_clear")]
-    #[test_case(true, false; "cancel_queued_with_clear")]
-    #[test_case(false, false; "cancel_queued_without_clear")]
-    fn cancellable_prepared_commit_does_not_need_runner(clear_history: bool, cancel_before: bool) {
+    #[test_case(false; "published_while_runner_gated")]
+    #[test_case(true; "cancelled_while_runner_gated")]
+    fn cancellable_prepared_commit_does_not_need_runner(cancel: bool) {
         smol::block_on(async {
             let (start, gate) = flume::bounded(1);
             let (actor, runner) = AgentActorHandle::spawn_inner(
@@ -1010,43 +1337,57 @@ mod tests {
             actor
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
-            let guard = actor.prepare_idle().unwrap();
             let operation = actor.reserve_prepared_operation(None).unwrap();
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
-            let publication = CheckpointPublication::default();
-            if cancel_before {
-                assert!(publication.cancel());
-            }
-            let checkpoint: HistoryEditCheckpoint =
-                Arc::new(|_| panic!("cancelled edit must not checkpoint"));
-            let mut commit = Box::pin(guard.commit_prepared_held_cancellable(
-                operation,
-                clear_history,
-                checkpoint,
-                publication.clone(),
-            ));
-            if !cancel_before {
-                assert!(future::poll_once(commit.as_mut()).await.is_none());
-                assert!(publication.cancel());
-            }
-            let result = future::poll_once(commit.as_mut())
-                .await
-                .expect(CHECKPOINT_ERROR);
-            assert!(matches!(result, Err(ActorError::PolicyCancelled)));
-            assert!(!actor.effective_config().unwrap().fast);
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(move |snapshot, publication| {
+                    Box::pin(async move {
+                        assert!(snapshot.config.fast);
+                        assert_eq!(snapshot.history.messages.len(), 1);
+                        if cancel {
+                            assert!(publication.cancel());
+                            return Err(CHECKPOINT_ERROR.into());
+                        }
+                        assert!(publication.try_publish());
+                        Ok(())
+                    })
+                }),
+                finalize: Box::new(|commit| assert!(commit.config.fast)),
+            };
+            let result = operation.commit_durable(transaction).await;
+            assert_eq!(result.is_ok(), !cancel);
+            assert_eq!(actor.effective_config().unwrap().fast, !cancel);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
-            drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
+            assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 0);
             start.send(()).unwrap();
             actor.close();
             runner.await;
         });
     }
 
-    #[test_case(true, false; "ready_checkpoint_loses_to_cancel")]
-    #[test_case(false, false; "published_checkpoint_succeeds")]
-    #[test_case(false, true; "published_checkpoint_reports_failure")]
-    fn cancellable_prepared_commit_observes_publication(cancel: bool, fail: bool) {
+    #[test_case(false, false, "cancel", false; "config_cancel_preclaim")]
+    #[test_case(false, true, "cancel", false; "config_cancel_postclaim")]
+    #[test_case(false, false, "close", false; "config_close_preclaim")]
+    #[test_case(false, true, "close", false; "config_close_postclaim")]
+    #[test_case(false, false, "drop", false; "config_drop_preclaim")]
+    #[test_case(false, true, "drop", false; "config_drop_postclaim")]
+    #[test_case(false, true, "close", true; "config_claimed_storage_failure")]
+    #[test_case(false, false, "unclaimed", false; "config_rejects_unclaimed_success")]
+    #[test_case(true, false, "cancel", false; "history_cancel_preclaim")]
+    #[test_case(true, true, "cancel", false; "history_cancel_postclaim")]
+    #[test_case(true, false, "close", false; "history_close_preclaim")]
+    #[test_case(true, true, "close", false; "history_close_postclaim")]
+    #[test_case(true, false, "drop", false; "history_drop_preclaim")]
+    #[test_case(true, true, "drop", false; "history_drop_postclaim")]
+    #[test_case(true, true, "close", true; "history_claimed_storage_failure")]
+    fn cancellable_prepared_commit_observes_publication(
+        replace_history: bool,
+        claimed: bool,
+        invalidation: &str,
+        fail: bool,
+    ) {
         smol::block_on(async {
             let (actor, runner) = AgentActorHandle::spawn(
                 AgentId::generate(),
@@ -1057,54 +1398,154 @@ mod tests {
             actor
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
+            let events = actor.subscribe_events();
+            let commits = actor.subscribe_config_commits();
             let history = actor.inner.history.load_full();
-            let guard = actor.prepare_idle().unwrap();
+            let initial = actor.config_snapshot().unwrap();
+            let staged_commit = Arc::new(Mutex::new(None));
+            let published_commit = Arc::clone(&staged_commit);
+            let guard = replace_history.then(|| actor.prepare_idle().unwrap());
             let operation = actor.reserve_prepared_operation(None).unwrap();
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let publication = CheckpointPublication::default();
-            let checkpoint: HistoryEditCheckpoint = Arc::new({
-                let publication = publication.clone();
-                move |_| {
-                    let publication = publication.clone();
+            let (entered, entry) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let unclaimed = invalidation == "unclaimed";
+            let (settled, settlement) = flume::bounded(1);
+            let (finalized, finalization) = flume::bounded(1);
+            let transaction = PreparedTransaction {
+                publication: publication.clone(),
+                publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
-                        if cancel {
-                            assert!(publication.cancel());
-                        } else {
+                        assert!(snapshot.config.fast);
+                        assert_eq!(snapshot.history.messages.is_empty(), replace_history);
+                        assert_eq!(
+                            snapshot.commit.generation,
+                            initial.generation.wrapping_add(1)
+                        );
+                        assert!(Arc::ptr_eq(&snapshot.commit.identity, &initial.identity));
+                        assert!(snapshot.commit.config.fast);
+                        *published_commit.lock().unwrap() = Some(snapshot.commit);
+                        if claimed {
                             assert!(publication.try_publish());
-                            assert!(!publication.cancel());
                         }
-                        if fail {
+                        entered.send(()).unwrap();
+                        released.recv_async().await.unwrap();
+                        settled.send(()).unwrap();
+                        if fail || (!claimed && !unclaimed && !publication.try_publish()) {
                             Err(CHECKPOINT_ERROR.into())
                         } else {
                             Ok(())
                         }
                     })
+                }),
+                finalize: Box::new(move |commit| {
+                    assert!(commit.config.fast);
+                    assert!(commits.is_empty());
+                    finalized.send(()).unwrap();
+                }),
+            };
+            let mut commit = Some(Box::pin(async move {
+                if let Some(guard) = guard {
+                    guard
+                        .commit_prepared_transaction_held(
+                            operation,
+                            Some(HistorySnapshot::new(Vec::new())),
+                            transaction,
+                        )
+                        .await
+                        .map(|(guard, _, _)| drop(guard))
+                } else {
+                    operation.commit_durable(transaction).await.map(|_| ())
                 }
-            });
-            let result = guard
-                .commit_prepared_held_cancellable(operation, true, checkpoint, publication)
-                .await;
-            if cancel || fail {
-                assert!(matches!(
-                    result,
-                    Err(ActorError::PolicyCancelled | ActorError::HistoryCheckpoint(_))
-                ));
-                assert!(!actor.effective_config().unwrap().fast);
+            }));
+            assert!(
+                future::poll_once(commit.as_mut().unwrap().as_mut())
+                    .await
+                    .is_none()
+            );
+            entry.recv_async().await.unwrap();
+            let later = actor.reserve_prepared_operation(None).unwrap();
+            let mut predecessor = Box::pin(later.wait_predecessor());
+            assert!(future::poll_once(&mut predecessor).await.is_none());
+            later.resolve(None).unwrap();
+            assert!(matches!(
+                later.ready_config(),
+                Err(ActorError::PolicyPending)
+            ));
+            assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 1);
+            assert!(!actor.effective_config().unwrap().fast);
+            match invalidation {
+                "cancel" => actor.cancel_local(0),
+                "close" => {
+                    actor.close();
+                    (None, 0)
+                }
+                "drop" => {
+                    drop(commit.take());
+                    (None, 0)
+                }
+                "unclaimed" => (None, 0),
+                _ => unreachable!(),
+            };
+            assert_eq!(publication.is_cancelled(), !claimed && !unclaimed);
+            assert!(
+                !events
+                    .try_iter()
+                    .any(|event| matches!(event, crate::actor::ActorEvent::Close { .. }))
+            );
+            assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 1);
+            release.send(()).unwrap();
+            settlement.recv_async().await.unwrap();
+            let succeeds = claimed && !fail;
+            if let Some(commit) = commit {
+                let result = commit.await;
+                assert_eq!(result.is_ok(), succeeds);
+                if fail {
+                    assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
+                }
+            }
+            loop {
+                let listener = actor.inner.policy_changed.listen();
+                if actor.inner.state.lock().unwrap().pending_publications == 0 {
+                    break;
+                }
+                listener.await;
+            }
+            assert_eq!(finalization.try_recv().is_ok(), succeeds);
+            assert_eq!(actor.effective_config().unwrap().fast, succeeds);
+            if succeeds {
+                let staged_commit = staged_commit.lock().unwrap().take().unwrap();
+                let committed = actor.config_snapshot().unwrap();
+                assert_eq!(staged_commit.generation, committed.generation);
+                assert!(Arc::ptr_eq(&staged_commit.config, &committed.config));
+            }
+            if succeeds && replace_history {
+                assert!(actor.inner.history.load().messages.is_empty());
+            } else {
                 assert!(Arc::ptr_eq(
                     &history.messages,
                     &actor.inner.history.load().messages
                 ));
-            } else {
-                let (idle, _, change) = result.unwrap();
-                assert!(actor.effective_config().unwrap().fast);
-                assert!(change.unwrap().messages.is_empty());
-                assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
-                drop(idle);
             }
-            drop(actor.prepare_idle().expect(CHECKPOINT_ERROR));
+            let predecessor = predecessor.await;
+            if invalidation == "close" {
+                assert!(matches!(predecessor, Err(ActorError::Closed)));
+            } else {
+                let predecessor = predecessor.unwrap();
+                assert_eq!(predecessor.fast, succeeds);
+                assert!(Arc::ptr_eq(
+                    &predecessor,
+                    &actor.config_snapshot().unwrap().config
+                ));
+                later.wait_ready().await.unwrap();
+                assert_eq!(later.ready_config().unwrap().fast, succeeds);
+                later.commit().unwrap();
+            }
             actor.close();
             runner.await;
+            assert!(actor.callbacks_drained());
         });
     }
 
@@ -1131,9 +1572,24 @@ mod tests {
                 })))
                 .unwrap();
             operation.wait_ready().await.unwrap();
-            let checkpoint: HistoryEditCheckpoint =
-                Arc::new(|_| Box::pin(async { Err(CHECKPOINT_ERROR.into()) }));
-            let result = guard.commit_prepared(operation, true, checkpoint).await;
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(|snapshot, _| {
+                    Box::pin(async move {
+                        assert!(snapshot.config.fast);
+                        assert!(snapshot.history.messages.is_empty());
+                        Err(CHECKPOINT_ERROR.into())
+                    })
+                }),
+                finalize: Box::new(|_| panic!("failed checkpoint must not finalize")),
+            };
+            let result = guard
+                .commit_prepared_transaction_held(
+                    operation,
+                    Some(HistorySnapshot::new(Vec::new())),
+                    transaction,
+                )
+                .await;
             assert!(
                 matches!(result, Err(ActorError::HistoryCheckpoint(error)) if error == CHECKPOINT_ERROR)
             );

@@ -23,10 +23,13 @@ pub use delivery::{
 mod inbox;
 pub use inbox::{MAX_PENDING_INSTRUCTION_BYTES, MAX_PENDING_INSTRUCTIONS, TurnInbox};
 mod idle;
-pub use idle::ActorIdleGuard;
 use idle::IdleReservation;
+pub use idle::{ActorIdleGuard, ActorSourceSnapshot};
 mod prepared;
-pub use prepared::{PreparedCommit, PreparedOperationTicket, PreparedTurn};
+pub use prepared::{
+    PreparedCommit, PreparedFinalization, PreparedOperationTicket, PreparedPublication,
+    PreparedTransaction, PreparedTransactionSnapshot, PreparedTurn,
+};
 mod queue;
 mod runner;
 mod tickets;
@@ -329,6 +332,7 @@ pub(crate) struct ActorState {
     usage: TokenUsage,
     operations: VecDeque<ActorOperation>,
     preparing: Option<u64>,
+    prepared_publication: Option<prepared::PreparedPublicationState>,
     config_observers: Vec<flume::Sender<ConfigCommit>>,
     event_observers: Vec<flume::Sender<ActorEvent>>,
     leased_event_observers: Vec<(flume::Sender<LeasedActorEvent>, Arc<CallbackDrain>)>,
@@ -522,7 +526,9 @@ fn settle_deferred(
 }
 
 fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
-    if state.idle.as_ref().is_some_and(|idle| idle.committing) {
+    if state.prepared_publication.is_some()
+        || state.idle.as_ref().is_some_and(|idle| idle.committing)
+    {
         return;
     }
     inner.policy_changed.notify(usize::MAX);
@@ -535,6 +541,14 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
             state.preparing = None;
             return;
         };
+        if state.idle.is_some()
+            && !matches!(
+                head,
+                ActorOperation::Prepared(_) | ActorOperation::Turn { .. }
+            )
+        {
+            return;
+        }
         let id = head.id();
         if state.preparing == Some(id) {
             return;
@@ -1062,6 +1076,7 @@ impl ActorState {
             usage: TokenUsage::default(),
             operations: VecDeque::new(),
             preparing: None,
+            prepared_publication: None,
             config_observers: Vec::new(),
             event_observers: Vec::new(),
             leased_event_observers: Vec::new(),
@@ -1071,23 +1086,28 @@ impl ActorState {
     }
 }
 
+pub(crate) struct ActorCloseCut {
+    deferred: Vec<ActorOperation>,
+    deliveries: Vec<Arc<ChildDelivery>>,
+    reason: TurnCancellationReason,
+    edit: Option<HistoryEditWork>,
+    lifecycle: ActorLifecycle,
+}
+
 pub(crate) struct LocalCancellationCut {
     pub(crate) turn_id: Option<TurnId>,
     pub(crate) fence: u64,
-    active: Option<ActiveCancel>,
     deferred: Vec<ActorOperation>,
     drained: Vec<ActorWork>,
 }
 
 pub(crate) struct TurnCancelCut {
-    active: Option<ActiveCancel>,
     deferred: Vec<ActorOperation>,
     queued: Option<TurnAdmission>,
 }
 
 pub(crate) struct CorrelationCancelCut {
     pub(crate) active_turn: Option<TurnId>,
-    active: Option<ActiveCancel>,
     deferred: Vec<ActorOperation>,
     matched: Vec<ActorWork>,
 }
@@ -1595,6 +1615,7 @@ impl AgentActorHandle {
         state: &mut ActorState,
         displayed: u64,
     ) -> LocalCancellationCut {
+        state.cancel_prepared_publication();
         let turn_id = state
             .processing
             .as_ref()
@@ -1618,7 +1639,9 @@ impl AgentActorHandle {
             ActorOperation::Prepared(pending) => pending.turn.is_none(),
             _ => true,
         });
-        let active = turn_id.and_then(|_| state.active.take());
+        if let Some(active) = turn_id.and_then(|_| state.active.take()) {
+            active.fire(TurnCancellationReason::User);
+        }
         let drained = self.inner.queue.drain_except(|work| {
             !matches!(work,
             ActorWork::Turn(admission) if !deliveries.contains(&admission.turn_id))
@@ -1628,16 +1651,12 @@ impl AgentActorHandle {
         LocalCancellationCut {
             turn_id,
             fence: state.presentation,
-            active,
             deferred,
             drained,
         }
     }
 
     pub(crate) fn settle_local_cancel(&self, cut: LocalCancellationCut) {
-        if let Some(active) = cut.active {
-            active.fire(TurnCancellationReason::User);
-        }
         settle_deferred(&self.inner, cut.deferred, TurnCancellationReason::User);
         terminalize_work(&self.inner, cut.drained, TurnCancellationReason::User);
     }
@@ -2619,6 +2638,7 @@ impl AgentActorHandle {
     /// cannot move a turn through the pop/install gap without observing the cut.
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancel_prepared_publication();
         state.instructions.clear();
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
         if let Some(processing) = &mut state.processing {
@@ -2675,14 +2695,15 @@ impl AgentActorHandle {
         {
             processing.cancellation_reason.get_or_insert(reason);
         }
-        let active = if running { state.active.take() } else { None };
+        if running && let Some(active) = state.active.take() {
+            active.fire(reason);
+        }
         let queued = self.inner.queue.remove_turn(turn_id);
         let deferred = state.operations.iter().position(|admission| {
             matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id)
         }).and_then(|index| state.operations.remove(index));
         drive_operations(&self.inner, state);
         Ok(TurnCancelCut {
-            active,
             deferred: deferred.into_iter().collect(),
             queued,
         })
@@ -2690,9 +2711,6 @@ impl AgentActorHandle {
 
     pub(crate) fn settle_turn_cancel(&self, cut: TurnCancelCut, reason: TurnCancellationReason) {
         settle_deferred(&self.inner, cut.deferred, reason);
-        if let Some(active) = cut.active {
-            active.fire(reason);
-        }
         if let Some(admission) = cut.queued {
             let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
             finalize_turn(
@@ -2709,11 +2727,15 @@ impl AgentActorHandle {
     /// cancelled with `Closed`, queued turns terminalize immediately, and the
     /// runner retains the active backend outcome before emitting `Close` and exiting.
     pub fn close(&self) {
-        self.close_internal(ActorLifecycle::Closed, TurnCancellationReason::Closed);
+        if let Some(cut) = self.capture_close(false) {
+            self.settle_close(cut);
+        }
     }
 
     pub fn shutdown(&self) {
-        self.close_internal(ActorLifecycle::Shutdown, TurnCancellationReason::Shutdown);
+        if let Some(cut) = self.capture_close(true) {
+            self.settle_close(cut);
+        }
     }
 
     /// Cancels work matching one correlation: the active run if its
@@ -2735,16 +2757,15 @@ impl AgentActorHandle {
         correlation: &str,
         reason: TurnCancellationReason,
     ) -> CorrelationCancelCut {
+        state.cancel_prepared_correlation(correlation);
         let matched_active = state.active_matches_correlation(correlation);
         let active_turn = match state.status {
             ActorStatus::Running(turn_id) if matched_active => Some(turn_id),
             ActorStatus::Running(_) | ActorStatus::Idle => None,
         };
-        let active = if matched_active {
-            state.active.take()
-        } else {
-            None
-        };
+        if matched_active && let Some(active) = state.active.take() {
+            active.fire(reason);
+        }
         let matched_processing = state.processing.as_mut().is_some_and(|processing| {
             if !processing.matches_correlation(correlation) {
                 return false;
@@ -2827,7 +2848,6 @@ impl AgentActorHandle {
         }
         CorrelationCancelCut {
             active_turn,
-            active,
             deferred,
             matched,
         }
@@ -2842,9 +2862,6 @@ impl AgentActorHandle {
         settle_deferred(&self.inner, cut.deferred, reason);
 
         terminalize_work(&self.inner, cut.matched, reason);
-        if let Some(active) = cut.active {
-            active.fire(reason);
-        }
         info!(
             agent_id = %self.inner.agent_id,
             %correlation,
@@ -2933,20 +2950,26 @@ impl AgentActorHandle {
         }
     }
 
-    fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
-        let (active, deferred, active_reason, edit) = {
+    pub(crate) fn capture_close(&self, shutdown: bool) -> Option<ActorCloseCut> {
+        let (lifecycle, reason) = if shutdown {
+            (ActorLifecycle::Shutdown, TurnCancellationReason::Shutdown)
+        } else {
+            (ActorLifecycle::Closed, TurnCancellationReason::Closed)
+        };
+        let (deferred, deliveries, edit) = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             // First terminal lifecycle/reason wins: repeated close/shutdown are
             // idempotent no-ops, so a race cannot overwrite Closed with Shutdown
             // or vice versa.
             if state.lifecycle != ActorLifecycle::Open {
-                return;
+                return None;
             }
             if let Some(processing) = &mut state.processing {
                 processing.cancellation_reason.get_or_insert(reason);
             }
+            state.cancel_prepared_publication();
             state.instructions.clear();
-            delivery::discard(&mut state, reason);
+            let deliveries = delivery::take_pending(&mut state);
             state.lifecycle = lifecycle;
             state.close_pending = true;
             state.preparing = None;
@@ -2966,19 +2989,52 @@ impl AgentActorHandle {
                         .get_or_insert_with(|| Err(lifecycle_error(lifecycle)));
                 }
             }
-            self.inner.policy_changed.notify(usize::MAX);
             state.cancelled_correlations.clear();
-            (
-                state.active.take(),
-                state.operations.drain(..).collect::<Vec<_>>(),
-                state
+            let edit = state.idle.take().and_then(|idle| idle.edit);
+            if let Some(id) = edit.as_ref().and_then(HistoryEditWork::prepared_id) {
+                state.end_prepared_publication(id);
+            }
+            if let Some(active) = state.active.take() {
+                let active_reason = state
                     .processing
                     .as_ref()
                     .and_then(|processing| processing.cancellation_reason)
-                    .unwrap_or(reason),
-                state.idle.take().and_then(|idle| idle.edit),
+                    .unwrap_or(reason);
+                active.fire(active_reason);
+            }
+            (
+                state.operations.drain(..).collect::<Vec<_>>(),
+                deliveries,
+                edit,
             )
         };
+        Some(ActorCloseCut {
+            deferred,
+            deliveries,
+            reason,
+            edit,
+            lifecycle,
+        })
+    }
+
+    pub(crate) fn settle_close(&self, cut: ActorCloseCut) {
+        let ActorCloseCut {
+            deferred,
+            deliveries,
+            reason,
+            edit,
+            lifecycle,
+        } = cut;
+        self.inner.policy_changed.notify(usize::MAX);
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            for delivery in deliveries {
+                state.emit(ActorEvent::Delivery(DeliveryEvent {
+                    delivery,
+                    status: DeliveryStatus::Discarded(reason),
+                }));
+            }
+        }
         #[cfg(test)]
         if let Some((captured, release)) = self.inner.after_close_cut.lock().unwrap().take() {
             let _ = captured.send(());
@@ -2986,9 +3042,6 @@ impl AgentActorHandle {
         }
         if let Some(edit) = edit {
             edit.fail(lifecycle_error(lifecycle));
-        }
-        if let Some(active) = active {
-            active.fire(active_reason);
         }
         settle_deferred(&self.inner, deferred, reason);
         let drained = self.inner.queue.drain_all();

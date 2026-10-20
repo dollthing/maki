@@ -1,9 +1,15 @@
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::FutureExt;
+use maki_providers::Message;
+use maki_storage::checkpoint::CheckpointPublication;
+use maki_storage::sessions::HistorySnapshot;
 
 use crate::agent::TurnAdmissionSnapshot;
+use crate::cancel::PublicationRegistration;
 use crate::{AgentInput, CancelToken, CancelTrigger, EventSender, TurnId};
 
 use super::{
@@ -23,6 +29,74 @@ pub struct PreparedCommit {
     pub ticket: Option<TurnTicket>,
 }
 
+#[derive(Clone)]
+pub struct PreparedTransactionSnapshot {
+    pub config: Arc<EffectiveAgentConfig>,
+    pub history: HistorySnapshot<Message>,
+    pub commit: ConfigCommit,
+}
+
+/// Stages and publishes the captured candidate outside the actor lock. The host
+/// must claim `publication` at durable replacement, and finish rollback before
+/// returning an error. It must not await work on this actor's occupied runner.
+pub type PreparedPublication = Box<
+    dyn FnOnce(
+            PreparedTransactionSnapshot,
+            CheckpointPublication,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send,
+>;
+
+/// Installs reserved public options and the matching host snapshot before config
+/// observers or the caller see success. It must not fail or reenter the actor.
+pub type PreparedFinalization = Box<dyn FnOnce(&ConfigCommit) + Send>;
+
+pub struct PreparedTransaction {
+    pub publication: CheckpointPublication,
+    pub publish: PreparedPublication,
+    pub finalize: PreparedFinalization,
+}
+
+pub(super) struct PreparedPublicationState {
+    id: u64,
+    correlation: Option<String>,
+    publication: CheckpointPublication,
+}
+
+pub(super) struct CancelPublication(pub CheckpointPublication);
+
+impl Drop for CancelPublication {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl PreparedTransaction {
+    pub(super) async fn publish(
+        self,
+        snapshot: PreparedTransactionSnapshot,
+    ) -> Result<PreparedFinalization, ActorError> {
+        let future = catch_unwind(AssertUnwindSafe(|| {
+            (self.publish)(snapshot, self.publication.clone())
+        }))
+        .map_err(|_| ActorError::HistoryCheckpoint("publication callback panicked".into()))?;
+        AssertUnwindSafe(future)
+            .catch_unwind()
+            .await
+            .map_err(|_| ActorError::HistoryCheckpoint("publication future panicked".into()))?
+            .map_err(ActorError::HistoryCheckpoint)?;
+        if self.publication.is_cancelled() {
+            return Err(ActorError::PolicyCancelled);
+        }
+        if self.publication.cancel() {
+            return Err(ActorError::HistoryCheckpoint(
+                "publication callback succeeded without claiming durable publication".into(),
+            ));
+        }
+        Ok(self.finalize)
+    }
+}
+
 pub(super) struct PreparedOperation {
     pub id: u64,
     pub turn: Option<PreparedTurn>,
@@ -32,6 +106,7 @@ pub(super) struct PreparedOperation {
     pub(super) failure: Arc<Mutex<Option<ActorError>>>,
     cancel: CancelToken,
     _trigger: CancelTrigger,
+    publication: Option<PublicationRegistration>,
 }
 
 pub struct PreparedOperationTicket {
@@ -55,6 +130,9 @@ impl AgentActorHandle {
         {
             return Err(ActorError::PolicyCancelled);
         }
+        if state.idle.is_some() && !state.operations.is_empty() {
+            return Err(ActorError::Busy);
+        }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let id = state.next_operation_id;
         let failure = Arc::new(Mutex::new(None));
@@ -71,6 +149,7 @@ impl AgentActorHandle {
                 failure: Arc::clone(&failure),
                 cancel,
                 _trigger: trigger,
+                publication: None,
             })));
         Ok(PreparedOperationTicket {
             inner: Arc::clone(&self.inner),
@@ -81,6 +160,30 @@ impl AgentActorHandle {
 }
 
 impl PreparedOperationTicket {
+    /// Registers cancellation before asynchronous host preparation begins.
+    pub fn register_publication(
+        &self,
+        publication: &CheckpointPublication,
+    ) -> Result<(), ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = self.failure() {
+            publication.cancel();
+            return Err(error);
+        }
+        if state.lifecycle != ActorLifecycle::Open {
+            publication.cancel();
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        let pending = state
+            .pending_prepared(self.id)
+            .ok_or(ActorError::PolicyCancelled)?;
+        if pending.publication.is_some() {
+            return Err(ActorError::PolicyPending);
+        }
+        pending.publication = Some(pending.cancel.register_publication(publication));
+        Ok(())
+    }
+
     /// Swaps in a new turn input while the operation still accepts one.
     /// Fails with [`ActorError::PolicyCancelled`] when the operation was
     /// cancelled, closed, or carries no turn, and
@@ -136,10 +239,11 @@ impl PreparedOperationTicket {
                 if state.lifecycle != ActorLifecycle::Open {
                     return Err(lifecycle_error(state.lifecycle));
                 }
-                if state
-                    .operations
-                    .front()
-                    .is_some_and(|entry| entry.id() == self.id)
+                if state.prepared_publication.is_none()
+                    && state
+                        .operations
+                        .front()
+                        .is_some_and(|entry| entry.id() == self.id)
                 {
                     return state.policy.clone().ok_or_else(|| {
                         ActorError::InvalidConfig("actor configuration is not initialized".into())
@@ -188,6 +292,30 @@ impl PreparedOperationTicket {
     /// same-crate tests that need to cancel without dropping.
     pub(crate) fn cancel(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(publication) = &state.prepared_publication
+            && publication.id == self.id
+            && publication.publication.cancel()
+        {
+            let edit = state.idle.as_mut().and_then(|idle| {
+                if idle
+                    .edit
+                    .as_ref()
+                    .and_then(super::HistoryEditWork::prepared_id)
+                    == Some(self.id)
+                {
+                    idle.edit.take()
+                } else {
+                    None
+                }
+            });
+            if let Some(edit) = edit {
+                state.end_prepared_publication(self.id);
+                state.idle = None;
+                edit.fail(ActorError::PolicyCancelled);
+                drive_operations(&self.inner, &mut state);
+                state.publish_idle(&self.inner);
+            }
+        }
         if self.failure().is_some() {
             return;
         }
@@ -210,8 +338,72 @@ impl PreparedOperationTicket {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
+        if state.idle.is_some() {
+            return Err(ActorError::Busy);
+        }
         let pending = self.take_ready_locked(&mut state)?;
-        Ok(pending.commit_locked(&self.inner, &mut state))
+        Ok(pending.commit_locked(&self.inner, &mut state, Box::new(|_| {})))
+    }
+
+    /// Transfers a ready config-only operation to an actor-owned task. Dropping
+    /// the waiter cancels before the durable claim, but never drops that task.
+    pub async fn commit_durable(
+        self,
+        transaction: PreparedTransaction,
+    ) -> Result<PreparedCommit, ActorError> {
+        let _cancellation = CancelPublication(transaction.publication.clone());
+        let (completion, response) = flume::bounded(1);
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(lifecycle_error(state.lifecycle));
+            }
+            if state.idle.is_some() {
+                return Err(ActorError::Busy);
+            }
+            if state
+                .pending_prepared(self.id)
+                .is_some_and(|pending| pending.turn.is_some())
+            {
+                return Err(ActorError::Busy);
+            }
+            let operation = self.take_ready_locked(&mut state)?;
+            let snapshot = operation.transaction_snapshot(
+                &self.inner,
+                &state,
+                (*self.inner.history.load_full()).clone(),
+            );
+            state.begin_prepared_publication(&operation, transaction.publication.clone());
+            let inner = Arc::clone(&self.inner);
+            smol::spawn(async move {
+                let result = transaction.publish(snapshot).await;
+                let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let id = operation.id;
+                let result = match result {
+                    Ok(finalize) => Ok(operation.commit_locked(&inner, &mut state, finalize)),
+                    Err(error) => {
+                        operation.fail(error.clone());
+                        Err(error)
+                    }
+                };
+                state.end_prepared_publication(id);
+                drive_operations(&inner, &mut state);
+                state.publish_idle(&inner);
+                state.finish_close(&inner);
+                inner.policy_changed.notify(usize::MAX);
+                inner.queue.notify();
+                let _ = completion.send(result);
+            })
+            .detach();
+        }
+        response
+            .recv_async()
+            .await
+            .map_err(|_| ActorError::Closed)?
+    }
+
+    pub(super) fn operation_id(&self) -> u64 {
+        self.id
     }
 
     pub(super) fn belongs_to(&self, actor: &AgentActorHandle) -> bool {
@@ -236,27 +428,48 @@ impl PreparedOperationTicket {
 }
 
 impl PreparedOperation {
+    pub(super) fn transaction_snapshot(
+        &self,
+        inner: &ActorInner,
+        state: &ActorState,
+        history: HistorySnapshot<Message>,
+    ) -> PreparedTransactionSnapshot {
+        PreparedTransactionSnapshot {
+            config: Arc::clone(&self.ready.as_ref().unwrap().0),
+            history,
+            commit: self.config_commit(inner, state),
+        }
+    }
+
+    fn config_commit(&self, inner: &ActorInner, state: &ActorState) -> ConfigCommit {
+        let candidate = &self.ready.as_ref().unwrap().0;
+        let current = state
+            .policy
+            .as_ref()
+            .filter(|current| config::equivalent(current, candidate));
+        ConfigCommit {
+            identity: Arc::clone(&inner.identity),
+            generation: state
+                .policy_generation
+                .wrapping_add(u64::from(current.is_none())),
+            config: current.map_or_else(|| Arc::clone(candidate), Arc::clone),
+        }
+    }
+
     pub(super) fn commit_locked(
         mut self,
         inner: &Arc<ActorInner>,
         state: &mut ActorState,
+        finalize: PreparedFinalization,
     ) -> PreparedCommit {
-        let (config, snapshot) = self.ready.take().unwrap();
-        let (config, changed) = match state.policy.as_ref() {
-            Some(current) if config::equivalent(current, &config) => (Arc::clone(current), false),
-            // No current policy means the actor never initialized one; the
-            // committed candidate is the first.
-            _ => (Arc::clone(&config), true),
-        };
+        let commit = self.config_commit(inner, state);
+        let (_, snapshot) = self.ready.take().unwrap();
+        let changed = commit.generation != state.policy_generation;
         if changed {
-            state.policy_generation = state.policy_generation.wrapping_add(1);
-            state.policy = Some(Arc::clone(&config));
+            state.policy_generation = commit.generation;
+            state.policy = Some(Arc::clone(&commit.config));
         }
-        let commit = ConfigCommit {
-            identity: Arc::clone(&inner.identity),
-            generation: state.policy_generation,
-            config,
-        };
+        finalize(&commit);
         state.delivery_suspended = false;
         inner.queue.notify();
         let ticket = self.turn.take().map(|turn| {
@@ -332,6 +545,62 @@ impl PreparedOperationTicket {
 }
 
 impl ActorState {
+    pub(super) fn begin_prepared_publication(
+        &mut self,
+        operation: &PreparedOperation,
+        publication: CheckpointPublication,
+    ) {
+        self.prepared_publication = Some(PreparedPublicationState {
+            id: operation.id,
+            correlation: operation.turn.as_ref().map(|turn| turn.correlation.clone()),
+            publication,
+        });
+        self.pending_publications += 1;
+    }
+
+    pub(super) fn end_prepared_publication(&mut self, id: u64) {
+        if self
+            .prepared_publication
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+        {
+            self.prepared_publication = None;
+            self.pending_publications -= 1;
+        }
+    }
+
+    pub(super) fn cancel_prepared_correlation(&self, correlation: &str) {
+        for operation in &self.operations {
+            if let ActorOperation::Prepared(pending) = operation
+                && pending
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.correlation == correlation)
+                && let Some(publication) = &pending.publication
+            {
+                publication.cancel();
+            }
+        }
+        if let Some(pending) = &self.prepared_publication
+            && pending.correlation.as_deref() == Some(correlation)
+        {
+            pending.publication.cancel();
+        }
+    }
+
+    pub(super) fn cancel_prepared_publication(&self) {
+        for operation in &self.operations {
+            if let ActorOperation::Prepared(pending) = operation
+                && let Some(publication) = &pending.publication
+            {
+                publication.cancel();
+            }
+        }
+        if let Some(pending) = &self.prepared_publication {
+            pending.publication.cancel();
+        }
+    }
+
     fn pending_prepared(&mut self, id: u64) -> Option<&mut PreparedOperation> {
         self.operations.iter_mut().find_map(|entry| match entry {
             ActorOperation::Prepared(pending) if pending.id == id => Some(&mut **pending),

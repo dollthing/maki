@@ -1,10 +1,20 @@
 use std::sync::Arc;
 
+use maki_providers::Message;
+use maki_storage::sessions::HistorySnapshot;
+
 use super::{
     ActorError, ActorLifecycle, ActorOperation, ActorQueue, ActorState, ActorStatus, ActorWork,
-    AgentActorHandle, HistoryEditWork, TurnTicket, lifecycle_error,
+    AgentActorHandle, ConfigCommit, HistoryEditWork, TurnTicket, lifecycle_error,
 };
-use crate::TurnId;
+use crate::{AgentId, TurnId};
+
+#[derive(Clone)]
+pub struct ActorSourceSnapshot {
+    pub agent_id: AgentId,
+    pub config: ConfigCommit,
+    pub history: HistorySnapshot<Message>,
+}
 
 pub(super) struct IdleReservation {
     owner: Arc<()>,
@@ -21,6 +31,38 @@ pub struct ActorIdleGuard {
 }
 
 impl ActorIdleGuard {
+    pub fn source_snapshot(&self) -> Result<ActorSourceSnapshot, ActorError> {
+        let mut state = self
+            .actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        state
+            .owned_idle(&self.owner)
+            .filter(|reservation| {
+                !reservation.committing
+                    && reservation.permission.is_none()
+                    && reservation.edit.is_none()
+            })
+            .ok_or(ActorError::Busy)?;
+        let config = state.policy.clone().ok_or_else(|| {
+            ActorError::InvalidConfig("actor configuration is not initialized".into())
+        })?;
+        Ok(ActorSourceSnapshot {
+            agent_id: self.actor.agent_id(),
+            config: ConfigCommit {
+                identity: Arc::clone(&self.actor.inner.identity),
+                generation: state.policy_generation,
+                config,
+            },
+            history: self.actor.inner.history.load_full().as_ref().clone(),
+        })
+    }
+
     pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ActorError> {
         if !self.actor.owns_ticket(ticket) {
             return Err(ActorError::PolicyCancelled);
@@ -89,6 +131,7 @@ impl ActorState {
         self.status != ActorStatus::Idle
             || self.active.is_some()
             || self.processing.is_some()
+            || self.pending_publications != 0
             || self
                 .operations
                 .iter()
@@ -137,7 +180,10 @@ impl AgentActorHandle {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        if state.idle.is_some() || state.has_pending_work(&self.inner.queue) {
+        if state.idle.is_some()
+            || !state.operations.is_empty()
+            || state.has_pending_work(&self.inner.queue)
+        {
             return Err(ActorError::Busy);
         }
         let owner = Arc::new(());

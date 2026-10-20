@@ -599,7 +599,7 @@ impl EventLoop<'_> {
         if let Err(error) = operation.set_turn_displayed(true) {
             return runtime.abort_plan_approval(error.to_string());
         }
-        let commit = match operation.commit() {
+        let commit = match idle.commit_prepared_in_memory(operation) {
             Ok(commit) => commit,
             Err(error) => return runtime.abort_plan_approval(error.to_string()),
         };
@@ -802,8 +802,9 @@ impl EventLoop<'_> {
             operation
                 .set_turn_displayed(true)
                 .map_err(|error| error.to_string())?;
-            let PreparedCommit { config, ticket } =
-                operation.commit().map_err(|error| error.to_string())?;
+            let PreparedCommit { config, ticket } = idle
+                .commit_prepared_in_memory(operation)
+                .map_err(|error| error.to_string())?;
             let ticket = ticket.ok_or_else(|| APPROVAL_CHANGED.to_string())?;
             idle.allow_turn(&ticket).map_err(unavailable_message)?;
             let lock = smol::unblock(move || claim_lock(&sessions_dir, &target))

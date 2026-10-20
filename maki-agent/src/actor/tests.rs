@@ -2198,7 +2198,16 @@ fn ui_terminal_observes_sealed_immutable_result(setup_failure: bool, cancel: boo
         } else {
             ScriptedBackend::new()
         };
-        let (handle, task) = spawn(backend);
+        let (start, ready) = flume::bounded(1);
+        let (handle, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(backend),
+            None,
+            None,
+            Some(ready),
+        );
         let observed_ticket = Arc::new(Mutex::new(None::<super::TurnTicket>));
         let ticket_slot = Arc::clone(&observed_ticket);
         let observed = Arc::new(AtomicUsize::new(0));
@@ -2226,6 +2235,7 @@ fn ui_terminal_observes_sealed_immutable_result(setup_failure: bool, cancel: boo
         if cancel {
             handle.cancel_turn(ticket.turn_id()).unwrap();
         }
+        start.send(()).unwrap();
         ticket.wait().await;
         assert_eq!(observed.load(Ordering::SeqCst), 1);
         assert_eq!(rx.drain().count(), 1);

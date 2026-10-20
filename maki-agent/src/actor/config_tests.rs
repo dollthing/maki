@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use maki_storage::checkpoint::CheckpointPublication;
+
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
     ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
@@ -404,6 +406,8 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
                 correlation: WORK.into(),
             }))
             .unwrap();
+        let publication = CheckpointPublication::default();
+        reservation.register_publication(&publication).unwrap();
         let successor = actor.reserve_config_update().unwrap();
         successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
         match action {
@@ -428,6 +432,7 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
             }
             _ => unreachable!(),
         }
+        assert!(publication.is_cancelled());
         if action != "close" {
             successor.wait().await.unwrap();
         }
