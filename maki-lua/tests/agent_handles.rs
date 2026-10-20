@@ -1556,6 +1556,51 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
     });
 }
 
+/// A trusted command handler carries the pinned template but no dispatch
+/// authority. `maki.agent.resolve_model` reads only that template, so a weaker
+/// tier must resolve there instead of failing with a capability error.
+#[test]
+fn trusted_command_handler_resolves_weaker_model_tier() {
+    smol::block_on(async {
+        let fixture = Fixture::start("resolve_model_tier", "");
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "fixture setup completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        fixture
+            ._host
+            .load_source(
+                "resolve_model_tier_command",
+                r#"
+            maki.api.register_command({
+                name = "/resolve_model_tier", description = "resolve the weak tier", tui_only = false,
+                handler = function(_, ctx)
+                    local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+                    assert(model ~= nil, err)
+                    assert(model.tier == "weak", "expected weak tier, got " .. model.tier)
+                end,
+            })
+        "#,
+            )
+            .unwrap();
+        let result = fixture
+            ._host
+            .event_handle()
+            .run_command_for_test(
+                Arc::from("resolve_model_tier_command"),
+                Arc::from("/resolve_model_tier"),
+                String::new(),
+                0,
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("trusted command never completed");
+        assert_eq!(result, Ok(()));
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
 #[test]
 fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
     smol::block_on(async {

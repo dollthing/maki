@@ -398,6 +398,16 @@ impl LuaCtx {
         }
     }
 
+    /// Read-only agent context for model resolution. Dispatch stays
+    /// handler-only, but a trusted invocation carries the pinned target's
+    /// template, and resolving a model reads no actor state.
+    pub(crate) fn model_context(&self) -> Option<&AgentContext> {
+        match &self.caps {
+            Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent),
+            _ => None,
+        }
+    }
+
     fn config(&self) -> Option<&AgentConfig> {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(&agent.config),

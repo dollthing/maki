@@ -1276,8 +1276,8 @@ The returned table has fields: `id` (string), `tier` (string),
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
 - `{opts?}` (`table?`) Optional fields:
-  - `tier` (`string?`) target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-    the parent tier so you cannot escalate.
+  - `tier` (`string?`) target tier, one of `"weak"`, `"medium"`, `"strong"`.
+    Clamped to the parent tier so you cannot escalate.
   - `spec` (`string?`) exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
     Takes precedence over `tier`.
 
@@ -1286,7 +1286,7 @@ The returned table has fields: `id` (string), `tier` (string),
 **Example:**
 
 ```lua
-local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
 if err then error(err) end
 print(model.spec, model.tier)
 ```

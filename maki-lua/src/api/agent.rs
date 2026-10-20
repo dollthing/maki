@@ -756,6 +756,14 @@ fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a Agen
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
 }
 
+/// Runtime resolution touches no actor state, so a trusted invocation may
+/// resolve against its pinned target's template where dispatch would not.
+fn resolve_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx) -> Result<&'a AgentContext, String> {
+    ctx.validate_origin(lua)?;
+    ctx.model_context()
+        .ok_or_else(|| ctx.cap_err("maki.agent.resolve_model"))
+}
+
 /// Forwards subagent events to the parent, stamped with the subagent identity.
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
@@ -802,13 +810,13 @@ async fn relay_session_events(
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
-///   `tier` (string?) - target tier, e.g. `"fast"`, `"mid"`, `"best"`. Clamped to
-///     the parent tier so you cannot escalate.
+///   `tier` (string?) - target tier, one of `"weak"`, `"medium"`, `"strong"`.
+///     Clamped to the parent tier so you cannot escalate.
 ///   `spec` (string?) - exact model spec string, e.g. `"claude-3-5-haiku-20241022"`.
 ///     Takes precedence over `tier`.
 /// @return (table?, string?) Model table on success, or `(nil, err)` on failure.
 /// @example
-/// local model, err = maki.agent.resolve_model(ctx, { tier = "fast" })
+/// local model, err = maki.agent.resolve_model(ctx, { tier = "weak" })
 /// if err then error(err) end
 /// print(model.spec, model.tier)
 #[lua_fn]
@@ -817,7 +825,7 @@ async fn resolve_model(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
-    let agent = try_pair!(dispatch_ctx(&lua, &ctx, "resolve_model"));
+    let agent = try_pair!(resolve_ctx(&lua, &ctx));
     let tier_str = opts
         .as_ref()
         .and_then(|t| t.get::<Option<String>>("tier").ok().flatten());
