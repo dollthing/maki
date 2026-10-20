@@ -223,7 +223,6 @@ mod tests {
             workflow: false,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         }
     }
 

@@ -2,26 +2,34 @@
 //! A broken restore silently falls back to raw LLM output, so we assert
 //! things only the real views produce (gutters, command headers, truncation).
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use maki_agent::AgentEvent;
-use maki_agent::SessionMailbox;
+use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
 use maki_agent::session_coordinator::{
-    DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
-    SessionCoordinatorParams, builtin_option_definitions,
+    SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+    builtin_option_definitions,
 };
 use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
-use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry};
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
+use maki_agent::{
+    ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
+    ControlWork, DoneReason, History, RunSettings, SessionMailbox, TurnContext, TurnOutcome,
+    WorkKind,
+};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     ToolOutputLines,
 };
 use maki_lua::PluginHost;
-use maki_providers::{Model, StreamResponse};
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_providers::{Message, StreamResponse};
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
 };
@@ -33,6 +41,9 @@ mod common;
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
+const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
+const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
@@ -686,10 +697,6 @@ fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
         model: Arc::from("test/model"),
         cwd: PathBuf::from("/tmp"),
         model_policy: Arc::default(),
-        model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
-        directory_adopter: Arc::new(|path: PathBuf| {
-            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-        }),
         checkpoint,
         mailbox: SessionMailbox::new(id),
     })
@@ -864,15 +871,8 @@ fn auto_mode_error_without_responder_fails_closed() {
     );
 }
 
-// Phase 4 (real driver): the classifier agent session runs for real against a
-// canned provider (via `inherit_provider`), instead of a synchronous Lua stub.
-// This is what lets the approve path be observed at all: after the classifier
-// approves, the bash handler falls through to the real jobstart loop.
-
-/// Load the real bash plugin with auto mode on and `bh.classify_verdict` wrapped
-/// so the classifier session is the real `maki.agent.session` reusing the parent
-/// (canned) provider via `inherit_provider`. The plugin's gating logic runs
-/// unchanged; only the spawn is forwarded.
+/// Load the bundled bash handler unchanged. Its classifier inherits the provider
+/// from the manager-owned root when the handler executes.
 fn bash_host_with_real_classifier() -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
     bash_host_with_real_classifier_auto(true)
 }
@@ -888,23 +888,9 @@ fn bash_host_with_real_classifier_auto(
 ) -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let classifier_setup = r#"
-local bh = require("bash_helpers")
-local real_classify = bh.classify_verdict
-local real_session = maki.agent.session
-local function canned_spawn(ctx, opts)
-  local so = bh.spawn_opts(opts)
-  so.inherit_provider = true
-  return real_session(ctx, so)
-end
-bh.classify_verdict = function(command, cwd, opts, ctx)
-  return real_classify(command, cwd, opts, ctx, canned_spawn)
-end
-"#;
     let mut opts = serde_json::Map::new();
     opts.insert("auto_mode".to_string(), json!(auto_on));
-    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
-        .unwrap();
+    host.load_source_with_opts("bash", BASH_SRC, opts).unwrap();
     let session = session_for(&host);
     (host, reg, session)
 }
@@ -916,8 +902,75 @@ fn verdict_tool_use(approved: bool, reason: &str) -> StreamResponse {
     )
 }
 
-/// Run the real bash handler against a canned-provider ctx and return its
-/// `output` (`Ok` for the jobstart path, `Err` for the gate's deny/error paths).
+struct BashInvocationBackend {
+    context: ToolContext,
+    input: Value,
+    completed: flume::Sender<Result<ToolOutput, String>>,
+}
+
+impl ActorBackend for BashInvocationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        turn: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(inbox) = &turn.inbox {
+                for instruction in inbox.drain_instructions() {
+                    history.push(Message::user(instruction.message));
+                }
+                inbox.instructions_submitted();
+            }
+            self.context
+                .apply_effective_config(turn.policy.as_ref().expect("root policy"));
+            self.context.cancel = turn.cancel;
+            self.context.managed_turn = turn.managed_turn;
+            let invocation = self
+                .context
+                .registry
+                .get("bash")
+                .expect("bash tool registered")
+                .tool
+                .parse(&self.input)
+                .expect("parse failed");
+            let result = invocation.execute(&self.context).await.output;
+            self.completed.send(result).unwrap();
+            if let Some(inbox) = turn.inbox {
+                assert!(inbox.finish());
+            }
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                turn.agent_id,
+                turn.turn_id.unwrap(),
+                Default::default(),
+                0,
+                DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+/// Run the real bash handler inside a managed root turn. Classifier children use
+/// the root's canned provider through the production orchestration binding.
 fn exec_bash_real(
     host: &PluginHost,
     reg: &ToolRegistry,
@@ -930,15 +983,94 @@ fn exec_bash_real(
     maki_agent::tools::test_support::set_session(&mut ctx, session.read().session_id());
     ctx.permissions = permissions;
     ctx.tool_output_lines = view_lines();
-    let inv = reg
-        .get("bash")
-        .expect("bash tool registered")
-        .tool
-        .parse(&input)
-        .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    ctx.registry = host.registry();
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    ctx = common::with_request_tools(reg, &ctx);
+    let policy = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&ctx.provider),
+            model: (*ctx.model).clone(),
+            fast: ctx.opts.fast,
+            workflow: ctx.workflow,
+            thinking: ctx.opts.thinking,
+        },
+        ctx.mode.clone(),
+    )
+    .with_context(AgentContextSnapshot::new(ctx.cwd.clone()));
+    let manager = AgentManagerHandle::new(Default::default()).unwrap();
+    let (completed_tx, completed) = flume::bounded(1);
+    let template = ctx.clone();
+    let root = manager
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(BashInvocationBackend {
+                context: ctx,
+                input,
+                completed: completed_tx,
+            }) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    host.event_handle()
+        .install_orchestration_services(Arc::new(AgentOrchestration::bind_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root.clone(),
+                template,
+            },
+        )));
+    host.wait_for_worker_barrier_for_test();
+    let ticket = root
+        .actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput::from_defaults(
+                "run bash".into(),
+                AgentMode::Build,
+                Vec::new(),
+                Default::default(),
+            ),
+            None,
+            "bash".into(),
+        )
+        .unwrap();
+    let result = smol::block_on(futures_lite::future::race(
+        async {
+            let result = completed.recv_async().await.unwrap();
+            assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+            assert!(
+                manager
+                    .list()
+                    .iter()
+                    .all(|agent| agent.snapshot().unwrap().parent_id.is_none())
+            );
+            let report = manager.shutdown(MANAGED_SHUTDOWN_TIMEOUT).await;
+            assert!(
+                report.timed_out.is_empty(),
+                "managed bash shutdown: {report:?}"
+            );
+            result
+        },
+        async {
+            smol::Timer::after(MANAGED_BASH_TIMEOUT).await;
+            panic!(
+                "managed bash did not complete: agents={:?}, requests={}",
+                manager
+                    .list()
+                    .iter()
+                    .map(|agent| agent.snapshot())
+                    .collect::<Vec<_>>(),
+                provider.captured_tools().len(),
+            );
+        },
+    ));
+    for tools in provider.captured_tools() {
+        assert_eq!(common::tool_names(&tools), [CLASSIFIER_TOOL_NAME]);
+    }
     host.load_source("auto_barrier", "").unwrap();
-    result.output
+    result
 }
 
 fn bash_output(out: ToolOutput) -> String {

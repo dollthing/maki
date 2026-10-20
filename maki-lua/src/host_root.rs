@@ -1,6 +1,7 @@
 use maki_agent::{
     AgentId,
-    session_coordinator::{ModelMutationValidator, SessionCoordinatorHandle},
+    cancel::{CancelToken, CancelTrigger, PublicationRegistration},
+    session_coordinator::SessionCoordinatorHandle,
     session_options::{
         DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionsSnapshot,
         THINKING_OPTION_ID,
@@ -11,14 +12,16 @@ use maki_config::ModelPolicy;
 use maki_providers::{
     CompleteModelSelection, Model, ModelSelection, RequestOptions, provider::available_model_specs,
 };
-use maki_storage::id::MakiId;
+use maki_storage::{
+    checkpoint::{CheckpointClaim, CheckpointPublication},
+    id::MakiId,
+};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use thiserror::Error;
 
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub const FIXED_MODEL_ERROR: &str = "model changes are unavailable for this fixed host root";
 pub const UNSUPPORTED_OPERATION_ERROR: &str = "operation is unavailable for this host root";
 
@@ -40,8 +43,9 @@ pub enum HostRootError {
 
 struct Identity {
     id: AgentId,
-    generation: u64,
     alive: AtomicBool,
+    publication_cancel: CancelToken,
+    publication_trigger: Mutex<Option<CancelTrigger>>,
 }
 
 #[derive(Clone)]
@@ -52,10 +56,6 @@ pub struct HostRootRef {
 impl HostRootRef {
     pub fn id(&self) -> AgentId {
         self.identity.id
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.identity.generation
     }
 
     pub fn same_runtime(&self, other: &Self) -> bool {
@@ -116,12 +116,14 @@ impl HostRootServices {
     }
 
     fn new(id: AgentId, source: ModelSource, policy: Arc<ModelPolicy>) -> Self {
+        let (trigger, cancel) = CancelToken::new();
         Self {
             reference: HostRootRef {
                 identity: Arc::new(Identity {
                     id,
-                    generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
                     alive: AtomicBool::new(true),
+                    publication_cancel: cancel,
+                    publication_trigger: Mutex::new(Some(trigger)),
                 }),
             },
             source,
@@ -156,12 +158,45 @@ impl HostRootServices {
         Ok(())
     }
 
+    pub fn register_publication(
+        &self,
+        reference: &HostRootRef,
+        publication: &CheckpointPublication,
+    ) -> Result<(PublicationRegistration, Option<PublicationRegistration>), HostRootError> {
+        self.validate(reference)?;
+        let coordinator = match &self.source {
+            ModelSource::Coordinator(coordinator) => {
+                Some(coordinator.register_publication(publication)?)
+            }
+            ModelSource::Fixed(_) => None,
+        };
+        let trigger = reference
+            .identity
+            .publication_trigger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if trigger.is_none() {
+            publication.cancel();
+            return Err(HostRootError::Stale);
+        }
+        Ok((
+            reference
+                .identity
+                .publication_cancel
+                .register_publication(publication),
+            coordinator,
+        ))
+    }
+
     /// Retires authority only; session shutdown remains the host's responsibility.
     pub fn retire(&self) {
-        self.reference
-            .identity
-            .alive
-            .store(false, Ordering::Release);
+        let identity = &self.reference.identity;
+        let mut trigger = identity
+            .publication_trigger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        trigger.take();
+        identity.alive.store(false, Ordering::Release);
     }
 
     pub fn model(&self, reference: &HostRootRef) -> Result<CompleteModelSelection, HostRootError> {
@@ -184,33 +219,35 @@ impl HostRootServices {
         reference: &HostRootRef,
         patch: ModelSelection,
     ) -> Result<CompleteModelSelection, HostRootError> {
-        self.set_model_guarded(reference, patch, None).await
+        let publication = CheckpointPublication::default();
+        let registrations = self.register_publication(reference, &publication)?;
+        let request = publication.clone();
+        let claim: CheckpointClaim = Arc::new(move |publication| {
+            let _registrations = &registrations;
+            if request.same_request(publication) && publication.try_publish() {
+                Ok(())
+            } else {
+                Err(Arc::from(HostRootError::Stale.to_string()))
+            }
+        });
+        self.set_model_with_claim(reference, patch, publication, claim)
+            .await
     }
 
-    pub async fn set_model_guarded(
+    pub async fn set_model_with_claim(
         &self,
         reference: &HostRootRef,
         patch: ModelSelection,
-        validator: Option<ModelMutationValidator>,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
     ) -> Result<CompleteModelSelection, HostRootError> {
         self.validate(reference)?;
         let ModelSource::Coordinator(coordinator) = &self.source else {
             return Err(HostRootError::FixedModel);
         };
-        let identity = Arc::clone(&reference.identity);
-        let validator: ModelMutationValidator = Arc::new(move || {
-            if !identity.alive.load(Ordering::Acquire) {
-                return Err(Arc::from(HostRootError::Stale.to_string()));
-            }
-            if let Some(validator) = &validator {
-                validator()?;
-            }
-            Ok(())
-        });
         let snapshot = coordinator
-            .set_model_guarded(patch.spec, patch.fast, patch.thinking, Some(validator))
+            .set_model_with_claim(patch.spec, patch.fast, patch.thinking, publication, claim)
             .await?;
-        self.validate(reference)?;
         selection_from_options(&snapshot)
     }
 
@@ -313,7 +350,6 @@ mod tests {
         let other = fixed();
         let reference = services.reference();
         assert!(reference.same_runtime(&services.reference()));
-        assert_ne!(reference.generation(), other.reference().generation());
         assert!(matches!(
             other.model(&reference),
             Err(HostRootError::WrongRuntime)

@@ -1,8 +1,17 @@
+use maki_agent::SessionMailbox;
+use maki_agent::session_coordinator::{
+    SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
+    builtin_option_definitions,
+};
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
     ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings, TurnCancellationReason,
     TurnContext, TurnId, TurnOutcome, WorkKind,
-    actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, TurnOrigin, TurnProvenance},
+    actor::{
+        ActorEvent, ActorLifecycle, DeliveryStatus, EffectiveAgentConfig, TurnOrigin,
+        TurnProvenance,
+    },
+    cancel::CancelToken,
     tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
 };
 use maki_commands::CommandInvocation;
@@ -16,7 +25,10 @@ use maki_lua::{
         STRUCTURED_OUTPUT_CONFLICT, TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED,
         TRUSTED_TIMER_REQUIRED, TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
-    orchestration::{OrchestrationServices, TrustedTarget},
+    orchestration::{
+        AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver,
+        OrchestrationServices, TrustedTarget, TurnCompletion, nonpersistent_config_mutation,
+    },
     test_support::InMemoryFs,
 };
 use maki_providers::{
@@ -24,10 +36,16 @@ use maki_providers::{
     ProviderEvent, RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
-use maki_storage::id::SessionRef;
+use maki_storage::checkpoint::{
+    CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
+    CheckpointRequest, CheckpointWriter,
+};
+use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::HistorySnapshot;
 use serde_json::{Value, json};
 use std::{
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -106,10 +124,145 @@ struct ScriptedProvider {
     requests: flume::Sender<CapturedRequest>,
 }
 
+struct GatedConfigCheckpoint {
+    path: PathBuf,
+    entered: flume::Sender<()>,
+    released: flume::Receiver<()>,
+    after_claim: bool,
+}
+
+impl CheckpointWriter<SessionCheckpoint> for GatedConfigCheckpoint {
+    fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
+        Box::pin(async move {
+            Err(CheckpointError::Save {
+                session_id: request.session_id,
+                message: Arc::from("config test requires guarded checkpoint"),
+            })
+        })
+    }
+
+    fn checkpoint_guarded(
+        &self,
+        request: CheckpointRequest<SessionCheckpoint>,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> CheckpointFuture {
+        let path = self.path.clone();
+        let entered = self.entered.clone();
+        let released = self.released.clone();
+        let after_claim = self.after_claim;
+        Box::pin(async move {
+            let config = &request.snapshot.config.as_ref().unwrap().config;
+            let candidate = json!({
+                "model": config.model.spec(),
+                "thinking": config.thinking.to_string(),
+                "fast": config.fast,
+                "mode": config.mode.id().key(),
+            });
+            let staged = path.with_extension("pending");
+            std::fs::write(&staged, serde_json::to_vec(&candidate).unwrap()).unwrap();
+            if !after_claim {
+                entered.send(()).unwrap();
+                released.recv_async().await.unwrap();
+            }
+            if let Err(message) = claim(&publication) {
+                std::fs::remove_file(staged).unwrap();
+                return Err(CheckpointError::Save {
+                    session_id: request.session_id,
+                    message,
+                });
+            }
+            if after_claim {
+                entered.send(()).unwrap();
+                released.recv_async().await.unwrap();
+            }
+            std::fs::rename(staged, path).unwrap();
+            Ok(CheckpointAck {
+                session_id: request.session_id,
+                version: request.version,
+            })
+        })
+    }
+}
+
+fn gated_config_mutations(
+    checkpoint: Arc<GatedConfigCheckpoint>,
+    committed: Arc<Mutex<Option<Arc<EffectiveAgentConfig>>>>,
+    coordinator: Arc<Mutex<Option<SessionCoordinatorHandle>>>,
+) -> ConfigMutationReserver {
+    Arc::new(move |target, publication| {
+        if target
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .parent_id
+            .is_some()
+        {
+            return Ok(nonpersistent_config_mutation(publication));
+        }
+        let mut slot = coordinator.lock().unwrap();
+        if slot.is_none() {
+            let config = target
+                .effective_config()
+                .map_err(|error| error.to_string())?
+                .unwrap();
+            let id = MakiId::generate();
+            let handle = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id: id,
+                catalog: SessionOptionCatalog::default(),
+                definitions: builtin_option_definitions(
+                    config.model.spec(),
+                    [Arc::from(config.model.spec()), Arc::from(FAST_MODEL)],
+                    false,
+                    false,
+                    false,
+                    config.thinking,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(config.model.spec()),
+                cwd: config.context.cwd().to_path_buf(),
+                model_policy: Arc::new(maki_config::ModelPolicy::default()),
+                checkpoint: checkpoint.clone(),
+                mailbox: SessionMailbox::new(id),
+            })
+            .map_err(|error| error.to_string())?;
+            let provider = Arc::clone(&config.provider);
+            let committed = Arc::clone(&committed);
+            *committed.lock().unwrap() = Some(Arc::clone(&config));
+            handle
+                .bind_actor(
+                    target.clone(),
+                    Arc::new(move |model| {
+                        let provider = Arc::clone(&provider);
+                        Box::pin(
+                            async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
+                        )
+                    }),
+                    Arc::new(move |commit| {
+                        *committed.lock().unwrap() = Some(Arc::clone(&commit.config))
+                    }),
+                )
+                .map_err(|error| error.to_string())?;
+            *slot = Some(handle);
+        }
+        let reservation = slot
+            .as_ref()
+            .unwrap()
+            .reserve_transaction(publication)
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(move |config, claim| {
+            reservation
+                .prepare(config, claim, false)
+                .map_err(|error| error.to_string())
+        }))
+    })
+}
+
 struct RegisteredOrchestrationTargets {
     targets: Mutex<Vec<TrustedTarget>>,
     selected: AtomicUsize,
     models: Result<Vec<String>, String>,
+    config_mutations: Option<ConfigMutationReserver>,
 }
 
 impl RegisteredOrchestrationTargets {
@@ -118,6 +271,7 @@ impl RegisteredOrchestrationTargets {
             targets: Mutex::new(targets),
             selected: AtomicUsize::new(0),
             models: Err(MODEL_CATALOG_UNAVAILABLE.into()),
+            config_mutations: None,
         }
     }
 }
@@ -164,6 +318,18 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
             targets.push(target);
         }
         Ok(())
+    }
+
+    fn reserve_config_mutation(
+        &self,
+        target: &maki_agent::AgentRef,
+        publication: CheckpointPublication,
+    ) -> Result<ConfigMutationReservation, String> {
+        self.validate_target(target)?;
+        match &self.config_mutations {
+            Some(reserve) => reserve(target, publication),
+            None => Ok(nonpersistent_config_mutation(publication)),
+        }
     }
 
     fn available_models(&self, target: &maki_agent::AgentRef) -> Result<Vec<String>, String> {
@@ -245,6 +411,7 @@ struct LuaInvocationBackend {
     tool: &'static str,
     completed: flume::Sender<Result<(), String>>,
     observations: flume::Sender<(TurnId, TurnProvenance, Vec<Message>)>,
+    invocation_cancel: Option<CancelToken>,
 }
 
 impl ActorBackend for LuaInvocationBackend {
@@ -295,7 +462,10 @@ impl ActorBackend for LuaInvocationBackend {
                 self.context.mode = config.mode.clone();
                 self.context.mode_def = config.mode_def.clone().map(Arc::new);
             }
-            self.context.cancel = context.cancel.clone();
+            self.context.cancel = self
+                .invocation_cancel
+                .clone()
+                .unwrap_or_else(|| context.cancel.clone());
             self.context.managed_turn = context.managed_turn;
             let invocation = self
                 .registry
@@ -377,6 +547,8 @@ struct FixtureOptions {
     nested_capture: bool,
     schema_inheritance: bool,
     plugin_source: String,
+    config_mutations: Option<ConfigMutationReserver>,
+    invocation_cancel: Option<CancelToken>,
 }
 
 async fn settle_legacy_reply(manager: &AgentManagerHandle, request: &CapturedRequest, reply: &str) {
@@ -473,6 +645,8 @@ impl Fixture {
             nested_capture,
             schema_inheritance,
             plugin_source,
+            config_mutations,
+            invocation_cancel,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
         let registry = Arc::clone(ToolRegistry::global_arc());
@@ -661,15 +835,17 @@ impl Fixture {
                     tool,
                     completed: completed_tx,
                     observations: observations_tx,
+                    invocation_cancel,
                 }) as Box<dyn ActorBackend>)
             })
             .unwrap();
-        host.event_handle().install_orchestration_services(Arc::new(
-            RegisteredOrchestrationTargets::new(vec![TrustedTarget {
-                target: root.clone(),
-                template,
-            }]),
-        ));
+        let mut services = RegisteredOrchestrationTargets::new(vec![TrustedTarget {
+            target: root.clone(),
+            template,
+        }]);
+        services.config_mutations = config_mutations;
+        host.event_handle()
+            .install_orchestration_services(Arc::new(services));
         host.wait_for_worker_barrier_for_test();
         let root_ticket = root
             .actor()
@@ -685,7 +861,6 @@ impl Fixture {
                     workflow: false,
                     prompt: None,
                     cancel: None,
-                    lease_committer: None,
                 },
                 None,
                 tool.into(),
@@ -743,6 +918,55 @@ impl Fixture {
         );
         shutdown_manager(&self.manager).await;
     }
+}
+
+#[test]
+fn orchestration_completion_awaits_host_callback_and_returns_checkpoint_error() {
+    const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
+    smol::block_on(async {
+        let fixture = Fixture::start("pr5_completion_callback", "");
+        let target = fixture.manager.root().unwrap();
+        let (template, _, _cancel) = common::ctx_with_canned_provider();
+        let services = AgentOrchestration::bind_root(
+            Arc::default(),
+            TrustedTarget {
+                target: target.clone(),
+                template,
+            },
+        );
+        services
+            .complete_turn(&target, HistorySnapshot::new(Vec::new()))
+            .await
+            .unwrap();
+        let expected = target.id();
+        let (entered, entries) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let completion: TurnCompletion = Arc::new(move |target, history| {
+            assert_eq!(target.id(), expected);
+            assert_eq!(history.messages.len(), 1);
+            let entered = entered.clone();
+            let released = released.clone();
+            Box::pin(async move {
+                entered.send_async(()).await.unwrap();
+                released.recv_async().await.unwrap();
+                Err(CHECKPOINT_ERROR.into())
+            })
+        });
+        let services: Arc<dyn OrchestrationServices> =
+            Arc::new(services.with_completion(completion));
+        let history = HistorySnapshot::new(vec![Message::user("terminal history".into())]);
+        let task = smol::spawn(services.complete_turn(&target, history));
+        bounded(entries.recv_async(), "completion checkpoint entry")
+            .await
+            .unwrap();
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(
+            bounded(task, "completion checkpoint acknowledgement").await,
+            Err(CHECKPOINT_ERROR.into())
+        );
+        fixture.finish().await;
+    });
 }
 
 #[test_case::test_case(0; "zero_timeout")]
@@ -1604,8 +1828,28 @@ fn trusted_command_handler_resolves_weaker_model_tier() {
 #[test]
 fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
     smol::block_on(async {
-        let fixture = Fixture::start(
+        let disk = tempfile::tempdir().unwrap();
+        let (entered, entries) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let committed = Arc::new(Mutex::new(None));
+        let coordinator = Arc::new(Mutex::new(None));
+        let path = disk.path().join("config.json");
+        let reserve = gated_config_mutations(
+            Arc::new(GatedConfigCheckpoint {
+                path: path.clone(),
+                entered,
+                released,
+                after_claim: false,
+            }),
+            Arc::clone(&committed),
+            Arc::clone(&coordinator),
+        );
+        let fixture = Fixture::start_with_options(
             "pr5_tool_spawn_config",
+            FixtureOptions {
+                config_mutations: Some(reserve),
+                ..Default::default()
+            },
             &format!(
                 r#"
             local parent = assert(maki.agent.current(ctx))
@@ -1617,7 +1861,67 @@ fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
         "#
             ),
         );
+        bounded(entries.recv_async(), "model checkpoint stage")
+            .await
+            .unwrap();
+        assert!(fixture.root_ticket.peek_result().is_none());
+        assert!(!path.exists());
+        assert_eq!(
+            committed.lock().unwrap().as_ref().unwrap().model.spec(),
+            common::default_model().spec()
+        );
+        release.send(()).unwrap();
+        bounded(entries.recv_async(), "mode checkpoint stage")
+            .await
+            .unwrap();
+        assert!(fixture.root_ticket.peek_result().is_none());
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["model"], FAST_MODEL);
+        assert_eq!(saved["mode"], "build");
+        assert_eq!(
+            committed.lock().unwrap().as_ref().unwrap().mode,
+            AgentMode::Build
+        );
+        release.send(()).unwrap();
         let request = fixture.request().await;
+        let parent = fixture
+            .manager
+            .root()
+            .unwrap()
+            .effective_config()
+            .unwrap()
+            .unwrap();
+        let host = committed.lock().unwrap().clone().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parent.model.spec(), FAST_MODEL);
+        assert_eq!(host.model.spec(), parent.model.spec());
+        assert_eq!(host.thinking, parent.thinking);
+        assert_eq!(host.fast, parent.fast);
+        assert_eq!(host.mode, parent.mode);
+        assert_eq!(saved["model"], parent.model.spec());
+        assert_eq!(saved["thinking"], parent.thinking.to_string());
+        assert_eq!(saved["fast"], parent.fast);
+        assert_eq!(saved["mode"], parent.mode.id().key());
+        let options = coordinator
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .read()
+            .options();
+        for (id, expected) in [
+            ("model", FAST_MODEL),
+            ("thinking", "low"),
+            ("fast", "enabled"),
+        ] {
+            let option = options
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == id)
+                .unwrap();
+            assert_eq!(option.current_value.as_ref(), expected);
+        }
+        assert!(fixture.root_ticket.peek_result().is_none());
         let child = fixture
             .manager
             .snapshot()
@@ -1933,6 +2237,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                         tool: "pr5_reject_foreign",
                         completed: completed_tx,
                         observations: flume::unbounded().0,
+                        invocation_cancel: None,
                     }) as Box<dyn ActorBackend>)
                 },
             )
@@ -1951,7 +2256,6 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                     workflow: false,
                     prompt: None,
                     cancel: None,
-                    lease_committer: None,
                 },
                 None,
                 String::new(),
@@ -2182,26 +2486,198 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
     });
 }
 
-#[test]
-fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change() {
+#[test_case::test_case(None, false; "immutable_admission")]
+#[test_case::test_case(Some(true), false; "plugin_revoked_before_claim")]
+#[test_case::test_case(Some(true), true; "plugin_revoked_after_claim")]
+#[test_case::test_case(Some(false), false; "invocation_cancelled_before_claim")]
+#[test_case::test_case(Some(false), true; "invocation_cancelled_after_claim")]
+fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
+    revoke_plugin: Option<bool>,
+    after_claim: bool,
+) {
     smol::block_on(async {
-        let fixture = Fixture::start(
-            "pr5_admitted_model",
-            r#"
+        const TOOL: &str = "pr5_admitted_model";
+        let disk = tempfile::tempdir().unwrap();
+        let (entered, entries) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let committed = Arc::new(Mutex::new(None));
+        let coordinator = Arc::new(Mutex::new(None));
+        let path = disk.path().join("config.json");
+        let baseline = json!({
+            "model": common::default_model().spec(),
+            "thinking": "off", "fast": false, "mode": "build",
+        });
+        std::fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+        let reserve = gated_config_mutations(
+            Arc::new(GatedConfigCheckpoint {
+                path: path.clone(),
+                entered,
+                released,
+                after_claim,
+            }),
+            Arc::clone(&committed),
+            Arc::clone(&coordinator),
+        );
+        let (cancel, cancelled) = CancelToken::new();
+        let fixture = Fixture::start_with_options(
+            TOOL,
+            FixtureOptions {
+                config_mutations: Some(reserve),
+                invocation_cancel: Some(cancelled),
+                ..Default::default()
+            },
+            &format!(
+                r#"
             local agent = assert(maki.agent.current(ctx))
             local admitted = assert(ctx:model())
             assert(admitted.thinking == "off", tostring(admitted.thinking))
-            assert(agent:set_model(ctx, { thinking = "high" }))
-            assert(assert(agent:model(ctx)).thinking == "high")
-            assert(assert(ctx:model()).thinking == "off")
+            local sentinel = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local changed, err = agent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "high", fast = true }})
+            assert(changed, err)
+            if {keep_authority} then
+                assert(assert(agent:model(ctx)).thinking == "high")
+                assert(assert(ctx:model()).thinking == "off")
+                assert(sentinel:close(ctx))
+            end
         "#,
+                keep_authority = revoke_plugin.is_none(),
+            ),
         );
+        bounded(entries.recv_async(), "admitted model checkpoint claim gate")
+            .await
+            .unwrap();
+        assert!(fixture.root_ticket.peek_result().is_none());
+        let root = fixture.manager.root().unwrap();
+        let actor = root.actor().unwrap();
+        let previous = root.effective_config().unwrap().unwrap();
+        let installed = committed.lock().unwrap().clone().unwrap();
+        let handle = coordinator.lock().unwrap().clone().unwrap();
+        let previous_options = handle.read().options();
+        for (id, expected) in [
+            ("model", common::default_model().spec().as_str()),
+            ("thinking", "off"),
+            ("fast", "disabled"),
+        ] {
+            let option = previous_options
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == id)
+                .unwrap();
+            assert_eq!(option.current_value.as_ref(), expected);
+        }
+        assert_eq!(previous.model.spec(), common::default_model().spec());
+        assert_eq!(previous.thinking, ThinkingConfig::Off);
+        assert!(!previous.fast);
+        assert_eq!(previous.mode, AgentMode::Build);
+        assert!(Arc::ptr_eq(&previous, &installed));
         assert_eq!(
-            bounded(fixture.completed.recv_async(), "admitted model reads")
-                .await
-                .unwrap(),
-            Ok(())
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            baseline,
         );
+        let barrier = actor.reserve_prepared_operation(None).unwrap();
+        let unloading = if let Some(revoke_plugin) = revoke_plugin {
+            if revoke_plugin {
+                let child = fixture
+                    .manager
+                    .snapshot()
+                    .into_iter()
+                    .find(|node| node.parent_id.is_some())
+                    .unwrap();
+                let child_actor = fixture.manager.actor(child.agent_id).unwrap();
+                let (finished, result) = flume::bounded(1);
+                let host = fixture._host;
+                std::thread::spawn(move || {
+                    let unloaded = host.unload(TOOL);
+                    finished.send((host, unloaded)).unwrap();
+                });
+                bounded(
+                    async {
+                        while child_actor.snapshot().lifecycle == ActorLifecycle::Open {
+                            smol::future::yield_now().await;
+                        }
+                    },
+                    "plugin revocation child cleanup",
+                )
+                .await;
+                Some(result)
+            } else {
+                cancel.cancel();
+                let result = bounded(
+                    fixture.completed.recv_async(),
+                    "cancelled Lua invocation before storage release",
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.is_err(),
+                    "cancelled invocation unexpectedly succeeded"
+                );
+                None
+            }
+        } else {
+            None
+        };
+        release.send(()).unwrap();
+        bounded(barrier.wait_predecessor(), "durable mutation finalization")
+            .await
+            .unwrap();
+        drop(barrier);
+        let current = root.effective_config().unwrap().unwrap();
+        let installed = committed.lock().unwrap().clone().unwrap();
+        let options = handle.read().options();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if revoke_plugin.is_some() && !after_claim {
+            assert!(Arc::ptr_eq(&previous, &current));
+            assert!(Arc::ptr_eq(&previous, &installed));
+            assert_eq!(options, previous_options);
+            assert_eq!(saved, baseline);
+        } else {
+            assert_eq!(current.model.spec(), FAST_MODEL);
+            assert_eq!(current.thinking, ThinkingConfig::Effort(Effort::High));
+            assert!(current.fast);
+            assert_eq!(current.mode, AgentMode::Build);
+            assert!(Arc::ptr_eq(&current, &installed));
+            for (id, expected) in [
+                ("model", FAST_MODEL),
+                ("thinking", "high"),
+                ("fast", "enabled"),
+            ] {
+                let option = options
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                    .unwrap();
+                assert_eq!(option.current_value.as_ref(), expected);
+            }
+            assert_eq!(
+                saved,
+                json!({
+                    "model": current.model.spec(), "thinking": current.thinking.to_string(),
+                    "fast": current.fast, "mode": current.mode.id().key(),
+                })
+            );
+        }
+        assert!(!path.with_extension("pending").exists());
+        if revoke_plugin != Some(false) {
+            let result = bounded(fixture.completed.recv_async(), "admitted model reads")
+                .await
+                .unwrap();
+            if revoke_plugin.is_none() || after_claim {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "invalidated invocation unexpectedly succeeded"
+                );
+            }
+        }
+        if let Some(unloading) = unloading {
+            let (_host, result) = bounded(unloading.recv_async(), "plugin unload completion")
+                .await
+                .unwrap();
+            result.unwrap();
+        }
+        bounded(fixture.root_ticket.wait(), "root turn settlement").await;
         shutdown_manager(&fixture.manager).await;
     });
 }

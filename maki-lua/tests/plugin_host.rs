@@ -167,8 +167,7 @@ fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: 
 
 fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
     use maki_agent::session_coordinator::{
-        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorParams,
-        builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorParams, builtin_option_definitions,
     };
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -200,12 +199,6 @@ fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCo
         model: Arc::from("test/model"),
         cwd: "/tmp".into(),
         model_policy: Arc::default(),
-        model_adopter: Arc::new(|_: maki_providers::Model| {
-            Box::pin(async { Ok(()) }) as ModelAdoptionFuture
-        }),
-        directory_adopter: Arc::new(|path| {
-            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-        }),
         checkpoint,
         mailbox: maki_agent::SessionMailbox::new(id),
     })

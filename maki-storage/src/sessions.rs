@@ -175,6 +175,12 @@ pub struct SessionMeta {
     pub session_options: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryDestination {
+    Main,
+    Child(String),
+}
+
 /// Messages plus the token of the run they belong to. Comparing tokens tells
 /// an append from a rewrite, with no need to diff the lists.
 #[derive(Debug, Clone)]

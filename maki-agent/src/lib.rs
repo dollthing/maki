@@ -138,14 +138,13 @@ pub fn batch_key(input: &AgentInput) -> Option<BatchKey> {
         workflow,
         prompt,
         cancel,
-        lease_committer,
         message: _,
         images: _,
         preamble: _,
         thinking: _,
         fast: _,
     } = input;
-    if prompt.is_some() || cancel.is_some() || lease_committer.is_some() {
+    if prompt.is_some() || cancel.is_some() {
         return None;
     }
     Some((mode.clone(), *workflow))
@@ -191,7 +190,6 @@ pub struct AgentInput {
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
     pub cancel: Option<CancelToken>,
-    pub lease_committer: Option<session_coordinator::SessionLeaseCommitter>,
 }
 
 impl AgentInput {
@@ -214,7 +212,6 @@ impl AgentInput {
             workflow: defaults.workflow,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         }
     }
 }

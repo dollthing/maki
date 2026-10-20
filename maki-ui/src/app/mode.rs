@@ -216,7 +216,6 @@ impl App {
             workflow: self.state.workflow,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         }
     }
 

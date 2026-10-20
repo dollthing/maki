@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
-use maki_agent::cancel::CancelToken;
-use maki_agent::session_coordinator::ModelMutationValidator;
+use maki_agent::cancel::{CancelToken, PublicationRegistration};
 use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
-use maki_agent::{AgentEvent, AgentId};
+use maki_agent::{AgentEvent, AgentId, AgentRef};
 use maki_config::{AgentConfig, ToolOutputLines};
+use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
@@ -232,7 +232,7 @@ impl LuaCtx {
         ));
         {
             let mut cell = lock_cell(&task);
-            cell.plugin_origin = Some((authority.plugin.clone(), authority.generation));
+            cell.set_plugin_origin(Some((authority.plugin.clone(), authority.generation)));
             cell.plugin_owner = Some(owner);
         }
         Self {
@@ -291,7 +291,7 @@ impl LuaCtx {
         {
             return Err("plugin generation expired before host root admission".into());
         }
-        cell.plugin_origin = Some((authority.plugin.clone(), authority.generation));
+        cell.set_plugin_origin(Some((authority.plugin.clone(), authority.generation)));
         cell.plugin_owner = Some(owner);
         Ok(Some(Self {
             caps: Caps::TrustedHostRoot {
@@ -349,12 +349,13 @@ impl LuaCtx {
         Ok(Some(services.clone()))
     }
 
-    pub(crate) fn host_model_validator(
+    pub(crate) fn host_model_publication_claim(
         &self,
         lua: &mlua::Lua,
         services: &Arc<HostRootServices>,
         reference: &HostRootRef,
-    ) -> Result<ModelMutationValidator, String> {
+        publication: &CheckpointPublication,
+    ) -> Result<CheckpointClaim, String> {
         self.validate_origin(lua)?;
         let bound = self
             .host_root(lua)?
@@ -365,28 +366,86 @@ impl LuaCtx {
         services
             .validate(reference)
             .map_err(|error| error.to_string())?;
+        let (host, session) = services
+            .register_publication(reference, publication)
+            .map_err(|error| error.to_string())?;
+        let mut registrations = vec![host];
+        registrations.extend(session);
+        self.publication_claim(lua, publication, registrations)
+    }
+
+    pub(crate) fn agent_publication_claim(
+        &self,
+        lua: &mlua::Lua,
+        target: &AgentRef,
+        publication: &CheckpointPublication,
+    ) -> Result<CheckpointClaim, String> {
+        self.validate_origin(lua)?;
+        target.validate_live().map_err(|error| error.to_string())?;
+        let mut registrations = Vec::new();
+        if let Some(host) = lua
+            .app_data_ref::<HostRootServicesSlot>()
+            .and_then(|slot| slot.services.clone())
+        {
+            let (host, session) = host
+                .register_publication(&host.reference(), publication)
+                .map_err(|error| error.to_string())?;
+            registrations.push(host);
+            registrations.extend(session);
+        }
+        self.publication_claim(lua, publication, registrations)
+    }
+
+    fn publication_claim(
+        &self,
+        lua: &mlua::Lua,
+        publication: &CheckpointPublication,
+        registrations: Vec<PublicationRegistration>,
+    ) -> Result<CheckpointClaim, String> {
         let task = active_task(lua);
-        let plugin_origin = lock_cell(&task).plugin_origin.clone();
-        let owner = lock_cell(&task).plugin_owner.clone();
+        let (plugin_origin, owner) = {
+            let cell = lock_cell(&task);
+            (cell.plugin_origin.clone(), cell.plugin_owner.clone())
+        };
+        let plugin_registration = owner
+            .as_ref()
+            .map(|owner| owner.register_publication(publication));
+        let task_registrations = lock_cell(&task).register_publication(publication);
+        let cancel_registration = self.cancel.register_publication(publication);
         let task = Arc::downgrade(&task);
         let cancel = self.cancel.clone();
-        let services = services.clone();
-        let reference = reference.clone();
-        Ok(Arc::new(move || {
-            let task = task
-                .upgrade()
-                .ok_or_else(|| Arc::<str>::from(INVOCATION_EXPIRED))?;
-            let cell = lock_cell(&task);
-            if !cell.is_live()
-                || cancel.is_cancelled()
-                || cell.plugin_origin != plugin_origin
-                || owner.as_ref().is_some_and(|owner| !owner.is_alive())
-            {
+        let request = publication.clone();
+        Ok(Arc::new(move |publication| {
+            let _registrations = (
+                &plugin_registration,
+                &task_registrations,
+                &cancel_registration,
+                &registrations,
+            );
+            if !request.same_request(publication) {
                 return Err(Arc::from(INVOCATION_EXPIRED));
             }
-            services
-                .validate(&reference)
-                .map_err(|error| Arc::from(error.to_string()))
+            // Writer guard -> plugin gate -> task scope -> cancellation guard -> request CAS.
+            let claim = || {
+                let task = task
+                    .upgrade()
+                    .ok_or_else(|| Arc::<str>::from(INVOCATION_EXPIRED))?;
+                let cell = lock_cell(&task);
+                if !cancel.claim_publication_if(publication, || {
+                    cell.is_live() && cell.plugin_origin == plugin_origin
+                }) {
+                    return Err(Arc::from(INVOCATION_EXPIRED));
+                }
+                Ok(())
+            };
+            let result = match &owner {
+                Some(owner) => owner.claim_publication(claim),
+                None => claim(),
+            };
+            if result.is_err() {
+                publication.cancel();
+            }
+            result
         }))
     }
 
@@ -622,7 +681,7 @@ impl UserData for LuaCtx {
             }
             try_pair!(this.validate_origin(lua));
             let handle = active_task(lua);
-            let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cell = handle.lock().unwrap_or_else(|e| e.into_inner());
             if cell.deadline_secs.get().is_some() {
                 return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
             }
@@ -633,6 +692,9 @@ impl UserData for LuaCtx {
                     .get()
                     .map_or(deadline, |current| current.min(deadline)),
             ));
+            if !cell.is_live() {
+                cell.invalidate_publications();
+            }
             cell.deadline_changed.notify(usize::MAX);
             Ok((Some(true), None))
         });
@@ -883,44 +945,98 @@ mod tests {
         assert!(ctx.host_root(&lua).is_err());
     }
 
-    #[test]
-    fn captured_host_model_validator_rejects_revoked_plugin_and_expired_task() {
-        let lua = mlua::Lua::new();
-        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
-        let scope = crate::runtime::TaskScope::detached(&lua);
-        let template = populated_ctx();
-        let services = Arc::new(HostRootServices::fixed(
-            maki_agent::AgentId::generate(),
-            &template.model,
-            maki_providers::RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(services.clone()),
-            template: Some(template),
-        });
-        let ctx = LuaCtx::trusted_host_root_context(&lua, Arc::from("owner"))
-            .unwrap()
-            .unwrap();
-        let validator = ctx
-            .host_model_validator(&lua, &services, &services.reference())
-            .unwrap();
-        let check = validator.clone();
-        assert!(thread::spawn(move || check()).join().unwrap().is_ok());
-        lock_cell(scope.handle())
-            .deadline
-            .set(Some(Instant::now() - Duration::from_secs(1)));
-        assert!(validator().is_err());
-        lock_cell(scope.handle()).deadline.set(None);
-        assert!(validator().is_ok());
-        crate::orchestration::revoke_plugin(&lua, "owner");
-        assert!(validator().is_err());
-        drop(scope);
-        assert!(validator().is_err());
+    #[derive(Clone, Copy, Debug)]
+    enum PublicationInvalidation {
+        Plugin,
+        Invocation,
+        Deadline,
+        Scope,
+        Host,
+        Origin,
     }
 
-    #[test]
-    fn tool_host_model_validator_binds_live_plugin_authority() {
+    #[test_case::test_case(PublicationInvalidation::Plugin; "plugin_revocation")]
+    #[test_case::test_case(PublicationInvalidation::Invocation; "invocation_cancellation")]
+    #[test_case::test_case(PublicationInvalidation::Deadline; "deadline_expiry")]
+    #[test_case::test_case(PublicationInvalidation::Scope; "scope_exit")]
+    #[test_case::test_case(PublicationInvalidation::Host; "host_retirement")]
+    #[test_case::test_case(PublicationInvalidation::Origin; "origin_change")]
+    fn captured_host_model_claim_orders_invalidation(invalidation: PublicationInvalidation) {
+        for claim_first in [false, true] {
+            let lua = mlua::Lua::new();
+            crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
+            let (trigger, cancel) = CancelToken::new();
+            let scope = crate::runtime::TaskScope::new(
+                &lua,
+                crate::runtime::TaskCell::new(cancel, None, None),
+            );
+            let mut scope = Some(scope);
+            let template = populated_ctx();
+            let services = Arc::new(HostRootServices::fixed(
+                maki_agent::AgentId::generate(),
+                &template.model,
+                maki_providers::RequestOptions::default(),
+                Arc::new(maki_config::ModelPolicy::default()),
+            ));
+            lua.set_app_data(HostRootServicesSlot {
+                services: Some(services.clone()),
+                template: Some(template),
+            });
+            let ctx = LuaCtx::trusted_host_root_context(&lua, Arc::from("owner"))
+                .unwrap()
+                .unwrap();
+            let publication = CheckpointPublication::default();
+            let claim = ctx
+                .host_model_publication_claim(&lua, &services, &services.reference(), &publication)
+                .unwrap();
+            if claim_first {
+                let claim = claim.clone();
+                let publication = publication.clone();
+                assert!(
+                    thread::spawn(move || claim(&publication))
+                        .join()
+                        .unwrap()
+                        .is_ok()
+                );
+            }
+            match invalidation {
+                PublicationInvalidation::Plugin => {
+                    crate::orchestration::revoke_plugin(&lua, "owner")
+                }
+                PublicationInvalidation::Invocation => trigger.cancel(),
+                PublicationInvalidation::Deadline => lock_cell(scope.as_ref().unwrap().handle())
+                    .deadline
+                    .set(Some(Instant::now() - Duration::from_secs(1))),
+                PublicationInvalidation::Scope => drop(scope.take()),
+                PublicationInvalidation::Host => services.retire(),
+                PublicationInvalidation::Origin => {
+                    lock_cell(scope.as_ref().unwrap().handle()).set_plugin_origin(None)
+                }
+            }
+            if !claim_first {
+                if !matches!(invalidation, PublicationInvalidation::Deadline) {
+                    assert!(publication.is_cancelled());
+                }
+                let request = publication.clone();
+                assert_eq!(
+                    thread::spawn(move || claim(&request))
+                        .join()
+                        .unwrap()
+                        .unwrap_err()
+                        .as_ref(),
+                    INVOCATION_EXPIRED
+                );
+                assert!(publication.is_cancelled());
+            } else {
+                assert!(!publication.is_cancelled());
+                assert!(publication.finish_commit());
+            }
+        }
+    }
+
+    #[test_case::test_case(false; "revoked_before_claim")]
+    #[test_case::test_case(true; "revoked_after_claim")]
+    fn tool_host_model_claim_binds_live_plugin_authority(claim_first: bool) {
         let lua = mlua::Lua::new();
         let owner = crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
@@ -941,12 +1057,33 @@ mod tests {
         let mut ctx = LuaCtx::handler(&template);
         ctx.pin_host_root(&lua);
         ctx.bind_origin(scope.handle());
-        let validator = ctx
-            .host_model_validator(&lua, &services, &services.reference())
+        let publication = CheckpointPublication::default();
+        let aborted = CheckpointPublication::default();
+        let aborted_claim = ctx
+            .host_model_publication_claim(&lua, &services, &services.reference(), &aborted)
             .unwrap();
-        assert!(validator().is_ok());
+        drop(aborted_claim);
+        let claim = ctx
+            .host_model_publication_claim(&lua, &services, &services.reference(), &publication)
+            .unwrap();
+        let other = CheckpointPublication::default();
+        assert_eq!(claim(&other).unwrap_err().as_ref(), INVOCATION_EXPIRED);
+        assert!(!other.is_cancelled());
+        assert!(!publication.is_cancelled());
+        if claim_first {
+            assert!(claim(&publication).is_ok());
+        }
         crate::orchestration::revoke_plugin(&lua, "owner");
-        assert!(validator().is_err());
+        assert_eq!(publication.is_cancelled(), !claim_first);
+        assert!(!aborted.is_cancelled());
+        if claim_first {
+            assert!(publication.finish_commit());
+        } else {
+            assert_eq!(
+                claim(&publication).unwrap_err().as_ref(),
+                INVOCATION_EXPIRED
+            );
+        }
     }
 
     #[test]

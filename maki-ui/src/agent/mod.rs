@@ -258,14 +258,7 @@ pub(crate) struct PreparedAgentHandles {
 }
 
 impl PreparedAgentHandles {
-    pub(crate) fn agent_tx(&self) -> flume::Sender<Envelope> {
-        self.handles
-            .as_ref()
-            .expect("prepared handles")
-            .agent_tx
-            .clone()
-    }
-
+    #[cfg(test)]
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         let handles = self.handles.as_ref().expect("prepared handles");
         (handles.manager.clone(), handles.root_id)
@@ -273,10 +266,6 @@ impl PreparedAgentHandles {
 
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
         self.handles.as_ref().expect("prepared handles").mailbox()
-    }
-
-    pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
-        self.handles.as_ref().expect("prepared handles").cwd_slot()
     }
 
     pub(crate) fn activate(mut self) -> AgentHandles {
@@ -880,8 +869,8 @@ mod tests {
         mailbox: SessionMailbox,
     ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
         use maki_agent::session_coordinator::{
-            DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint,
-            SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
+            SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+            builtin_option_definitions,
         };
         use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
 
@@ -901,10 +890,6 @@ mod tests {
             model: Arc::from("test/model"),
             cwd: PathBuf::from("/tmp"),
             model_policy: Arc::default(),
-            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
-            directory_adopter: Arc::new(|path: PathBuf| {
-                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-            }),
             checkpoint: Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
                 Box::pin(async move {
                     Ok(CheckpointAck {

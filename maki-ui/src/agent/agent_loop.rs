@@ -374,30 +374,24 @@ impl TuiActorBackend {
         Ok((system, tools, prompt_slots))
     }
 
-    /// Resolves this session's coordinator lease for a run. `Ok(None)` when
-    /// there is no session, or when it is already gone (nothing left to
-    /// commit into); `Err` when the lease itself cannot be taken.
-    async fn acquire_lease(
-        &self,
-    ) -> Result<Option<maki_agent::session_coordinator::SessionLease>, AgentError> {
+    async fn persist_history(&self, history: &History) -> Result<(), AgentError> {
         use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
 
         let Some(session_id) = &self.session_id else {
-            return Ok(None);
+            return Ok(());
         };
         match SessionCoordinatorHandle::resolve(session_id.id()) {
-            Ok(coordinator) => coordinator
-                .acquire_lease()
-                .await
-                .map(Some)
-                .map_err(|error| AgentError::Config {
-                    message: error.to_string(),
-                }),
-            Err(SessionCoordinatorError::StaleSession(_)) => Ok(None),
-            Err(error) => Err(AgentError::Config {
-                message: error.to_string(),
-            }),
+            Ok(coordinator) => {
+                coordinator
+                    .persist_history(history.snapshot().clone())
+                    .await
+            }
+            Err(SessionCoordinatorError::StaleSession(_)) => return Ok(()),
+            Err(error) => Err(error),
         }
+        .map_err(|error| AgentError::Config {
+            message: error.to_string(),
+        })
     }
 
     /// A setup failure never enters a run, and the runner drops the outcome it
@@ -450,18 +444,6 @@ impl TuiActorBackend {
         let setup = context
             .cancel
             .race(async {
-                let lease = match self.acquire_lease().await {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        self.report_setup_failure(
-                            run_id,
-                            turn_id,
-                            "session lease unavailable",
-                            &error,
-                        );
-                        return None;
-                    }
-                };
                 let Some(policy) = context.policy.as_deref() else {
                     let error = AgentError::Config {
                         message: "turn was admitted without an effective agent configuration"
@@ -491,10 +473,10 @@ impl TuiActorBackend {
                         return None;
                     }
                 };
-                Some((lease, provider, model, prepared))
+                Some((provider, model, prepared))
             })
             .await;
-        let (lease, provider, model, (system, tools, prompt_slots)) = match setup {
+        let (provider, model, (system, tools, prompt_slots)) = match setup {
             Ok(prepared) => prepared?,
             Err(_) => return Some(self.cancel_setup(context, turn_id, run_id)),
         };
@@ -538,11 +520,8 @@ impl TuiActorBackend {
 
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
-        // Only a completed turn's history is worth checkpointing; a failure or
-        // cancellation leaves the coordinator's copy as the last good one.
-        if let (TurnOutcome::Completed { .. }, Some(committer)) =
-            (&outcome, lease.as_ref().and_then(|lease| lease.committer()))
-            && let Err(error) = committer.commit_history(history.as_slice().to_vec()).await
+        if matches!(outcome, TurnOutcome::Completed { .. })
+            && let Err(error) = self.persist_history(history).await
         {
             warn!(%error, "committing session history after turn failed");
         }
@@ -919,16 +898,7 @@ impl ActorBackend for TuiActorBackend {
                 self.timeouts,
                 &self.model_policy,
             );
-            let lease = match self.acquire_lease().await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    warn!(error = %error, "session lease unavailable for idle compaction");
-                    let _ = event_tx.send(AgentEvent::ControlError {
-                        message: error.user_message(),
-                    });
-                    return BackendResult::CompactDone;
-                }
-            };
+            let previous = history.snapshot().clone();
             let mut result = maki_agent::agent::compact(
                 &*provider,
                 &model,
@@ -940,19 +910,13 @@ impl ActorBackend for TuiActorBackend {
                 self.session_id.as_ref(),
             )
             .await;
-            if result.is_ok()
-                && let Some(committer) = lease.as_ref().and_then(|lease| lease.committer())
-            {
-                result = committer
-                    .commit_history(history.as_slice().to_vec())
-                    .await
-                    .map_err(|error| AgentError::Config {
-                        message: error.to_string(),
-                    });
+            if result.is_ok() {
+                result = self.persist_history(history).await;
             }
             match result {
                 Ok(()) => BackendResult::CompactDone,
                 Err(e) => {
+                    history.replace_snapshot(previous);
                     warn!(error = %e, "idle compaction failed");
                     let _ = event_tx.send(AgentEvent::ControlError {
                         message: e.user_message(),
@@ -3230,7 +3194,6 @@ mod tests {
                 arguments: HashMap::new(),
             })),
             cancel: None,
-            lease_committer: None,
         };
         (backend, input, agent_rx)
     }

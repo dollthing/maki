@@ -1,9 +1,10 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
@@ -16,7 +17,9 @@ use agent_client_protocol_schema::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
+use arc_swap::ArcSwapOption;
 use flume::{Receiver, Sender, WeakSender};
+use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -25,19 +28,22 @@ use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
 use maki_commands::{
-    AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
-    TargetHandle,
+    AgentTurn, CommandAttachment, CommandContent, CommandError, CommandFuture, CommandHost,
+    CommandOutcome, HostRequest, HostResponse, InputDispatch, PresentedCommand, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_lua::host_root::{HostRootRetirementGuard, HostRootServices};
+use maki_lua::orchestration::{
+    AgentOrchestration, ConfigMutationReserver, TrustedTarget, TurnCompletion,
+};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, StoredTokenUsage};
+use maki_storage::sessions::{SESSIONS_DIR, StoredSubagent, StoredTokenUsage};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -51,6 +57,7 @@ const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
     "session cancellation is still in progress; retry the prompt";
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
+const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
 
@@ -75,7 +82,6 @@ struct PendingOperation {
     run_id: Option<u64>,
     cancelling: bool,
     cancel: Option<maki_agent::cancel::CancelTrigger>,
-    _lease: Option<maki_agent::session_coordinator::SessionLease>,
 }
 
 /// What the client still owes us. Subagents have independent answer channels,
@@ -234,8 +240,24 @@ struct SpawnSession {
     project_config: ProjectConfig,
 }
 
+struct AcpCommandHost {
+    host: maki_agent::command::SessionCommandHost,
+    root: TrustedTarget,
+}
+
+impl CommandHost for AcpCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(Arc::new(self.root.clone()))
+    }
+
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        self.host.request(request)
+    }
+}
+
 struct InstallSession<'a> {
     handle: InteractiveHandle,
+    root_target: Receiver<TrustedTarget>,
     mcp: Option<McpHandle>,
     current_model: String,
     history: Vec<Message>,
@@ -494,7 +516,7 @@ async fn new_session(
         &params.trust_policy,
     );
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
-    let handle = spawn_session(
+    let (handle, root_target) = spawn_session(
         params,
         SpawnSession {
             model: params.model.clone(),
@@ -517,6 +539,7 @@ async fn new_session(
         InstallSession {
             handle,
             mcp,
+            root_target,
             current_model: spec,
             history: Vec::new(),
             initial_cost: None,
@@ -581,7 +604,7 @@ async fn load_session(
     let replay_history = Arc::clone(&restored.history.messages);
     let coordinator_history = restored.history.messages.as_ref().clone();
     let history_snapshot = restored.history;
-    let handle = spawn_session_with_history(
+    let (handle, root_target) = spawn_session_with_history(
         params,
         SpawnSession {
             model: recorded_model.clone(),
@@ -614,6 +637,7 @@ async fn load_session(
             handle,
             mcp,
             current_model: spec,
+            root_target,
             history: coordinator_history,
             initial_cost: restored_cost,
             cwd: session_cwd.clone(),
@@ -634,7 +658,10 @@ async fn load_session(
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
-fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle {
+fn spawn_session(
+    params: &AcpParams,
+    session: SpawnSession,
+) -> (InteractiveHandle, Receiver<TrustedTarget>) {
     spawn_session_with_history(params, session, None)
 }
 
@@ -642,7 +669,7 @@ fn spawn_session_with_history(
     params: &AcpParams,
     session: SpawnSession,
     snapshot: Option<maki_agent::agent::HistorySnapshot>,
-) -> InteractiveHandle {
+) -> (InteractiveHandle, Receiver<TrustedTarget>) {
     let SpawnSession {
         model,
         cwd,
@@ -682,10 +709,166 @@ fn spawn_session_with_history(
         local_tools: Default::default(),
         state_dir: Some(params.storage.path().to_path_buf()),
     };
-    match snapshot {
-        Some(snapshot) => headless::spawn_interactive_with_history(interactive, snapshot),
-        None => headless::spawn_interactive(interactive),
+    let (ready, root_target) = flume::bounded(1);
+    let handle = headless::spawn_interactive_with_binding(
+        interactive,
+        Box::new(|mut model, timeouts| {
+            Box::pin(async move {
+                let provider =
+                    maki_providers::provider::from_model_async(&mut model, timeouts).await?;
+                Ok((model, Arc::from(provider)))
+            })
+        }),
+        snapshot,
+        Some(Box::new(move |_, target, template| {
+            Box::pin(async move {
+                ready
+                    .send(TrustedTarget { target, template })
+                    .map_err(|error| error.to_string())
+            })
+        })),
+    );
+    (handle, root_target)
+}
+
+#[cfg(test)]
+fn orchestration_binding_with_completion(
+    event_handle: maki_lua::EventHandle,
+    models: Arc<ArcSwapOption<Vec<String>>>,
+    completion: TurnCompletion,
+) -> headless::RootBinding {
+    Box::new(move |_, target, template| {
+        Box::pin(async move {
+            let session_id = template
+                .session_id
+                .as_ref()
+                .ok_or("ACP root session is unavailable")?
+                .id();
+            let services = acp_orchestration(
+                models,
+                TrustedTarget { target, template },
+                session_id,
+                Arc::new(|_, publication| {
+                    Ok(maki_lua::orchestration::nonpersistent_config_mutation(
+                        publication,
+                    ))
+                }),
+            )
+            .with_completion(completion);
+            event_handle.install_orchestration_services(Arc::new(services));
+            Ok(())
+        })
+    })
+}
+
+fn acp_orchestration(
+    models: Arc<ArcSwapOption<Vec<String>>>,
+    root: TrustedTarget,
+    session_id: MakiId,
+    child_config: ConfigMutationReserver,
+) -> AgentOrchestration {
+    let root_id = root.target.id();
+    AgentOrchestration::bind_root(models, root).with_config_mutations(Arc::new(
+        move |target, publication| {
+            if target.id() != root_id {
+                return child_config(target, publication);
+            }
+            let coordinator =
+                maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+                    .map_err(|error| error.to_string())?;
+            let reservation = coordinator
+                .reserve_transaction(publication)
+                .map_err(|error| error.to_string())?;
+            Ok(Box::new(move |config, claim| {
+                reservation
+                    .prepare(config, claim, false)
+                    .map_err(|error| error.to_string())
+            }))
+        },
+    ))
+}
+
+fn acp_child_destination(
+    services: &Weak<AgentOrchestration>,
+    target: &maki_agent::AgentRef,
+) -> Result<(String, String), String> {
+    let services = services.upgrade().ok_or("ACP orchestration is closed")?;
+    let key = services.history_key(target)?;
+    let name = target
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .metadata
+        .label
+        .unwrap_or_default();
+    Ok((key, name))
+}
+
+fn acp_child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
+    StoredSubagent {
+        tool_use_id: key,
+        name,
+        model: Some(config.model.spec()),
+        thinking: Some(config.thinking.into()),
+        fast: config.fast,
     }
+}
+
+fn acp_child_config(
+    services: Weak<AgentOrchestration>,
+    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
+) -> ConfigMutationReserver {
+    Arc::new(move |target, publication| {
+        let (key, name) = acp_child_destination(&services, target)?;
+        let checkpoint = Arc::clone(&checkpoint);
+        Ok(Box::new(move |_, claim| {
+            Ok(PreparedTransaction {
+                publication,
+                publish: Box::new(move |ready, publication| {
+                    Box::pin(async move {
+                        checkpoint
+                            .checkpoint_child_config(
+                                acp_child_metadata(key, name, &ready.config),
+                                publication,
+                                claim,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+                finalize: Box::new(|_| {}),
+            })
+        }))
+    })
+}
+
+fn acp_child_completion(
+    services: Weak<AgentOrchestration>,
+    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
+) -> TurnCompletion {
+    Arc::new(move |target, history| {
+        let child = (|| {
+            let (key, name) = acp_child_destination(&services, target)?;
+            let config = target
+                .effective_config()
+                .map_err(|error| error.to_string())?
+                .ok_or("child agent configuration is unavailable")?;
+            Ok::<_, String>(acp_child_metadata(key, name, &config))
+        })();
+        let checkpoint = Arc::clone(&checkpoint);
+        Box::pin(async move {
+            let result = match child {
+                Ok(child) => checkpoint
+                    .checkpoint_child(child, history)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                warn!(%error, "failed to checkpoint ACP child history");
+            }
+            Ok(())
+        })
+    })
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we
@@ -785,6 +968,7 @@ async fn close_session(srv: &mut Server) {
         });
     }
     answer_cancelled_requests(&state.handle, permission_answers, elicitation);
+    state.handle.manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
     state.handle.task.cancel().await;
     if let Some(coordinator) = state.coordinator.take()
         && let Err(error) = coordinator.close().await
@@ -823,6 +1007,11 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
             match lease.heartbeat() {
                 Ok(session_lock::LockBeat::Lost) => {
                     warn!(session_id = %id, "session lock heartbeat lost ownership");
+                    if let Ok(coordinator) =
+                        maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(id)
+                    {
+                        coordinator.retire();
+                    }
                     return;
                 }
                 Err(error) => warn!(session_id = %id, %error, "session lock heartbeat failed"),
@@ -878,6 +1067,7 @@ async fn install_session_with_lock(
 ) -> Result<maki_agent::session_options::SessionOptionsSnapshot, String> {
     let InstallSession {
         handle,
+        root_target,
         mcp,
         current_model,
         history,
@@ -938,29 +1128,6 @@ async fn install_session_with_lock(
             model: Arc::from(current_model.as_str()),
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
-            model_adopter: Arc::new(maki_agent::session_coordinator::GuardedModelAdopter({
-                // Install into the shared source without waiting for the
-                // running turn. The actor pins model settings at admission, so
-                // this takes effect for later turns while the active turn keeps
-                // its selected model.
-                let shared = handle.model.clone();
-                let timeouts = params.timeouts;
-                move |mut model: Model, validator: maki_agent::session_coordinator::ModelMutationValidator| {
-                    let shared = shared.clone();
-                    Box::pin(async move {
-                        let provider =
-                            maki_providers::provider::from_model_async(&mut model, timeouts)
-                                .await
-                                .map_err(|error| Arc::from(error.user_message()))?;
-                        validator()?;
-                        shared.install(Arc::from(provider), model);
-                        Ok(())
-                    }) as maki_agent::session_coordinator::ModelAdoptionFuture
-                }
-            })),
-            directory_adopter: maki_agent::headless::interactive_directory_adopter(
-                handle.control_tx.clone(),
-            ),
             checkpoint: checkpoint.clone(),
             mailbox: handle.mailbox.clone(),
         },
@@ -972,8 +1139,66 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
+    let root = match handle.initialized_root().await {
+        Ok(root) => root,
+        Err(error) => {
+            rollback_install(handle, mcp, Some(coordinator)).await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = coordinator.bind_actor(
+        root.clone(),
+        Arc::new({
+            let timeouts = params.timeouts;
+            move |mut model| {
+                Box::pin(async move {
+                    let provider = maki_providers::provider::from_model_async(&mut model, timeouts)
+                        .await
+                        .map_err(|error| Arc::from(error.user_message()))?;
+                    Ok(maki_agent::actor::PreparedModel {
+                        provider: Arc::from(provider),
+                        model,
+                    })
+                })
+            }
+        }),
+        Arc::new({
+            let model = handle.model.clone();
+            let permissions = Arc::clone(&handle.permissions);
+            move |commit| {
+                model.install(
+                    Arc::clone(&commit.config.provider),
+                    commit.config.model.clone(),
+                );
+                permissions.set_cwd(commit.config.context.cwd().to_path_buf());
+            }
+        }),
+    ) {
+        rollback_install(handle, mcp, Some(coordinator)).await;
+        return Err(error.to_string());
+    }
+    let trusted_root = match root_target.recv_async().await {
+        Ok(root) => root,
+        Err(error) => {
+            rollback_install(handle, mcp, Some(coordinator)).await;
+            return Err(error.to_string());
+        }
+    };
+    params
+        .lua_event_handle
+        .install_orchestration_services(Arc::new_cyclic(|weak| {
+            acp_orchestration(
+                Arc::new(ArcSwapOption::from_pointee(available_model_specs(
+                    &params.model_policy,
+                ))),
+                trusted_root.clone(),
+                handle.session_id.id(),
+                acp_child_config(weak.clone(), Arc::clone(&checkpoint)),
+            )
+            .with_completion(acp_child_completion(weak.clone(), Arc::clone(&checkpoint)))
+        }));
     let host_root = Arc::new(HostRootServices::coordinated(
-        handle.agent_id,
+        root.id(),
         coordinator.clone(),
         Arc::clone(&params.model_policy),
     ));
@@ -1014,14 +1239,15 @@ async fn install_session_with_lock(
             maki_commands::TargetCapability::SessionReplacement,
         )),
         portable_capabilities,
-        Arc::new(
-            maki_agent::command::SessionCommandHost::new(
+        Arc::new(AcpCommandHost {
+            host: maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 Arc::clone(&command_state),
             )
             .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
             .with_coordinator(coordinator.clone()),
-        ),
+            root: trusted_root,
+        }),
     );
     let session_id = SessionId::from(handle.session_id.to_string());
     let command_projection_task = watch_available_commands(
@@ -1278,14 +1504,7 @@ async fn send_manual_compaction(
     if session.pending.lock().unwrap().operation.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
-    let lease = session
-        .coordinator
-        .as_ref()
-        .ok_or_else(no_session)?
-        .acquire_lease()
-        .await
-        .map_err(coordinator_error)?;
-    let lease_committer = lease.committer();
+    session.coordinator.as_ref().ok_or_else(no_session)?;
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let tool_id = format!("compact-{operation_id}");
     let (trigger, cancel) = maki_agent::cancel::CancelToken::new();
@@ -1301,7 +1520,6 @@ async fn send_manual_compaction(
             run_id: None,
             cancelling: false,
             cancel: Some(trigger),
-            _lease: Some(lease),
         });
     }
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -1318,8 +1536,8 @@ async fn send_manual_compaction(
             instructions,
             output,
             cancel,
-            lease_committer,
         })
+        .await
         .is_err()
     {
         release_operation(
@@ -1436,13 +1654,7 @@ async fn send_isolated_turn(
             )
         })
         .collect();
-    let lease = session
-        .coordinator
-        .as_ref()
-        .ok_or_else(no_session)?
-        .acquire_lease()
-        .await
-        .map_err(coordinator_error)?;
+    session.coordinator.as_ref().ok_or_else(no_session)?;
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let (trigger, cancel) = maki_agent::cancel::CancelToken::new();
     {
@@ -1457,7 +1669,6 @@ async fn send_isolated_turn(
             run_id: None,
             cancelling: false,
             cancel: Some(trigger),
-            _lease: Some(lease),
         });
     }
     let (output, events) = flume::unbounded();
@@ -1470,6 +1681,7 @@ async fn send_isolated_turn(
             output,
             cancel,
         })
+        .await
         .is_err()
     {
         release_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
@@ -1592,15 +1804,8 @@ async fn send_command_turn(
     if session.pending.lock().unwrap().operation.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
-    let lease = session
-        .coordinator
-        .as_ref()
-        .ok_or_else(no_session)?
-        .acquire_lease()
-        .await
-        .map_err(coordinator_error)?;
+    session.coordinator.as_ref().ok_or_else(no_session)?;
     input.cancel = Some(cancel);
-    input.lease_committer = lease.committer();
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut pending = session.pending.lock().unwrap();
@@ -1614,10 +1819,9 @@ async fn send_command_turn(
             run_id: None,
             cancelling: false,
             cancel: Some(cancel_trigger),
-            _lease: Some(lease),
         });
     }
-    if session.handle.input_tx.send(input).is_err() {
+    if session.handle.input_tx.send(input).await.is_err() {
         release_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
         return Err(AcpError::new(-32603, "session ended"));
     }
@@ -2297,7 +2501,6 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::PermissionManager;
     use maki_commands::TargetCapabilities;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
@@ -2315,10 +2518,13 @@ mod tests {
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
     const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
+    static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
 
     struct RecordingAcpProvider {
         name: &'static str,
         requests: Sender<(&'static str, String, bool)>,
+        nested: bool,
+        permission: bool,
     }
 
     impl maki_providers::provider::Provider for RecordingAcpProvider {
@@ -2338,6 +2544,116 @@ mod tests {
             self.requests
                 .send((self.name, model.spec(), options.fast))
                 .unwrap();
+            if self.nested {
+                let prompt = messages
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User))
+                    .flat_map(|message| &message.content)
+                    .find_map(|block| match block {
+                        MsgBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let last_result = messages
+                    .iter()
+                    .rev()
+                    .flat_map(|message| message.content.iter().rev())
+                    .find_map(|block| match block {
+                        MsgBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
+                            assert!(!is_error, "nested tool failed: {content}");
+                            Some(content)
+                        }
+                        _ => None,
+                    });
+                let depth = if prompt.contains("grandchild work") {
+                    2
+                } else if prompt.contains("child work") {
+                    1
+                } else {
+                    0
+                };
+                let call = |name: &str, input: Value| MsgBlock::ToolUse {
+                    id: format!("{name}-{depth}"),
+                    name: name.into(),
+                    input,
+                    thought_signature: None,
+                };
+                let follow_up = messages
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User))
+                    .flat_map(|message| &message.content)
+                    .any(
+                        |block| matches!(block, MsgBlock::Text { text } if text == "after option"),
+                    );
+                let block = if follow_up {
+                    MsgBlock::Text {
+                        text: "root result".into(),
+                    }
+                } else if depth == 2 {
+                    MsgBlock::Text {
+                        text: "grandchild result".into(),
+                    }
+                } else if last_result.is_none() {
+                    if self.permission && depth == 1 {
+                        call("acp_child_permission", serde_json::json!({}))
+                    } else {
+                        call(
+                            "task_spawn",
+                            serde_json::json!({
+                                "description": if depth == 0 { "ACP child" } else { "ACP grandchild" },
+                                "prompt": if depth == 0 { "child work" } else { "grandchild work" },
+                                "subagent_type": "general",
+                            }),
+                        )
+                    }
+                } else if let Some(result) = last_result
+                    && let Ok(spawned) = serde_json::from_str::<Value>(result)
+                    && spawned.get("task_id").is_some()
+                {
+                    call(
+                        "task_wait",
+                        serde_json::json!({"task_id": spawned["task_id"], "turn_id": spawned["turn_id"]}),
+                    )
+                } else {
+                    let expected = if self.permission && depth == 1 {
+                        "permission granted"
+                    } else if depth == 1 {
+                        "grandchild result"
+                    } else {
+                        "child result"
+                    };
+                    assert!(
+                        last_result.is_some_and(|result| result.contains(expected)),
+                        "unexpected nested result: {last_result:?}"
+                    );
+                    MsgBlock::Text {
+                        text: if depth == 0 {
+                            "root result"
+                        } else {
+                            "child result"
+                        }
+                        .into(),
+                    }
+                };
+                let stop_reason = if matches!(block, MsgBlock::ToolUse { .. }) {
+                    maki_providers::StopReason::ToolUse
+                } else {
+                    maki_providers::StopReason::EndTurn
+                };
+                return Box::pin(async move {
+                    Ok(maki_providers::StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![block],
+                            ..Default::default()
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(stop_reason),
+                    })
+                });
+            }
             maki_providers::provider::Provider::stream_message(
                 &EndTurnProvider,
                 model,
@@ -2358,6 +2674,213 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    async fn managed_test_session(
+        srv: &mut Server,
+        nested: bool,
+        permission: bool,
+        completion: Option<TurnCompletion>,
+        checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        >,
+    ) -> (
+        maki_lua::PluginHost,
+        Receiver<(&'static str, String, bool)>,
+        Receiver<String>,
+    ) {
+        let (requests, received) = flume::unbounded();
+        let provider: Arc<dyn maki_providers::provider::Provider> =
+            Arc::new(RecordingAcpProvider {
+                name: "managed provider",
+                requests,
+                nested,
+                permission,
+            });
+        let prepared = Arc::clone(&provider);
+        let registry = Arc::clone(maki_agent::tools::ToolRegistry::global_arc());
+        let host = maki_lua::PluginHost::with_session_provider_preparer(
+            registry,
+            Default::default(),
+            true,
+            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            None,
+            Some(Arc::new(move |model| Ok((model, Arc::clone(&prepared))))),
+        )
+        .unwrap();
+        host.load_source(
+            "acp_bundled_task",
+            include_str!("../../plugins/task/init.lua"),
+        )
+        .unwrap();
+        host.load_source(
+            "acp_options",
+            r#"
+            maki.api.register_command({
+                name = "/acp_fast", tui_only = false,
+                handler = function(_, ctx)
+                    local root = assert(maki.agent.current(ctx))
+                    assert(assert(root:set_model(ctx, { fast = true })).fast)
+                    assert(assert(root:model(ctx)).fast)
+                end,
+            })
+        "#,
+        )
+        .unwrap();
+        if permission {
+            host.load_source("acp_child_permission", r#"
+                maki.api.register_tool({
+                    name = "acp_child_permission", description = "request a child permission",
+                    schema = { type = "object", properties = {} }, audiences = { "main", "general_sub" },
+                    permission = "run", permission_scopes = function() return { scopes = { "ACP child permission" }, force_prompt = true } end,
+                    handler = function() return "permission granted" end,
+                })
+            "#).unwrap();
+        }
+        let session = srv.session.as_mut().unwrap();
+        let id = session.handle.session_id.clone();
+        session.coordinator.take().unwrap().close().await.unwrap();
+        let coordinator = test_coordinator_with(
+            id.id(),
+            FAST_SPEC,
+            PathBuf::from("/tmp"),
+            host.event_handle().session_option_catalog(),
+            checkpoint,
+        );
+        let initial = Arc::clone(&provider);
+        let (root_answers_tx, root_answers_rx) = flume::bounded(1);
+        let binding = orchestration_binding_with_completion(
+            host.event_handle(),
+            Arc::new(ArcSwapOption::from_pointee(vec![FAST_SPEC.into()])),
+            completion.unwrap_or_else(|| Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+        );
+        let handle = headless::spawn_interactive_with_binding(
+            InteractiveParams {
+                model: Model::from_spec(FAST_SPEC).unwrap(),
+                config: maki_agent::AgentConfig {
+                    max_concurrent_agent_turns: 1,
+                    ..Default::default()
+                },
+                permissions_config: maki_config::PermissionsConfig {
+                    default: maki_config::DefaultEffect::Prompt,
+                    ..Default::default()
+                },
+                timeouts: Default::default(),
+                prompt_slots: Arc::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: PathBuf::from("/tmp"),
+                session_id: Some(id.clone()),
+                initial_history: Vec::new(),
+                yolo: false,
+                system_prompt_override: Some(String::new()),
+                append_system_prompt: None,
+                defaults: Default::default(),
+                model_policy: Arc::default(),
+                modes: Arc::default(),
+                question_mode: QuestionMode::Headless,
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(Path::new("/tmp")),
+                local_tools: Default::default(),
+                state_dir: None,
+            },
+            Box::new(move |model, _| Box::pin(async move { Ok((model, initial)) })),
+            None,
+            Some(Box::new(move |manager, target, template| {
+                Box::pin(async move {
+                    let answers = template
+                        .user_response_rx
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .await
+                        .clone();
+                    root_answers_tx.send_async(answers).await.unwrap();
+                    binding(manager, target, template).await
+                })
+            })),
+        );
+        let root = handle.initialized_root().await.unwrap();
+        let replacement = Arc::clone(&provider);
+        coordinator
+            .bind_actor(
+                root.clone(),
+                Arc::new(move |model| {
+                    let provider = Arc::clone(&replacement);
+                    Box::pin(
+                        async move { Ok(maki_agent::actor::PreparedModel { provider, model }) },
+                    )
+                }),
+                Arc::new({
+                    let shared = handle.model.clone();
+                    move |commit| {
+                        shared.install(
+                            Arc::clone(&commit.config.provider),
+                            commit.config.model.clone(),
+                        );
+                    }
+                }),
+            )
+            .unwrap();
+        let root_answers = root_answers_rx.recv_async().await.unwrap();
+        let previous = std::mem::replace(&mut session.handle, handle);
+        previous.task.cancel().await;
+        session.host_root = Arc::new(HostRootServices::coordinated(
+            root.id(),
+            coordinator.clone(),
+            Arc::default(),
+        ));
+        session._host_root_retirement = session.host_root.retirement_guard();
+        session.coordinator = Some(coordinator.clone());
+        session.option_projection = Some(Arc::new(OptionProjection {
+            out_tx: srv.out_tx.clone(),
+            session_id: SessionId::from(session.handle.session_id.to_string()),
+            read: coordinator.read(),
+            command_state: Arc::clone(&session.command_state),
+            permissions: Arc::clone(&session.handle.permissions),
+            supports_boolean: false,
+            emitted_version: Mutex::new(coordinator.read().options().version),
+        }));
+        session.pending.lock().unwrap().permissions.clear();
+        start_event_pump(
+            session.handle.event_rx.clone(),
+            id,
+            srv.out_tx.clone(),
+            Arc::clone(&session.pending),
+            false,
+            session.handle.answer_tx.clone(),
+            session.handle.cancel_tx.clone(),
+            coordinator.read(),
+            None,
+            PUMP_TRUSTED,
+            None,
+        );
+        srv.lua_event_handle = host.event_handle();
+        (host, received, root_answers)
+    }
+
+    async fn prompt_terminal(out: &Receiver<Value>, id: i64) -> Value {
+        smol::future::or(
+            async {
+                loop {
+                    let response = out.recv_async().await.unwrap();
+                    if response["id"] == id {
+                        return response;
+                    }
+                    assert!(
+                        response.get("result").is_none() && response.get("error").is_none(),
+                        "leaked terminal: {response}"
+                    );
+                }
+            },
+            async {
+                smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                panic!("ACP prompt {id} did not complete");
+            },
+        )
+        .await
     }
 
     struct EndTurnProvider;
@@ -2442,7 +2965,7 @@ mod tests {
 
     fn test_target(
         registry: &maki_commands::CommandRegistry,
-        control_tx: Sender<maki_agent::headless::InteractiveControl>,
+        control_tx: maki_agent::headless::InteractiveControlSender,
         command_state: Arc<maki_agent::command::SessionCommandState>,
     ) -> TargetHandle {
         {
@@ -2457,6 +2980,49 @@ mod tests {
                         .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
                 ),
             )
+        }
+    }
+
+    struct GuardedTestCheckpoint(
+        Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        >,
+    );
+
+    impl
+        maki_storage::checkpoint::CheckpointWriter<
+            maki_agent::session_coordinator::SessionCheckpoint,
+        > for GuardedTestCheckpoint
+    {
+        fn checkpoint(
+            &self,
+            request: maki_storage::checkpoint::CheckpointRequest<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >,
+        ) -> maki_storage::checkpoint::CheckpointFuture {
+            self.0.checkpoint(request)
+        }
+
+        fn checkpoint_guarded(
+            &self,
+            request: maki_storage::checkpoint::CheckpointRequest<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >,
+            publication: maki_storage::checkpoint::CheckpointPublication,
+            claim: maki_storage::checkpoint::CheckpointClaim,
+        ) -> maki_storage::checkpoint::CheckpointFuture {
+            let writer = Arc::clone(&self.0);
+            Box::pin(async move {
+                claim(&publication).map_err(|message| {
+                    maki_storage::checkpoint::CheckpointError::Save {
+                        session_id: request.session_id,
+                        message,
+                    }
+                })?;
+                writer.checkpoint(request).await
+            })
         }
     }
 
@@ -2524,15 +3090,7 @@ mod tests {
                 model: Arc::from(model),
                 cwd,
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
-                model_adopter: Arc::new(|_: Model| {
-                    Box::pin(async { Ok(()) })
-                        as maki_agent::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path: PathBuf| {
-                    Box::pin(async move { Ok(path) })
-                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
-                }),
-                checkpoint,
+                checkpoint: Arc::new(GuardedTestCheckpoint(checkpoint)),
                 mailbox: maki_agent::SessionMailbox::new(session_id),
             },
         )
@@ -2602,49 +3160,43 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
         let session_id = MakiId::generate();
-        let input_handle = headless::spawn_interactive(InteractiveParams {
-            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
-            config: Default::default(),
-            permissions_config: Default::default(),
-            timeouts: Default::default(),
-            prompt_slots: Arc::default(),
-            excluded_tools: Vec::new(),
-            mcp_handle: None,
-            initial_wd: PathBuf::from("/project"),
-            session_id: Some(SessionRef::from(session_id)),
-            modes: Arc::default(),
-            initial_history: Vec::new(),
-            yolo: false,
-            system_prompt_override: Some(String::new()),
-            append_system_prompt: None,
-            defaults: Default::default(),
-            model_policy: Arc::default(),
-            question_mode: QuestionMode::Headless,
-            plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(Path::new("/project")),
-            local_tools: Default::default(),
-            state_dir: None,
-        });
-        let handle = InteractiveHandle {
-            agent_id: input_handle.agent_id,
-            model: Default::default(),
-            event_rx: flume::unbounded().1,
-            tool_names: Vec::new(),
-            input_tx: input_handle.input_tx.with_input_mirror(input_tx),
-            answer_tx: answer_tx.clone(),
-            cancel_tx: flume::unbounded().0,
-            model_tx: flume::unbounded().0,
-            control_tx: flume::unbounded().0,
-            session_id: SessionRef::from(session_id),
-            mailbox: maki_agent::SessionMailbox::new(session_id),
-            permissions: Arc::new(PermissionManager::new(
-                maki_config::PermissionsConfig::default(),
-                PathBuf::from("/project"),
-                ProjectConfig::for_project(Path::new("/project")),
-                Arc::default(),
-            )),
-            task: smol::spawn(async {}),
-        };
+        let mut handle = headless::spawn_interactive_with_preparation(
+            InteractiveParams {
+                model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                config: Default::default(),
+                permissions_config: Default::default(),
+                timeouts: Default::default(),
+                prompt_slots: Arc::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: PathBuf::from("/project"),
+                session_id: Some(SessionRef::from(session_id)),
+                modes: Arc::default(),
+                initial_history: Vec::new(),
+                yolo: false,
+                system_prompt_override: Some(String::new()),
+                append_system_prompt: None,
+                defaults: Default::default(),
+                model_policy: Arc::default(),
+                question_mode: QuestionMode::Headless,
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(Path::new("/project")),
+                local_tools: Default::default(),
+                state_dir: None,
+            },
+            Box::new(|model, _| {
+                Box::pin(async {
+                    let provider: Arc<dyn maki_providers::provider::Provider> =
+                        Arc::new(EndTurnProvider);
+                    Ok((model, provider))
+                })
+            }),
+        );
+        let root = smol::block_on(handle.initialized_root()).unwrap();
+        handle.event_rx = flume::unbounded().1;
+        handle.input_tx = handle.input_tx.with_input_mirror(input_tx);
+        handle.answer_tx = answer_tx.clone();
+        handle.control_tx = flume::unbounded().0.into();
         let coordinator = test_coordinator_with(
             handle.session_id.id(),
             OFFLINE_SPEC,
@@ -2652,6 +3204,28 @@ mod tests {
             Default::default(),
             checkpoint,
         );
+        coordinator
+            .bind_actor(
+                root.clone(),
+                Arc::new(|model| {
+                    Box::pin(async move {
+                        Ok(maki_agent::actor::PreparedModel {
+                            model,
+                            provider: Arc::new(EndTurnProvider),
+                        })
+                    })
+                }),
+                Arc::new({
+                    let model = handle.model.clone();
+                    move |commit| {
+                        model.install(
+                            Arc::clone(&commit.config.provider),
+                            commit.config.model.clone(),
+                        );
+                    }
+                }),
+            )
+            .unwrap();
         let command_registry = test_registry(&[]);
         let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
             String::new(),
@@ -2676,7 +3250,7 @@ mod tests {
             ),
         );
         let host_root = Arc::new(HostRootServices::coordinated(
-            handle.agent_id,
+            root.id(),
             coordinator.clone(),
             Arc::new(ModelPolicy::default()),
         ));
@@ -2771,7 +3345,7 @@ mod tests {
                 lua_event_handle: params.lua_event_handle.clone(),
                 defaults: SessionDefaults::default(),
             };
-            let handle = spawn_session(
+            let (handle, root_target) = spawn_session(
                 &params,
                 SpawnSession {
                     model: params.model.clone(),
@@ -2793,6 +3367,7 @@ mod tests {
                 &params,
                 InstallSession {
                     handle,
+                    root_target,
                     mcp: None,
                     current_model: OFFLINE_SPEC.to_owned(),
                     history: Vec::new(),
@@ -2817,6 +3392,7 @@ mod tests {
                         SessionDefaults::default(),
                         None,
                     ))
+                    .await
                     .is_err(),
                 "session task was not cancelled"
             );
@@ -2846,7 +3422,7 @@ mod tests {
             let session_id = SessionRef::from(MakiId::generate());
             let persisted_options = BTreeMap::new();
 
-            let first = spawn_session(
+            let (first, root_target) = spawn_session(
                 &params,
                 SpawnSession {
                     model: params.model.clone(),
@@ -2865,6 +3441,7 @@ mod tests {
                 &params,
                 InstallSession {
                     handle: first,
+                    root_target,
                     mcp: None,
                     current_model: OFFLINE_SPEC.to_owned(),
                     history: Vec::new(),
@@ -2892,7 +3469,7 @@ mod tests {
     }
 
     #[test]
-    fn close_retires_routing_with_retained_committer() {
+    fn close_retires_routing_with_retained_coordinator() {
         smol::block_on(async {
             let (mut srv, ..) = server_awaiting_answer();
             let id = srv.session.as_ref().unwrap().handle.session_id.id();
@@ -2904,14 +3481,17 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .clone();
-            let lease = coordinator.acquire_lease().await.unwrap();
-            let committer = lease.committer().unwrap();
-            std::mem::forget(lease);
-
             close_session(&mut srv).await;
             let replacement = test_coordinator(id, OFFLINE_SPEC, PathBuf::from("/project"));
-
-            drop(committer);
+            assert!(
+                coordinator
+                    .set_option(
+                        maki_agent::session_options::YOLO_OPTION_ID,
+                        maki_agent::session_options::ENABLED_VALUE
+                    )
+                    .await
+                    .is_err()
+            );
             replacement.close().await.unwrap();
         });
     }
@@ -2966,7 +3546,6 @@ mod tests {
                 run_id: None,
                 cancelling: false,
                 cancel: None,
-                _lease: None,
             }),
             ..Pending::default()
         }));
@@ -2988,7 +3567,6 @@ mod tests {
                 run_id: None,
                 cancelling: true,
                 cancel: None,
-                _lease: None,
             }),
             ..Pending::default()
         }));
@@ -3014,7 +3592,6 @@ mod tests {
                 run_id: None,
                 cancelling: false,
                 cancel: None,
-                _lease: None,
             }),
             ..Pending::default()
         }));
@@ -3024,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_prompt_holds_coordinator_lease_until_terminal() {
+    fn primary_prompt_retains_pending_operation_until_terminal() {
         smol::block_on(async {
             let (mut srv, _, _, input_rx) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.id();
@@ -3046,26 +3623,11 @@ mod tests {
             .unwrap();
             assert!(input_rx.try_recv().is_ok());
 
-            // The lease guards history, so history replacement is what it
-            // holds off. An option change is served while the prompt runs and
-            // would not observe the lease at all.
-            let (done_tx, done_rx) = flume::bounded(1);
-            let queued = coordinator.clone();
-            smol::spawn(async move {
-                let result = queued
-                    .replace_history(vec![maki_providers::Message::user("late".into())])
-                    .await;
-                let _ = done_tx.send(result);
-            })
-            .detach();
-            assert!(done_rx.try_recv().is_err());
-
             let pending = &srv.session.as_ref().unwrap().pending;
+            assert!(pending.lock().unwrap().operation.is_some());
             let operation = take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
             assert_eq!(operation, request_id);
-            drop(operation);
-            done_rx.recv_async().await.unwrap().unwrap();
-            assert_eq!(coordinator.read().history().len(), 1);
+            assert!(take_active_operation(pending, OperationKind::PrimaryTurn).is_none());
             coordinator.close().await.unwrap();
         });
     }
@@ -3467,7 +4029,6 @@ mod tests {
             run_id: None,
             cancelling: false,
             cancel: None,
-            _lease: None,
         });
         drop(pending);
         handle_notification(
@@ -3506,7 +4067,6 @@ mod tests {
             run_id: None,
             cancelling: false,
             cancel: None,
-            _lease: None,
         });
         drop(pending);
 
@@ -3925,12 +4485,20 @@ mod tests {
             )
             .await
             .unwrap();
-            let first = input_rx.recv_async().await.unwrap();
+            let _first = input_rx.recv_async().await.unwrap();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
             let checkpoint_task = smol::spawn(async move {
-                first
-                    .lease_committer
-                    .unwrap()
-                    .commit_history(vec![Message::user("first".into())])
+                coordinator
+                    .persist_history(maki_agent::agent::HistorySnapshot::new(vec![
+                        Message::user("first".into()),
+                    ]))
                     .await
                     .unwrap();
                 event_tx
@@ -4081,7 +4649,6 @@ mod tests {
                 run_id: None,
                 cancelling: true,
                 cancel: None,
-                _lease: None,
             }),
             ..Default::default()
         }));
@@ -4205,7 +4772,6 @@ mod tests {
                     run_id: None,
                     cancelling: false,
                     cancel: None,
-                    _lease: None,
                 }),
                 ..Default::default()
             }));
@@ -4246,7 +4812,6 @@ mod tests {
                 run_id: None,
                 cancelling: false,
                 cancel: None,
-                _lease: None,
             });
             event_tx
                 .send_async(Envelope {
@@ -4408,63 +4973,84 @@ mod tests {
 
     #[test]
     fn event_pump_routes_subagent_permission_answer_to_subagent() {
+        let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
-            let (srv, root_answer_rx, out_rx, _) = server_awaiting_answer();
-            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
-            let (subagent_answer_tx, subagent_answer_rx) = flume::unbounded();
-            let session = srv.session.as_ref().unwrap();
-            session.pending.lock().unwrap().permissions.clear();
-            start_event_pump(
-                event_rx,
-                session.handle.session_id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(&session.pending),
-                false,
-                session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
-                session.coordinator.as_ref().unwrap().read(),
-                maki_storage::paths::home(),
-                PUMP_TRUSTED,
-                None,
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let (_host, received, root_answer_rx) =
+                managed_test_session(&mut srv, true, true, None, successful_checkpoint()).await;
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "permission root", false),
+                &RequestId::Number(93),
+            )
+            .await
+            .unwrap();
+            let request = smol::future::or(
+                async {
+                    loop {
+                        let message = out_rx.recv_async().await.unwrap();
+                        assert!(
+                            message.get("result").is_none() && message.get("error").is_none(),
+                            "early terminal: {message}"
+                        );
+                        if message["method"] == "session/request_permission" {
+                            return message;
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    panic!("managed child did not request permission");
+                },
+            )
+            .await;
+            assert_eq!(
+                request["params"]["toolCall"]["toolCallId"],
+                "acp_child_permission-1"
             );
-
-            event_tx
-                .send_async(subagent_activity(AgentEvent::TextDelta {
-                    text: "hidden".to_owned(),
-                }))
-                .await
-                .unwrap();
-            event_tx
-                .send_async(subagent_activity_with_answer(
-                    AgentEvent::PermissionRequest {
-                        id: "subagent-tool".to_owned(),
-                        tool: maki_config::ToolKey::native("bash"),
-                        scopes: vec!["true".to_owned()],
-                    },
-                    subagent_answer_tx,
-                ))
-                .await
-                .unwrap();
-
-            let request = out_rx.recv_async().await.unwrap();
-            assert_eq!(request["method"], "session/request_permission");
-            assert_eq!(request["params"]["toolCall"]["toolCallId"], "subagent-tool");
             let request_id = request["id"].as_i64().unwrap();
+            assert!(
+                !srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .is_empty()
+            );
             handle_incoming_response(&srv, &allow_once(request_id));
             assert_eq!(
-                subagent_answer_rx.recv_async().await.unwrap(),
-                TaggedAnswer::new("subagent-tool", PermissionAnswer::AllowOnce).encode()
+                prompt_terminal(&out_rx, 93).await["result"]["stopReason"],
+                "end_turn"
             );
             assert!(root_answer_rx.is_empty());
-
-            event_tx
-                .send_async(subagent_activity(AgentEvent::ControlComplete {
-                    usage: TokenUsage::default(),
-                }))
-                .await
-                .unwrap();
-            smol::future::yield_now().await;
-            assert!(out_rx.is_empty());
+            assert!(
+                received.try_iter().count() >= 5,
+                "child did not continue after the answer"
+            );
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .permissions
+                    .is_empty()
+            );
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .operation
+                    .is_none()
+            );
+            close_session(&mut srv).await;
         });
     }
 
@@ -4541,7 +5127,7 @@ mod tests {
         let registry = test_registry(&[]);
         let target = test_target(
             &registry,
-            flume::unbounded().0,
+            flume::unbounded().0.into(),
             Arc::new(maki_agent::command::SessionCommandState::new(
                 String::new(),
                 Arc::from([]),
@@ -4665,10 +5251,6 @@ mod tests {
         subagent_activity_with_optional_answer(event, None)
     }
 
-    fn subagent_activity_with_answer(event: AgentEvent, answer_tx: Sender<String>) -> Envelope {
-        subagent_activity_with_optional_answer(event, Some(answer_tx))
-    }
-
     fn subagent_activity_with_optional_answer(
         event: AgentEvent,
         answer_tx: Option<Sender<String>>,
@@ -4735,7 +5317,7 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
             let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
             install_registry(&mut srv, test_registry(&[]));
             let request_id = RequestId::Number(30);
 
@@ -4776,7 +5358,7 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
             install_registry(&mut srv, test_registry(&[]));
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
 
@@ -4823,7 +5405,7 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
             install_registry(&mut srv, test_registry(&[]));
 
             dispatch_prompt(&mut srv, "/compact", false, &RequestId::Number(32))
@@ -4856,7 +5438,7 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
             let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
             install_registry(&mut srv, test_registry(&[]));
             let request_id = RequestId::Number(31);
 
@@ -4913,7 +5495,7 @@ mod tests {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
             let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
-            let handle = spawn_session(
+            let (handle, _root_target) = spawn_session(
                 &AcpParams {
                     model: model.clone(),
                     config: Default::default(),
@@ -4963,10 +5545,20 @@ mod tests {
                 provider_ready,
                 "spawned session provider did not initialize"
             );
-            handle.model.install(
-                Arc::new(EndTurnProvider),
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
-            );
+            let actor = handle.initialized_root().await.unwrap().actor().unwrap();
+            let update = actor.reserve_config_update().unwrap();
+            update
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(EndTurnProvider),
+                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            update.wait().await.unwrap();
             let session = srv.session.as_mut().unwrap();
             let previous_handle = std::mem::replace(&mut session.handle, handle);
             previous_handle.task.cancel().await;
@@ -5049,88 +5641,55 @@ mod tests {
         });
     }
 
-    #[test_case(false; "protocol_option")]
-    #[test_case(true; "host_root_option")]
-    fn acp_immediate_prompt_and_option_change(use_host_root: bool) {
-        const SPEC: &str = "anthropic/claude-opus-4-8";
-        const FIRST: &str = "initial provider";
-        const SECOND: &str = "replacement provider";
+    #[test_case(false, false; "protocol_option")]
+    #[test_case(true, false; "host_root_option")]
+    #[test_case(false, true; "nested_task")]
+    fn acp_immediate_prompt_and_option_change(use_host_root: bool, nested: bool) {
+        let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (requests, received) = flume::unbounded();
-            let (release, ready) = flume::bounded(1);
-            let session = srv.session.as_mut().unwrap();
-            let id = session.handle.session_id.clone();
-            session.coordinator.take().unwrap().close().await.unwrap();
-            session.coordinator = Some(test_coordinator_with(
-                id.id(),
-                SPEC,
-                PathBuf::from("/tmp"),
-                Default::default(),
-                successful_checkpoint(),
-            ));
-            let first_requests = requests.clone();
-            let handle = headless::spawn_interactive_with_preparation(
-                InteractiveParams {
-                    model: Model::from_spec(SPEC).unwrap(),
-                    config: Default::default(),
-                    permissions_config: Default::default(),
-                    timeouts: Default::default(),
-                    prompt_slots: Arc::default(),
-                    excluded_tools: Vec::new(),
-                    mcp_handle: None,
-                    initial_wd: PathBuf::from("/tmp"),
-                    session_id: Some(id.clone()),
-                    initial_history: Vec::new(),
-                    yolo: false,
-                    system_prompt_override: Some(String::new()),
-                    append_system_prompt: None,
-                    defaults: Default::default(),
-                    model_policy: Arc::default(),
-                    modes: Arc::default(),
-                    question_mode: QuestionMode::Headless,
-                    plugin_rules: Arc::default(),
-                    project_config: ProjectConfig::for_project(Path::new("/tmp")),
-                    local_tools: Default::default(),
-                    state_dir: None,
-                },
-                Box::new(move |model, _| {
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let checkpoint = Arc::new(
+                move |request: maki_storage::checkpoint::CheckpointRequest<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >| {
+                    let started = started_tx.clone();
+                    let release = release_rx.clone();
                     Box::pin(async move {
-                        ready.recv_async().await.unwrap();
-                        let provider: Arc<dyn maki_providers::provider::Provider> =
-                            Arc::new(RecordingAcpProvider {
-                                name: FIRST,
-                                requests: first_requests,
-                            });
-                        Ok((model, provider))
-                    })
-                }),
+                        if request.snapshot.history.is_some() {
+                            started.send_async(()).await.unwrap();
+                            release.recv_async().await.unwrap();
+                        }
+                        Ok(maki_storage::checkpoint::CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
             );
-            let previous = std::mem::replace(&mut session.handle, handle);
-            previous.task.cancel().await;
-            let host_root = Arc::new(HostRootServices::coordinated(
-                session.handle.agent_id,
-                session.coordinator.as_ref().unwrap().clone(),
-                Arc::new(ModelPolicy::default()),
-            ));
-            session._host_root_retirement = host_root.retirement_guard();
-            session.host_root = host_root;
+            let (child_started_tx, child_started_rx) = flume::bounded(1);
+            let (child_release_tx, child_release_rx) = flume::bounded(1);
+            let completion: TurnCompletion = Arc::new(move |target, history| {
+                let child = target.snapshot().unwrap().depth == 1;
+                let started = child_started_tx.clone();
+                let release = child_release_rx.clone();
+                Box::pin(async move {
+                    if child {
+                        assert!(history.messages.iter().flat_map(|message| &message.content)
+                            .any(|block| matches!(block, MsgBlock::Text { text } if text == "child result")));
+                        started.send_async(()).await.unwrap();
+                        release.recv_async().await.unwrap();
+                    }
+                    Ok(())
+                })
+            });
+            let (_host, received, _) =
+                managed_test_session(&mut srv, nested, false, Some(completion), checkpoint).await;
+            let session = srv.session.as_ref().unwrap();
+            let session_id = session.handle.session_id.to_string();
+            let manager = session.handle.manager.clone();
             let reference = session.host_root.reference();
-            assert_eq!(reference.id(), session.handle.agent_id);
-            start_event_pump(
-                session.handle.event_rx.clone(),
-                id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(&session.pending),
-                false,
-                session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
-                session.coordinator.as_ref().unwrap().read(),
-                None,
-                PUMP_TRUSTED,
-                None,
-            );
-            let session_id = id.to_string();
             handle_prompt(
                 &mut srv,
                 &prompt_request(&session_id, "immediate", false),
@@ -5138,57 +5697,145 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(received.is_empty());
-            release.send(()).unwrap();
-            loop {
-                let response = smol::future::or(async { out_rx.recv_async().await.ok() }, async {
-                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
-                    None
-                })
-                .await
-                .expect("immediate ACP prompt did not complete");
-                if response["id"] == 91 {
-                    assert!(response.get("error").is_none(), "{response}");
-                    break;
-                }
+            if nested {
+                smol::future::or(
+                    async {
+                        child_started_rx.recv_async().await.unwrap();
+                    },
+                    async {
+                        smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                        panic!("ACP child completion policy did not start");
+                    },
+                )
+                .await;
+                assert_eq!(
+                    received.len(),
+                    6,
+                    "root observed child result before completion policy"
+                );
+                assert!(
+                    started_rx.is_empty(),
+                    "task_wait observed the child before completion policy"
+                );
+                assert!(out_rx.try_iter().all(
+                    |message| message.get("result").is_none() && message.get("error").is_none()
+                ));
+                child_release_tx.send_async(()).await.unwrap();
             }
-            assert_eq!(received.try_recv().unwrap(), (FIRST, SPEC.into(), false));
+            smol::future::or(
+                async {
+                    started_rx.recv_async().await.unwrap();
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    panic!("ACP terminal checkpoint did not start");
+                },
+            )
+            .await;
+            let before = out_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                before.iter().all(
+                    |message| message.get("result").is_none() && message.get("error").is_none()
+                ),
+                "terminal before persistence: {before:?}"
+            );
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .operation
+                    .is_some()
+            );
+            if nested {
+                let graph = manager.snapshot();
+                assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
+                assert_eq!(graph.len(), 3, "{graph:?}");
+                let root = graph.iter().find(|node| node.parent_id.is_none()).unwrap();
+                let child = graph
+                    .iter()
+                    .find(|node| node.parent_id == Some(root.agent_id))
+                    .unwrap();
+                assert!(
+                    graph
+                        .iter()
+                        .any(|node| node.parent_id == Some(child.agent_id))
+                );
+            }
+            release_tx.send_async(()).await.unwrap();
+            assert_eq!(
+                prompt_terminal(&out_rx, 91).await["result"]["stopReason"],
+                "end_turn"
+            );
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .operation
+                    .is_none()
+            );
+            let recorded = received.try_iter().collect::<Vec<_>>();
+            assert!(!recorded.is_empty());
+            assert!(
+                recorded
+                    .iter()
+                    .all(|(_, spec, fast)| spec == FAST_SPEC && !fast)
+            );
+            let option_version = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .read()
+                .options()
+                .version;
             if use_host_root {
                 let root = &srv.session.as_ref().unwrap().host_root;
                 assert!(matches!(
                     root.unsupported(&reference),
                     Err(maki_lua::host_root::HostRootError::UnsupportedOperation)
                 ));
-                let selection = root
-                    .set_model(
-                        &reference,
-                        maki_providers::ModelSelection {
-                            fast: Some(true),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
-                assert!(selection.fast);
-                assert_eq!(selection.spec.as_ref(), SPEC);
+                let changed = _host.event_handle().run_command_for_test(
+                    Arc::from("acp_options"),
+                    Arc::from("/acp_fast"),
+                    String::new(),
+                    0,
+                );
+                changed.recv_async().await.unwrap().unwrap();
             } else {
-                handle_set_config(
-                    &mut srv,
-                    &serde_json::json!({ "params": {
-                        "sessionId": session_id,
-                        "configId": maki_agent::session_options::FAST_OPTION_ID,
-                        "value": maki_agent::session_options::ENABLED_VALUE,
-                    }}),
-                )
-                .await
-                .unwrap();
+                handle_set_config(&mut srv, &serde_json::json!({ "params": {
+                    "sessionId": session_id, "configId": maki_agent::session_options::FAST_OPTION_ID,
+                    "value": maki_agent::session_options::ENABLED_VALUE,
+                }})).await.unwrap();
             }
-            srv.session.as_ref().unwrap().handle.model.install(
-                Arc::new(RecordingAcpProvider {
-                    name: SECOND,
-                    requests,
-                }),
-                Model::from_spec(SPEC).unwrap(),
+            let session = srv.session.as_ref().unwrap();
+            assert!(
+                session
+                    .coordinator
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .options()
+                    .version
+                    > option_version
+            );
+            assert!(
+                session
+                    .handle
+                    .initialized_root()
+                    .await
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .unwrap()
+                    .fast
             );
             handle_prompt(
                 &mut srv,
@@ -5197,26 +5844,33 @@ mod tests {
             )
             .await
             .unwrap();
-            loop {
-                let response = smol::future::or(async { out_rx.recv_async().await.ok() }, async {
-                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
-                    None
-                })
-                .await
-                .expect("ACP prompt after option change did not complete");
-                if response["id"] == 92 {
-                    assert!(response.get("error").is_none(), "{response}");
-                    break;
-                }
-            }
-            assert_eq!(received.try_recv().unwrap(), (SECOND, SPEC.into(), true));
-            assert!(received.is_empty());
+            started_rx.recv_async().await.unwrap();
+            release_tx.send_async(()).await.unwrap();
+            assert_eq!(
+                prompt_terminal(&out_rx, 92).await["result"]["stopReason"],
+                "end_turn"
+            );
+            assert!(
+                received
+                    .try_iter()
+                    .all(|(_, spec, fast)| spec == FAST_SPEC && fast)
+            );
+            assert!(
+                out_rx.try_iter().all(
+                    |message| message.get("result").is_none() && message.get("error").is_none()
+                )
+            );
             let root = Arc::clone(&srv.session.as_ref().unwrap().host_root);
             close_session(&mut srv).await;
             assert!(matches!(
                 root.model(&reference),
                 Err(maki_lua::host_root::HostRootError::Stale)
             ));
+            assert!(manager.snapshot().iter().all(|node| matches!(
+                node.graph_lifecycle,
+                maki_agent::manager::GraphLifecycle::Closed
+                    | maki_agent::manager::GraphLifecycle::Removed
+            )));
         });
     }
 
@@ -5246,6 +5900,37 @@ mod tests {
             assert_eq!(new_response["id"], 82);
             let session = srv.session.as_ref().unwrap();
             let session_id = session.handle.session_id.to_string();
+            let next_cwd = TempDir::new().unwrap();
+            let old_scope = temp
+                .path()
+                .join("before.txt")
+                .to_string_lossy()
+                .into_owned();
+            let next_scope = next_cwd
+                .path()
+                .join("after.txt")
+                .to_string_lossy()
+                .into_owned();
+            let write = maki_config::ToolKey::Native(Arc::from("write"));
+            assert!(matches!(
+                session.handle.permissions.check(&write, &old_scope, None),
+                maki_agent::permissions::PermissionCheck::Allowed
+            ));
+            session
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .change_directory(next_cwd.path().to_path_buf())
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.handle.permissions.check(&write, &old_scope, None),
+                maki_agent::permissions::PermissionCheck::NeedsPrompt { .. }
+            ));
+            assert!(matches!(
+                session.handle.permissions.check(&write, &next_scope, None),
+                maki_agent::permissions::PermissionCheck::Allowed
+            ));
             handle_request(
                 &mut srv,
                 "session/prompt",
@@ -5383,10 +6068,29 @@ mod tests {
                 "new session provider did not initialize; {}",
                 lifecycle_state(&srv)
             );
-            srv.session.as_ref().unwrap().handle.model.install(
-                Arc::new(EndTurnProvider),
-                Model::from_spec(OFFLINE_SPEC).unwrap(),
-            );
+            let actor = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .handle
+                .initialized_root()
+                .await
+                .unwrap()
+                .actor()
+                .unwrap();
+            let update = actor.reserve_config_update().unwrap();
+            update
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(EndTurnProvider),
+                            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            update.wait().await.unwrap();
 
             let prompt_result = handle_prompt(
                 &mut srv,
@@ -5486,7 +6190,7 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
             let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
             install_registry(&mut srv, test_registry(&[]));
             let target = &srv.session.as_ref().unwrap().command_target;
             let presented = srv

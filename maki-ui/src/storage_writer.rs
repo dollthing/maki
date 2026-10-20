@@ -13,18 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use maki_storage::checkpoint::{
-    CheckpointAck, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
-    CheckpointVersion, CheckpointWriter,
+    CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
+    CheckpointRequest, CheckpointVersion, CheckpointWriter,
 };
 use maki_storage::id::MakiId;
 use maki_storage::session_lock::SessionPublicationGuard;
 use maki_storage::sessions::{
-    HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError, SessionLog,
+    HistoryDestination, HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError, SessionLog,
 };
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
-use maki_agent::session_coordinator::SessionCheckpoint;
+use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
     YOLO_OPTION_ID,
@@ -39,7 +40,12 @@ use maki_providers::Message;
 pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
-const CHECKPOINT_CANCELLED: &str = "child approval checkpoint cancelled";
+const CHECKPOINT_CANCELLED: &str = "session checkpoint cancelled";
+const HISTORY_MISSING_SNAPSHOT: &str = "history checkpoint requires an exact snapshot";
+const HISTORY_MISSING_REVISION: &str = "history checkpoint requires an exact revision";
+const SELECTED_CONFIG_DESTINATION: &str =
+    "selected config requires its child checkpoint destination";
+const SELECTED_CONFIG_MISSING: &str = "selected child config requires existing stored metadata";
 #[cfg(not(test))]
 const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
     Duration::from_millis(100),
@@ -68,26 +74,36 @@ struct PendingState {
     /// Latest authoritative state from the app or a successful coordinator
     /// checkpoint. It may still be newer than durable storage.
     latest: HashMap<MakiId, Arc<AppSession>>,
+    acknowledged: HashMap<MakiId, Arc<AppSession>>,
     latest_generations: HashMap<MakiId, u64>,
     coordinator_pending: HashMap<MakiId, CoordinatorPending>,
     coordinator_history_bases: HashMap<MakiId, HistoryIdentity>,
     config_versions: HashMap<MakiId, (u64, u64)>,
+    history_versions: HashMap<MakiId, HashMap<Option<String>, (u64, u64)>>,
     live_children: HashMap<MakiId, Vec<String>>,
     next_generation: u64,
-    child_approvals: Vec<ChildApprovalSave>,
-    child_publications: HashMap<MakiId, Vec<CheckpointPublication>>,
+    staged_checkpoints: Vec<StagedCheckpointSave>,
+    publications: HashMap<MakiId, Vec<CheckpointPublication>>,
     incarnations: HashMap<MakiId, Arc<()>>,
     #[cfg(test)]
     child_stage_gate: Option<(flume::Sender<()>, flume::Receiver<()>)>,
 }
 
-struct ChildApprovalSave {
-    session_id: MakiId,
-    child_key: String,
-    history: HistorySnapshot<Message>,
-    publication: CheckpointPublication,
-    guard: SessionPublicationGuard,
+pub struct StagedSessionCheckpoint {
+    pub session_id: MakiId,
+    pub checkpoint: Option<Arc<SessionCheckpoint>>,
+    pub selected_config: Option<(HistoryDestination, Arc<EffectiveAgentConfig>)>,
+    pub history: Option<(HistoryDestination, HistorySnapshot<Message>)>,
+    pub publication: CheckpointPublication,
+    pub claim: CheckpointClaim,
+    pub guard: SessionPublicationGuard,
+}
+
+struct StagedCheckpointSave {
+    request: StagedSessionCheckpoint,
     incarnation: Arc<()>,
+    config_version: Option<(u64, u64)>,
+    history_version: Option<(u64, u64)>,
     reply: flume::Sender<Result<(), String>>,
 }
 
@@ -124,7 +140,7 @@ struct PendingSave {
 }
 
 enum RequiredHistory {
-    Root(Arc<Vec<Message>>),
+    Root(HistorySnapshot<Message>, Option<u64>),
     Child {
         key: String,
         history: HistorySnapshot<Message>,
@@ -134,7 +150,12 @@ enum RequiredHistory {
 impl RequiredHistory {
     fn retained_by(&self, session: &AppSession) -> bool {
         match self {
-            Self::Root(messages) => Arc::ptr_eq(messages, &session.history_snapshot().messages),
+            Self::Root(history, _) => {
+                let saved = session.history_snapshot();
+                saved.epoch == history.epoch
+                    && saved.compacted == history.compacted
+                    && Arc::ptr_eq(&history.messages, &saved.messages)
+            }
             Self::Child { key, history } => {
                 session.subagent_history_snapshot(key).is_some_and(|saved| {
                     saved.epoch == history.epoch && Arc::ptr_eq(&saved.messages, &history.messages)
@@ -152,7 +173,7 @@ struct CheckpointWaiter {
 }
 
 fn required_histories(session: &AppSession) -> Vec<RequiredHistory> {
-    let mut histories = vec![RequiredHistory::Root(session.history_snapshot().messages)];
+    let mut histories = vec![RequiredHistory::Root(session.history_snapshot(), None)];
     histories.extend(session.subagent_messages().keys().filter_map(|key| {
         session
             .subagent_history_snapshot(key)
@@ -180,6 +201,7 @@ pub struct StorageWriter {
 struct CoordinatorCheckpointWriter {
     pending: Pending,
     wake: flume::Sender<()>,
+    publication: Option<(SessionPublicationGuard, HistoryDestination)>,
 }
 
 impl CheckpointWriter<AppSession> for StorageWriter {
@@ -189,6 +211,61 @@ impl CheckpointWriter<AppSession> for StorageWriter {
 }
 
 impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
+    fn checkpoint_guarded(
+        &self,
+        request: CheckpointRequest<SessionCheckpoint>,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> CheckpointFuture {
+        let session_id = request.session_id;
+        let version = request.version;
+        let Some((guard, destination)) = &self.publication else {
+            return Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from("checkpoint writer has no session publication guard"),
+                })
+            });
+        };
+        let mut checkpoint = request.snapshot.as_ref().clone();
+        let history = checkpoint
+            .history
+            .take()
+            .filter(|_| checkpoint.kind != SessionCheckpointKind::Options)
+            .map(|history| (destination.clone(), history));
+        let response = enqueue_staged_checkpoint(
+            &self.pending,
+            &self.wake,
+            StagedSessionCheckpoint {
+                session_id,
+                checkpoint: Some(Arc::new(checkpoint)),
+                selected_config: None,
+                history,
+                publication,
+                claim,
+                guard: guard.clone(),
+            },
+        );
+        Box::pin(async move {
+            let response = response.map_err(|message| CheckpointError::Save {
+                session_id,
+                message: Arc::from(message),
+            })?;
+            response
+                .recv_async()
+                .await
+                .map_err(|_| CheckpointError::Closed(session_id))?
+                .map_err(|message| CheckpointError::Save {
+                    session_id,
+                    message: Arc::from(message),
+                })?;
+            Ok(CheckpointAck {
+                session_id,
+                version,
+            })
+        })
+    }
+
     fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
         let session_id = request.session_id;
         let version = request.version;
@@ -196,11 +273,36 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         if state.closed {
             return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
         }
-        let config_version = request
-            .snapshot
-            .config
-            .as_ref()
+        if let Err(message) =
+            validate_checkpoint_history(&request.snapshot, request.snapshot.history.is_some())
+        {
+            return Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from(message),
+                })
+            });
+        }
+        let config_version = (request.snapshot.kind == SessionCheckpointKind::Config)
+            .then_some(request.snapshot.config.as_ref())
+            .flatten()
             .map(|config| (config.runtime_epoch, config.generation));
+        if request.snapshot.kind != SessionCheckpointKind::Options
+            && let Some(history) = &request.snapshot.history
+            && let Some(revision) = request.snapshot.history_revision
+        {
+            let incoming = (history.epoch, revision);
+            if history_version(&state, session_id, &HistoryDestination::Main)
+                .is_some_and(|current| incoming < current)
+            {
+                return Box::pin(async move {
+                    Err(CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(CHECKPOINT_REPLACED),
+                    })
+                });
+            }
+        }
         if config_version.is_some_and(|incoming| {
             state
                 .config_versions
@@ -231,20 +333,25 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                     })
                 });
             };
-        if history_base.is_none() && request.snapshot.history.is_some() {
+        if history_base.is_none()
+            && request.snapshot.kind != SessionCheckpointKind::Options
+            && request.snapshot.history.is_some()
+        {
             history_base = Some(base.history_identity());
         }
-        let live_ids = state.live_children.get(&session_id).map(Vec::as_slice);
-        let mut merged = merge_checkpoint(&base, &request.snapshot, live_ids);
-        if config_version.is_none() && state.config_versions.contains_key(&session_id) {
-            merged.set_model(base.model.clone());
-            merged.meta.fast = base.meta.fast;
-            merged.meta.workflow = base.meta.workflow;
-            merged.meta.thinking = base.meta.thinking;
-            merged.meta.mode = base.meta.mode.clone();
-            merged.meta.plan_path = base.meta.plan_path.clone();
+        if request.snapshot.kind != SessionCheckpointKind::Options
+            && let Some(history) = &request.snapshot.history
+            && let Some(revision) = request.snapshot.history_revision
+        {
+            set_history_version(
+                &mut state,
+                session_id,
+                &HistoryDestination::Main,
+                (history.epoch, revision),
+            );
         }
-        let merged = Arc::new(merged);
+        let live_ids = state.live_children.get(&session_id).map(Vec::as_slice);
+        let merged = Arc::new(merge_checkpoint(&base, &request.snapshot, live_ids));
         let generation = next_generation(&mut state);
         state.latest_generations.insert(session_id, generation);
         if let Some(config_version) = config_version {
@@ -284,7 +391,10 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
             .snapshot
             .history
             .as_ref()
-            .map(|messages| RequiredHistory::Root(Arc::clone(messages)))
+            .filter(|_| request.snapshot.kind != SessionCheckpointKind::Options)
+            .map(|history| {
+                RequiredHistory::Root(history.clone(), request.snapshot.history_revision)
+            })
             .into_iter()
             .collect();
         enqueue_locked(
@@ -378,7 +488,7 @@ impl StorageWriter {
         {
             return;
         }
-        cancel_child_publications(&mut state, id);
+        cancel_publications(&mut state, id);
         state.config_versions.insert(id, (runtime_epoch, 0));
         state.coordinator_pending.remove(&id);
         let generation = next_generation(&mut state);
@@ -399,8 +509,9 @@ impl StorageWriter {
     pub fn seed(&self, session: Arc<AppSession>) {
         let id = session.id;
         let mut state = lock(&self.pending);
-        cancel_child_publications(&mut state, id);
+        cancel_publications(&mut state, id);
         let generation = next_generation(&mut state);
+        state.acknowledged.insert(id, Arc::clone(&session));
         state.latest.insert(id, session);
         state.latest_generations.insert(id, generation);
     }
@@ -579,38 +690,8 @@ impl StorageWriter {
         })
     }
 
-    pub async fn checkpoint_child_approval(
-        &self,
-        session_id: MakiId,
-        child_key: String,
-        history: HistorySnapshot<Message>,
-        publication: CheckpointPublication,
-        guard: SessionPublicationGuard,
-    ) -> Result<(), String> {
-        let (reply, response) = flume::bounded(1);
-        {
-            let mut state = lock(&self.pending);
-            if state.closed {
-                return Err(CheckpointError::Closed(session_id).to_string());
-            }
-            let incarnation = Arc::clone(state.incarnations.entry(session_id).or_default());
-            state
-                .child_publications
-                .entry(session_id)
-                .or_default()
-                .push(publication.clone());
-            state.child_approvals.push(ChildApprovalSave {
-                session_id,
-                child_key,
-                history,
-                publication,
-                guard,
-                incarnation,
-                reply,
-            });
-        }
-        self.wake.send(()).map_err(|error| error.to_string())?;
-        response
+    pub async fn checkpoint_staged(&self, request: StagedSessionCheckpoint) -> Result<(), String> {
+        enqueue_staged_checkpoint(&self.pending, &self.wake, request)?
             .recv_async()
             .await
             .map_err(|error| error.to_string())?
@@ -620,6 +701,19 @@ impl StorageWriter {
         Arc::new(CoordinatorCheckpointWriter {
             pending: Arc::clone(&self.pending),
             wake: self.wake.clone(),
+            publication: None,
+        })
+    }
+
+    pub fn coordinator_checkpoint_guarded(
+        &self,
+        guard: SessionPublicationGuard,
+        destination: HistoryDestination,
+    ) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
+        Arc::new(CoordinatorCheckpointWriter {
+            pending: Arc::clone(&self.pending),
+            wake: self.wake.clone(),
+            publication: Some((guard, destination)),
         })
     }
 
@@ -656,7 +750,20 @@ impl StorageWriter {
                 })
                 .unwrap_or(request.snapshot)
         } else {
-            request.snapshot
+            let mut snapshot = request.snapshot;
+            if let Some(latest) = state.latest.get(&session_id) {
+                preserve_newer_child_histories(&mut snapshot, latest);
+                preserve_child_config(&mut snapshot, latest);
+                if snapshot.history_snapshot().epoch < latest.history_snapshot().epoch {
+                    let session = Arc::make_mut(&mut snapshot);
+                    session.adopt_history(&latest.history_snapshot());
+                    prune_main_history(
+                        session,
+                        state.live_children.get(&session_id).map(Vec::as_slice),
+                    );
+                }
+            }
+            snapshot
         };
         state.latest.insert(session_id, Arc::clone(&snapshot));
         state.latest_generations.insert(session_id, generation);
@@ -694,8 +801,9 @@ impl StorageWriter {
     /// leave one behind every time.
     pub fn forget(&self, id: MakiId) {
         let mut state = lock(&self.pending);
-        cancel_child_publications(&mut state, id);
+        cancel_publications(&mut state, id);
         state.latest.remove(&id);
+        state.acknowledged.remove(&id);
         state.latest_generations.remove(&id);
         state.coordinator_pending.remove(&id);
         state.coordinator_history_bases.remove(&id);
@@ -745,9 +853,10 @@ impl StorageWriter {
             done(Err(writer_gone()));
             return;
         }
-        cancel_child_publications(&mut state, id);
+        cancel_publications(&mut state, id);
         if forget_snapshot {
             state.latest.remove(&id);
+            state.acknowledged.remove(&id);
             state.latest_generations.remove(&id);
             state.coordinator_pending.remove(&id);
             state.coordinator_history_bases.remove(&id);
@@ -790,7 +899,7 @@ impl StorageWriter {
         {
             let mut state = lock(&self.pending);
             state.closed = true;
-            for publications in state.child_publications.values() {
+            for publications in state.publications.values() {
                 for publication in publications {
                     publication.cancel();
                 }
@@ -805,13 +914,141 @@ impl StorageWriter {
     }
 }
 
+fn validate_checkpoint_history(
+    checkpoint: &SessionCheckpoint,
+    has_history: bool,
+) -> Result<(), &'static str> {
+    if checkpoint.kind == SessionCheckpointKind::Options {
+        return Ok(());
+    }
+    if checkpoint.kind == SessionCheckpointKind::History && !has_history {
+        return Err(HISTORY_MISSING_SNAPSHOT);
+    }
+    if has_history && checkpoint.history_revision.is_none() {
+        return Err(HISTORY_MISSING_REVISION);
+    }
+    Ok(())
+}
+
+fn history_version(
+    state: &PendingState,
+    id: MakiId,
+    destination: &HistoryDestination,
+) -> Option<(u64, u64)> {
+    let versions = state.history_versions.get(&id)?;
+    match destination {
+        HistoryDestination::Main => versions.get(&None),
+        HistoryDestination::Child(key) => versions.get(&Some(key.clone())),
+    }
+    .copied()
+}
+
+fn set_history_version(
+    state: &mut PendingState,
+    id: MakiId,
+    destination: &HistoryDestination,
+    version: (u64, u64),
+) {
+    let key = match destination {
+        HistoryDestination::Main => None,
+        HistoryDestination::Child(key) => Some(key.clone()),
+    };
+    state
+        .history_versions
+        .entry(id)
+        .or_default()
+        .entry(key)
+        .and_modify(|current| *current = (*current).max(version))
+        .or_insert(version);
+}
+
+fn enqueue_staged_checkpoint(
+    pending: &Pending,
+    wake: &flume::Sender<()>,
+    request: StagedSessionCheckpoint,
+) -> Result<flume::Receiver<Result<(), String>>, String> {
+    let session_id = request.session_id;
+    let (reply, response) = flume::bounded(1);
+    {
+        let mut state = lock(pending);
+        if state.closed {
+            return Err(CheckpointError::Closed(session_id).to_string());
+        }
+        if request
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.history.is_some())
+        {
+            return Err("staged history requires a destination and exact snapshot".into());
+        }
+        if let Some(checkpoint) = &request.checkpoint {
+            validate_checkpoint_history(checkpoint, request.history.is_some())
+                .map_err(str::to_owned)?;
+        }
+        if let Some((destination, _)) = &request.selected_config
+            && (!matches!(destination, HistoryDestination::Child(_))
+                || request
+                    .history
+                    .as_ref()
+                    .is_some_and(|(history_destination, _)| history_destination != destination)
+                || request
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.kind != SessionCheckpointKind::History))
+        {
+            return Err(SELECTED_CONFIG_DESTINATION.into());
+        }
+        let config_version = state.config_versions.get(&session_id).copied();
+        if request
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.kind == SessionCheckpointKind::Config)
+            .and_then(|checkpoint| checkpoint.config.as_ref())
+            .is_some_and(|config| {
+                config_version
+                    .is_some_and(|current| (config.runtime_epoch, config.generation) < current)
+            })
+        {
+            return Err(CHECKPOINT_REPLACED.into());
+        }
+        let incoming_history_version =
+            request.history.as_ref().and_then(|(destination, history)| {
+                let revision = request.checkpoint.as_ref()?.history_revision?;
+                Some((destination, (history.epoch, revision)))
+            });
+        if incoming_history_version.is_some_and(|(destination, incoming)| {
+            history_version(&state, session_id, destination)
+                .is_some_and(|current| incoming < current)
+        }) {
+            return Err(CHECKPOINT_REPLACED.into());
+        }
+        let history_version = incoming_history_version.map(|(_, version)| version);
+        let incarnation = Arc::clone(state.incarnations.entry(session_id).or_default());
+        state
+            .publications
+            .entry(session_id)
+            .or_default()
+            .push(request.publication.clone());
+        state.staged_checkpoints.push(StagedCheckpointSave {
+            request,
+            incarnation,
+            config_version,
+            history_version,
+            reply,
+        });
+    }
+    wake.send(()).map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
 fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, PendingState> {
     pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn cancel_child_publications(state: &mut PendingState, id: MakiId) {
+fn cancel_publications(state: &mut PendingState, id: MakiId) {
+    state.history_versions.remove(&id);
     state.incarnations.insert(id, Arc::new(()));
-    if let Some(publications) = state.child_publications.remove(&id) {
+    if let Some(publications) = state.publications.remove(&id) {
         for publication in publications {
             publication.cancel();
         }
@@ -847,6 +1084,9 @@ fn wake_checkpoint(pending: &Pending, wake: &flume::Sender<()>, id: MakiId) {
 }
 
 fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
+    lock(pending)
+        .acknowledged
+        .insert(id, Arc::clone(&save.session));
     let Some(generation) = save.coordinator_generation else {
         return;
     };
@@ -990,7 +1230,11 @@ fn preserve_newer_child_histories(incoming: &mut Arc<AppSession>, latest: &AppSe
         };
         if incoming
             .subagent_history_snapshot(key)
-            .is_none_or(|incoming| incoming.epoch < history.epoch)
+            .is_none_or(|incoming| {
+                incoming.epoch < history.epoch
+                    || (incoming.epoch == history.epoch
+                        && incoming.messages.len() < history.messages.len())
+            })
         {
             let incoming = Arc::make_mut(incoming);
             incoming.adopt_subagent_history(key.clone(), &history);
@@ -999,12 +1243,96 @@ fn preserve_newer_child_histories(incoming: &mut Arc<AppSession>, latest: &AppSe
     }
 }
 
-fn promote_child_approval(session: &mut Arc<AppSession>, approval: &ChildApprovalSave) {
-    let current = session.subagent_history_snapshot(&approval.child_key);
-    if current.is_none_or(|history| history.epoch <= approval.history.epoch) {
+fn adopt_checkpoint_history(
+    session: &mut AppSession,
+    destination: &HistoryDestination,
+    history: &HistorySnapshot<Message>,
+    live_ids: Option<&[String]>,
+) -> bool {
+    match destination {
+        HistoryDestination::Main => {
+            if session.history_snapshot().epoch > history.epoch {
+                return false;
+            }
+            session.adopt_history(history);
+            prune_main_history(session, live_ids);
+        }
+        HistoryDestination::Child(key) => {
+            if !session.adopt_subagent_history(key.clone(), history) {
+                return false;
+            }
+            session.prune_posts(Some(key), history.messages.len());
+        }
+    }
+    true
+}
+
+fn project_selected_config(
+    session: &mut AppSession,
+    destination: &HistoryDestination,
+    config: &EffectiveAgentConfig,
+) -> bool {
+    let HistoryDestination::Child(key) = destination else {
+        return false;
+    };
+    let mut subagents = session.subagents().to_vec();
+    let Some(child) = subagents.iter_mut().find(|child| &child.tool_use_id == key) else {
+        return false;
+    };
+    child.model = Some(config.model.id.clone());
+    child.thinking = Some(config.thinking.into());
+    child.fast = config.fast;
+    session.set_subagents(subagents);
+    true
+}
+
+fn preserve_child_config(incoming: &mut Arc<AppSession>, latest: &AppSession) {
+    let mut subagents = incoming.subagents().to_vec();
+    for current in latest.subagents() {
+        if let Some(child) = subagents
+            .iter_mut()
+            .find(|child| child.tool_use_id == current.tool_use_id)
+        {
+            child.model.clone_from(&current.model);
+            child.thinking = current.thinking;
+            child.fast = current.fast;
+        } else if incoming
+            .subagent_messages()
+            .contains_key(&current.tool_use_id)
+        {
+            subagents.push(current.clone());
+        }
+    }
+    if subagents != incoming.subagents() {
+        Arc::make_mut(incoming).set_subagents(subagents);
+    }
+}
+
+fn promote_staged_checkpoint(
+    session: &mut Arc<AppSession>,
+    request: &StagedSessionCheckpoint,
+    published: &AppSession,
+    live_ids: Option<&[String]>,
+) {
+    if let Some(checkpoint) = &request.checkpoint {
+        *session = Arc::new(merge_checkpoint(session, checkpoint, live_ids));
+    }
+    if let Some((destination, history)) = &request.history {
+        adopt_checkpoint_history(Arc::make_mut(session), destination, history, live_ids);
+    }
+    if let Some((destination, config)) = &request.selected_config {
         let session = Arc::make_mut(session);
-        session.adopt_subagent_history(approval.child_key.clone(), &approval.history);
-        session.prune_posts(Some(&approval.child_key), approval.history.messages.len());
+        if !project_selected_config(session, destination, config)
+            && let HistoryDestination::Child(key) = destination
+            && let Some(child) = published
+                .subagents()
+                .iter()
+                .find(|child| &child.tool_use_id == key)
+        {
+            let mut subagents = session.subagents().to_vec();
+            subagents.push(child.clone());
+            session.set_subagents(subagents);
+        }
     }
 }
 
@@ -1016,7 +1344,10 @@ fn merge_tui_snapshot(
 ) -> Arc<AppSession> {
     let mut session = Arc::clone(incoming);
     preserve_newer_child_histories(&mut session, latest);
-    if preserve_history && session.history_identity() != latest.history_identity() {
+    preserve_child_config(&mut session, latest);
+    if (preserve_history || session.history_snapshot().epoch < latest.history_snapshot().epoch)
+        && session.history_identity() != latest.history_identity()
+    {
         let session = Arc::make_mut(&mut session);
         session.adopt_history(&latest.history_snapshot());
         prune_main_history(session, live_ids);
@@ -1030,6 +1361,8 @@ fn merge_tui_snapshot(
         session.meta.workflow = latest.meta.workflow;
         session.meta.thinking = latest.meta.thinking;
         session.meta.session_options = latest.meta.session_options.clone();
+        session.meta.mode = latest.meta.mode.clone();
+        session.meta.plan_path = latest.meta.plan_path.clone();
     }
     session
 }
@@ -1042,6 +1375,8 @@ fn same_coordinator_metadata(left: &AppSession, right: &AppSession) -> bool {
         && left.meta.workflow == right.meta.workflow
         && left.meta.thinking == right.meta.thinking
         && left.meta.session_options == right.meta.session_options
+        && left.meta.mode == right.meta.mode
+        && left.meta.plan_path == right.meta.plan_path
 }
 
 fn prune_main_history(session: &mut AppSession, live_ids: Option<&[String]>) {
@@ -1074,37 +1409,40 @@ fn merge_checkpoint(
     live_ids: Option<&[String]>,
 ) -> AppSession {
     let mut session = base.clone();
-    // Only a history replacement carries messages. An option or model change
-    // leaves them alone: while a turn holds the lease the coordinator's copy
-    // is the pre-turn one, and writing it would rewind the stored session to
-    // before the running turn.
-    if let Some(history) = &checkpoint.history {
-        session.replace_shared_messages(Arc::clone(history));
+    if checkpoint.kind != SessionCheckpointKind::Options
+        && let Some(history) = &checkpoint.history
+    {
+        session.adopt_history(history);
         prune_main_history(&mut session, live_ids);
     }
-    if let Some(projection) = &checkpoint.config {
-        session.meta.mode = Some(match &projection.config.mode {
-            AgentMode::Build => StoredMode::Build,
-            AgentMode::Plan(_) => StoredMode::Plan,
-            AgentMode::Custom(mode) => StoredMode::Custom(mode.to_string()),
-        });
-        session.meta.plan_path = match &projection.config.mode {
-            AgentMode::Plan(path) => Some(path.to_string_lossy().into_owned()),
-            _ => None,
-        };
+    if checkpoint.kind == SessionCheckpointKind::History {
+        return session;
     }
-    session.set_model(checkpoint.model.to_string());
-    session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
     session.meta.yolo = Some(option_enabled(&checkpoint.options, YOLO_OPTION_ID));
-    session.meta.fast = option_enabled(&checkpoint.options, FAST_OPTION_ID);
-    session.meta.workflow = option_enabled(&checkpoint.options, WORKFLOW_OPTION_ID);
-    session.meta.thinking = checkpoint
-        .options
-        .options
-        .iter()
-        .find(|state| state.definition.id.as_ref() == THINKING_OPTION_ID)
-        .and_then(|state| state.current_value.parse::<ThinkingConfig>().ok())
-        .map(Into::into);
+    if checkpoint.kind == SessionCheckpointKind::Config {
+        if let Some(projection) = &checkpoint.config {
+            session.meta.mode = Some(match &projection.config.mode {
+                AgentMode::Build => StoredMode::Build,
+                AgentMode::Plan(_) => StoredMode::Plan,
+                AgentMode::Custom(mode) => StoredMode::Custom(mode.to_string()),
+            });
+            session.meta.plan_path = match &projection.config.mode {
+                AgentMode::Plan(path) => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            };
+        }
+        session.set_model(checkpoint.model.to_string());
+        session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
+        session.meta.fast = option_enabled(&checkpoint.options, FAST_OPTION_ID);
+        session.meta.workflow = option_enabled(&checkpoint.options, WORKFLOW_OPTION_ID);
+        session.meta.thinking = checkpoint
+            .options
+            .options
+            .iter()
+            .find(|state| state.definition.id.as_ref() == THINKING_OPTION_ID)
+            .and_then(|state| state.current_value.parse::<ThinkingConfig>().ok())
+            .map(Into::into);
+    }
     session.meta.session_options = checkpoint
         .options
         .options
@@ -1163,6 +1501,10 @@ fn acknowledge_waiters(
         if waiter
             .config_version
             .is_some_and(|version| state.config_versions.get(&id) != Some(&version))
+            || waiter.histories.iter().any(|history| {
+                matches!(history, RequiredHistory::Root(snapshot, Some(revision))
+                    if history_version(&state, id, &HistoryDestination::Main).is_some_and(|current| (snapshot.epoch, *revision) < current))
+            })
         {
             fail_waiters(
                 id,
@@ -1312,16 +1654,15 @@ impl Writer {
                 }
             }
         }
-        let approvals = mem::take(&mut lock(pending).child_approvals);
-        for approval in approvals {
-            let result = self.write_child_approval(pending, &approval);
-            if let Some(publications) = lock(pending)
-                .child_publications
-                .get_mut(&approval.session_id)
+        let checkpoints = mem::take(&mut lock(pending).staged_checkpoints);
+        for save in checkpoints {
+            let result = self.write_staged_checkpoint(pending, &save);
+            if let Some(publications) = lock(pending).publications.get_mut(&save.request.session_id)
             {
-                publications.retain(|publication| !publication.same_request(&approval.publication));
+                publications
+                    .retain(|publication| !publication.same_request(&save.request.publication));
             }
-            let _ = approval.reply.send(result);
+            let _ = save.reply.send(result);
         }
         lock(pending)
             .entries
@@ -1333,36 +1674,73 @@ impl Writer {
             .min()
     }
 
-    fn write_child_approval(
+    fn write_staged_checkpoint(
         &mut self,
         pending: &Pending,
-        approval: &ChildApprovalSave,
+        save: &StagedCheckpointSave,
     ) -> Result<(), String> {
-        if approval.publication.is_cancelled() {
+        let request = &save.request;
+        let id = request.session_id;
+        if request.publication.is_cancelled() {
             return Err(CHECKPOINT_CANCELLED.into());
         }
-        let mut candidate = {
+        let (mut candidate, live_ids) = {
             let state = lock(pending);
             if state.closed {
-                return Err(CheckpointError::Closed(approval.session_id).to_string());
+                return Err(CheckpointError::Closed(id).to_string());
             }
-            state
-                .latest
-                .get(&approval.session_id)
+            let mut candidate = state
+                .acknowledged
+                .get(&id)
                 .cloned()
-                .ok_or_else(|| CHECKPOINT_REPLACED.to_owned())?
+                .ok_or_else(|| CHECKPOINT_REPLACED.to_owned())?;
+            if let Some((HistoryDestination::Child(key), _)) = &request.selected_config
+                && !candidate
+                    .subagents()
+                    .iter()
+                    .any(|child| &child.tool_use_id == key)
+                && let Some(child) = state.latest.get(&id).and_then(|latest| {
+                    latest
+                        .subagents()
+                        .iter()
+                        .find(|child| &child.tool_use_id == key)
+                })
+            {
+                let candidate = Arc::make_mut(&mut candidate);
+                let mut subagents = candidate.subagents().to_vec();
+                subagents.push(child.clone());
+                candidate.set_subagents(subagents);
+            }
+            (candidate, state.live_children.get(&id).cloned())
         };
-        let session = Arc::make_mut(&mut candidate);
-        if !session.adopt_subagent_history(approval.child_key.clone(), &approval.history) {
+        if let Some(checkpoint) = &request.checkpoint {
+            candidate = Arc::new(merge_checkpoint(
+                &candidate,
+                checkpoint,
+                live_ids.as_deref(),
+            ));
+        }
+        if let Some((destination, history)) = &request.history
+            && !adopt_checkpoint_history(
+                Arc::make_mut(&mut candidate),
+                destination,
+                history,
+                live_ids.as_deref(),
+            )
+        {
             return Err(CHECKPOINT_REPLACED.into());
         }
-        session.prune_posts(Some(&approval.child_key), approval.history.messages.len());
+        if let Some((destination, config)) = &request.selected_config
+            && !project_selected_config(Arc::make_mut(&mut candidate), destination, config)
+        {
+            return Err(SELECTED_CONFIG_MISSING.into());
+        }
         let directory = self
             .dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| error.to_string())?;
-        let staged =
-            SessionLog::stage_checkpoint(&directory, session).map_err(|error| error.to_string())?;
+        let staged = SessionLog::stage_checkpoint(&directory, candidate.as_ref())
+            .map_err(|error| error.to_string())?;
         #[cfg(test)]
         {
             let gate = lock(pending).child_stage_gate.clone();
@@ -1371,37 +1749,119 @@ impl Writer {
                 let _ = release.recv();
             }
         }
+        let mut claim_error = None;
         let published = staged
-            .publish(&approval.guard, || {
+            .publish(&request.guard, || {
                 let state = lock(pending);
-                !state.closed
-                    && state
+                if state.closed
+                    || !state
                         .incarnations
-                        .get(&approval.session_id)
-                        .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &approval.incarnation))
-                    && approval.publication.try_publish()
+                        .get(&id)
+                        .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &save.incarnation))
+                    || (request
+                        .checkpoint
+                        .as_ref()
+                        .is_none_or(|checkpoint| checkpoint.kind != SessionCheckpointKind::History)
+                        && state.config_versions.get(&id).copied() != save.config_version)
+                    || save.history_version.is_some_and(|incoming| {
+                        request.history.as_ref().is_some_and(|(destination, _)| {
+                            history_version(&state, id, destination)
+                                .is_some_and(|current| incoming < current)
+                        })
+                    })
+                    || request
+                        .history
+                        .as_ref()
+                        .is_some_and(|(destination, history)| {
+                            state.latest.get(&id).is_some_and(|session| {
+                                let current = match destination {
+                                    HistoryDestination::Main => Some(session.history_snapshot()),
+                                    HistoryDestination::Child(key) => {
+                                        session.subagent_history_snapshot(key)
+                                    }
+                                };
+                                current.is_some_and(|current| current.epoch > history.epoch)
+                            })
+                        })
+                {
+                    return false;
+                }
+                match (request.claim)(&request.publication) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        claim_error = Some(error);
+                        false
+                    }
+                }
             })
             .map_err(|error| error.to_string())?;
         if !published {
-            return Err(CHECKPOINT_CANCELLED.into());
+            return Err(
+                claim_error.map_or_else(|| CHECKPOINT_CANCELLED.into(), |error| error.to_string())
+            );
         }
-        self.logs.remove(&approval.session_id);
+        self.logs.remove(&id);
         let mut state = lock(pending);
         if !state
             .incarnations
-            .get(&approval.session_id)
-            .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &approval.incarnation))
+            .get(&id)
+            .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &save.incarnation))
         {
             return Ok(());
         }
-        if let Some(latest) = state.latest.get_mut(&approval.session_id) {
-            promote_child_approval(latest, approval);
+        state.acknowledged.insert(id, Arc::clone(&candidate));
+        if let Some(version) = save.history_version
+            && let Some((destination, _)) = &request.history
+        {
+            set_history_version(&mut state, id, destination, version);
         }
-        if let Some(provisional) = state.coordinator_pending.get_mut(&approval.session_id) {
-            promote_child_approval(&mut provisional.session, approval);
+        let config_version = request
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.kind == SessionCheckpointKind::Config)
+            .and_then(|checkpoint| checkpoint.config.as_ref())
+            .map(|config| (config.runtime_epoch, config.generation));
+        if let Some(version) = config_version {
+            state.config_versions.insert(id, version);
         }
-        if let Some(Entry::Save(queued)) = state.entries.get_mut(&approval.session_id) {
-            promote_child_approval(&mut queued.session, approval);
+        let live_ids = state.live_children.get(&id).cloned();
+        let history_base = state
+            .latest
+            .get(&id)
+            .map(|session| session.history_identity());
+        if let Some(latest) = state.latest.get_mut(&id) {
+            promote_staged_checkpoint(latest, request, &candidate, live_ids.as_deref());
+        }
+        if matches!(&request.history, Some((HistoryDestination::Main, _)))
+            && let Some(base) = history_base
+        {
+            state.coordinator_history_bases.insert(id, base);
+        }
+        if let Some(provisional) = state.coordinator_pending.get_mut(&id) {
+            promote_staged_checkpoint(
+                &mut provisional.session,
+                request,
+                &candidate,
+                live_ids.as_deref(),
+            );
+            if matches!(&request.history, Some((HistoryDestination::Main, _))) {
+                provisional.history_base = history_base;
+            }
+        }
+        let generation = next_generation(&mut state);
+        state.latest_generations.insert(id, generation);
+        if let Some(Entry::Save(queued)) = state.entries.get_mut(&id) {
+            promote_staged_checkpoint(
+                &mut queued.session,
+                request,
+                &candidate,
+                live_ids.as_deref(),
+            );
+            queued.generation = generation;
+            if let Some(version) = config_version {
+                queued.config_version = Some(version);
+            }
+            retain_history_waiters(id, &queued.session, &mut queued.waiters);
         }
         Ok(())
     }
@@ -1465,7 +1925,6 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::actor::EffectiveAgentConfig;
     use maki_agent::session_coordinator::CommittedConfigProjection;
     use maki_agent::session_coordinator::builtin_option_definitions;
     use maki_agent::session_options::SessionOptions;
@@ -1478,7 +1937,7 @@ mod tests {
     use maki_providers::{Effort, Message};
     use maki_storage::id::SessionRef;
     use maki_storage::session_lock;
-    use maki_storage::sessions::{StoredMode, StoredPost, StoredThinking};
+    use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1523,6 +1982,8 @@ mod tests {
 
     fn config_checkpoint(epoch: u64, generation: u64) -> SessionCheckpoint {
         SessionCheckpoint {
+            kind: SessionCheckpointKind::Config,
+            history_revision: None,
             history: None,
             model: Arc::from(FAILED_MODEL),
             cwd: CWD.into(),
@@ -1569,6 +2030,426 @@ mod tests {
             },
             wake_rx,
         )
+    }
+
+    #[test_case(false, false, false, false, false; "main_config_then_terminal_history")]
+    #[test_case(false, true, false, false, false; "main_terminal_history_then_config")]
+    #[test_case(false, false, true, false, false; "main_rejected_claim_keeps_config_and_history")]
+    #[test_case(false, false, false, true, false; "main_queued_config_then_terminal_history")]
+    #[test_case(false, true, false, true, false; "main_queued_terminal_history_then_config")]
+    #[test_case(true, false, false, false, false; "child_config_then_terminal_history")]
+    #[test_case(true, true, false, false, false; "child_terminal_history_then_config")]
+    #[test_case(true, false, true, false, false; "child_rejected_claim_keeps_config_and_history")]
+    #[test_case(true, false, false, true, false; "child_queued_config_then_terminal_history")]
+    #[test_case(true, true, false, true, false; "child_queued_terminal_history_then_config")]
+    #[test_case(true, false, false, false, true; "child_pending_metadata_config_then_terminal_history")]
+    #[test_case(true, true, false, true, true; "child_pending_metadata_queued_terminal_history_then_config")]
+    fn guarded_config_preserves_acknowledged_history(
+        child: bool,
+        history_first: bool,
+        reject: bool,
+        queued: bool,
+        pending_metadata: bool,
+    ) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        session.set_subagents(
+            [TOOL_ID, SIBLING_AGENT_ID]
+                .into_iter()
+                .map(|key| StoredSubagent {
+                    tool_use_id: key.into(),
+                    name: key.into(),
+                    model: Some(MODEL.into()),
+                    thinking: Some(StoredThinking::Adaptive),
+                    fast: false,
+                })
+                .collect(),
+        );
+        let id = session.id;
+        let original = session.clone();
+        let mut root_meta = serde_json::to_value(&session.meta).unwrap();
+        root_meta.as_object_mut().unwrap().remove("yolo");
+        let sibling = session.subagents()[1].clone();
+        writer.seed(Arc::new(session.clone()));
+        if pending_metadata {
+            let mut state = lock(&writer.pending);
+            let acknowledged = Arc::make_mut(state.acknowledged.get_mut(&id).unwrap());
+            acknowledged.set_subagents(vec![sibling.clone()]);
+            state.latest.insert(id, Arc::new(session.clone()));
+        }
+        writer.bind_config_runtime(id, 1);
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let destination = if child {
+            HistoryDestination::Child(TOOL_ID.into())
+        } else {
+            HistoryDestination::Main
+        };
+        let checkpoint =
+            writer.coordinator_checkpoint_guarded(lease.publication_guard(), destination.clone());
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.write(&session).unwrap();
+        if child {
+            session.set_subagent_messages(
+                TOOL_ID.into(),
+                vec![
+                    Message::user(BASE_MSG.into()),
+                    Message::user(COORDINATOR_MSG.into()),
+                ],
+            );
+        } else {
+            session.push_message(Message::user(COORDINATOR_MSG.into()));
+        }
+        let mut terminal_history = if child {
+            session.subagent_history_snapshot(TOOL_ID).unwrap()
+        } else {
+            session.history_snapshot()
+        };
+        terminal_history.compacted = true;
+        let version = CheckpointVersion {
+            revision: 2,
+            epoch: terminal_history.epoch,
+        };
+        let mut terminal = config_checkpoint(1, 0);
+        terminal.kind = SessionCheckpointKind::History;
+        terminal.history_revision = Some(2);
+        terminal.history = Some(terminal_history.clone());
+        let terminal = Arc::new(terminal);
+        let claim: CheckpointClaim = Arc::new(|publication| {
+            publication
+                .try_publish()
+                .then_some(())
+                .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+        });
+        let selected_texts = |saved: &AppSession| {
+            if child {
+                saved.subagent_messages()[TOOL_ID]
+                    .iter()
+                    .map(|message| message.user_text().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            } else {
+                message_texts(saved)
+            }
+        };
+        let compacted = |saved: &AppSession| {
+            if child {
+                saved.subagent_history_snapshot(TOOL_ID).unwrap().compacted
+            } else {
+                saved.meta.compacted
+            }
+        };
+        let mut queued_history_ack = None;
+        if history_first {
+            let ack = checkpoint.checkpoint_guarded(
+                CheckpointRequest {
+                    session_id: id,
+                    version,
+                    snapshot: Arc::clone(&terminal),
+                },
+                CheckpointPublication::default(),
+                Arc::clone(&claim),
+            );
+            if queued {
+                queued_history_ack = Some(ack);
+            } else {
+                disk.flush(&writer.pending);
+                assert!(smol::block_on(ack).is_ok());
+            }
+        }
+        let publication = CheckpointPublication::default();
+        let config_claim: CheckpointClaim = Arc::new(move |publication| {
+            if reject {
+                return Err(Arc::from(CHECKPOINT_CANCELLED));
+            }
+            publication
+                .try_publish()
+                .then_some(())
+                .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+        });
+        let mut config = config_checkpoint(1, 1);
+        let selected = Arc::make_mut(&mut config.config.as_mut().unwrap().config);
+        selected.settings.model.id = FAILED_MODEL.into();
+        let ack: CheckpointFuture =
+            if child {
+                let response = enqueue_staged_checkpoint(
+                    &writer.pending,
+                    &writer.wake,
+                    StagedSessionCheckpoint {
+                        session_id: id,
+                        checkpoint: None,
+                        selected_config: Some((
+                            destination.clone(),
+                            Arc::clone(&config.config.as_ref().unwrap().config),
+                        )),
+                        history: None,
+                        publication: publication.clone(),
+                        claim: config_claim,
+                        guard: lease.publication_guard(),
+                    },
+                )
+                .unwrap();
+                Box::pin(async move {
+                    response.recv_async().await.unwrap().map_err(|message| {
+                        CheckpointError::Save {
+                            session_id: id,
+                            message: message.into(),
+                        }
+                    })?;
+                    Ok(CheckpointAck {
+                        session_id: id,
+                        version,
+                    })
+                })
+            } else {
+                checkpoint.checkpoint_guarded(
+                    CheckpointRequest {
+                        session_id: id,
+                        version,
+                        snapshot: Arc::new(config),
+                    },
+                    publication.clone(),
+                    config_claim,
+                )
+            };
+        if !history_first {
+            let mut state = lock(&writer.pending);
+            let mut latest = session.clone();
+            if pending_metadata {
+                latest.push_message(Message::user(RESUMED_MSG.into()));
+            }
+            state.latest.insert(id, Arc::new(latest));
+            assert_eq!(message_texts(&state.acknowledged[&id]), [BASE_MSG]);
+        }
+        if queued && !history_first {
+            queued_history_ack = Some(checkpoint.checkpoint_guarded(
+                CheckpointRequest {
+                    session_id: id,
+                    version,
+                    snapshot: Arc::clone(&terminal),
+                },
+                CheckpointPublication::default(),
+                Arc::clone(&claim),
+            ));
+        }
+        disk.flush(&writer.pending);
+        assert_eq!(smol::block_on(ack).is_err(), reject);
+        if let Some(ack) = queued_history_ack {
+            assert!(smol::block_on(ack).is_ok());
+        }
+        let stored = AppSession::load(id, &dir).unwrap();
+        let expected_model = if reject { MODEL } else { FAILED_MODEL };
+        let assert_untouched = |saved: &AppSession| {
+            let untouched = if child {
+                saved.messages()
+            } else {
+                &saved.subagent_messages()[TOOL_ID]
+            };
+            assert_eq!(untouched.len(), 1);
+            assert_eq!(untouched[0].user_text(), Some(BASE_MSG));
+        };
+        let assert_metadata = |saved: &AppSession| {
+            if child {
+                assert_eq!(saved.model, MODEL);
+                assert_eq!(saved.cwd, CWD);
+                let mut metadata = serde_json::to_value(&saved.meta).unwrap();
+                metadata.as_object_mut().unwrap().remove("yolo");
+                assert_eq!(metadata, root_meta);
+                let selected = saved
+                    .subagents()
+                    .iter()
+                    .find(|stored| stored.tool_use_id == TOOL_ID)
+                    .unwrap();
+                assert_eq!(selected.model.as_deref(), Some(expected_model));
+                assert_eq!(
+                    selected.thinking,
+                    Some(if reject {
+                        StoredThinking::Adaptive
+                    } else {
+                        StoredThinking::Off
+                    })
+                );
+                assert_eq!(selected.fast, !reject);
+                assert_eq!(
+                    saved
+                        .subagents()
+                        .iter()
+                        .find(|stored| stored.tool_use_id == SIBLING_AGENT_ID),
+                    Some(&sibling)
+                );
+            } else {
+                assert_eq!(saved.model, expected_model);
+            }
+        };
+        assert_metadata(&stored);
+        assert_untouched(&stored);
+        assert_metadata(&writer.latest_snapshot(id).unwrap());
+        assert_eq!(
+            selected_texts(&stored),
+            if history_first || queued {
+                vec![BASE_MSG, COORDINATOR_MSG]
+            } else {
+                vec![BASE_MSG]
+            }
+        );
+        let terminal_ack = checkpoint.checkpoint_guarded(
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 3,
+                    ..version
+                },
+                snapshot: Arc::clone(&terminal),
+            },
+            CheckpointPublication::default(),
+            Arc::clone(&claim),
+        );
+        disk.flush(&writer.pending);
+        assert!(smol::block_on(terminal_ack).is_ok());
+        let stored = AppSession::load(id, &dir).unwrap();
+        assert_metadata(&stored);
+        assert_untouched(&stored);
+        assert_eq!(selected_texts(&stored), [BASE_MSG, COORDINATOR_MSG]);
+        assert_eq!(compacted(&stored), !child);
+        if child {
+            writer.send(Arc::new(original));
+            disk.flush(&writer.pending);
+            let stored = AppSession::load(id, &dir).unwrap();
+            assert_metadata(&stored);
+            assert_eq!(selected_texts(&stored), [BASE_MSG, COORDINATOR_MSG]);
+            assert!(!compacted(&stored));
+        }
+        let mut stale = terminal.as_ref().clone();
+        stale.history_revision = Some(1);
+        stale.history = Some(HistorySnapshot {
+            messages: Arc::new(vec![Message::user(REWOUND_MSG.into())]),
+            ..terminal_history
+        });
+        let stale_ack = checkpoint.checkpoint_guarded(
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 4,
+                    ..version
+                },
+                snapshot: Arc::new(stale),
+            },
+            CheckpointPublication::default(),
+            Arc::clone(&claim),
+        );
+        assert!(smol::block_on(stale_ack).is_err());
+        assert_eq!(
+            selected_texts(&AppSession::load(id, &dir).unwrap()),
+            [BASE_MSG, COORDINATOR_MSG]
+        );
+        let mut options = config_checkpoint(1, 0);
+        options.kind = SessionCheckpointKind::Options;
+        options.model = MODEL.into();
+        options.history = Some(HistorySnapshot::new(Vec::new()));
+        Arc::make_mut(&mut options.options.options)
+            .iter_mut()
+            .find(|state| state.definition.id.as_ref() == YOLO_OPTION_ID)
+            .unwrap()
+            .current_value = Arc::from(ENABLED_VALUE);
+        let options_ack = checkpoint.checkpoint_guarded(
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 5,
+                    ..version
+                },
+                snapshot: Arc::new(options),
+            },
+            CheckpointPublication::default(),
+            claim,
+        );
+        disk.flush(&writer.pending);
+        assert!(smol::block_on(options_ack).is_ok());
+        let stored = AppSession::load(id, &dir).unwrap();
+        assert_metadata(&stored);
+        assert_eq!(stored.meta.yolo, Some(true));
+        assert_eq!(writer.latest_snapshot(id).unwrap().meta.yolo, Some(true));
+        assert_eq!(compacted(&stored), !child);
+        assert_eq!(selected_texts(&stored), [BASE_MSG, COORDINATOR_MSG]);
+        if child {
+            let mut later = writer.latest_snapshot(id).unwrap().as_ref().clone();
+            later.set_subagent_messages(
+                TOOL_ID.into(),
+                vec![
+                    Message::user(BASE_MSG.into()),
+                    Message::user(COORDINATOR_MSG.into()),
+                    Message::user(RESUMED_MSG.into()),
+                ],
+            );
+            writer.send(Arc::new(later));
+            disk.flush(&writer.pending);
+            let stored = AppSession::load(id, &dir).unwrap();
+            assert_metadata(&stored);
+            assert_eq!(
+                selected_texts(&stored),
+                [BASE_MSG, COORDINATOR_MSG, RESUMED_MSG]
+            );
+        }
+        if pending_metadata {
+            let publication = CheckpointPublication::default();
+            let response = enqueue_staged_checkpoint(
+                &writer.pending,
+                &writer.wake,
+                StagedSessionCheckpoint {
+                    session_id: id,
+                    checkpoint: None,
+                    selected_config: Some((
+                        HistoryDestination::Child(ORPHAN_CHILD.into()),
+                        config_checkpoint(1, 1).config.unwrap().config,
+                    )),
+                    history: None,
+                    publication: publication.clone(),
+                    claim: Arc::new(|publication| {
+                        publication
+                            .try_publish()
+                            .then_some(())
+                            .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+                    }),
+                    guard: lease.publication_guard(),
+                },
+            )
+            .unwrap();
+            disk.flush(&writer.pending);
+            assert_eq!(
+                response.recv().unwrap().unwrap_err(),
+                SELECTED_CONFIG_MISSING
+            );
+            assert!(publication.cancel());
+            let stored = AppSession::load(id, &dir).unwrap();
+            assert_metadata(&stored);
+            assert_eq!(
+                selected_texts(&stored),
+                [BASE_MSG, COORDINATOR_MSG, RESUMED_MSG]
+            );
+            assert!(
+                stored
+                    .subagents()
+                    .iter()
+                    .all(|child| child.tool_use_id != ORPHAN_CHILD)
+            );
+        }
+        if !reject {
+            if !child {
+                assert_eq!(stored.meta.mode, Some(StoredMode::Plan));
+                assert!(stored.meta.fast);
+                assert!(stored.meta.workflow);
+            }
+            assert!(!publication.cancel());
+        }
     }
 
     #[test]
@@ -1647,7 +2528,11 @@ mod tests {
         let mut history = config_checkpoint(1, 1);
         history.config = None;
         history.model = Arc::from(MODEL);
-        history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+        history.kind = SessionCheckpointKind::History;
+        history.history_revision = Some(1);
+        history.history = Some(HistorySnapshot::new(vec![Message::user(
+            COORDINATOR_MSG.into(),
+        )]));
         let history_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -1748,7 +2633,11 @@ mod tests {
         }
         let mut history = config_checkpoint(1, 1);
         history.config = None;
-        history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+        history.kind = SessionCheckpointKind::History;
+        history.history_revision = Some(2);
+        history.history = Some(HistorySnapshot::new(vec![Message::user(
+            COORDINATOR_MSG.into(),
+        )]));
         let mut history_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -1762,7 +2651,8 @@ mod tests {
         };
         let mut config = config_checkpoint(1, 2);
         if replace_history {
-            config.history = Some(Arc::new(vec![Message::user(BASE_MSG.into())]));
+            config.history_revision = Some(3);
+            config.history = Some(HistorySnapshot::new(vec![Message::user(BASE_MSG.into())]));
         }
         let config_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
@@ -1823,7 +2713,11 @@ mod tests {
         let mut provisional = config_checkpoint(1, 1);
         provisional.config = None;
         provisional.model = Arc::from(MODEL);
-        provisional.history = Some(Arc::new(vec![Message::user(REWOUND_MSG.into())]));
+        provisional.kind = SessionCheckpointKind::History;
+        provisional.history_revision = Some(1);
+        provisional.history = Some(HistorySnapshot::new(vec![Message::user(
+            REWOUND_MSG.into(),
+        )]));
         let candidate = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -1925,7 +2819,11 @@ mod tests {
         let checkpoint = writer.coordinator_checkpoint();
         let mut history = config_checkpoint(1, 1);
         history.config = None;
-        history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+        history.kind = SessionCheckpointKind::History;
+        history.history_revision = Some(1);
+        history.history = Some(HistorySnapshot::new(vec![Message::user(
+            COORDINATOR_MSG.into(),
+        )]));
         let history_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -2191,7 +3089,11 @@ mod tests {
             let mut history = config_checkpoint(1, 1);
             history.config = None;
             history.model = MODEL.into();
-            history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+            history.kind = SessionCheckpointKind::History;
+            history.history_revision = Some(1);
+            history.history = Some(HistorySnapshot::new(vec![Message::user(
+                COORDINATOR_MSG.into(),
+            )]));
             writer
                 .coordinator_checkpoint()
                 .checkpoint(CheckpointRequest {
@@ -2265,7 +3167,11 @@ mod tests {
         let mut history = config_checkpoint(1, 1);
         history.config = None;
         history.model = MODEL.into();
-        history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+        history.kind = SessionCheckpointKind::History;
+        history.history_revision = Some(1);
+        history.history = Some(HistorySnapshot::new(vec![Message::user(
+            COORDINATOR_MSG.into(),
+        )]));
         let history_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -2345,7 +3251,9 @@ mod tests {
                 let mut history = config_checkpoint(1, 1);
                 history.config = None;
                 history.model = MODEL.into();
-                history.history = Some(Arc::new(vec![Message::user(text.into())]));
+                history.kind = SessionCheckpointKind::History;
+                history.history_revision = Some(1);
+                history.history = Some(HistorySnapshot::new(vec![Message::user(text.into())]));
                 writer
                     .coordinator_checkpoint()
                     .checkpoint(CheckpointRequest {
@@ -2373,7 +3281,14 @@ mod tests {
         disk.write(&first.session).unwrap();
         commit_save(&writer.pending, id, &first);
         acknowledge_waiters(&writer.pending, &first.session, first.waiters);
-        assert!(smol::block_on(first_ack).is_ok());
+        let first_result = smol::block_on(first_ack);
+        if child {
+            first_result.unwrap();
+        } else {
+            assert!(
+                matches!(first_result, Err(CheckpointError::Save { session_id, .. }) if session_id == id)
+            );
+        }
         {
             let state = lock(&writer.pending);
             let candidate = &state.coordinator_pending[&id].session;
@@ -2642,7 +3557,9 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Some(Arc::new(Vec::new())),
+                        kind: SessionCheckpointKind::Config,
+                        history_revision: Some(1),
+                        history: Some(HistorySnapshot::new(Vec::new())),
                         model: Arc::from("next/model"),
                         cwd: std::path::PathBuf::from(CWD),
                         options,
@@ -2696,7 +3613,9 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Some(Arc::new(Vec::new())),
+                        kind: SessionCheckpointKind::Config,
+                        history_revision: Some(1),
+                        history: Some(HistorySnapshot::new(Vec::new())),
                         model: Arc::from("next/model"),
                         cwd: std::path::PathBuf::from(CWD),
                         options,
@@ -2775,19 +3694,26 @@ mod tests {
             let id = session.id;
             writer.send(Arc::new(session));
             writer.set_live_children(id, vec![LIVE_CHILD.into()]);
-            let mut checkpoint = config_checkpoint(0, 0);
-            checkpoint.config = None;
-            checkpoint.model = MODEL.into();
-            checkpoint.history = Some(Arc::new(vec![Message::user(REWOUND_MSG.into())]));
+            let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+                .unwrap()
+                .unwrap();
             writer
-                .coordinator_checkpoint()
-                .checkpoint(CheckpointRequest {
+                .checkpoint_staged(StagedSessionCheckpoint {
                     session_id: id,
-                    version: CheckpointVersion {
-                        revision: 1,
-                        epoch: 1,
-                    },
-                    snapshot: Arc::new(checkpoint),
+                    checkpoint: None,
+                    selected_config: None,
+                    history: Some((
+                        HistoryDestination::Main,
+                        HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
+                    )),
+                    publication: CheckpointPublication::default(),
+                    claim: Arc::new(|publication| {
+                        publication
+                            .try_publish()
+                            .then_some(())
+                            .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+                    }),
+                    guard: lease.publication_guard(),
                 })
                 .await
                 .unwrap();
@@ -2877,7 +3803,9 @@ mod tests {
         let checkpoint = |message: &str, revision| {
             let mut snapshot = config_checkpoint(1, revision);
             snapshot.config = None;
-            snapshot.history = Some(Arc::new(vec![Message::user(message.into())]));
+            snapshot.kind = SessionCheckpointKind::History;
+            snapshot.history_revision = Some(revision);
+            snapshot.history = Some(HistorySnapshot::new(vec![Message::user(message.into())]));
             writer
                 .coordinator_checkpoint()
                 .checkpoint(CheckpointRequest {
@@ -2909,13 +3837,23 @@ mod tests {
         let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
             .unwrap()
             .unwrap();
-        let mut child = Box::pin(writer.checkpoint_child_approval(
-            id,
-            TOOL_ID.into(),
-            HistorySnapshot::new(Vec::new()),
-            publication.clone(),
-            lease.publication_guard(),
-        ));
+        let mut child = Box::pin(writer.checkpoint_staged(StagedSessionCheckpoint {
+            session_id: id,
+            checkpoint: None,
+            selected_config: None,
+            history: Some((
+                HistoryDestination::Child(TOOL_ID.into()),
+                HistorySnapshot::new(Vec::new()),
+            )),
+            publication: publication.clone(),
+            claim: Arc::new(|publication| {
+                publication
+                    .try_publish()
+                    .then_some(())
+                    .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+            }),
+            guard: lease.publication_guard(),
+        }));
         assert!(smol::block_on(futures_lite::future::poll_once(child.as_mut())).is_none());
         if cancel {
             assert!(publication.cancel());
@@ -2940,12 +3878,15 @@ mod tests {
         );
     }
 
-    #[test_case(false; "without_later_save")]
-    #[test_case(true; "with_later_save")]
-    fn child_approval_cancelled_before_dequeue(interleave: bool) {
+    #[test_case(false, false; "main_without_later_save")]
+    #[test_case(true, false; "child_without_later_save")]
+    #[test_case(false, true; "main_with_later_save")]
+    #[test_case(true, true; "child_with_later_save")]
+    fn staged_checkpoint_cancelled_before_dequeue(child: bool, interleave: bool) {
         let (_tmp, dir) = state_dir();
         let (writer, _wake) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
@@ -2953,13 +3894,27 @@ mod tests {
         let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
             .unwrap()
             .unwrap();
-        let mut checkpoint = Box::pin(writer.checkpoint_child_approval(
-            id,
-            TOOL_ID.into(),
-            HistorySnapshot::new(Vec::new()),
-            publication.clone(),
-            lease.publication_guard(),
-        ));
+        let mut checkpoint = Box::pin(writer.checkpoint_staged(StagedSessionCheckpoint {
+            session_id: id,
+            checkpoint: None,
+            selected_config: None,
+            history: Some((
+                if child {
+                    HistoryDestination::Child(TOOL_ID.into())
+                } else {
+                    HistoryDestination::Main
+                },
+                HistorySnapshot::new(Vec::new()),
+            )),
+            publication: publication.clone(),
+            claim: Arc::new(|publication| {
+                publication
+                    .try_publish()
+                    .then_some(())
+                    .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+            }),
+            guard: lease.publication_guard(),
+        }));
         assert!(smol::block_on(futures_lite::future::poll_once(checkpoint.as_mut())).is_none());
         assert!(publication.cancel());
         if interleave {
@@ -2979,20 +3934,32 @@ mod tests {
             CHECKPOINT_CANCELLED
         );
         let loaded = AppSession::load(id, &dir).unwrap();
-        assert_eq!(loaded.subagent_messages()[TOOL_ID].len(), 1);
+        let latest = writer.latest_snapshot(id).unwrap();
+        for saved in [&loaded, &*latest] {
+            assert_eq!(saved.messages()[0].user_text(), Some(BASE_MSG));
+            assert_eq!(
+                saved.subagent_messages()[TOOL_ID][0].user_text(),
+                Some(BASE_MSG)
+            );
+        }
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
-        assert!(writer.latest_snapshot(id).unwrap().subagent_messages()[TOOL_ID].len() == 1);
         if interleave {
             assert_eq!(loaded.title, TITLE);
         }
     }
 
-    #[test_case(false, false, false, false; "publish_rebases_later_save")]
-    #[test_case(true, false, false, false; "cancel_preserves_later_save")]
-    #[test_case(false, true, false, false; "replacement_fences_staged_publication")]
-    #[test_case(false, false, true, false; "runtime_fences_staged_publication")]
-    #[test_case(false, false, false, true; "lock_loss_fences_staged_publication")]
-    fn child_approval_staging_is_isolated(
+    #[test_case(false, false, false, false, false; "main_publish_rebases_later_save")]
+    #[test_case(true, false, false, false, false; "child_publish_rebases_later_save")]
+    #[test_case(false, true, false, false, false; "main_cancel_preserves_later_save")]
+    #[test_case(true, true, false, false, false; "child_cancel_preserves_later_save")]
+    #[test_case(false, false, true, false, false; "main_replacement_fences_staged_publication")]
+    #[test_case(true, false, true, false, false; "child_replacement_fences_staged_publication")]
+    #[test_case(false, false, false, true, false; "main_runtime_fences_staged_publication")]
+    #[test_case(true, false, false, true, false; "child_runtime_fences_staged_publication")]
+    #[test_case(false, false, false, false, true; "main_lock_loss_fences_staged_publication")]
+    #[test_case(true, false, false, false, true; "child_lock_loss_fences_staged_publication")]
+    fn staged_checkpoint_is_isolated(
+        child: bool,
         cancel: bool,
         replace: bool,
         rebind: bool,
@@ -3010,7 +3977,9 @@ mod tests {
                 vec![Message::user(BASE_MSG.into())],
             );
             session.push_post(stored_post(Some(TOOL_ID), 2));
+            session.push_post(stored_post(None, 2));
             let id = session.id;
+            writer.set_live_children(id, vec![TOOL_ID.into(), SIBLING_AGENT_ID.into()]);
             writer.send(Arc::new(session.clone()));
             let publication = CheckpointPublication::default();
             let history = HistorySnapshot::new(Vec::new());
@@ -3026,12 +3995,36 @@ mod tests {
                 let publication = publication.clone();
                 async move {
                     writer
-                        .checkpoint_child_approval(id, TOOL_ID.into(), history, publication, guard)
+                        .checkpoint_staged(StagedSessionCheckpoint {
+                            session_id: id,
+                            checkpoint: None,
+                            selected_config: None,
+                            history: Some((
+                                if child {
+                                    HistoryDestination::Child(TOOL_ID.into())
+                                } else {
+                                    HistoryDestination::Main
+                                },
+                                history,
+                            )),
+                            publication,
+                            claim: Arc::new(|publication| {
+                                publication
+                                    .try_publish()
+                                    .then_some(())
+                                    .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+                            }),
+                            guard,
+                        })
                         .await
                 }
             });
             entry.recv_async().await.unwrap();
-            assert!(writer.latest_snapshot(id).unwrap().subagent_messages()[TOOL_ID].len() == 1);
+            let latest = writer.latest_snapshot(id).unwrap();
+            for messages in [latest.messages(), &latest.subagent_messages()[TOOL_ID]] {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].user_text(), Some(BASE_MSG));
+            }
             assert!(lock(&writer.pending).coordinator_pending.is_empty());
             session.set_title(TITLE.into());
             session.push_message(Message::user(RESUMED_MSG.into()));
@@ -3063,15 +4056,18 @@ mod tests {
             writer.shutdown(DRAIN_TIMEOUT);
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(loaded.title, TITLE);
-            assert_eq!(loaded.messages().len(), 2);
+            assert_eq!(
+                loaded.messages().len(),
+                if child || cancelled { 2 } else { 0 }
+            );
             assert_eq!(
                 loaded
                     .subagent_messages()
                     .get(TOOL_ID)
                     .map_or(0, |messages| messages.len()),
-                usize::from(cancelled)
+                usize::from(!child || cancelled)
             );
-            assert_eq!(loaded.posts().len(), usize::from(cancelled));
+            assert_eq!(loaded.posts().len(), 1 + usize::from(cancelled));
             assert_eq!(
                 serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap(),
                 serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
@@ -3079,21 +4075,37 @@ mod tests {
         });
     }
 
-    #[test_case(false; "without_interleaved_save")]
-    #[test_case(true; "with_interleaved_save")]
-    fn failed_child_replacement_keeps_committed_history(interleaved: bool) {
+    #[test_case(false, false; "main_without_interleaved_save")]
+    #[test_case(true, false; "child_without_interleaved_save")]
+    #[test_case(false, true; "main_with_interleaved_save")]
+    #[test_case(true, true; "child_with_interleaved_save")]
+    fn failed_replacement_keeps_committed_history(child: bool, interleaved: bool) {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
-        let checkpoint = writer.checkpoint_child_history(
-            id,
-            TOOL_ID.into(),
-            HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
-        );
+        let history = HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]);
+        let checkpoint = if child {
+            writer.checkpoint_child_history(id, TOOL_ID.into(), history)
+        } else {
+            let mut snapshot = config_checkpoint(1, 1);
+            snapshot.config = None;
+            snapshot.kind = SessionCheckpointKind::History;
+            snapshot.history_revision = Some(1);
+            let epoch = history.epoch;
+            snapshot.history = Some(history);
+            writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion { revision: 1, epoch },
+                    snapshot: Arc::new(snapshot),
+                })
+        };
         if interleaved {
             session.set_title(TITLE.into());
             writer.send(Arc::new(session.clone()));
@@ -3116,10 +4128,12 @@ mod tests {
         );
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
         let latest = writer.latest_snapshot(id).unwrap();
-        assert_eq!(
-            serde_json::to_value(&latest.subagent_messages()[TOOL_ID]).unwrap(),
-            serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
-        );
+        for messages in [latest.messages(), &latest.subagent_messages()[TOOL_ID]] {
+            assert_eq!(
+                serde_json::to_value(messages).unwrap(),
+                serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
+            );
+        }
         std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
         let mut retry = latest.as_ref().clone();
         retry.set_title(TITLE.into());
@@ -3127,14 +4141,17 @@ mod tests {
         disk.flush(&writer.pending);
         let stored = AppSession::load(id, &dir).unwrap();
         assert_eq!(stored.title, TITLE);
-        assert_eq!(
-            serde_json::to_value(&stored.subagent_messages()[TOOL_ID]).unwrap(),
-            serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
-        );
+        for messages in [stored.messages(), &stored.subagent_messages()[TOOL_ID]] {
+            assert_eq!(
+                serde_json::to_value(messages).unwrap(),
+                serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
+            );
+        }
     }
 
-    #[test]
-    fn successive_child_replacements_fence_stale_snapshots_and_reconstructed_events() {
+    #[test_case(false; "main_history")]
+    #[test_case(true; "child_history")]
+    fn successive_replacements_fence_stale_snapshots_and_reconstructed_events(child: bool) {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
             let (writer, _warn_rx) = writer(&dir);
@@ -3147,18 +4164,42 @@ mod tests {
             );
             let id = session.id;
             let original = session.clone();
+            writer.set_live_children(id, vec![TOOL_ID.into(), SIBLING_AGENT_ID.into()]);
             writer.send(Arc::new(session.clone()));
+            let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+                .unwrap()
+                .unwrap();
+            let destination = if child {
+                HistoryDestination::Child(TOOL_ID.into())
+            } else {
+                HistoryDestination::Main
+            };
+            let checkpoint = |history| {
+                writer.checkpoint_staged(StagedSessionCheckpoint {
+                    session_id: id,
+                    checkpoint: None,
+                    selected_config: None,
+                    history: Some((destination.clone(), history)),
+                    publication: CheckpointPublication::default(),
+                    claim: Arc::new(|publication| {
+                        publication
+                            .try_publish()
+                            .then_some(())
+                            .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+                    }),
+                    guard: lease.publication_guard(),
+                })
+            };
             let earlier = HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]);
-            writer
-                .checkpoint_child_history(id, TOOL_ID.into(), earlier.clone())
-                .await
-                .unwrap();
-            assert!(session.adopt_subagent_history(TOOL_ID.into(), &earlier));
+            checkpoint(earlier.clone()).await.unwrap();
+            assert!(adopt_checkpoint_history(
+                &mut session,
+                &destination,
+                &earlier,
+                None
+            ));
             let replacement = HistorySnapshot::new(vec![Message::user(RESUMED_MSG.into())]);
-            writer
-                .checkpoint_child_history(id, TOOL_ID.into(), replacement.clone())
-                .await
-                .unwrap();
+            checkpoint(replacement.clone()).await.unwrap();
             // A delayed save from B must not resurrect B after the B -> C replacement.
             writer.send(Arc::new(session.clone()));
             // Reallocation cannot turn an old producer epoch into a new one.
@@ -3166,36 +4207,54 @@ mod tests {
                 messages: Arc::new(earlier.messages.as_ref().clone()),
                 ..earlier
             };
-            session.adopt_subagent_history(TOOL_ID.into(), &reconstructed);
+            adopt_checkpoint_history(&mut session, &destination, &reconstructed, None);
             session.set_title(TITLE.into());
             session.set_subagent_messages(
                 SIBLING_AGENT_ID.into(),
                 vec![Message::user(REWOUND_MSG.into())],
             );
             writer.send(Arc::new(session.clone()));
-            assert_eq!(
-                writer
-                    .latest_snapshot(id)
-                    .unwrap()
-                    .subagent_history_snapshot(TOOL_ID)
-                    .unwrap()
-                    .epoch,
-                replacement.epoch
-            );
-            assert!(session.adopt_subagent_history(TOOL_ID.into(), &replacement));
-            assert!(!session.adopt_subagent_history(TOOL_ID.into(), &reconstructed));
+            let latest = writer.latest_snapshot(id).unwrap();
+            let saved = if child {
+                latest.subagent_history_snapshot(TOOL_ID).unwrap()
+            } else {
+                latest.history_snapshot()
+            };
+            assert_eq!(saved.epoch, replacement.epoch);
+            assert!(adopt_checkpoint_history(
+                &mut session,
+                &destination,
+                &replacement,
+                None
+            ));
+            assert!(!adopt_checkpoint_history(
+                &mut session,
+                &destination,
+                &reconstructed,
+                None
+            ));
             writer.send(Arc::new(original));
             writer.send(Arc::new(session));
             writer.shutdown(DRAIN_TIMEOUT);
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(loaded.title, TITLE);
+            let selected = if child {
+                &loaded.subagent_messages()[TOOL_ID]
+            } else {
+                loaded.messages()
+            };
             assert_eq!(
-                serde_json::to_value(loaded.messages()).unwrap(),
-                serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_value(&loaded.subagent_messages()[TOOL_ID]).unwrap(),
+                serde_json::to_value(selected).unwrap(),
                 serde_json::to_value(&replacement.messages).unwrap()
+            );
+            let untouched = if child {
+                loaded.messages()
+            } else {
+                &loaded.subagent_messages()[TOOL_ID]
+            };
+            assert_eq!(
+                serde_json::to_value(untouched).unwrap(),
+                serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
             );
             assert_eq!(
                 serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap(),
@@ -3240,7 +4299,9 @@ mod tests {
                     session_id: id,
                     version,
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Some(Arc::new(history)),
+                        kind: SessionCheckpointKind::Config,
+                        history_revision: Some(1),
+                        history: Some(HistorySnapshot::new(history)),
                         model: Arc::from("next/model"),
                         cwd: "/tmp/next".into(),
                         options,
@@ -3316,7 +4377,11 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Some(Arc::new(vec![Message::user("coordinator".into())])),
+                        kind: SessionCheckpointKind::History,
+                        history_revision: Some(1),
+                        history: Some(HistorySnapshot::new(vec![Message::user(
+                            "coordinator".into(),
+                        )])),
                         model: Arc::from(MODEL),
                         cwd: CWD.into(),
                         options,
@@ -3379,7 +4444,11 @@ mod tests {
                     epoch: 1,
                 },
                 snapshot: Arc::new(SessionCheckpoint {
-                    history: Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())])),
+                    kind: SessionCheckpointKind::History,
+                    history_revision: Some(1),
+                    history: Some(HistorySnapshot::new(vec![Message::user(
+                        COORDINATOR_MSG.into(),
+                    )])),
                     model: Arc::from(MODEL),
                     cwd: CWD.into(),
                     options,
@@ -3460,6 +4529,8 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
+                        kind: SessionCheckpointKind::Config,
+                        history_revision: None,
                         history: None,
                         model: Arc::from(FAILED_MODEL),
                         cwd: CWD.into(),

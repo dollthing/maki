@@ -3,17 +3,26 @@ use crate::agent_errors::{
 };
 use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
-use maki_agent::cancel::{CancelToken, CancelTrigger};
+use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
+use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
+use maki_providers::Message;
+use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
+use maki_storage::sessions::HistorySnapshot;
 use mlua::{Function, Lua, RegistryKey};
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+mod targets;
+pub use targets::AgentOrchestration;
 
 const WRONG_TASK: &str = "orchestration context belongs to another task";
 static NEXT_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,9 +31,64 @@ static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct PluginAuthority {
     alive: AtomicBool,
     generation: u64,
+    publication_gate: Mutex<()>,
+    publication_cancel: CancelToken,
+    publication_trigger: Mutex<Option<CancelTrigger>>,
 }
 
 impl PluginAuthority {
+    fn new(alive: bool, generation: u64) -> Self {
+        let (trigger, cancel) = CancelToken::new();
+        let authority = Self {
+            alive: AtomicBool::new(alive),
+            generation,
+            publication_gate: Mutex::new(()),
+            publication_cancel: cancel,
+            publication_trigger: Mutex::new(Some(trigger)),
+        };
+        if !alive {
+            authority.revoke();
+        }
+        authority
+    }
+
+    fn revoke(&self) {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.alive.store(false, Ordering::Release);
+        self.publication_trigger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    pub(crate) fn register_publication(
+        &self,
+        publication: &CheckpointPublication,
+    ) -> PublicationRegistration {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.publication_cancel.register_publication(publication)
+    }
+
+    pub(crate) fn claim_publication(
+        &self,
+        claim: impl FnOnce() -> Result<(), Arc<str>>,
+    ) -> Result<(), Arc<str>> {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.is_alive() {
+            return Err(Arc::from(crate::agent_errors::INVOCATION_EXPIRED));
+        }
+        claim()
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -123,6 +187,36 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
+pub type ConfigMutationReservation = Box<
+    dyn FnOnce(Arc<EffectiveAgentConfig>, CheckpointClaim) -> Result<PreparedTransaction, String>
+        + Send,
+>;
+
+pub type ConfigMutationReserver = Arc<
+    dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutationReservation, String>
+        + Send
+        + Sync,
+>;
+
+pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+pub type TurnCompletion =
+    Arc<dyn Fn(&AgentRef, HistorySnapshot<Message>) -> TurnCompletionFuture + Send + Sync>;
+
+pub fn nonpersistent_config_mutation(
+    publication: CheckpointPublication,
+) -> ConfigMutationReservation {
+    Box::new(move |_, claim| {
+        Ok(PreparedTransaction {
+            publication,
+            publish: Box::new(move |_, publication| {
+                Box::pin(async move { claim(&publication).map_err(|error| error.to_string()) })
+            }),
+            finalize: Box::new(|_| {}),
+        })
+    })
+}
+
 pub trait OrchestrationServices: Send + Sync + 'static {
     fn resolve_target(
         &self,
@@ -133,8 +227,47 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         self.template(target).map(|_| ())
     }
 
+    fn validate_config_mutation(&self, target: &AgentRef) -> Result<(), String> {
+        self.validate_target(target)
+    }
+
+    fn reserve_config_mutation(
+        &self,
+        target: &AgentRef,
+        publication: CheckpointPublication,
+    ) -> Result<ConfigMutationReservation, String> {
+        self.validate_target(target)?;
+        if target
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .parent_id
+            .is_none()
+        {
+            return Err("durable root configuration adapter is unavailable".into());
+        }
+        Ok(nonpersistent_config_mutation(publication))
+    }
+
+    /// Completes the host's persistence attempt before the backend returns.
+    /// The callback must not await work on the target's occupied runner.
+    fn complete_turn(
+        &self,
+        _target: &AgentRef,
+        _history: HistorySnapshot<Message>,
+    ) -> TurnCompletionFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn register_target(&self, _target: TrustedTarget) -> Result<(), String> {
         Err("host target registration is unavailable".into())
+    }
+
+    fn register_child_target(
+        &self,
+        target: TrustedTarget,
+        _history_key: String,
+    ) -> Result<(), String> {
+        self.register_target(target)
     }
 
     fn template(&self, _target: &AgentRef) -> Result<ToolContext, String> {
@@ -220,7 +353,7 @@ pub(crate) fn revoke_plugin(lua: &Lua, plugin: &str) {
     if let Some(mut owners) = lua.app_data_mut::<PluginAuthorities>()
         && let Some(alive) = owners.0.remove(plugin)
     {
-        alive.alive.store(false, Ordering::Release);
+        alive.revoke();
     }
     crate::api::agent::close_plugin_agents(lua, plugin);
     let removed = if let Some(mut callbacks) = lua.app_data_mut::<EventCallbacks>() {
@@ -247,12 +380,7 @@ pub(crate) fn revoke_plugin(lua: &Lua, plugin: &str) {
 pub(crate) fn plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {
     lua.app_data_ref::<PluginAuthorities>()
         .and_then(|owners| owners.0.get(&plugin).cloned())
-        .unwrap_or_else(|| {
-            Arc::new(PluginAuthority {
-                alive: AtomicBool::new(false),
-                generation: 0,
-            })
-        })
+        .unwrap_or_else(|| Arc::new(PluginAuthority::new(false, 0)))
 }
 
 /// Whether the running code belongs to {plugin} at {generation} and the
@@ -274,10 +402,10 @@ pub(crate) fn install_plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<Plugi
     if lua.app_data_ref::<PluginAuthorities>().is_none() {
         lua.set_app_data(PluginAuthorities::default());
     }
-    let authority = Arc::new(PluginAuthority {
-        alive: AtomicBool::new(true),
-        generation: NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed),
-    });
+    let authority = Arc::new(PluginAuthority::new(
+        true,
+        NEXT_PLUGIN_GENERATION.fetch_add(1, Ordering::Relaxed),
+    ));
     lua.app_data_mut::<PluginAuthorities>()
         .expect("authority map installed")
         .0

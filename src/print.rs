@@ -7,6 +7,7 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
+use std::any::Any;
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
@@ -17,8 +18,9 @@ use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
-use maki_agent::headless::{HeadlessHandle, HeadlessParams};
+use maki_agent::headless::{HeadlessHandle, HeadlessParams, RootBinding};
 use maki_agent::permissions::PluginRuleStore;
+use maki_agent::session_coordinator::SessionCoordinatorHandle;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::tools::offload::OffloadCleanup;
 use maki_agent::{
@@ -33,9 +35,10 @@ use maki_commands::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
 use maki_lua::host_root::HostRootServices;
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_providers::model::Model;
-use maki_providers::{RequestOptions, TokenUsage, add_cost};
+use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -188,7 +191,8 @@ where
 #[derive(Default)]
 struct CommandTurnMarker;
 
-struct PrintCommandHost;
+#[derive(Default)]
+struct PrintCommandHost(Option<TrustedTarget>);
 
 fn print_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
@@ -198,6 +202,12 @@ fn print_capabilities() -> TargetCapabilities {
 }
 
 impl CommandHost for PrintCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.0
+            .clone()
+            .map(|target| Arc::new(target) as Arc<dyn Any + Send + Sync>)
+    }
+
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
         Box::pin(async move {
             match request {
@@ -269,7 +279,6 @@ fn drive_print(
             workflow: literal.workflow,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         },
     };
     runner.run(input)
@@ -288,6 +297,7 @@ impl VerboseOutput {
 fn run_and_settle<T>(
     task: smol::Task<()>,
     cleanup: Option<OffloadCleanup>,
+    on_cancel: impl AsyncFnOnce(Instant),
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let body_result = catch_unwind(AssertUnwindSafe(body));
@@ -322,6 +332,10 @@ fn run_and_settle<T>(
                 },
             )
             .await;
+            futures_lite::future::or(on_cancel(deadline), async {
+                smol::Timer::at(deadline).await;
+            })
+            .await;
         });
     }));
 
@@ -342,6 +356,84 @@ fn run_and_settle<T>(
         (Ok(_), Err(task_panic)) => resume_unwind(task_panic),
         (Ok(result), Ok(())) => result,
     }
+}
+
+fn print_initialization_input(literal: &AgentInput) -> AgentInput {
+    AgentInput::from_defaults(
+        String::new(),
+        literal.mode.clone(),
+        Vec::new(),
+        SessionDefaults {
+            fast: literal.fast,
+            workflow: literal.workflow,
+            thinking: Some(literal.thinking.into()),
+        },
+    )
+}
+
+fn with_print_handle<T>(
+    handle: HeadlessHandle,
+    body: impl FnOnce(&HeadlessHandle) -> Result<T>,
+) -> Result<T> {
+    let cleanup = handle.offload_cleanup.clone();
+    let manager = handle.manager.clone();
+    let coordinator = SessionCoordinatorHandle::resolve(handle.session_id.id()).ok();
+    let result = catch_unwind(AssertUnwindSafe(|| body(&handle)));
+    let task = {
+        let handle = handle;
+        handle.task
+    };
+    run_and_settle(
+        task,
+        cleanup,
+        async move |deadline| {
+            futures_lite::future::zip(
+                manager.shutdown(deadline.saturating_duration_since(Instant::now())),
+                async {
+                    if let Some(coordinator) = coordinator {
+                        let _ = coordinator.close().await;
+                    }
+                },
+            )
+            .await;
+        },
+        || match result {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        },
+    )
+}
+
+fn bind_print_root(
+    lua_handle: EventHandle,
+) -> (
+    RootBinding,
+    flume::Receiver<(Arc<HostRootServices>, TrustedTarget)>,
+) {
+    let (installed, services) = flume::bounded(1);
+    let binding: RootBinding = Box::new(move |_, root, template| {
+        Box::pin(async move {
+            let host_root = Arc::new(HostRootServices::fixed(
+                root.id(),
+                &template.model,
+                template.opts,
+                Arc::clone(&template.model_policy),
+            ));
+            let target = TrustedTarget {
+                target: root,
+                template,
+            };
+            lua_handle.install_host_root_services(Arc::clone(&host_root));
+            lua_handle.install_orchestration_services(Arc::new(
+                AgentOrchestration::bind_fixed_root(Arc::default(), target.clone())
+                    .with_completion(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+            ));
+            installed
+                .send((host_root, target))
+                .map_err(|error| error.to_string())
+        })
+    });
+    (binding, services)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -378,9 +470,6 @@ pub fn run(
     let literal = AgentInput::from_defaults(prompt, AgentMode::Build, images, defaults);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
-    let target = command_registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost));
-    let command_turn_marker = CommandTurnMarker;
-
     let prompt_slots = lua_handle.collect_prompt_slots();
     let session_options = lua_handle.session_option_catalog();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -402,241 +491,247 @@ pub fn run(
 
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
-    let runner = |input: AgentInput| {
-        let options = RequestOptions {
-            thinking: input.thinking,
-            fast: input.fast,
-        };
-        let handle = maki_agent::headless::spawn(HeadlessParams {
-            model: model.clone(),
-            config,
-            permissions_config,
-            timeouts,
-            input,
-            prompt_slots,
-            excluded_tools: vec![QUESTION_TOOL_NAME],
-            mcp_handle,
-            initial_wd: cwd,
-            model_policy: Arc::clone(&model_policy),
-            system_prompt_override,
-            append_system_prompt,
-            plugin_rules: Arc::clone(&plugin_rules),
-            project_config,
-            modes: Arc::clone(&modes),
-            session_options: session_options.clone(),
-            state_dir: state_dir.clone(),
-        })
+    let outcome = (|| {
+        let (binding, host_root) = bind_print_root(lua_handle.clone());
+        let handle = maki_agent::headless::spawn_with_binding(
+            HeadlessParams {
+                model: model.clone(),
+                config,
+                permissions_config,
+                timeouts,
+                input: print_initialization_input(&literal),
+                prompt_slots,
+                excluded_tools: vec![QUESTION_TOOL_NAME],
+                mcp_handle,
+                initial_wd: cwd,
+                model_policy: Arc::clone(&model_policy),
+                system_prompt_override,
+                append_system_prompt,
+                plugin_rules: Arc::clone(&plugin_rules),
+                project_config,
+                modes: Arc::clone(&modes),
+                session_options: session_options.clone(),
+                state_dir: state_dir.clone(),
+            },
+            Box::new(|mut model, timeouts| {
+                Box::pin(async move {
+                    let provider =
+                        maki_providers::provider::from_model_async(&mut model, timeouts).await?;
+                    Ok((model, Arc::from(provider)))
+                })
+            }),
+            binding,
+        )
         .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
-        let HeadlessHandle {
-            agent_id,
-            event_rx,
-            tool_names,
-            session_id,
-            cwd,
-            task,
-            offload_cleanup,
-        } = handle;
-        let host_root = Arc::new(HostRootServices::fixed(
-            agent_id,
-            model,
-            options,
-            model_policy,
-        ));
-        let _host_root_retirement = host_root.retirement_guard();
-        lua_handle.install_host_root_services(host_root);
-        let start = Instant::now();
-        let (mut result, verbose_out) = run_and_settle(task, offload_cleanup, || {
-            let mut verbose_out = match format {
-                OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
-                _ if verbose => Some(VerboseOutput::Json(Vec::new())),
-                _ => None,
-            };
-
-            if let Some(out) = &mut verbose_out {
-                out.emit(&InitEvent {
-                    event_type: "system",
-                    subtype: "init",
-                    cwd: &cwd,
-                    session_id: &session_id,
-                    tools: &tool_names,
-                    model: &model.id,
-                })?;
-            }
-
-            let mut state = PrintTurnState::default();
-            // Summed as the turns land: rates move mid-run, and only a turn knows the
-            // rate it paid.
-            let mut cost = None;
-
+        with_print_handle(handle, |handle| {
+            smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
+            let (host_root, trusted) = host_root.recv().map_err(|error| eyre!(error))?;
+            let _host_root_retirement = host_root.retirement_guard();
+            let target = command_registry.bind_target(
+                print_capabilities(),
+                Arc::new(PrintCommandHost(Some(trusted))),
+            );
+            let selection = host_root.model(&host_root.reference())?;
             let snapshot = HeadlessSnapshot::default();
             snapshot.install(
                 &lua_handle,
                 HeadlessMeta {
-                    id: session_id.to_string(),
-                    cwd: cwd.clone(),
-                    model: model.spec(),
-                    fast: false,
-                    thinking: String::new(),
+                    id: handle.session_id.to_string(),
+                    cwd: handle.cwd.clone(),
+                    model: selection.spec.to_string(),
+                    fast: selection.fast,
+                    thinking: selection.thinking.to_string(),
                 },
-                // `makima --print` always runs the agent in build mode
-                // (`headless::spawn` hardcodes `AgentMode::Build`).
                 || MODE_BUILD,
             );
+            drive_print(
+                &command_registry,
+                &target,
+                &CommandTurnMarker,
+                literal,
+                |input| {
+                    smol::block_on(handle.start_with_input(input)).map_err(|error| eyre!(error))?;
+                    let event_rx = &handle.event_rx;
+                    let tool_names = &handle.tool_names;
+                    let session_id = &handle.session_id;
+                    let cwd = &handle.cwd;
+                    let start = Instant::now();
+                    let (mut result, verbose_out) = (|| -> Result<_> {
+                        let mut verbose_out = match format {
+                            OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
+                            _ if verbose => Some(VerboseOutput::Json(Vec::new())),
+                            _ => None,
+                        };
 
-            while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
-                if matches!(envelope.event, AgentEvent::StreamClosed) {
-                    break;
-                }
-                snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(
-                    &lua_handle,
-                    &session_id,
-                    &envelope,
-                    envelope.subagent.is_some(),
-                );
-                let Envelope {
-                    ref event,
-                    ref subagent,
-                    ..
-                } = envelope;
-                let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
-
-                match event {
-                    AgentEvent::TextDelta { text } => {
-                        if parent_tool_use_id.is_none() {
-                            state.result_text.push_str(text);
-                        }
-                    }
-                    AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
-                    AgentEvent::ToolPending { .. }
-                    | AgentEvent::ToolStart(_)
-                    | AgentEvent::ToolExecutionStart { .. }
-                    | AgentEvent::ToolOutput { .. }
-                    | AgentEvent::ToolDone(_)
-                    | AgentEvent::QueueItemConsumed { .. }
-                    | AgentEvent::ModelSwitched { .. }
-                    | AgentEvent::QueueDrained
-                    | AgentEvent::AutoCompacting { .. }
-                    | AgentEvent::CompactionDone { .. }
-                    | AgentEvent::AuthRequired
-                    | AgentEvent::PermissionRequest { .. }
-                    | AgentEvent::Question { .. }
-                    | AgentEvent::SubagentHistory { .. }
-                    | AgentEvent::SubagentClosed
-                    | AgentEvent::Post(_)
-                    | AgentEvent::ToolSnapshot { .. }
-                    | AgentEvent::ToolHeaderSnapshot { .. }
-                    | AgentEvent::LiveToolBuf { .. }
-                    | AgentEvent::Nudge
-                    | AgentEvent::PromptProgress { .. }
-                    | AgentEvent::StreamClosed => {}
-                    AgentEvent::Retry {
-                        attempt,
-                        message,
-                        delay_ms,
-                    } => {
                         if let Some(out) = &mut verbose_out {
-                            out.emit(&RetryEvent {
+                            out.emit(&InitEvent {
                                 event_type: "system",
-                                subtype: "api_retry",
-                                attempt: *attempt,
-                                retry_delay_ms: *delay_ms,
-                                error: message,
-                                session_id: &session_id,
+                                subtype: "init",
+                                cwd,
+                                session_id,
+                                tools: tool_names,
+                                model: &model.id,
                             })?;
                         }
-                    }
-                    AgentEvent::TurnComplete(tc) => {
-                        add_cost(&mut cost, tc.cost);
-                        if let Some(out) = &mut verbose_out {
-                            let content_value = serde_json::to_value(&tc.message.content)?;
-                            out.emit(&AssistantEvent {
-                                event_type: "assistant",
-                                message: AssistantMessage {
-                                    model: &tc.model,
-                                    role: "assistant",
-                                    content: &content_value,
-                                    usage: &tc.usage,
-                                },
-                                session_id: &session_id,
-                                parent_tool_use_id,
-                            })?;
+
+                        let mut state = PrintTurnState::default();
+                        // Summed as the turns land: rates move mid-run, and only a turn knows the
+                        // rate it paid.
+                        let mut cost = None;
+
+                        while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+                            if matches!(envelope.event, AgentEvent::StreamClosed) {
+                                break;
+                            }
+                            snapshot.observe(&envelope);
+                            maki_lua::agent_autocmd::dispatch(
+                                &lua_handle,
+                                &session_id,
+                                &envelope,
+                                envelope.subagent.is_some(),
+                            );
+                            let Envelope {
+                                ref event,
+                                ref subagent,
+                                ..
+                            } = envelope;
+                            let parent_tool_use_id =
+                                subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
+
+                            match event {
+                                AgentEvent::TextDelta { text } => {
+                                    if parent_tool_use_id.is_none() {
+                                        state.result_text.push_str(text);
+                                    }
+                                }
+                                AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {
+                                }
+                                AgentEvent::ToolPending { .. }
+                                | AgentEvent::ToolStart(_)
+                                | AgentEvent::ToolExecutionStart { .. }
+                                | AgentEvent::ToolOutput { .. }
+                                | AgentEvent::ToolDone(_)
+                                | AgentEvent::QueueItemConsumed { .. }
+                                | AgentEvent::ModelSwitched { .. }
+                                | AgentEvent::QueueDrained
+                                | AgentEvent::AutoCompacting { .. }
+                                | AgentEvent::CompactionDone { .. }
+                                | AgentEvent::AuthRequired
+                                | AgentEvent::PermissionRequest { .. }
+                                | AgentEvent::Question { .. }
+                                | AgentEvent::SubagentHistory { .. }
+                                | AgentEvent::SubagentClosed
+                                | AgentEvent::Post(_)
+                                | AgentEvent::ToolSnapshot { .. }
+                                | AgentEvent::ToolHeaderSnapshot { .. }
+                                | AgentEvent::LiveToolBuf { .. }
+                                | AgentEvent::Nudge
+                                | AgentEvent::PromptProgress { .. }
+                                | AgentEvent::StreamClosed => {}
+                                AgentEvent::Retry {
+                                    attempt,
+                                    message,
+                                    delay_ms,
+                                } => {
+                                    if let Some(out) = &mut verbose_out {
+                                        out.emit(&RetryEvent {
+                                            event_type: "system",
+                                            subtype: "api_retry",
+                                            attempt: *attempt,
+                                            retry_delay_ms: *delay_ms,
+                                            error: message,
+                                            session_id,
+                                        })?;
+                                    }
+                                }
+                                AgentEvent::TurnComplete(tc) => {
+                                    add_cost(&mut cost, tc.cost);
+                                    if let Some(out) = &mut verbose_out {
+                                        let content_value =
+                                            serde_json::to_value(&tc.message.content)?;
+                                        out.emit(&AssistantEvent {
+                                            event_type: "assistant",
+                                            message: AssistantMessage {
+                                                model: &tc.model,
+                                                role: "assistant",
+                                                content: &content_value,
+                                                usage: &tc.usage,
+                                            },
+                                            session_id,
+                                            parent_tool_use_id,
+                                        })?;
+                                    }
+                                }
+                                AgentEvent::ToolResultsSubmitted { message } => {
+                                    if let Some(out) = &mut verbose_out {
+                                        let content_value = serde_json::to_value(&message.content)?;
+                                        out.emit(&UserEvent {
+                                            event_type: "user",
+                                            message: UserMessage {
+                                                role: "user",
+                                                content: &content_value,
+                                            },
+                                            session_id,
+                                            parent_tool_use_id,
+                                        })?;
+                                    }
+                                }
+                                AgentEvent::TurnOutcome(_) => {
+                                    if state.accept_outcome(&envelope) {
+                                        break;
+                                    }
+                                }
+                                AgentEvent::ControlComplete { .. } => break,
+                                AgentEvent::ControlError { message } => {
+                                    state.is_error = true;
+                                    state.result_text = message.clone();
+                                    break;
+                                }
+                            }
+                        }
+                        Ok((
+                            PrintResult {
+                                result_type: "result",
+                                subtype: if state.is_error { "error" } else { "success" },
+                                is_error: state.is_error,
+                                duration_ms: 0,
+                                num_turns: state.num_turns,
+                                result: state.result_text,
+                                stop_reason: state.stop_reason,
+                                session_id: session_id.clone(),
+                                // Zero on an unpriced model, which is what its turns reported too.
+                                total_cost_usd: cost.unwrap_or_default(),
+                                usage: state.usage,
+                            },
+                            verbose_out,
+                        ))
+                    })()?;
+                    result.duration_ms = start.elapsed().as_millis();
+                    match format {
+                        OutputFormat::Text => print!("{}", result.result),
+                        OutputFormat::Json | OutputFormat::StreamJson => {
+                            match verbose_out {
+                                Some(VerboseOutput::Json(mut events)) => {
+                                    events.push(serde_json::to_value(&result)?);
+                                    println!("{}", serde_json::to_string(&events)?);
+                                }
+                                _ => println!("{}", serde_json::to_string(&result)?),
+                            }
+                            terminal_result_emitted.set(true);
                         }
                     }
-                    AgentEvent::ToolResultsSubmitted { message } => {
-                        if let Some(out) = &mut verbose_out {
-                            let content_value = serde_json::to_value(&message.content)?;
-                            out.emit(&UserEvent {
-                                event_type: "user",
-                                message: UserMessage {
-                                    role: "user",
-                                    content: &content_value,
-                                },
-                                session_id: &session_id,
-                                parent_tool_use_id,
-                            })?;
-                        }
+                    if result.is_error {
+                        // The error text is already in the emitted result; a detailed
+                        // error report here would print it twice.
+                        Err(eyre!("agent run failed"))
+                    } else {
+                        Ok(())
                     }
-                    AgentEvent::TurnOutcome(_) => {
-                        if state.accept_outcome(&envelope) {
-                            break;
-                        }
-                    }
-                    AgentEvent::ControlComplete { .. } => break,
-                    AgentEvent::ControlError { message } => {
-                        state.is_error = true;
-                        state.result_text = message.clone();
-                        break;
-                    }
-                }
-            }
-            Ok((
-                PrintResult {
-                    result_type: "result",
-                    subtype: if state.is_error { "error" } else { "success" },
-                    is_error: state.is_error,
-                    duration_ms: 0,
-                    num_turns: state.num_turns,
-                    result: state.result_text,
-                    stop_reason: state.stop_reason,
-                    session_id,
-                    // Zero on an unpriced model, which is what its turns reported too.
-                    total_cost_usd: cost.unwrap_or_default(),
-                    usage: state.usage,
                 },
-                verbose_out,
-            ))
-        })?;
-        result.duration_ms = start.elapsed().as_millis();
-        match format {
-            OutputFormat::Text => print!("{}", result.result),
-            OutputFormat::Json | OutputFormat::StreamJson => {
-                match verbose_out {
-                    Some(VerboseOutput::Json(mut events)) => {
-                        events.push(serde_json::to_value(&result)?);
-                        println!("{}", serde_json::to_string(&events)?);
-                    }
-                    _ => println!("{}", serde_json::to_string(&result)?),
-                }
-                terminal_result_emitted.set(true);
-            }
-        }
-        if result.is_error {
-            // The error text is already in the emitted result; a detailed
-            // error report here would print it twice.
-            Err(eyre!("agent run failed"))
-        } else {
-            Ok(())
-        }
-    };
-    let outcome = drive_print(
-        &command_registry,
-        &target,
-        &command_turn_marker,
-        literal,
-        runner,
-    );
+            )
+        })
+    })();
     if let (Err(error), true, false) = (
         &outcome,
         matches!(format, OutputFormat::Json | OutputFormat::StreamJson),
@@ -685,6 +780,15 @@ mod tests {
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const OUTPUT_ERROR: &str = "print output failed";
     const ROOT_RESPONSE: &str = "root response";
+    const PRINT_NESTED_TOOL: &str = "print_nested_task";
+    const PRINT_PROMPT: &str = "print request";
+    const PRINT_RESPONSE: &str = "done";
+    const PRINT_SETTLEMENT_TIMEOUT: &str = "print turn did not settle";
+    const CHILD_PROMPT: &str = "print child request";
+    const GRANDCHILD_PROMPT: &str = "print grandchild request";
+    const CHILD_RESPONSE: &str = "print child response";
+    const GRANDCHILD_RESPONSE: &str = "print grandchild response";
+    const COMMAND_CHILD_PROMPT: &str = "print command child request";
 
     #[test_case("completed"; "completed")]
     #[test_case("failed"; "failed")]
@@ -845,10 +949,15 @@ mod tests {
         let task = smol::spawn(std::future::pending::<()>());
         let (completed, returned) = flume::bounded(1);
         let thread = std::thread::spawn(move || {
-            let result = run_and_settle(task, Some(cleanup), || {
-                FailingOutput.write_all(b"result")?;
-                Ok(())
-            });
+            let result = run_and_settle(
+                task,
+                Some(cleanup),
+                async |_| {},
+                || {
+                    FailingOutput.write_all(b"result")?;
+                    Ok(())
+                },
+            );
             completed.send(()).unwrap();
             result
         });
@@ -902,20 +1011,22 @@ mod tests {
             workflow: false,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         }
     }
 
-    struct RecordingPrintProvider(flume::Sender<(String, String, bool)>);
+    struct RecordingPrintProvider {
+        requests: Sender<(String, String, bool)>,
+        nested: Option<(Sender<()>, Receiver<()>)>,
+    }
 
     impl maki_providers::provider::Provider for RecordingPrintProvider {
         fn stream_message<'a>(
             &'a self,
             model: &'a Model,
-            _: &'a [maki_providers::Message],
+            messages: &'a [maki_providers::Message],
             system: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            events: &'a flume::Sender<maki_providers::ProviderEvent>,
             options: maki_providers::RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> maki_providers::provider::BoxFuture<
@@ -923,19 +1034,90 @@ mod tests {
             Result<maki_providers::StreamResponse, maki_agent::AgentError>,
         > {
             Box::pin(async move {
-                self.0
+                self.requests
                     .send((model.spec(), system.to_owned(), options.fast))
                     .unwrap();
-                Ok(maki_providers::StreamResponse {
-                    message: maki_providers::Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text {
-                            text: "done".into(),
-                        }],
+                let mut content = ContentBlock::Text {
+                    text: PRINT_RESPONSE.into(),
+                };
+                let mut stop_reason = StopReason::EndTurn;
+                assert!(messages.iter().flat_map(|message| &message.content).any(|block| {
+                    matches!(block, ContentBlock::Text { text } if [PRINT_PROMPT, CHILD_PROMPT, GRANDCHILD_PROMPT, COMMAND_CHILD_PROMPT].contains(&text.as_str()))
+                }));
+                let command_child = messages.iter().flat_map(|message| &message.content).any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text == COMMAND_CHILD_PROMPT)
+                });
+                if let Some((entered, release)) = &self.nested
+                    && !command_child
+                {
+                    let prompt = messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .find_map(|block| match block {
+                            ContentBlock::Text { text }
+                                if [PRINT_PROMPT, CHILD_PROMPT, GRANDCHILD_PROMPT]
+                                    .contains(&text.as_str()) =>
+                            {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let joined = messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .find_map(|block| match block {
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
+                                assert!(!is_error, "nested task failed: {content}");
+                                Some(content.as_str())
+                            }
+                            _ => None,
+                        });
+                    let text = if prompt == GRANDCHILD_PROMPT {
+                        entered.send_async(()).await.unwrap();
+                        release.recv_async().await.unwrap();
+                        GRANDCHILD_RESPONSE
+                    } else if let Some(joined) = joined {
+                        let expected = if prompt == CHILD_PROMPT {
+                            GRANDCHILD_RESPONSE
+                        } else {
+                            CHILD_RESPONSE
+                        };
+                        assert!(joined.contains(expected), "missing joined text: {joined}");
+                        if prompt == CHILD_PROMPT {
+                            CHILD_RESPONSE
+                        } else {
+                            ROOT_RESPONSE
+                        }
+                    } else {
+                        content = ContentBlock::ToolUse {
+                            id: PRINT_NESTED_TOOL.into(),
+                            name: PRINT_NESTED_TOOL.into(),
+                            input: serde_json::json!({ "child": prompt == CHILD_PROMPT }),
+                            thought_signature: None,
+                        };
+                        stop_reason = StopReason::ToolUse;
+                        ""
+                    };
+                    if stop_reason == StopReason::EndTurn {
+                        content = ContentBlock::Text { text: text.into() };
+                    }
+                }
+                if let ContentBlock::Text { text } = &content {
+                    events
+                        .send(ProviderEvent::TextDelta { text: text.clone() })
+                        .unwrap();
+                }
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![content],
                         ..Default::default()
                     },
                     usage: TokenUsage::default(),
-                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    stop_reason: Some(stop_reason),
                 })
             })
         }
@@ -1031,9 +1213,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn print_failure_cancels_pending_headless_before_next_tool() {
-        let name = "print_settle_output_error";
+    #[test_case(false; "output_error")]
+    #[test_case(true; "body_panic")]
+    fn print_failure_cancels_pending_headless_before_next_tool(panic: bool) {
+        let name = if panic {
+            "print_settle_body_panic"
+        } else {
+            "print_settle_output_error"
+        };
         let (executed, execution) = flume::bounded(1);
         ToolRegistry::global()
             .register(
@@ -1074,11 +1261,27 @@ mod tests {
         )
         .unwrap();
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
-        let result = run_and_settle(handle.task, handle.offload_cleanup, || {
-            FailingOutput.write_all(b"result")?;
-            Ok(())
-        });
-        assert_eq!(result.unwrap_err().to_string(), OUTPUT_ERROR);
+        let manager = handle.manager.clone();
+        let session_id = handle.session_id.id();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_print_handle(handle, |_| {
+                if panic {
+                    std::panic::panic_any(OUTPUT_ERROR);
+                }
+                FailingOutput.write_all(b"result")?;
+                Ok(())
+            })
+        }));
+        if panic {
+            assert_eq!(
+                result.unwrap_err().downcast_ref::<&str>(),
+                Some(&OUTPUT_ERROR)
+            );
+        } else {
+            assert_eq!(result.unwrap().unwrap_err().to_string(), OUTPUT_ERROR);
+        }
+        assert!(manager.snapshot().is_empty());
+        assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         let _ = release.send(());
         assert!(execution.try_recv().is_err());
     }
@@ -1110,83 +1313,325 @@ mod tests {
                 session_options: Default::default(),
                 state_dir: Some(state.path().to_path_buf()),
             },
-            Arc::new(RecordingPrintProvider(requests)),
+            Arc::new(RecordingPrintProvider {
+                requests,
+                nested: None,
+            }),
         )
         .unwrap();
         let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), "output").unwrap();
 
-        received.recv().unwrap();
-        smol::block_on(handle.task);
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
+        smol::block_on(futures_lite::future::or(handle.task, async {
+            smol::Timer::after(GATE_TIMEOUT).await;
+            panic!("{PRINT_SETTLEMENT_TIMEOUT}");
+        }));
         assert!(!dir.exists(), "print mode must remove its offload dir");
     }
 
-    #[test_case(maki_providers::ModelSelection { fast: Some(false), ..Default::default() }; "options_only") ]
-    #[test_case(maki_providers::ModelSelection::default(); "empty_patch") ]
-    #[test_case(maki_providers::ModelSelection { spec: Some(Arc::from("openai/gpt-5")), ..Default::default() }; "model_switch") ]
-    fn print_turn_uses_initialized_config(patch: maki_providers::ModelSelection) {
+    #[test_case(maki_providers::ModelSelection { fast: Some(false), ..Default::default() }, false, "turn"; "options_only")]
+    #[test_case(maki_providers::ModelSelection::default(), false, "turn"; "empty_patch")]
+    #[test_case(maki_providers::ModelSelection { spec: Some(Arc::from("openai/gpt-5")), ..Default::default() }, false, "turn"; "model_switch")]
+    #[test_case(maki_providers::ModelSelection::default(), true, "turn"; "nested_task")]
+    #[test_case(maki_providers::ModelSelection::default(), false, "completed"; "completed_command")]
+    #[test_case(maki_providers::ModelSelection::default(), false, "unknown"; "unknown_command")]
+    fn print_turn_uses_initialized_config(
+        patch: maki_providers::ModelSelection,
+        nested: bool,
+        outcome: &str,
+    ) {
         const SPEC: &str = "anthropic/claude-opus-4-8";
         const SYSTEM: &str = "print initialized system";
+        const COMMAND: &str = "/print_initialized";
+        const COMMAND_FINISHED: &str = "print command finished";
         let registry = CommandRegistry::new();
-        let target = target(&registry);
+        let _commands = StandardCommands::register(
+            &registry,
+            &[command::CustomCommand {
+                name: "print_prompt".into(),
+                description: String::new(),
+                content: PRINT_PROMPT.into(),
+                scope: command::CommandScope::Project,
+                accepts_args: false,
+                argument_hint: None,
+            }],
+            StandardCompletions::default(),
+        )
+        .unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
         let (requests, received) = flume::unbounded();
-        let mut literal = input("print request");
+        let (entered, entering) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let provider: Arc<dyn Provider> = Arc::new(RecordingPrintProvider {
+            requests,
+            nested: nested.then_some((entered, gate)),
+        });
+        let child_provider = Arc::clone(&provider);
+        let host = maki_lua::PluginHost::with_session_provider_preparer(
+            Arc::clone(ToolRegistry::global_arc()),
+            registry.clone(),
+            true,
+            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            Some(state_dir.path().to_path_buf()),
+            Some(Arc::new(move |model| {
+                Ok((model, Arc::clone(&child_provider)))
+            })),
+        )
+        .unwrap();
+        if nested {
+            host.load_source(
+                "print_bundled_task",
+                include_str!("../plugins/task/init.lua"),
+            )
+            .unwrap();
+            host.load_source(PRINT_NESTED_TOOL, &format!(r#"
+                maki.api.register_tool({{
+                    name = "{PRINT_NESTED_TOOL}", description = "Exercise nested print tasks",
+                    schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
+                    audiences = {{ "main", "general_sub" }},
+                    handler = function(input, ctx)
+                        local agent = assert(maki.agent.current(ctx))
+                        local selection = assert(agent:model(ctx))
+                        local root_ref = assert(maki.agent.root(ctx))
+                        if input.child then
+                            assert(selection.spec == "{SPEC}" and selection.fast)
+                        else
+                            local root = assert(maki.agent.get(ctx, root_ref))
+                            assert(root:id() == agent:id())
+                            local value, err = root:set_model(ctx, {{ fast = false }})
+                            assert(value == nil and err == "{fixed_model}")
+                        end
+                        local prompt = input.child and "{GRANDCHILD_PROMPT}" or "{CHILD_PROMPT}"
+                        local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                            description = prompt, prompt = prompt, subagent_type = "general",
+                        }})
+                        assert(not err, err)
+                        local task = maki.json.decode(spawned)
+                        if input.child then
+                            local changed = assert(agent:set_model(ctx, {{ fast = false }}))
+                            assert(not changed.fast)
+                        end
+                        local joined, wait_err = maki.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                        assert(not wait_err, wait_err)
+                        local result = maki.json.decode(joined)
+                        local expected = input.child and "{GRANDCHILD_RESPONSE}" or "{CHILD_RESPONSE}"
+                        assert(result.result.text == expected, joined)
+                        return result.result.text
+                    end,
+                }})
+            "#, fixed_model = maki_lua::host_root::FIXED_MODEL_ERROR)).unwrap();
+        }
+        host.load_source(
+            "print_initialized_command",
+            &format!(r#"
+                maki.api.register_command({{
+                    name = "{COMMAND}", tui_only = false,
+                    handler = function(_, ctx)
+                        local root = assert(maki.agent.current(ctx))
+                        assert(root:id() == assert(maki.agent.root(ctx)):id())
+                        local selection = assert(root:model(ctx))
+                        assert(selection.spec == "{SPEC}" and selection.fast)
+                        local changed, err = root:set_model(ctx, {{ fast = false }})
+                        assert(changed == nil and err == "{fixed_model}")
+                        local child = assert(maki.agent.spawn(ctx, {{
+                            inherit_provider = true, silent = true, tools = {{}},
+                        }}))
+                        assert(assert(child:prompt(ctx, "{COMMAND_CHILD_PROMPT}")).text == "{PRINT_RESPONSE}")
+                        assert(child:close(ctx))
+                        maki.ui.flash("{COMMAND_FINISHED}")
+                    end,
+                }})
+            "#, fixed_model = maki_lua::host_root::FIXED_MODEL_ERROR),
+        ).unwrap();
+        let mut literal = input(match outcome {
+            "unknown" => "/print_unknown",
+            "completed" => "/exit",
+            _ => "/project:print_prompt",
+        });
         literal.fast = true;
-        drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
-            let cwd = std::env::temp_dir();
-            let handle = maki_agent::headless::spawn_with_provider(
-                HeadlessParams {
-                    model: Model::from_spec(SPEC).unwrap(),
-                    config: AgentConfig::default(),
-                    permissions_config: PermissionsConfig::default(),
-                    timeouts: Default::default(),
-                    input,
-                    prompt_slots: Default::default(),
-                    excluded_tools: Vec::new(),
-                    mcp_handle: None,
-                    initial_wd: cwd.clone(),
-                    system_prompt_override: Some(SYSTEM.into()),
-                    append_system_prompt: None,
-                    model_policy: Arc::default(),
-                    plugin_rules: Arc::default(),
-                    project_config: ProjectConfig::for_project(&cwd),
-                    modes: Arc::default(),
-                    session_options: Default::default(),
-                    state_dir: None,
+        let cwd = std::env::temp_dir();
+        let lua_handle = host.event_handle();
+        let (binding, installed) = bind_print_root(lua_handle.clone());
+        let handle = maki_agent::headless::spawn_with_binding(
+            HeadlessParams {
+                model: Model::from_spec(SPEC).unwrap(),
+                config: AgentConfig {
+                    max_concurrent_agent_turns: 1,
+                    ..Default::default()
                 },
-                Arc::new(RecordingPrintProvider(requests)),
-            )?;
-            let root = Arc::new(HostRootServices::fixed(
-                handle.agent_id,
-                &Model::from_spec(SPEC).unwrap(),
-                RequestOptions {
-                    fast: true,
-                    thinking: maki_providers::ThinkingConfig::Off,
+                permissions_config: PermissionsConfig {
+                    yolo: true,
+                    ..Default::default()
                 },
-                Arc::new(ModelPolicy::default()),
-            ));
-            let reference = root.reference();
-            assert_eq!(reference.id(), handle.agent_id);
-            assert!(root.model(&reference).unwrap().fast);
+                timeouts: Default::default(),
+                input: print_initialization_input(&literal),
+                prompt_slots: lua_handle.collect_prompt_slots(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: Some(SYSTEM.into()),
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: lua_handle.session_option_catalog(),
+                state_dir: Some(state_dir.path().to_path_buf()),
+            },
+            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            binding,
+        )
+        .unwrap();
+        let manager = handle.manager.clone();
+        let session_id = handle.session_id.id();
+        let dir = offload_dir(&state_dir.path().join(SESSIONS_DIR), session_id);
+        let mut ran = false;
+        let result = with_print_handle(handle, |handle| {
+            let root = smol::block_on(handle.initialized_root()).unwrap();
+            let (host_root, trusted) = installed.recv_timeout(GATE_TIMEOUT).unwrap();
+            let command_host = Arc::new(PrintCommandHost(Some(trusted)));
+            let target = registry.bind_target(print_capabilities(), command_host.clone());
+            let reference = host_root.reference();
+            assert_eq!(reference.id(), root.id());
+            assert!(host_root.model(&reference).unwrap().fast);
             assert!(matches!(
-                smol::block_on(root.set_model(&reference, patch)),
+                smol::block_on(host_root.set_model(&reference, patch)),
                 Err(maki_lua::host_root::HostRootError::FixedModel)
             ));
-            let _retirement = root.retirement_guard();
-            smol::block_on(handle.task);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            received.try_recv().unwrap(),
-            (SPEC.into(), SYSTEM.into(), true)
-        );
-        assert!(received.try_recv().is_err());
+            assert!(matches!(
+                smol::block_on(command_host.request(HostRequest::Builtin(
+                    BuiltinOperation::ChangeDirectory {
+                        path: state_dir.path().to_path_buf(),
+                    },
+                ))),
+                Err(CommandError::Producer(_))
+            ));
+            assert_eq!(root.effective_config().unwrap().unwrap().context.cwd(), cwd);
+            let _retirement = host_root.retirement_guard();
+            host.wait_for_worker_barrier_for_test();
+            assert_eq!(manager.snapshot()[0].parent_id, None);
+            assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("saved.txt"), "output").unwrap();
+            if outcome == "turn" {
+                let dispatch = smol::block_on(registry.dispatch_input(&target, COMMAND.into()));
+                assert!(
+                    matches!(
+                        dispatch,
+                        InputDispatch::Dispatched(CommandOutcome::Completed)
+                    ),
+                    "{dispatch:?}"
+                );
+                let action = host.ui_action_rx().recv_timeout(GATE_TIMEOUT).unwrap();
+                assert!(
+                    matches!(action, maki_lua::UiAction::Flash(ref text) if text == COMMAND_FINISHED),
+                    "initialized command did not finish"
+                );
+            }
+            drive_print(
+                &registry,
+                &target,
+                &CommandTurnMarker,
+                literal,
+                |input: AgentInput| {
+                    ran = true;
+                    assert_eq!(input.message, PRINT_PROMPT);
+                    let ticket = smol::block_on(handle.start_with_input(input)).unwrap();
+                    let child_actor = if nested {
+                        entering.recv_timeout(GATE_TIMEOUT).unwrap();
+                        let graph = manager.snapshot();
+                        assert_eq!(graph.len(), 3);
+                        let child = graph
+                            .iter()
+                            .find(|node| node.parent_id == Some(root.id()))
+                            .unwrap();
+                        let grandchild = graph
+                            .iter()
+                            .find(|node| node.parent_id == Some(child.agent_id))
+                            .unwrap();
+                        assert_eq!((child.depth, grandchild.depth), (1, 2));
+                        assert_eq!(grandchild.root_id, root.id());
+                        let actor = manager.lookup(child.agent_id).unwrap().actor().unwrap();
+                        assert!(root.effective_config().unwrap().unwrap().settings.fast);
+                        release.send(()).unwrap();
+                        Some(actor)
+                    } else {
+                        None
+                    };
+                    let events = handle.event_rx.clone();
+                    let state = smol::block_on(futures_lite::future::or(
+                        async {
+                            let mut state = PrintTurnState::default();
+                            let mut outcomes = 0;
+                            while let Ok(envelope) = events.recv_async().await {
+                                if matches!(envelope.event, AgentEvent::StreamClosed) {
+                                    break;
+                                }
+                                if let AgentEvent::TextDelta { text } = &envelope.event
+                                    && envelope.subagent.is_none()
+                                {
+                                    state.result_text.push_str(text);
+                                }
+                                outcomes += usize::from(state.accept_outcome(&envelope));
+                            }
+                            assert_eq!(outcomes, 1);
+                            Ok(state)
+                        },
+                        async {
+                            smol::Timer::after(GATE_TIMEOUT).await;
+                            Err(eyre!(PRINT_SETTLEMENT_TIMEOUT))
+                        },
+                    ))?;
+                    assert_eq!(
+                        state.result_text,
+                        if nested {
+                            ROOT_RESPONSE
+                        } else {
+                            PRINT_RESPONSE
+                        }
+                    );
+                    assert!(matches!(
+                        smol::block_on(ticket.wait()),
+                        TurnOutcome::Completed { .. }
+                    ));
+                    if let Some(child) = child_actor {
+                        assert!(!child.effective_config().unwrap().settings.fast);
+                    }
+                    Ok(())
+                },
+            )
+        });
+        assert_eq!(ran, outcome == "turn", "{result:?}");
+        if outcome == "unknown" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+        }
+        assert!(manager.snapshot().is_empty());
+        assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
+        assert!(!dir.exists());
+        let requests = received.try_iter().collect::<Vec<_>>();
+        if outcome != "turn" {
+            assert!(requests.is_empty());
+            return;
+        }
+        assert_eq!(requests[0], (SPEC.into(), String::new(), true));
+        assert_eq!(requests[1], (SPEC.into(), SYSTEM.into(), true));
+        if nested {
+            assert_eq!(requests.len(), 6);
+            assert!(requests.iter().all(|(spec, _, _)| spec == SPEC));
+            assert!(requests[2].2);
+            assert!(requests[3].2);
+            assert_eq!(requests[5], (SPEC.into(), SYSTEM.into(), true));
+        } else {
+            assert_eq!(requests.len(), 2);
+        }
     }
 
     fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {
-        registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost))
+        registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost::default()))
     }
 
     struct ReplaceAttachment;

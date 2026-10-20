@@ -631,10 +631,9 @@ mod tests {
     use std::sync::Arc;
 
     use maki_agent::session_coordinator::{
-        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
-        SessionCoordinatorParams, builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+        builtin_option_definitions,
     };
-    use maki_providers::Model;
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
@@ -676,10 +675,6 @@ mod tests {
             model: Arc::from("test/model"),
             cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
-            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
-            directory_adopter: Arc::new(|path: PathBuf| {
-                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
-            }),
             checkpoint,
             mailbox: mailbox.clone(),
         })

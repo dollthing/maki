@@ -457,7 +457,6 @@ impl<'h> Agent<'h> {
             workflow,
             prompt: _,
             cancel: _,
-            lease_committer: _,
         } = input;
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
@@ -2197,7 +2196,6 @@ mod tests {
             workflow: false,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         }
     }
 

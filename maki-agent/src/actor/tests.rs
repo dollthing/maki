@@ -421,7 +421,6 @@ pub(super) fn input(message: &str) -> AgentInput {
         workflow: false,
         prompt: None,
         cancel: None,
-        lease_committer: None,
     }
 }
 

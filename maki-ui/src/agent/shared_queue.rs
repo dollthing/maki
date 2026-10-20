@@ -416,7 +416,6 @@ mod tests {
                 workflow: false,
                 prompt: None,
                 cancel: None,
-                lease_committer: None,
             },
             run_id: 0,
             displayed,

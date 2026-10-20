@@ -7,7 +7,6 @@ use std::sync::Arc;
 use futures_lite::FutureExt;
 
 use maki_providers::{ContentBlock, Message, MessageKind, Role};
-use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 
 use super::prepared::{CancelPublication, PreparedOperation};
@@ -46,15 +45,6 @@ pub struct HistoryEditWork {
 type PreparedEditResult =
     Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError>;
 
-type LegacyPreparedEditResult = Result<
-    (
-        Option<ActorIdleGuard>,
-        PreparedCommit,
-        Option<HistoryChange>,
-    ),
-    ActorError,
->;
-
 enum HistoryEditAction {
     Rewind {
         boundary: HistoryBoundary,
@@ -67,14 +57,6 @@ enum HistoryEditAction {
         transaction: PreparedTransaction,
         completion: flume::Sender<PreparedEditResult>,
     },
-    LegacyPrepared {
-        operation: Box<PreparedOperation>,
-        clear_history: bool,
-        held: bool,
-        publication: Option<CheckpointPublication>,
-        checkpoint: HistoryEditCheckpoint,
-        completion: flume::Sender<LegacyPreparedEditResult>,
-    },
 }
 
 pub(super) enum HistoryEditCompletion {
@@ -86,10 +68,6 @@ pub(super) enum HistoryEditCompletion {
         sender: flume::Sender<PreparedEditResult>,
         result: PreparedEditResult,
     },
-    LegacyPrepared {
-        sender: flume::Sender<LegacyPreparedEditResult>,
-        result: LegacyPreparedEditResult,
-    },
 }
 
 impl HistoryEditCompletion {
@@ -99,9 +77,6 @@ impl HistoryEditCompletion {
                 let _ = sender.send(result);
             }
             Self::Prepared { sender, result } => {
-                let _ = sender.send(result);
-            }
-            Self::LegacyPrepared { sender, result } => {
                 let _ = sender.send(result);
             }
         }
@@ -160,154 +135,6 @@ impl AgentActorHandle {
 }
 
 impl ActorIdleGuard {
-    /// Retained for approval callers that have not moved to durable transactions.
-    pub fn commit_prepared_in_memory(
-        &self,
-        operation: PreparedOperationTicket,
-    ) -> Result<PreparedCommit, ActorError> {
-        if !operation.belongs_to(&self.actor) {
-            return Err(ActorError::PolicyCancelled);
-        }
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(super::lifecycle_error(state.lifecycle));
-        }
-        state
-            .owned_idle(&self.owner)
-            .filter(|reservation| {
-                !reservation.committing
-                    && reservation.permission.is_none()
-                    && reservation.edit.is_none()
-            })
-            .ok_or(ActorError::Busy)?;
-        let pending = operation.take_ready_locked(&mut state)?;
-        Ok(pending.commit_locked(&self.actor.inner, &mut state, Box::new(|_| {})))
-    }
-
-    /// Starts an actor-owned commit after the caller has revalidated preparation.
-    /// Once enqueued, dropping this future does not cancel the transaction.
-    pub async fn commit_prepared(
-        self,
-        operation: PreparedOperationTicket,
-        clear_history: bool,
-        checkpoint: HistoryEditCheckpoint,
-    ) -> Result<(PreparedCommit, Option<HistoryChange>), ActorError> {
-        self.commit_prepared_inner(operation, clear_history, checkpoint, false, None)
-            .await
-            .map(|(_, commit, history)| (commit, history))
-    }
-
-    pub async fn commit_prepared_held(
-        self,
-        operation: PreparedOperationTicket,
-        clear_history: bool,
-        checkpoint: HistoryEditCheckpoint,
-    ) -> Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError> {
-        let (guard, commit, history) = self
-            .commit_prepared_inner(operation, clear_history, checkpoint, true, None)
-            .await?;
-        Ok((guard.ok_or(ActorError::PolicyCancelled)?, commit, history))
-    }
-
-    pub async fn commit_prepared_held_cancellable(
-        self,
-        operation: PreparedOperationTicket,
-        clear_history: bool,
-        checkpoint: HistoryEditCheckpoint,
-        publication: CheckpointPublication,
-    ) -> Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError> {
-        let (guard, commit, history) = self
-            .commit_prepared_inner(
-                operation,
-                clear_history,
-                checkpoint,
-                true,
-                Some(publication),
-            )
-            .await?;
-        Ok((guard.ok_or(ActorError::PolicyCancelled)?, commit, history))
-    }
-
-    async fn commit_prepared_inner(
-        mut self,
-        operation: PreparedOperationTicket,
-        clear_history: bool,
-        checkpoint: HistoryEditCheckpoint,
-        held: bool,
-        publication: Option<CheckpointPublication>,
-    ) -> LegacyPreparedEditResult {
-        if !operation.belongs_to(&self.actor)
-            || publication
-                .as_ref()
-                .is_some_and(CheckpointPublication::is_cancelled)
-        {
-            return Err(ActorError::PolicyCancelled);
-        }
-        let cancellation = publication.clone();
-        let (completion, response) = flume::bounded(1);
-        let actor = self.actor.clone();
-        {
-            let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(super::lifecycle_error(state.lifecycle));
-            }
-            state
-                .owned_idle(&self.owner)
-                .filter(|reservation| {
-                    reservation.permission.is_none() && reservation.edit.is_none()
-                })
-                .ok_or(ActorError::Busy)?;
-            let pending = operation.take_ready_locked(&mut state)?;
-            state.owned_idle(&self.owner).unwrap().committing = true;
-            state.owned_idle(&self.owner).unwrap().edit = Some(HistoryEditWork {
-                owner: Arc::clone(&self.owner),
-                action: HistoryEditAction::LegacyPrepared {
-                    operation: Box::new(pending),
-                    clear_history,
-                    held,
-                    publication,
-                    checkpoint,
-                    completion,
-                },
-            });
-            self.release = false;
-            actor.inner.queue.notify();
-        }
-        drop(operation);
-        if let Some(publication) = cancellation {
-            let result = futures_lite::future::or(
-                async {
-                    publication.cancelled().await;
-                    let edit = {
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        state
-                            .owned_idle(&self.owner)
-                            .and_then(|idle| idle.edit.take())
-                    };
-                    if let Some(edit) = edit {
-                        edit.fail(ActorError::PolicyCancelled);
-                        self.release = true;
-                    }
-                    None
-                },
-                async { Some(response.recv_async().await) },
-            )
-            .await;
-            if let Some(result) = result {
-                return result.map_err(|_| ActorError::Closed)?;
-            }
-        }
-        response
-            .recv_async()
-            .await
-            .map_err(|_| ActorError::Closed)?
-    }
-
     pub async fn commit_prepared_transaction_held(
         mut self,
         operation: PreparedOperationTicket,
@@ -419,8 +246,7 @@ impl ActorIdleGuard {
 impl HistoryEditWork {
     pub(super) fn prepared_id(&self) -> Option<u64> {
         match &self.action {
-            HistoryEditAction::Prepared { operation, .. }
-            | HistoryEditAction::LegacyPrepared { operation, .. } => Some(operation.id),
+            HistoryEditAction::Prepared { operation, .. } => Some(operation.id),
             HistoryEditAction::Rewind { .. } => None,
         }
     }
@@ -431,14 +257,6 @@ impl HistoryEditWork {
                 let _ = completion.send(Err(error));
             }
             HistoryEditAction::Prepared {
-                operation,
-                completion,
-                ..
-            } => {
-                (*operation).fail(error.clone());
-                let _ = completion.send(Err(error));
-            }
-            HistoryEditAction::LegacyPrepared {
                 operation,
                 completion,
                 ..
@@ -557,125 +375,6 @@ impl HistoryEditWork {
                 });
                 drop(guard);
                 HistoryEditCompletion::Prepared {
-                    sender: completion,
-                    result,
-                }
-            }
-            HistoryEditAction::LegacyPrepared {
-                operation,
-                clear_history,
-                held,
-                publication,
-                checkpoint: checkpoint_fn,
-                completion,
-            } => {
-                let snapshot = clear_history.then(|| {
-                    let mut snapshot = HistorySnapshot::new(Vec::new());
-                    snapshot.compacted = actor.inner.history.load().compacted;
-                    snapshot
-                });
-                let result = if let Some(publication) = &publication {
-                    if publication.is_cancelled() {
-                        Err(ActorError::PolicyCancelled)
-                    } else if let Some(snapshot) = &snapshot {
-                        futures_lite::future::or(
-                            checkpoint(&checkpoint_fn, snapshot.clone()),
-                            async {
-                                publication.cancelled().await;
-                                Err(ActorError::PolicyCancelled)
-                            },
-                        )
-                        .await
-                        .and_then(|()| {
-                            if publication.finish_commit() {
-                                Ok(())
-                            } else {
-                                Err(ActorError::PolicyCancelled)
-                            }
-                        })
-                    } else if publication.try_publish() {
-                        Ok(())
-                    } else {
-                        Err(ActorError::PolicyCancelled)
-                    }
-                } else if let Some(snapshot) = &snapshot {
-                    checkpoint(&checkpoint_fn, snapshot.clone()).await
-                } else {
-                    Ok(())
-                };
-                let result = match result {
-                    Err(error) => {
-                        (*operation).fail(error.clone());
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        super::drive_operations(&actor.inner, &mut state);
-                        Err(error)
-                    }
-                    Ok(()) => {
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        let change = snapshot.map(|snapshot| {
-                            history.replace_snapshot(snapshot.clone());
-                            HistoryChange {
-                                agent_id: actor.agent_id(),
-                                epoch: snapshot.epoch,
-                                messages: snapshot.messages,
-                                draft: Message::user(String::new()),
-                            }
-                        });
-                        let committed =
-                            (*operation).commit_locked(&actor.inner, &mut state, Box::new(|_| {}));
-                        if let Some(reservation) = state.owned_idle(&self.owner) {
-                            reservation.committing = false;
-                            if held {
-                                guard.release = false;
-                            } else if let Some(ticket) = &committed.ticket {
-                                reservation.permission = Some(ticket.turn_id());
-                                guard.release = false;
-                            }
-                        }
-                        super::drive_operations(&actor.inner, &mut state);
-                        Ok((committed, change))
-                    }
-                };
-                if let Ok((committed, _)) = &result
-                    && let Some(ticket) = &committed.ticket
-                {
-                    let cancelled = {
-                        let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        let reason = match state.lifecycle {
-                            ActorLifecycle::Open => None,
-                            ActorLifecycle::Closed => Some(crate::TurnCancellationReason::Closed),
-                            ActorLifecycle::Shutdown => {
-                                Some(crate::TurnCancellationReason::Shutdown)
-                            }
-                        };
-                        if let Some(reason) = reason {
-                            actor
-                                .inner
-                                .queue
-                                .remove_turn(ticket.turn_id())
-                                .zip(Some(reason))
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((admission, reason)) = cancelled {
-                        super::terminalize_work(
-                            &actor.inner,
-                            vec![super::ActorWork::Turn(Box::new(admission))],
-                            reason,
-                        );
-                    }
-                }
-                let result = result.map(|(commit, history)| {
-                    let idle = held.then(|| ActorIdleGuard {
-                        actor: actor.clone(),
-                        owner: Arc::clone(&self.owner),
-                        release: true,
-                    });
-                    (idle, commit, history)
-                });
-                drop(guard);
-                HistoryEditCompletion::LegacyPrepared {
                     sender: completion,
                     result,
                 }
@@ -1200,7 +899,6 @@ mod tests {
                     workflow: false,
                     prompt: None,
                     cancel: None,
-                    lease_committer: None,
                 },
                 event_sender: None,
                 correlation: "prepared-close".into(),

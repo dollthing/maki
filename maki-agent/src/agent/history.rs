@@ -94,7 +94,7 @@ impl History {
         self.rewrite(|msgs| *msgs = messages);
     }
 
-    pub(crate) fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
+    pub fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
         self.snapshot = snapshot;
         self.publish();
     }

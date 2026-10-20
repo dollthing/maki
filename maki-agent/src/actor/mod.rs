@@ -777,7 +777,6 @@ fn preparation_input(input: &AgentInput) -> AgentInput {
         workflow: input.workflow,
         prompt: input.prompt.clone(),
         cancel: input.cancel.clone(),
-        lease_committer: None,
     }
 }
 

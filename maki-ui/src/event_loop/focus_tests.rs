@@ -4,7 +4,7 @@ use maki_agent::actor::{ConfigChange, ConfigPatch, PendingQueueEntry, PreparedMo
 use maki_commands::{CommandError, CommandOutcome, HostContextRequest, HostRequest};
 use test_case::test_case;
 
-use super::tests::with_event_loop;
+use super::tests::{select_child_chat, with_event_loop};
 use super::{
     CLOSED_TARGET_ERR, CommandEvent, EventLoop, SESSION_OP_TIMEOUT, SessionRequest, UiAction,
 };
@@ -392,9 +392,7 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
                 .find(|node| node.parent_id == Some(root))
                 .unwrap()
                 .agent_id;
-            event_loop.sessions[0].app.chats[1].agent_id = Some(child);
-            event_loop.sessions[0].app.active_chat = 1;
-            event_loop.sync_orchestration();
+            select_child_chat(event_loop, child, RESTORED_CHAT);
             Some(child)
         };
         let registry = command_runtime.registry.clone();

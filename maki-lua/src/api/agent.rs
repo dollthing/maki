@@ -69,7 +69,7 @@ use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::host_root::HostRootServices;
-use crate::orchestration::TrustedContext;
+use crate::orchestration::{OrchestrationServices, TrustedContext};
 use crate::runtime::{CANCELLED_MSG, Request};
 
 const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
@@ -349,6 +349,7 @@ impl LuaActorState {
 struct LuaActorBackend {
     state: Arc<LuaActorState>,
     offload: Option<Arc<OffloadStore>>,
+    completion: Option<Arc<dyn OrchestrationServices>>,
 }
 
 impl LuaActorBackend {
@@ -356,6 +357,7 @@ impl LuaActorBackend {
         Self {
             state,
             offload: None,
+            completion: None,
         }
     }
 }
@@ -628,6 +630,23 @@ impl ActorBackend for LuaActorBackend {
                 && let Some(value) = &captured
             {
                 context.output.append_output(value.clone());
+            }
+            if let Some(completion) = &self.completion
+                && let Some(current) = &context.managed_turn
+            {
+                let result = match current.agent_ref() {
+                    Ok(target) => {
+                        completion
+                            .complete_turn(&target, history.snapshot().clone())
+                            .await
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                if let Err(error) = result {
+                    let _ = state.chip_event_tx.send(AgentEvent::ControlError {
+                        message: format!("failed to checkpoint completed turn: {error}"),
+                    });
+                }
             }
             state.relay_history(history);
             BackendResult::EnteredRun(outcome)
@@ -1898,6 +1917,7 @@ fn spawn_session_actor(
     let backend = || -> Box<dyn ActorBackend> {
         let mut backend = LuaActorBackend::new(Arc::clone(state));
         backend.offload = parent.context.offload.clone();
+        backend.completion = crate::orchestration::services(lua);
         Box::new(backend)
     };
     let init_params = |agent_id| {
@@ -2038,10 +2058,13 @@ fn register_session(
     }
     if let SessionControl::Managed { agent, .. } = &sess.control
         && let Some(service) = crate::orchestration::services(lua)
-        && let Err(error) = service.register_target(crate::orchestration::TrustedTarget {
-            target: agent.clone(),
-            template: child_template,
-        })
+        && let Err(error) = service.register_child_target(
+            crate::orchestration::TrustedTarget {
+                target: agent.clone(),
+                template: child_template,
+            },
+            sess.state.ui_id.clone(),
+        )
     {
         sess.close_controlled();
         return Err(error.to_string());
@@ -2805,7 +2828,6 @@ async fn prompt(
         workflow: false,
         prompt: None,
         cancel: None,
-        lease_committer: None,
     };
     let result = if let Some((current, child_id)) = managed_wait {
         let admission = maki_agent::manager::PromptAdmission {
@@ -2958,7 +2980,6 @@ async fn send(
             workflow: false,
             prompt: None,
             cancel: None,
-            lease_committer: None,
         },
         None,
         String::new(),
@@ -3721,7 +3742,6 @@ mod tests {
                     workflow: false,
                     prompt: None,
                     cancel: None,
-                    lease_committer: None,
                 },
                 None,
                 String::new(),
@@ -4027,7 +4047,6 @@ mod tests {
                         workflow: false,
                         prompt: None,
                         cancel: None,
-                        lease_committer: None,
                     },
                     None,
                     String::new(),
@@ -4202,7 +4221,6 @@ mod tests {
                             workflow: false,
                             prompt: None,
                             cancel: None,
-                            lease_committer: None,
                         },
                         None,
                         String::new()

@@ -287,15 +287,6 @@ impl SessionOptions {
         Self::prepare_set_values_from_state(&state, values)
     }
 
-    pub(crate) fn prepare_set_model(
-        &self,
-        model: &str,
-        fast: &str,
-        thinking: &str,
-    ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
-        self.prepare_actor_config(model, fast, thinking, None)
-    }
-
     pub(crate) fn prepare_actor_config(
         &self,
         model: &str,
@@ -828,7 +819,7 @@ mod tests {
         let before = options.snapshot();
 
         let candidate = options
-            .prepare_set_model("new/model", ENABLED_VALUE, ENABLED_VALUE)
+            .prepare_actor_config("new/model", ENABLED_VALUE, ENABLED_VALUE, None)
             .unwrap()
             .unwrap();
         let staged = SessionOptions::candidate_snapshot(&candidate);

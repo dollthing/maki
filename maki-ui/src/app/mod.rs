@@ -2930,7 +2930,6 @@ impl App {
                 })
             }),
             cancel: None,
-            lease_committer: None,
         };
         let root = self.chats[0].agent_id == Some(admission.target.id());
         let starting = root && self.status != Status::Streaming;

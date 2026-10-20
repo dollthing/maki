@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use include_dir::Dir;
-use maki_agent::cancel::CancelToken;
+use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
@@ -26,6 +26,7 @@ use maki_agent::tools::{
 use maki_agent::{
     BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
+use maki_storage::checkpoint::CheckpointPublication;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
     ffi,
@@ -543,8 +544,7 @@ enum KillReason {
     Deadline,
 }
 
-/// Lua is single-threaded so this Mutex never contends, but
-/// `Lua::app_data` requires `Send + Sync` with the `send` feature.
+/// Shares invocation state between Lua execution and captured publication claims.
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
@@ -552,6 +552,8 @@ pub(crate) struct TaskCell {
     pub(crate) plugin_origin: Option<(Arc<str>, u64)>,
     pub(crate) plugin_owner: Option<Arc<crate::orchestration::PluginAuthority>>,
     pub(crate) scope_alive: bool,
+    publication_cancel: CancelToken,
+    publication_trigger: Option<CancelTrigger>,
     pub(crate) delegated_tool: Option<DelegatedTool>,
     pub(crate) agent_parent: Option<Arc<maki_agent::cancel::CancelMap<String>>>,
     defer_close: Vec<Box<dyn FnOnce() + Send>>,
@@ -597,6 +599,33 @@ pub(crate) struct TaskCell {
 }
 
 impl TaskCell {
+    pub(crate) fn register_publication(
+        &self,
+        publication: &CheckpointPublication,
+    ) -> [PublicationRegistration; 2] {
+        if !self.is_live() {
+            publication.cancel();
+        }
+        [
+            self.publication_cancel.register_publication(publication),
+            self.cancel.register_publication(publication),
+        ]
+    }
+
+    pub(crate) fn invalidate_publications(&mut self) {
+        self.publication_trigger.take();
+    }
+
+    pub(crate) fn set_plugin_origin(&mut self, origin: Option<(Arc<str>, u64)>) {
+        if self.plugin_origin != origin {
+            self.publication_trigger.take();
+            let (trigger, cancel) = CancelToken::new();
+            self.publication_trigger = Some(trigger);
+            self.publication_cancel = cancel;
+            self.plugin_origin = origin;
+        }
+    }
+
     pub(crate) fn validate_plugin_effect(&self) -> Result<(), String> {
         if self
             .plugin_owner
@@ -627,6 +656,7 @@ impl TaskCell {
         deadline: Option<Instant>,
         live: Option<LiveCtx>,
     ) -> Self {
+        let (publication_trigger, publication_cancel) = CancelToken::new();
         Self {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
@@ -636,6 +666,8 @@ impl TaskCell {
             plugin_origin: None,
             plugin_owner: None,
             scope_alive: true,
+            publication_cancel,
+            publication_trigger: Some(publication_trigger),
             defer_close: Vec::new(),
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
@@ -1317,6 +1349,7 @@ impl Drop for TaskScope {
         let (task_id, cleanup) = {
             let mut cell = lock_cell(&self.handle);
             cell.scope_alive = false;
+            cell.publication_trigger.take();
             cell.clear_cancel_hooks(&self.lua);
             (cell.id, std::mem::take(&mut cell.defer_close))
         };
@@ -1419,7 +1452,7 @@ pub(crate) fn bind_plugin_owner(
 ) -> mlua::Result<()> {
     let task = active_task(lua);
     let mut cell = lock_cell(&task);
-    cell.plugin_origin = Some((plugin, owner.generation()));
+    cell.set_plugin_origin(Some((plugin, owner.generation())));
     cell.plugin_owner = Some(owner);
     cell.validate_plugin_effect().map_err(mlua::Error::runtime)
 }
@@ -1979,7 +2012,10 @@ async fn until_abandoned<T>(
             // Bound before the match: the guard would outlive the await.
             let deadline = lock_cell(handle).deadline.get();
             match deadline {
-                Some(dl) if dl <= Instant::now() => break,
+                Some(dl) if dl <= Instant::now() => {
+                    lock_cell(handle).invalidate_publications();
+                    break;
+                }
                 Some(dl) => {
                     futures_lite::future::or(async { _ = smol::Timer::at(dl).await }, changed).await
                 }
@@ -2045,11 +2081,11 @@ fn spawn_async_task(
         cell.pinned_target = task.pinned_target;
         if let Some(owner) = &task.owner {
             let owner = lock_cell(&owner.0);
-            cell.plugin_origin = owner.plugin_origin.clone();
+            cell.set_plugin_origin(owner.plugin_origin.clone());
             cell.plugin_owner = owner.plugin_owner.clone();
         }
         if let Some((plugin, owner)) = task.plugin_grant {
-            cell.plugin_origin = Some((plugin, owner.generation()));
+            cell.set_plugin_origin(Some((plugin, owner.generation())));
             cell.plugin_owner = Some(owner);
         }
         let scope = TaskScope::new(&lua, cell);
@@ -4550,7 +4586,7 @@ async fn run_tool_call(
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
     let owner = crate::orchestration::plugin_authority(&lua, plugin.clone());
-    cell.plugin_origin = Some((plugin.clone(), owner.generation()));
+    cell.set_plugin_origin(Some((plugin.clone(), owner.generation())));
     cell.plugin_owner = Some(owner);
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());

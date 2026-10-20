@@ -19,7 +19,7 @@ use maki_commands::{
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::Model;
 
-use crate::headless::InteractiveControl;
+use crate::headless::{InteractiveControl, InteractiveControlSender};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -126,7 +126,7 @@ impl SessionCommandState {
 }
 
 pub struct SessionCommandHost {
-    control_tx: flume::Sender<InteractiveControl>,
+    control_tx: InteractiveControlSender,
     state: Arc<SessionCommandState>,
     reset_session_guidance: Option<Arc<str>>,
     coordinator: Option<crate::session_coordinator::SessionCoordinatorHandle>,
@@ -134,11 +134,11 @@ pub struct SessionCommandHost {
 
 impl SessionCommandHost {
     pub fn new(
-        control_tx: flume::Sender<InteractiveControl>,
+        control_tx: impl Into<InteractiveControlSender>,
         state: Arc<SessionCommandState>,
     ) -> Self {
         Self {
-            control_tx,
+            control_tx: control_tx.into(),
             state,
             reset_session_guidance: None,
             coordinator: None,
@@ -207,6 +207,7 @@ impl SessionCommandHost {
             let (reply, response) = flume::bounded(1);
             control_tx
                 .send(make(reply))
+                .await
                 .map_err(|_| CommandError::StaleTarget)?;
             response
                 .recv_async()
@@ -923,7 +924,8 @@ mod tests {
     use maki_config::ModelPolicy;
     use maki_providers::{Effort, ThinkingConfig};
     use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
+        CheckpointRequest, CheckpointWriter,
     };
     use tempfile::TempDir;
     use test_case::test_case;
@@ -968,24 +970,50 @@ mod tests {
     }
 
     struct FakeCommandHost;
+    struct CommandCheckpoint;
+
+    impl CheckpointWriter<crate::session_coordinator::SessionCheckpoint> for CommandCheckpoint {
+        fn checkpoint(
+            &self,
+            request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>,
+        ) -> CheckpointFuture {
+            Box::pin(async move {
+                Ok(CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            })
+        }
+
+        fn checkpoint_guarded(
+            &self,
+            request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>,
+            publication: CheckpointPublication,
+            claim: CheckpointClaim,
+        ) -> CheckpointFuture {
+            Box::pin(async move {
+                claim(&publication).map_err(|message| CheckpointError::Save {
+                    session_id: request.session_id,
+                    message,
+                })?;
+                Ok(CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            })
+        }
+    }
 
     fn test_coordinator(
         model: &str,
         models: impl IntoIterator<Item = Arc<str>>,
-    ) -> crate::session_coordinator::SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>> =
-            Arc::new(
-                |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
-                    Box::pin(async move {
-                        Ok(CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as CheckpointFuture
-                },
-            );
+    ) -> (
+        crate::session_coordinator::SessionCoordinatorHandle,
+        crate::headless::InteractiveHandle,
+    ) {
+        let checkpoint = Arc::new(CommandCheckpoint);
         let session_id = maki_storage::id::MakiId::generate();
-        crate::session_coordinator::SessionCoordinatorHandle::register(
+        let coordinator = crate::session_coordinator::SessionCoordinatorHandle::register(
             crate::session_coordinator::SessionCoordinatorParams {
                 session_id,
                 catalog: Default::default(),
@@ -1002,18 +1030,17 @@ mod tests {
                 model: Arc::from(model),
                 cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),
-                model_adopter: Arc::new(|_: Model| {
-                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
-                }),
-                directory_adopter: Arc::new(|path: PathBuf| {
-                    Box::pin(async move { Ok(path) })
-                        as crate::session_coordinator::DirectoryAdoptionFuture
-                }),
                 checkpoint,
                 mailbox: crate::SessionMailbox::new(session_id),
             },
         )
-        .unwrap()
+        .unwrap();
+        let handle = crate::headless::spawn_command_fixture(
+            Model::from_spec(model).unwrap(),
+            coordinator.clone(),
+        );
+        smol::block_on(handle.initialized_root()).unwrap();
+        (coordinator, handle)
     }
 
     #[derive(Default)]
@@ -1344,7 +1371,7 @@ mod tests {
             false,
             false,
         ));
-        let coordinator = test_coordinator(
+        let (coordinator, handle) = test_coordinator(
             FAST_MODEL,
             [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
         );
@@ -1359,10 +1386,13 @@ mod tests {
             option_value(&coordinator, crate::session_options::YOLO_OPTION_ID),
             crate::session_options::ENABLED_VALUE.into()
         );
-        assert!(matches!(
-            smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleFast))),
-            Ok(HostResponse::Completed)
-        ));
+        let fast =
+            smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleFast)));
+        assert!(
+            matches!(fast, Ok(HostResponse::Completed)),
+            "{:?}",
+            fast.err()
+        );
         assert_eq!(
             option_value(&coordinator, crate::session_options::FAST_OPTION_ID),
             crate::session_options::ENABLED_VALUE.into()
@@ -1419,6 +1449,7 @@ mod tests {
             option_value(&coordinator, crate::session_options::MODEL_OPTION_ID),
             model.spec().into()
         );
+        smol::block_on(handle.task.cancel());
         smol::block_on(coordinator.close()).unwrap();
     }
 
