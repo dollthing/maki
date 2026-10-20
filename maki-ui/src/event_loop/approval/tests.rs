@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use maki_agent::actor::{
-    ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket,
-    PreparedModel,
+    ActorEvent, ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch,
+    ConfigUpdateTicket, PreparedModel,
 };
 use maki_agent::manager::ManagerError;
 use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
@@ -501,7 +501,17 @@ fn managed_child_approval_is_pinned(
                 .after_message,
             committed_messages,
         );
+        let child_events = child.subscribe_events();
         release.send(()).unwrap();
+        let idle_deadline = Instant::now() + WAIT;
+        loop {
+            let event = child_events
+                .recv_timeout(idle_deadline.saturating_duration_since(Instant::now()))
+                .expect("pinned child setup did not become idle");
+            if matches!(event, ActorEvent::Idle { agent_id } if agent_id == child_id) {
+                break;
+            }
+        }
         let settled_deadline = Instant::now() + WAIT;
         pump_until(event_loop, |event_loop| {
             let settled = child.snapshot().status == ActorStatus::Idle

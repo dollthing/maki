@@ -443,30 +443,35 @@ pub struct SessionLog {
     saved_meta: Vec<u8>,
 }
 
-pub struct StagedChildHistory {
+pub struct StagedCheckpoint {
     temporary: NamedTempFile,
     path: PathBuf,
 }
 
-impl StagedChildHistory {
+impl StagedCheckpoint {
     pub fn publish(
         self,
         guard: &SessionPublicationGuard,
         claim_publication: impl FnOnce() -> bool,
     ) -> Result<bool, SessionError> {
         guard
-            .publish(|| {
-                if !claim_publication() {
-                    return Ok(false);
-                }
-                self.temporary
-                    .persist(&self.path)
-                    .map_err(|error| StorageError::from(error.error))?;
-                crate::sync_parent_dir(&self.path);
-                Ok(true)
-            })
+            .publish(|| self.publish_unowned(claim_publication))
             .map_err(StorageError::from)?
             .unwrap_or(Ok(false))
+    }
+
+    pub fn publish_unowned(
+        self,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<bool, SessionError> {
+        if !claim_publication() {
+            return Ok(false);
+        }
+        self.temporary
+            .persist(&self.path)
+            .map_err(|error| StorageError::from(error.error))?;
+        crate::sync_parent_dir(&self.path);
+        Ok(true)
     }
 }
 
@@ -665,11 +670,11 @@ impl SessionLog {
         Ok(Self::cursor_from(session, file))
     }
 
-    /// Stages a full child-history replacement without changing root history or cwd indexing.
-    pub fn stage_child_history<M, U, T>(
+    /// Stages a complete session without changing its durable file or cwd index.
+    pub fn stage_checkpoint<M, U, T>(
         dir: &Path,
         session: &Session<M, U, T>,
-    ) -> Result<StagedChildHistory, SessionError>
+    ) -> Result<StagedCheckpoint, SessionError>
     where
         M: Serialize,
         U: Serialize,
@@ -683,7 +688,7 @@ impl SessionLog {
             .as_file()
             .sync_data()
             .map_err(StorageError::from)?;
-        Ok(StagedChildHistory { temporary, path })
+        Ok(StagedCheckpoint { temporary, path })
     }
 
     pub fn session_id(&self) -> MakiId {

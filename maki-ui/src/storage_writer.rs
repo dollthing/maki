@@ -1361,8 +1361,8 @@ impl Writer {
             .dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| error.to_string())?;
-        let staged = SessionLog::stage_child_history(&directory, session)
-            .map_err(|error| error.to_string())?;
+        let staged =
+            SessionLog::stage_checkpoint(&directory, session).map_err(|error| error.to_string())?;
         #[cfg(test)]
         {
             let gate = lock(pending).child_stage_gate.clone();
