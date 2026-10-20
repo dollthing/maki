@@ -390,10 +390,6 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "records live one line at a time while reading or writing the log"
-)]
 enum LogRecord<M, U, T> {
     #[serde(rename = "header")]
     Header {
@@ -418,10 +414,6 @@ enum LogRecord<M, U, T> {
         updated_at: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        posts: Option<Vec<StoredPost>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        post_count: Option<usize>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
@@ -865,8 +857,6 @@ where
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
-            posts: None,
-            post_count: Some(session.posts.len()),
             usage_by_model: session.usage_by_model.clone(),
             meta: session.meta.clone(),
         },
@@ -1004,8 +994,6 @@ where
                 token_usage: m_usage,
                 updated_at: m_updated,
                 subagents: m_subagents,
-                posts: m_posts,
-                post_count,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
             } => {
@@ -1013,9 +1001,6 @@ where
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
-                if post_count.is_none() {
-                    posts = m_posts.unwrap_or_default();
-                }
                 usage_by_model = m_usage_by_model;
                 meta = m_meta;
             }
@@ -2419,9 +2404,15 @@ mod tests {
     fn posts_are_written_once_instead_of_repeated_in_meta() {
         let tmp = TempDir::new().unwrap();
         let mut session = TestSession::new("m", "/project");
+        session.push_message(user_message("first"));
         let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
-        for _ in 0..POST_APPEND_COUNT {
-            session.push_post(stored_post(None, 0, None));
+        for index in 0..POST_APPEND_COUNT {
+            let post = if index == 0 {
+                stored_post(None, 1, Some(POST_AGENT))
+            } else {
+                stored_post(None, 0, None)
+            };
+            session.push_post(post);
             log.append(&session).unwrap();
         }
         let data = fs::read_to_string(jsonl_path(tmp.path(), session.id)).unwrap();
@@ -2429,13 +2420,13 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["t"] == "post")
-                .count(),
-            POST_APPEND_COUNT
-        );
+        let post_records: Vec<_> = records
+            .iter()
+            .filter(|record| record["t"] == "post")
+            .collect();
+        assert_eq!(post_records.len(), POST_APPEND_COUNT);
+        assert_eq!(post_records[0]["d"]["after_message"], 1);
+        assert_eq!(post_records[0]["d"]["agent"], POST_AGENT);
         assert!(
             records
                 .iter()
@@ -2447,52 +2438,6 @@ mod tests {
         SessionLog::rewrite(tmp.path(), &session).unwrap();
         let rewritten = TestSession::load_from(session.id, tmp.path()).unwrap();
         assert_eq!(rewritten.posts(), session.posts());
-    }
-
-    #[test]
-    fn legacy_post_snapshots_mix_with_incremental_post_records() {
-        let tmp = TempDir::new().unwrap();
-        let session = TestSession::new("m", "/project");
-        SessionLog::rewrite(tmp.path(), &session).unwrap();
-        let first = stored_post(None, 0, None);
-        let second = stored_post(Some(POST_AGENT), 0, None);
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(jsonl_path(tmp.path(), session.id))
-            .unwrap();
-        for posts in [vec![first.clone(), second.clone()], vec![first.clone()]] {
-            writeln!(
-                file,
-                "{}",
-                serde_json::json!({
-                    "t": "meta", "title": DEFAULT_TITLE, "token_usage": null,
-                    "updated_at": 0, "posts": posts,
-                })
-            )
-            .unwrap();
-        }
-        writeln!(file, "{}", serde_json::json!({"t": "post", "d": second})).unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({
-                "t": "meta", "title": DEFAULT_TITLE, "token_usage": null,
-                "updated_at": 0, "post_count": 2,
-            })
-        )
-        .unwrap();
-        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
-        assert_eq!(loaded.posts(), [first, second]);
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({
-                "t": "meta", "title": DEFAULT_TITLE, "token_usage": null, "updated_at": 0,
-            })
-        )
-        .unwrap();
-        let cleared = TestSession::load_from(session.id, tmp.path()).unwrap();
-        assert!(cleared.posts().is_empty());
     }
 
     #[test]
@@ -2539,22 +2484,6 @@ mod tests {
         let revision = session.revision();
         session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
         assert_eq!(session.revision(), revision);
-    }
-
-    #[test]
-    fn posts_survive_an_append_and_reload() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("first"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
-
-        let post = stored_post(None, 1, Some(POST_AGENT));
-        session.push_post(post.clone());
-        log.append(&session).unwrap();
-
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.posts(), [post]);
     }
 
     #[test]
