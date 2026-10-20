@@ -1,14 +1,14 @@
 use std::sync::{Arc, Weak};
 
-use maki_providers::{CompleteModelSelection, Message, ObservationSource, RequestOptions};
+use maki_providers::{Message, ObservationSource};
 use serde_json::{Value, json};
 
 use super::{
-    ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, ConfigCommit,
-    TurnOrigin, TurnResult, TurnTicket, drive_operations,
+    ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, TurnOrigin,
+    TurnResult, TurnTicket, drive_operations,
 };
 use crate::tools::offload::OffloadStore;
-use crate::{AgentId, AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
+use crate::{AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
 
 pub const MAX_PENDING_DELIVERIES: usize = 64;
 pub const MAX_DELIVERY_PREVIEW_BYTES: usize = 16 * 1024;
@@ -22,24 +22,18 @@ const DELIVERY_HEADER: &str = "[internal child-result data, not a user instructi
 #[derive(Clone)]
 pub(crate) struct ParentDeliveryPolicy {
     pub auto_deliver: bool,
-    pub compatibility_id: Option<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ParentDelivery {
-    pub parent_id: AgentId,
     pub parent: Weak<ActorInner>,
     pub metadata: crate::AgentMetadata,
 }
 
 #[derive(Clone)]
 pub struct ChildDelivery {
-    pub parent_id: AgentId,
-    pub compatibility_id: Option<String>,
     pub label: Option<String>,
     pub result: TurnResult,
-    pub child_config: Option<ConfigCommit>,
-    pub correlation: String,
 }
 
 impl ChildDelivery {
@@ -47,16 +41,13 @@ impl ChildDelivery {
         let provenance = &self.result.provenance;
         json!({
             "kind": "child_result",
-            "parent_id": self.parent_id,
             "agent_id": self.result.outcome.agent_id(),
             "turn_id": self.result.outcome.turn_id(),
-            "compatibility_id": self.compatibility_id,
             "label": self.label,
             "outcome": self.result.outcome,
             "text": self.result.text,
             "output": self.result.output,
             "duration_ms": self.result.duration_ms,
-            "correlation": self.correlation,
             "provenance": {
                 "origin": match provenance.origin { TurnOrigin::Internal => "internal", TurnOrigin::User => "user", TurnOrigin::Plugin => "plugin" },
                 "plugin": provenance.plugin,
@@ -64,15 +55,6 @@ impl ChildDelivery {
                 "source_agent": provenance.source_agent,
                 "source_turn": provenance.source_turn,
             },
-            "configuration": self.child_config.as_ref().map(|commit| json!({
-                "generation": commit.generation,
-                "selection": CompleteModelSelection::from_model(&commit.config.model, RequestOptions {
-                    thinking: commit.config.thinking,
-                    fast: commit.config.fast,
-                }),
-                "mode": commit.config.mode.id().key(),
-                "workflow": commit.config.workflow,
-            })),
         })
     }
 
@@ -136,10 +118,6 @@ impl ChildDelivery {
         preview.label = preview
             .label
             .map(|text| bounded(&text, PREVIEW_METADATA_BYTES));
-        preview.compatibility_id = preview
-            .compatibility_id
-            .map(|text| bounded(&text, PREVIEW_METADATA_BYTES));
-        preview.correlation = bounded(&preview.correlation, PREVIEW_METADATA_BYTES);
         preview.result.provenance.plugin = preview
             .result
             .provenance
@@ -149,12 +127,7 @@ impl ChildDelivery {
     }
 
     fn input(&self) -> AgentInput {
-        let mut envelope = self.to_json();
-        if envelope.to_string().len() + DELIVERY_HEADER.len() + 1 > MAX_DELIVERY_PREVIEW_BYTES
-            && let Some(configuration) = envelope.get_mut("configuration")
-        {
-            bound_json_strings(configuration);
-        }
+        let envelope = self.to_json();
         AgentInput {
             message: String::new(),
             mode: AgentMode::Build,
@@ -184,14 +157,6 @@ fn bounded(text: &str, limit: usize) -> String {
     text[..end].to_string()
 }
 
-fn bound_json_strings(value: &mut Value) {
-    match value {
-        Value::String(text) => *text = bounded(text, PREVIEW_METADATA_BYTES),
-        Value::Object(fields) => fields.values_mut().for_each(bound_json_strings),
-        _ => {}
-    }
-}
-
 /// Absent and null read the same to the model, so the rendered envelope
 /// drops null fields rather than spending tokens on them.
 fn without_nulls(value: Value) -> Value {
@@ -203,29 +168,6 @@ fn without_nulls(value: Value) -> Value {
             .collect(),
         other => other,
     }
-}
-
-/// One line for the user describing a child-result delivery input, or `None`
-/// when the input carries no delivery.
-pub fn delivery_summary(input: &AgentInput) -> Option<String> {
-    let body = input
-        .preamble
-        .iter()
-        .find(|message| {
-            matches!(
-                message.observation_source,
-                Some(ObservationSource::ChildResult { .. })
-            )
-        })?
-        .first_text_content()?
-        .strip_prefix(DELIVERY_HEADER)?;
-    let delivery: Value = serde_json::from_str(body.trim()).ok()?;
-    let source = delivery["label"]
-        .as_str()
-        .or_else(|| delivery["agent_id"].as_str())?;
-    let status = delivery["outcome"]["status"].as_str().unwrap_or_default();
-    let text = delivery["text"].as_str().unwrap_or_default();
-    Some(format!("[{status} result from {source}] {text}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,36 +253,7 @@ pub(super) fn admit_delivery(
     Ok(())
 }
 
-pub(super) fn record(
-    inner: &ActorInner,
-    turn_id: TurnId,
-    generation: u64,
-    policy: Option<Arc<super::EffectiveAgentConfig>>,
-    correlation: String,
-) {
-    if inner
-        .managed_admission
-        .as_ref()
-        .is_some_and(|managed| managed.parent_delivery.is_some())
-    {
-        let config = policy.map(|config| ConfigCommit {
-            identity: Arc::clone(&inner.identity),
-            generation,
-            config,
-        });
-        inner
-            .delivery_records
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(turn_id, (config, correlation));
-    }
-}
-
-pub(super) fn publish(
-    inner: &ActorInner,
-    ticket: &TurnTicket,
-    admission: Option<&super::TurnAdmission>,
-) {
+pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
     let Some(target) = inner
         .managed_admission
         .as_ref()
@@ -348,11 +261,6 @@ pub(super) fn publish(
     else {
         return;
     };
-    let recorded = inner
-        .delivery_records
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&ticket.turn_id());
     if matches!(
         ticket.peek_result().map(|result| result.outcome),
         Some(TurnOutcome::Cancelled {
@@ -369,35 +277,16 @@ pub(super) fn publish(
             .unwrap_or_else(|error| error.into_inner());
         state.parent_delivery_policy.clone()
     };
-    let Some(policy) = policy.filter(|policy| policy.auto_deliver) else {
+    if !policy.is_some_and(|policy| policy.auto_deliver) {
         return;
-    };
-    let (child_config, correlation) = recorded.unwrap_or_else(|| {
-        let config = admission.and_then(|admission| {
-            admission.policy.clone().map(|config| ConfigCommit {
-                identity: Arc::clone(&inner.identity),
-                generation: admission.generation,
-                config,
-            })
-        });
-        (
-            config,
-            admission
-                .map(|admission| admission.correlation.clone())
-                .unwrap_or_default(),
-        )
-    });
+    }
     let Some(result) = ticket.peek_result() else {
         return;
     };
     let delivery = Arc::new(
         ChildDelivery {
-            parent_id: target.parent_id,
-            compatibility_id: policy.compatibility_id,
             label: target.metadata.label.clone(),
             result,
-            child_config,
-            correlation,
         }
         .preview(inner.offload.as_deref()),
     );
@@ -657,16 +546,12 @@ mod tests {
         }
     }
 
-    fn delivery(parent_id: AgentId) -> Arc<ChildDelivery> {
+    fn delivery(agent_id: AgentId) -> Arc<ChildDelivery> {
         Arc::new(ChildDelivery {
-            parent_id,
-            compatibility_id: None,
             label: None,
-            child_config: None,
-            correlation: CORRELATION.into(),
             result: TurnResult {
                 outcome: TurnOutcome::cancelled(
-                    AgentId::generate(),
+                    agent_id,
                     TurnId::generate(),
                     TokenUsage::default(),
                     0,
@@ -692,24 +577,22 @@ mod tests {
         envelope.result.text = "\u{0001}".repeat(super::MAX_DELIVERY_PREVIEW_BYTES);
         envelope.result.provenance.plugin = Some(LABEL.into());
         envelope.label = Some(LABEL.into());
-        envelope.child_config = Some(super::ConfigCommit {
-            identity: Arc::new(()),
-            generation: 3,
-            config: Arc::new(crate::EffectiveAgentConfig::new(
-                super::super::tests::policy(false),
-                crate::AgentMode::Build,
-            )),
-        });
+        envelope.result.provenance.origin = crate::actor::TurnOrigin::Plugin;
+        envelope.result.provenance.plugin_generation = Some(3);
+        envelope.result.provenance.source_agent = Some(AgentId::generate());
+        envelope.result.provenance.source_turn = Some(TurnId::generate());
         let canonical = envelope.to_json();
         let preview = envelope.preview(Some(&store));
         let rendered = preview.input().preamble.remove(0);
         assert!(rendered.first_text_content().unwrap().len() <= super::MAX_DELIVERY_PREVIEW_BYTES);
         let value = preview.to_json();
         for field in [
-            "configuration",
+            "kind",
+            "agent_id",
+            "turn_id",
             "provenance",
             "outcome",
-            "correlation",
+            "duration_ms",
             "label",
         ] {
             assert_eq!(value[field], canonical[field]);
@@ -731,51 +614,6 @@ mod tests {
             assert_eq!(reference["offload"]["complete"], true);
             assert_eq!(preview.preview(Some(&store)).to_json(), value);
         }
-    }
-
-    #[test]
-    fn delivery_summary_names_source_status_and_text() {
-        let mut envelope = (*delivery(AgentId::generate())).clone();
-        let agent_id = envelope.result.outcome.agent_id();
-        assert_eq!(
-            super::delivery_summary(&envelope.input()),
-            Some(format!("[cancelled result from {agent_id}] {CHILD_TEXT}"))
-        );
-        envelope.label = Some(LABEL.into());
-        assert_eq!(
-            super::delivery_summary(&envelope.input()),
-            Some(format!("[cancelled result from {LABEL}] {CHILD_TEXT}"))
-        );
-        assert_eq!(
-            super::delivery_summary(&AgentInput {
-                preamble: Vec::new(),
-                ..envelope.input()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn envelope_configuration_uses_normalized_selection_and_mode_key() {
-        let mut envelope = (*delivery(AgentId::generate())).clone();
-        let config = super::super::tests::policy(false);
-        let expected_spec = config.model.spec();
-        envelope.child_config = Some(super::ConfigCommit {
-            identity: Arc::new(()),
-            generation: 3,
-            config: Arc::new(crate::EffectiveAgentConfig::new(
-                config,
-                crate::AgentMode::Build,
-            )),
-        });
-        let configuration = &envelope.to_json()["configuration"];
-        assert_eq!(configuration["generation"], 3);
-        assert_eq!(configuration["mode"], "build");
-        assert_eq!(configuration["selection"]["spec"], expected_spec);
-        assert_eq!(configuration["selection"]["thinking"], "off");
-        assert_eq!(configuration["selection"]["fast"], false);
-        assert!(configuration.get("provider").is_none());
-        assert!(configuration.get("thinking").is_none());
     }
 
     #[test]
@@ -959,7 +797,6 @@ mod tests {
                 AgentId::generate(),
             );
             managed.parent_delivery = Some(super::ParentDelivery {
-                parent_id: ancestor.agent_id(),
                 parent: Arc::downgrade(&ancestor.inner),
                 metadata: Default::default(),
             });
@@ -973,7 +810,7 @@ mod tests {
                 None,
                 Some(rx),
             );
-            parent.configure_parent_delivery(true, None).unwrap();
+            parent.configure_parent_delivery(true).unwrap();
             let ancestor_events = ancestor.subscribe_events();
             let envelope = delivery(parent.agent_id());
             admit_delivery(&parent.inner, Arc::clone(&envelope)).unwrap();
@@ -1001,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_cancel_preserves_admission_configuration_and_correlation() {
+    fn deferred_cancel_delivers_result_to_actual_parent() {
         smol::block_on(async {
             const CORRELATION: &str = "cancelled before materialization";
             let (_start, rx) = flume::bounded(1);
@@ -1019,7 +856,6 @@ mod tests {
                 AgentId::generate(),
             );
             managed.parent_delivery = Some(super::ParentDelivery {
-                parent_id: parent.agent_id(),
                 parent: Arc::downgrade(&parent.inner),
                 metadata: Default::default(),
             });
@@ -1037,7 +873,7 @@ mod tests {
                 Some(Arc::new(config)),
                 Some(rx),
             );
-            child.configure_parent_delivery(true, None).unwrap();
+            child.configure_parent_delivery(true).unwrap();
             let barrier = child.reserve_config_update().unwrap();
             let events = parent.subscribe_events();
             let ticket = child
@@ -1055,11 +891,17 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(event.delivery.correlation, CORRELATION);
-            let config = event.delivery.child_config.as_ref().unwrap();
-            assert_eq!(config.generation, 0);
-            assert_eq!(config.config.mode, crate::AgentMode::Build);
-            assert!(child.inner.delivery_records.lock().unwrap().is_empty());
+            assert_eq!(event.status, DeliveryStatus::Accepted);
+            assert_eq!(event.delivery.result.outcome.agent_id(), child.agent_id());
+            assert_eq!(event.delivery.result.outcome.turn_id(), ticket.turn_id());
+            assert!(matches!(
+                event.delivery.result.outcome,
+                TurnOutcome::Cancelled {
+                    reason: TurnCancellationReason::User,
+                    ..
+                }
+            ));
+            assert_eq!(parent.inner.state.lock().unwrap().deliveries.len(), 1);
             drop(barrier);
             child.close();
             parent.close();
@@ -1072,7 +914,6 @@ mod tests {
     #[test_case(false; "disabled")]
     fn closed_parent_rejection_uses_creation_policy(auto_deliver: bool) {
         smol::block_on(async {
-            const COMPATIBILITY_ID: &str = "explicit compatibility";
             const TOOL_ID: &str = "tool metadata is not routing identity";
             let (_parent_start, parent_rx) = flume::bounded(1);
             let (parent, parent_task) = AgentActorHandle::spawn_inner(
@@ -1089,11 +930,10 @@ mod tests {
                 AgentId::generate(),
             );
             admission.parent_delivery = Some(super::ParentDelivery {
-                parent_id: parent.agent_id(),
                 parent: Arc::downgrade(&parent.inner),
                 metadata: crate::AgentMetadata {
+                    label: Some(LABEL.into()),
                     spawned_by_tool_use_id: Some(TOOL_ID.into()),
-                    ..Default::default()
                 },
             });
             let (_child_start, child_rx) = flume::bounded(1);
@@ -1106,9 +946,7 @@ mod tests {
                 None,
                 Some(child_rx),
             );
-            child
-                .configure_parent_delivery(auto_deliver, Some(COMPATIBILITY_ID.into()))
-                .unwrap();
+            child.configure_parent_delivery(auto_deliver).unwrap();
             let events = child.subscribe_events();
             parent.close();
             let ticket = crate::actor::TurnTicket::new(TurnId::generate(), child.identity());
@@ -1119,7 +957,7 @@ mod tests {
                 0,
                 TurnCancellationReason::User,
             ));
-            super::publish(&child.inner, &ticket, None);
+            super::publish(&child.inner, &ticket);
             let deliveries: Vec<_> = events
                 .try_iter()
                 .filter_map(|event| match event {
@@ -1133,10 +971,17 @@ mod tests {
                     deliveries[0].status,
                     DeliveryStatus::Rejected(DeliveryRejection::ParentClosed)
                 );
-                assert_eq!(
-                    deliveries[0].delivery.compatibility_id.as_deref(),
-                    Some(COMPATIBILITY_ID)
-                );
+                let delivery = &deliveries[0].delivery;
+                assert_eq!(delivery.label.as_deref(), Some(LABEL));
+                assert_eq!(delivery.result.outcome.agent_id(), child.agent_id());
+                assert_eq!(delivery.result.outcome.turn_id(), ticket.turn_id());
+                assert!(matches!(
+                    delivery.result.outcome,
+                    TurnOutcome::Cancelled {
+                        reason: TurnCancellationReason::User,
+                        ..
+                    }
+                ));
             } else {
                 assert!(deliveries.is_empty());
             }
@@ -1154,7 +999,10 @@ mod tests {
         let input = envelope.input();
         let rendered = input.preamble[0].first_text_content().unwrap();
         assert!(!rendered.contains("null"), "{rendered}");
-        assert!(super::delivery_summary(&input).is_some());
+        assert!(matches!(
+            input.preamble[0].observation_source,
+            Some(maki_providers::ObservationSource::ChildResult { .. })
+        ));
     }
 
     #[test]
@@ -1493,7 +1341,6 @@ mod tests {
                 AgentId::generate(),
             );
             managed.parent_delivery = Some(super::ParentDelivery {
-                parent_id: parent.agent_id(),
                 parent: Arc::downgrade(&parent.inner),
                 metadata: Default::default(),
             });
@@ -1513,7 +1360,7 @@ mod tests {
             Some(rx),
         );
         if parent.is_some() {
-            actor.configure_parent_delivery(true, None).unwrap();
+            actor.configure_parent_delivery(true).unwrap();
         }
         (actor, task, start)
     }
@@ -1547,7 +1394,7 @@ mod tests {
                 1
             );
             parent.cancel_turn(parent_ticket.turn_id()).unwrap();
-            super::publish(&parent.inner, &parent_ticket, None);
+            super::publish(&parent.inner, &parent_ticket);
             let ancestor_ticket = schedule_ticket(&ancestor);
             assert_eq!(
                 super::drain(&ancestor.inner, ancestor_ticket.turn_id()).len(),
@@ -1620,8 +1467,8 @@ mod tests {
                 1,
                 crate::DoneReason::EndTurn,
             ));
-            super::publish(&parent.inner, &continuation, None);
-            super::publish(&parent.inner, &continuation, None);
+            super::publish(&parent.inner, &continuation);
+            super::publish(&parent.inner, &continuation);
             super::settle(&parent.inner, continuation.turn_id(), None);
             admit_delivery(&parent.inner, child_report).unwrap();
             assert!(parent.inner.state.lock().unwrap().deliveries.is_empty());

@@ -1947,10 +1947,7 @@ fn spawn_session_actor(
     .map_err(|error| error.to_string())?;
     init_params(child.id());
     let actor = child.actor().map_err(|error| error.to_string())?;
-    if let Err(error) = actor.configure_parent_delivery(
-        state.auto_deliver && !state.silent,
-        Some(state.ui_id.clone()),
-    ) {
+    if let Err(error) = actor.configure_parent_delivery(state.auto_deliver && !state.silent) {
         let _ = child.close_subtree();
         return Err(error.to_string());
     }

@@ -973,8 +973,6 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
     const TEXT: &str = "bounded child result";
     let mut app = test_app();
     let delivery = Arc::new(ChildDelivery {
-        parent_id: AgentId::generate(),
-        compatibility_id: None,
         label: Some(LABEL.into()),
         result: TurnResult {
             outcome: TurnOutcome::completed(
@@ -989,8 +987,6 @@ fn typed_completion_notices_render_once_and_skip_withdrawn() {
             provenance: Default::default(),
             duration_ms: 0,
         },
-        child_config: None,
-        correlation: String::new(),
     });
     app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
         delivery: Arc::clone(&delivery),
@@ -10188,7 +10184,7 @@ fn spawn_input_child_with_mode(
     target
         .actor()
         .unwrap()
-        .configure_parent_delivery(false, Some(id.into()))
+        .configure_parent_delivery(false)
         .unwrap();
     let info = subagent_info_for_agent(target.id(), id, name, None, None);
     app.update(Msg::Agent(Box::new(Envelope {

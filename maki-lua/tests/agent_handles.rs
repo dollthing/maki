@@ -4526,7 +4526,6 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             ]
         );
         let envelope = &deliveries[0].delivery;
-        assert_eq!(envelope.parent_id, root.agent_id());
         assert_eq!(envelope.result.outcome.agent_id(), child.agent_id);
         assert!(matches!(
             envelope.result.outcome,
@@ -4545,14 +4544,6 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
         );
         assert!(envelope.result.provenance.plugin.is_some());
         assert!(envelope.result.provenance.plugin_generation.is_some());
-        assert_eq!(
-            envelope.child_config.as_ref().unwrap().config.model.spec(),
-            request.model
-        );
-        assert_eq!(
-            envelope.child_config.as_ref().unwrap().config.mode,
-            AgentMode::Build
-        );
         assert_eq!(provenance.origin, TurnOrigin::Internal);
         assert_eq!(provenance.source_agent, None);
         assert_eq!(provenance.source_turn, None);

@@ -2032,9 +2032,7 @@ mod tests {
                     )
                     .unwrap();
                 let reporter_actor = reporter.actor().unwrap();
-                reporter_actor
-                    .configure_parent_delivery(true, None)
-                    .unwrap();
+                reporter_actor.configure_parent_delivery(true).unwrap();
                 let report_ticket = reporter_actor
                     .submit(reporter_input, None, String::new(), Default::default())
                     .unwrap();
@@ -2692,7 +2690,7 @@ mod tests {
                     },
                 ).unwrap();
                 let child_actor = child.actor().unwrap();
-                child_actor.configure_parent_delivery(true, None).unwrap();
+                child_actor.configure_parent_delivery(true).unwrap();
                 let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
                 assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
                 if active { release.send(()).unwrap(); }
@@ -2787,7 +2785,7 @@ mod tests {
                     },
                 ).unwrap();
                 let child_actor = child.actor().unwrap();
-                child_actor.configure_parent_delivery(true, None).unwrap();
+                child_actor.configure_parent_delivery(true).unwrap();
                 let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
                 assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
                 let mut seen = Vec::new();

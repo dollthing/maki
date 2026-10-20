@@ -1677,11 +1677,7 @@ mod tests {
             entry.recv_async().await.unwrap();
             let turn_id = TurnId::generate();
             let report = ChildDelivery {
-                parent_id: actor.agent_id(),
-                compatibility_id: None,
                 label: None,
-                child_config: None,
-                correlation: "rewind-report".into(),
                 result: TurnResult {
                     outcome: TurnOutcome::cancelled(
                         AgentId::generate(),

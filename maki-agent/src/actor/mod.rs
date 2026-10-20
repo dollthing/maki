@@ -18,7 +18,7 @@ pub(crate) mod delivery;
 pub use delivery::{
     ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus, MAX_DELIVERY_BATCH,
     MAX_DELIVERY_BATCH_BYTES, MAX_DELIVERY_PREVIEW_BYTES, MAX_PENDING_DELIVERIES,
-    MAX_PENDING_PREVIEW_BYTES, delivery_summary,
+    MAX_PENDING_PREVIEW_BYTES,
 };
 mod inbox;
 pub use inbox::{MAX_PENDING_INSTRUCTION_BYTES, MAX_PENDING_INSTRUCTIONS, TurnInbox};
@@ -227,7 +227,6 @@ pub(crate) struct ActorInner {
     latest_admitted: Mutex<Option<TurnId>>,
     history: SharedMessages,
     coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
-    delivery_records: Mutex<HashMap<TurnId, (Option<ConfigCommit>, String)>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     mode_ceiling: Option<config::ModeCeiling>,
     pub(crate) completion_policy: types::CompletionPolicy,
@@ -598,22 +597,10 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
             inner.policy_changed.notify(usize::MAX);
             continue;
         }
-        if let ActorOperation::Turn {
-            ticket,
-            correlation,
-            ..
-        } = head
+        if let ActorOperation::Turn { ticket, .. } = head
+            && let Some(inbox) = state.instructions.get_mut(&ticket.turn_id())
         {
-            if let Some(inbox) = state.instructions.get_mut(&ticket.turn_id()) {
-                inbox.policy = state.policy.clone();
-            }
-            delivery::record(
-                inner,
-                ticket.turn_id(),
-                state.policy_generation,
-                state.policy.clone(),
-                correlation.clone(),
-            );
+            inbox.policy = state.policy.clone();
         }
         if let ActorOperation::Turn {
             policy_constraint: Some(constraint),
@@ -814,13 +801,6 @@ fn materialize(
                 input.fast = config.fast;
                 input.workflow = config.workflow;
             }
-            delivery::record(
-                inner,
-                ticket.turn_id(),
-                state.policy_generation,
-                state.policy.clone(),
-                correlation.clone(),
-            );
             if !state.delivery_runs.contains_key(&ticket.turn_id()) {
                 state
                     .instructions
@@ -927,13 +907,9 @@ impl ActorState {
         if let ActorEvent::Delivery(event) = &event {
             let delivery = &event.delivery;
             info!(
-                parent_id = %delivery.parent_id,
                 child_id = %delivery.result.outcome.agent_id(),
                 child_turn_id = %delivery.result.outcome.turn_id(),
-                compatibility_id = ?delivery.compatibility_id,
-                correlation = %delivery.correlation,
                 status = ?event.status,
-                config_generation = ?delivery.child_config.as_ref().map(|config| config.generation),
                 origin = ?delivery.result.provenance.origin,
                 plugin = ?delivery.result.provenance.plugin,
                 plugin_generation = ?delivery.result.provenance.plugin_generation,
@@ -1299,7 +1275,7 @@ fn retire_and_publish(
             let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
         }
         if let Some(ticket) = &ticket {
-            delivery::publish(inner, ticket, admission);
+            delivery::publish(inner, ticket);
         }
         delivery::settle(
             inner,
@@ -1461,7 +1437,6 @@ impl AgentActorHandle {
             managed_admission,
             mode_ceiling,
             offload: backend.offload_store(),
-            delivery_records: Mutex::new(HashMap::new()),
             admission_preparation,
             prepared_readiness: backend.prepared_readiness(),
             #[cfg(test)]
@@ -1516,11 +1491,7 @@ impl AgentActorHandle {
     }
 
     /// Sets child-result routing before any work is admitted.
-    pub fn configure_parent_delivery(
-        &self,
-        auto_deliver: bool,
-        compatibility_id: Option<String>,
-    ) -> Result<(), ActorError> {
+    pub fn configure_parent_delivery(&self, auto_deliver: bool) -> Result<(), ActorError> {
         let mut state = self
             .inner
             .state
@@ -1532,10 +1503,7 @@ impl AgentActorHandle {
         if state.next_operation_id != 0 || state.parent_delivery_policy.is_some() {
             return Err(ActorError::Busy);
         }
-        state.parent_delivery_policy = Some(delivery::ParentDeliveryPolicy {
-            auto_deliver,
-            compatibility_id,
-        });
+        state.parent_delivery_policy = Some(delivery::ParentDeliveryPolicy { auto_deliver });
         Ok(())
     }
 
@@ -2357,13 +2325,6 @@ impl AgentActorHandle {
             inbox.operation = after;
         }
         let reason = state.cancelled_correlations.get(&correlation).copied();
-        delivery::record(
-            &self.inner,
-            turn_id,
-            state.policy_generation,
-            state.policy.clone(),
-            correlation.clone(),
-        );
         let work = ActorOperation::Turn {
             id: after,
             input,

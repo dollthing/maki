@@ -919,7 +919,6 @@ impl AgentManagerHandle {
                     .and_then(|node| node.actor.as_ref())
             {
                 admission.parent_delivery = Some(crate::actor::delivery::ParentDelivery {
-                    parent_id,
                     parent: Arc::downgrade(&parent.inner),
                     metadata: node.metadata.clone(),
                 });

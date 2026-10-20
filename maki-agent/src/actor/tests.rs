@@ -950,7 +950,6 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
         );
         let mut managed = super::types::ManagedTurnAdmission::new(Weak::new(), AgentId::generate());
         managed.parent_delivery = Some(super::delivery::ParentDelivery {
-            parent_id: parent.agent_id(),
             parent: Arc::downgrade(&parent.inner),
             metadata: Default::default(),
         });
@@ -972,7 +971,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
             ))),
             Some(rx),
         );
-        actor.configure_parent_delivery(true, None).unwrap();
+        actor.configure_parent_delivery(true).unwrap();
         let events = parent.subscribe_events();
         let barrier = actor.reserve_config_update().unwrap();
         let constraint_actor = actor.clone();
@@ -1035,15 +1034,13 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
             }
         };
         assert_eq!(envelope.result.outcome.turn_id(), ticket.turn_id());
-        assert_eq!(envelope.correlation, CORRELATION);
-        let configuration = envelope.to_json()["configuration"].clone();
-        assert_eq!(configuration["generation"], 1);
-        assert_eq!(configuration["selection"]["spec"], MODEL);
-        assert_eq!(configuration["selection"]["thinking"], "off");
-        assert_eq!(configuration["selection"]["fast"], true);
-        assert_eq!(configuration["mode"], MODE);
-        assert_eq!(configuration["workflow"], true);
-        assert!(actor.inner.delivery_records.lock().unwrap().is_empty());
+        assert_eq!(envelope.result.outcome.agent_id(), actor.agent_id());
+        let result = ticket.wait_result().await;
+        assert_eq!(envelope.result.outcome, result.outcome);
+        assert_eq!(envelope.result.text, result.text);
+        assert_eq!(envelope.result.output, result.output);
+        assert_eq!(envelope.result.provenance, result.provenance);
+        assert_eq!(envelope.result.duration_ms, result.duration_ms);
         actor.close();
         parent.close();
         task.await;
@@ -1256,11 +1253,7 @@ fn busy_parent_consumes_delivery_without_reordering_config_fifo() {
         let source_agent = AgentId::generate();
         let source_turn = crate::TurnId::generate();
         let envelope = Arc::new(super::ChildDelivery {
-            parent_id: parent.agent_id(),
-            compatibility_id: Some(CHILD.into()),
             label: None,
-            child_config: None,
-            correlation: CHILD.into(),
             result: super::TurnResult {
                 outcome: TurnOutcome::cancelled(
                     source_agent,
@@ -1333,11 +1326,9 @@ fn busy_parent_consumes_delivery_without_reordering_config_fifo() {
 fn parent_delivery_policy_is_creation_time_only() {
     smol::block_on(async {
         let (actor, task) = spawn(ScriptedBackend::new());
-        actor
-            .configure_parent_delivery(true, Some("compatibility".into()))
-            .unwrap();
+        actor.configure_parent_delivery(true).unwrap();
         assert!(matches!(
-            actor.configure_parent_delivery(false, None),
+            actor.configure_parent_delivery(false),
             Err(ActorError::Busy)
         ));
         let ticket = actor
@@ -1345,12 +1336,12 @@ fn parent_delivery_policy_is_creation_time_only() {
             .unwrap();
         ticket.wait().await;
         assert!(matches!(
-            actor.configure_parent_delivery(false, None),
+            actor.configure_parent_delivery(false),
             Err(ActorError::Busy)
         ));
         actor.close();
         assert!(matches!(
-            actor.configure_parent_delivery(false, None),
+            actor.configure_parent_delivery(false),
             Err(ActorError::Closed)
         ));
         task.await;
@@ -4843,7 +4834,6 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
         );
         let mut managed = super::ManagedTurnAdmission::new(Weak::new(), AgentId::generate());
         managed.parent_delivery = Some(super::delivery::ParentDelivery {
-            parent_id: parent.agent_id(),
             parent: Arc::downgrade(&parent.inner),
             metadata: Default::default(),
         });
@@ -4857,7 +4847,7 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
             None,
             Some(child_rx),
         );
-        child.configure_parent_delivery(true, None).unwrap();
+        child.configure_parent_delivery(true).unwrap();
         let events = parent.subscribe_events();
         let child_turn = child
             .admit_turn(input(CHILD), None, CHILD.into())
@@ -4963,11 +4953,7 @@ fn delivery_arrival_during_finalization() {
 
         let child_turn = TurnId::generate();
         let envelope = Arc::new(ChildDelivery {
-            parent_id: parent.agent_id(),
-            compatibility_id: None,
             label: None,
-            child_config: None,
-            correlation: CHILD.into(),
             result: super::TurnResult {
                 outcome: TurnOutcome::cancelled(
                     AgentId::generate(),

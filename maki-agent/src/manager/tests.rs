@@ -1528,7 +1528,7 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
             Vec::new()
         };
         let child_actor = child.actor().unwrap();
-        child_actor.configure_parent_delivery(true, None).unwrap();
+        child_actor.configure_parent_delivery(true).unwrap();
         let child_ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
         child_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
         child_gate.release(1);
@@ -4089,7 +4089,7 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
 fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
     smol::block_on(async {
         const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-        const COMPATIBILITY_ID: &str = "nested child";
+        const CORRELATION: &str = "nested child";
         let (manager, root, current, root_gate) = active_root(AgentLimits::default());
         let parent = manager
             .spawn_child_trusted_with_config(
@@ -4116,15 +4116,13 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
             )
             .unwrap();
         let child_actor = child.actor().unwrap();
-        child_actor
-            .configure_parent_delivery(true, Some(COMPATIBILITY_ID.into()))
-            .unwrap();
+        child_actor.configure_parent_delivery(true).unwrap();
         let child_events = child_actor.subscribe_events();
         if closed {
             parent_actor.close();
         }
         let ticket = child_actor
-            .admit_turn(input(), None, COMPATIBILITY_ID.into())
+            .admit_turn(input(), None, CORRELATION.into())
             .unwrap();
         ticket.wait().await;
         if closed {
@@ -4134,7 +4132,8 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
                     break event;
                 }
             };
-            assert_eq!(event.delivery.parent_id, parent.id());
+            assert_eq!(event.delivery.result.outcome.agent_id(), child.id());
+            assert_eq!(event.delivery.result.outcome.turn_id(), ticket.turn_id());
             assert_eq!(
                 event.status,
                 crate::actor::DeliveryStatus::Rejected(
@@ -4149,7 +4148,8 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
                     break event;
                 }
             };
-            assert_eq!(event.delivery.parent_id, parent.id());
+            assert_eq!(event.delivery.result.outcome.agent_id(), child.id());
+            assert_eq!(event.delivery.result.outcome.turn_id(), ticket.turn_id());
             let crate::actor::DeliveryStatus::Accepted = event.status else {
                 panic!("delivery was not admitted")
             };
@@ -4207,9 +4207,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
             )
             .unwrap();
         let actor = child.actor().unwrap();
-        actor
-            .configure_parent_delivery(true, Some(CHILD.into()))
-            .unwrap();
+        actor.configure_parent_delivery(true).unwrap();
         let child_events = actor.subscribe_events();
         let mut pending_turns = Vec::new();
         for _ in 0..crate::actor::delivery::MAX_PENDING_DELIVERIES {
@@ -4325,9 +4323,7 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
             )
             .unwrap();
         let child_actor = child.actor().unwrap();
-        child_actor
-            .configure_parent_delivery(true, Some(CHILD.into()))
-            .unwrap();
+        child_actor.configure_parent_delivery(true).unwrap();
         let user = parent.admit_turn(input(), None, USER.into()).unwrap();
         let ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
         let wait = current
@@ -4343,9 +4339,9 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
                 break event;
             }
         };
-        assert_eq!(delivery.delivery.parent_id, root.id());
+        assert_eq!(delivery.delivery.result.outcome.agent_id(), child.id());
+        assert_eq!(delivery.delivery.result.outcome.turn_id(), ticket.turn_id());
         assert_eq!(delivery.delivery.result.outcome, result.outcome);
-        assert_eq!(delivery.delivery.compatibility_id.as_deref(), Some(CHILD));
         let crate::actor::DeliveryStatus::Accepted = delivery.status else {
             panic!("delivery was not admitted")
         };
@@ -5151,7 +5147,7 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
             .unwrap();
         let child_actor = child.actor().unwrap();
         child_actor
-            .configure_parent_delivery(!matches!(case, JoinCase::NonReportingChildOfChild), None)
+            .configure_parent_delivery(!matches!(case, JoinCase::NonReportingChildOfChild))
             .unwrap();
         let child_ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
         let cancelled_successor = matches!(case, JoinCase::CancelledSuccessorOfRunningTurn);
