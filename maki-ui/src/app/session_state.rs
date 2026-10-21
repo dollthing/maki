@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+use maki_agent::{AgentMode, ModeRegistry, RunSettings};
 use maki_config::{Effect, ModelPolicy};
-use maki_providers::provider::adjust_model;
+use maki_providers::provider::{Provider, adjust_model};
 use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
@@ -14,6 +16,11 @@ use super::mode::{Mode, PlanState};
 pub(crate) struct SessionState {
     /// Shared with the writer thread, so a checkpoint is just a refcount bump.
     pub session: Arc<AppSession>,
+    /// The model the UI currently shows and accounts against. Seeded before the
+    /// agent exists, then refined by model discovery, which is the only thing
+    /// that can move context window and fast support after the model is picked.
+    /// Mode, fast, workflow and thinking are not read off this: they follow the
+    /// agent's committed config.
     pub model: Model,
     pub token_usage: TokenUsage,
     /// What the session has billed so far: the restored total plus every turn
@@ -21,9 +28,16 @@ pub(crate) struct SessionState {
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
     pub context_size: u32,
+    /// The mode the agent runs in. `plan` is UI-owned bookkeeping the agent only
+    /// learns through the plan path carried in its mode, so the two live
+    /// together here rather than deriving one from the other.
     pub mode: Mode,
     pub plan: PlanState,
     pub warnings: Vec<String>,
+    /// Mirrors of the agent's committed config. Construction seeds both from one
+    /// resolved config, and afterwards only a config commit writes them, so they
+    /// cannot drift from what the agent will actually send. They exist because a
+    /// frame renders before it can ask the actor.
     pub thinking: ThinkingConfig,
     /// What we actually bill and send.
     pub fast: bool,
@@ -54,22 +68,36 @@ impl SessionState {
         storage: &StateDir,
         model_policy: &ModelPolicy,
     ) -> Self {
-        let mut model = model_policy
-            .allows(&session.model)
-            .then(|| Model::from_spec(&session.model))
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                session.model = fallback_model.spec();
-                fallback_model.clone()
-            });
-        // Apply the provider's per-model adjustments (e.g. ZAI's glm-5.2
-        // thinking support, or Aperture's routed-provider inheritance) so a
-        // resumed session matches one started fresh.
-        if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
-            tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
-        }
+        // A caller that resolved the session's own model hands in a value that
+        // has already been through the provider (and its `adjust_model`), so it
+        // is richer than anything a rebuild from the spec could produce. Only a
+        // saved model the caller did not resolve gets rebuilt and adjusted.
+        let model = if model_policy.allows(&session.model) && fallback_model.spec() == session.model
+        {
+            fallback_model.clone()
+        } else {
+            match model_policy
+                .allows(&session.model)
+                .then(|| Model::from_spec(&session.model))
+                .transpose()
+                .ok()
+                .flatten()
+            {
+                Some(mut model) => {
+                    // Apply the provider's per-model adjustments (e.g. ZAI's
+                    // glm-5.2 thinking support) so a resumed session matches one
+                    // started fresh.
+                    if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
+                        tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
+                    }
+                    model
+                }
+                None => {
+                    session.model = fallback_model.spec();
+                    fallback_model.clone()
+                }
+            }
+        };
 
         let mode = match &session.meta.mode {
             Some(StoredMode::Plan) => Mode::Plan,
@@ -123,6 +151,68 @@ impl SessionState {
 
     pub fn session_mut(&mut self) -> &mut AppSession {
         Arc::make_mut(&mut self.session)
+    }
+
+    /// The mode the agent runs in, carrying the plan path plan mode writes to.
+    pub fn agent_mode(&self) -> AgentMode {
+        match &self.mode {
+            Mode::Plan => match self.plan.path() {
+                Some(path) => AgentMode::Plan(path.to_path_buf()),
+                None => {
+                    debug_assert!(false, "plan mode without a path");
+                    AgentMode::Build
+                }
+            },
+            Mode::Build => AgentMode::Build,
+            Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(Arc::clone(name))),
+        }
+    }
+
+    /// The configuration the agent is seeded with. Resolved before the app is
+    /// built and then adopted by it, so mode, fast, workflow and thinking have
+    /// a single starting value instead of an app-side copy the agent follows.
+    pub fn starting_config(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: &Model,
+        cwd: PathBuf,
+        registry: &ModeRegistry,
+    ) -> EffectiveAgentConfig {
+        let mode = self.agent_mode();
+        EffectiveAgentConfig::new(
+            RunSettings {
+                provider,
+                model: model.clone(),
+                thinking: self.thinking,
+                fast: self.fast,
+                workflow: self.workflow,
+            },
+            mode.clone(),
+        )
+        .with_mode_def(registry.get(&mode.id()))
+        .with_context(AgentContextSnapshot::new(cwd))
+    }
+
+    /// Makes `config` this session's own. Construction runs it against the
+    /// config it just seeded the agent with, so the two cannot start apart.
+    pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
+        self.thinking = config.thinking;
+        (self.fast, self.pending_fast) = clamp_fast(config.fast, &config.model);
+        self.workflow = config.workflow;
+        self.mode = match &config.mode {
+            AgentMode::Build => Mode::Build,
+            AgentMode::Plan(_) => Mode::Plan,
+            AgentMode::Custom(id) => match id {
+                maki_agent::ModeId::Build => Mode::Build,
+                maki_agent::ModeId::Plan => Mode::Plan,
+                maki_agent::ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
+            },
+        };
+        if let Some(path) = config.mode.plan_path()
+            && self.plan.path() != Some(path)
+        {
+            self.plan = PlanState::Drafting(path.to_path_buf());
+        }
     }
 
     /// What the user asked for, whether or not the model can honour it yet.

@@ -22,7 +22,7 @@ use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use maki_agent::SessionMailbox;
-use maki_agent::actor::{AgentContextSnapshot, ConfigChange, HistoryChange};
+use maki_agent::actor::{ConfigChange, HistoryChange};
 use maki_agent::command::CustomCommand;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -39,7 +39,7 @@ use maki_agent::session_options::{
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, RunSettings, mcp,
+    McpHandle, McpSnapshotReader, mcp,
 };
 use maki_commands::{BuiltinOperation, CommandError, HostResponse};
 use maki_config::project::TrustQuestion;
@@ -84,6 +84,7 @@ use crate::agent::{
     SystemPromptOverride, orchestration::AgentOrchestration, shared_queue::QueueItem,
 };
 use crate::app::EMPTY_PROMPT_ERR;
+use crate::app::session_state::SessionState;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
@@ -811,6 +812,7 @@ fn complete_mode_change(app: &mut App, id: String, plan: crate::app::mode::PlanS
     app.set_mode_id(id);
 }
 
+#[cfg(test)]
 fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
     match app.state.mode.id_key().as_str() {
         "build" => maki_agent::AgentMode::Build,
@@ -1746,8 +1748,27 @@ impl SpawnCtx {
         let permissions = Arc::new(permissions.fork());
         permissions.set_session_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
+        // Resolve the agent's configuration before the app exists, so mode, fast,
+        // workflow and thinking have one starting value: the one the agent is
+        // seeded with. `effective_config` only carries a caller's explicit
+        // override; everything else comes from the session being resumed.
+        let config = effective_config.unwrap_or_else(|| {
+            let state = SessionState::from_session(
+                session.clone(),
+                &model,
+                &self.storage,
+                &self.model_policy,
+            );
+            let provider = Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>;
+            state.starting_config(
+                provider,
+                &model,
+                cwd.clone(),
+                &self.lua_event_handle.mode_registry(),
+            )
+        });
         let mut app = App::prepare(
-            &model,
+            config.clone(),
             session.clone(),
             self.storage.clone(),
             Arc::clone(&self.available_models),
@@ -1768,30 +1789,9 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
-        let initial_mode = agent_mode_for_app(&app.app);
-        let initial_mode_def = self
-            .lua_event_handle
-            .mode_registry()
-            .get(&initial_mode.id());
-        let initial_config = maki_agent::EffectiveAgentConfig::new(
-            RunSettings {
-                provider: Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>,
-                model: model.clone(),
-                thinking: crate::app::session_state::resolve_thinking(
-                    &session,
-                    &model,
-                    &self.storage,
-                ),
-                fast: session.meta.fast && model.supports_fast(),
-                workflow: session.meta.workflow,
-            },
-            initial_mode,
-        )
-        .with_mode_def(initial_mode_def)
-        .with_context(AgentContextSnapshot::new(cwd.clone()));
         let handles = AgentHandles::prepare(
             &model_slot,
-            effective_config.unwrap_or(initial_config),
+            config,
             session.history_snapshot(),
             self.config.clone(),
             self.ui_config.tool_output_lines,

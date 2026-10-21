@@ -64,7 +64,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
-use maki_agent::actor::{TranscriptRequest, TurnAdmissionOptions, TurnOrigin, TurnProvenance};
+use maki_agent::actor::{
+    EffectiveAgentConfig, TranscriptRequest, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
+};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
@@ -133,6 +135,40 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const THEME_APPLIED_PREFIX: &str = "Theme";
+
+/// Stands in for the runtime provider in fixtures that build an app without
+/// spawning an agent. Nothing streams through it; it only lets the starting
+/// config resolve to the same shape a live runtime would hand the app.
+#[cfg(test)]
+struct DetachedProvider;
+
+#[cfg(test)]
+impl maki_providers::provider::Provider for DetachedProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        _messages: &'a [maki_providers::Message],
+        _system: &'a str,
+        _tools: &'a serde_json::Value,
+        _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+        _opts: maki_providers::RequestOptions,
+        _session_id: Option<&'a maki_storage::id::SessionRef>,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+    > {
+        Box::pin(async { std::future::pending().await })
+    }
+
+    fn list_models(
+        &self,
+    ) -> maki_providers::provider::BoxFuture<
+        '_,
+        Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 
@@ -495,7 +531,7 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
-        model: &Model,
+        config: EffectiveAgentConfig,
         session: AppSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<Vec<String>>>,
@@ -513,7 +549,8 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> PreparedApp {
-        let state = SessionState::from_session(session, model, &storage, &model_policy);
+        let mut state = SessionState::from_session(session, &config.model, &storage, &model_policy);
+        state.adopt(&config);
         permissions.load_session_rules(session_state::stored_to_rules(
             &state.session.meta.session_rules,
         ));
@@ -652,8 +689,20 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        Self::prepare(
+        let config = session_state::SessionState::from_session(
+            session.clone(),
             model,
+            &storage,
+            &model_policy,
+        )
+        .starting_config(
+            Arc::new(DetachedProvider),
+            model,
+            PathBuf::from(&session.cwd),
+            &lua_event_handle.mode_registry(),
+        );
+        Self::prepare(
+            config,
             session,
             storage,
             available_models,
