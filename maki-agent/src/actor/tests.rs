@@ -2579,6 +2579,63 @@ fn control_produces_no_outcome() {
 }
 
 #[test]
+fn duplicate_finalize_keeps_the_first_settled_identity() {
+    let (actor, task) = AgentActorHandle::spawn(
+        AgentId::generate(),
+        Vec::new(),
+        None,
+        Box::new(ScriptedBackend::new()),
+    );
+    let settle = |turn_id: TurnId, presentation: u64| {
+        let admission = super::TurnAdmission {
+            turn_id,
+            input: None,
+            event_sender: None,
+            correlation: String::new(),
+            work: crate::ActorWorkIdentity::new(
+                actor.agent_id(),
+                crate::ActorWorkKind::Turn {
+                    operation_id: presentation,
+                    turn_id,
+                },
+                presentation,
+            ),
+            generation: 0,
+            policy: None,
+            ticket: crate::TurnTicket::new(turn_id, actor.identity()),
+            admission: None,
+        };
+        super::retire_and_publish(
+            &actor.inner,
+            turn_id,
+            super::cancelled_outcome(actor.agent_id(), turn_id, TurnCancellationReason::User),
+            Some(&admission),
+            false,
+            false,
+            true,
+        );
+    };
+    let reconciled = TurnId::generate();
+    settle(reconciled, 1);
+    // A repeated finalize of already-retired work publishes nothing, so it must
+    // not move the settled identity either.
+    settle(reconciled, 2);
+    assert_eq!(
+        actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settled
+            .map(|settled| settled.presentation_id),
+        Some(1),
+        "a duplicate finalize keeps the identity that actually settled"
+    );
+    actor.close();
+    smol::block_on(task);
+}
+
+#[test]
 fn first_cancellation_reason_wins() {
     smol::block_on(async {
         let backend = CancellableBackend::new();
