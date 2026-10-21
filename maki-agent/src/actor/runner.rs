@@ -125,6 +125,11 @@ impl Runner {
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
                     state.idle_pending = true;
+                    // Controls and compacts never retire a turn, so their
+                    // settlement identity is recorded here.
+                    if let Some(identity) = work.identity() {
+                        state.settled = Some(identity);
+                    }
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(|work| {

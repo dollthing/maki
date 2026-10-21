@@ -208,6 +208,15 @@ pub enum ActorWork {
 }
 
 impl ActorWork {
+    /// The settlement identity for work that retires no turn. Turns record
+    /// theirs when the outcome is finalized.
+    pub(crate) fn identity(&self) -> Option<ActorWorkIdentity> {
+        match self {
+            Self::Control(control) => Some(control.work),
+            Self::Compact { work, .. } => Some(*work),
+            Self::Turn(_) | Self::HistoryEdit(_) => None,
+        }
+    }
     /// Every correlation targeted cancels can match this work by. Compacts
     /// re-derive theirs from the run id (see [`run_correlation`]), so they
     /// match cancels like run work but never retire precancel marks; see
@@ -1182,6 +1191,7 @@ fn retire_turn(
     inner: &ActorInner,
     turn_id: TurnId,
     outcome: &mut TurnOutcome,
+    settled: Option<ActorWorkIdentity>,
     settle_runner: bool,
     history_ready: bool,
 ) -> Option<Option<TurnTicket>> {
@@ -1228,6 +1238,9 @@ fn retire_turn(
             history_ready.then_some((history.epoch, history.messages.len())),
         );
     state.latest = Some(outcome.clone());
+    if let Some(settled) = settled {
+        state.settled = Some(settled);
+    }
     if history_ready {
         state.latest_history_turn = Some((turn_id, history.epoch, history.messages.len()));
     }
@@ -1302,18 +1315,15 @@ fn retire_and_publish(
     let presentation = admission
         .filter(|_| deliver)
         .and_then(|admission| admission.event_sender.as_ref());
-    if let Some(admission) = admission {
-        // Recorded here rather than at the pop site: a turn can be finalized
-        // without ever popping (targeted cancel, clear, deferred settlement),
-        // and settlement publishes during this same call.
-        inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .settled = Some(admission.work);
-    }
     let mut outcome = outcome;
-    if let Some(ticket) = retire_turn(inner, turn_id, &mut outcome, settle_runner, history_ready) {
+    if let Some(ticket) = retire_turn(
+        inner,
+        turn_id,
+        &mut outcome,
+        admission.map(|admission| admission.work),
+        settle_runner,
+        history_ready,
+    ) {
         #[cfg(test)]
         if let Some((retired, release)) = inner
             .after_finalization_retire

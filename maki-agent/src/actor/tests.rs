@@ -2083,20 +2083,19 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
         ));
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
         // The queued turn never popped. Settlement must name the work that was
-        // finalized, so it can never report the still-running earlier turn.
+        // finalized, not the turn still running.
         let settled = handle
             .inner
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .settled;
-        let settled = settled.expect("the cancelled turn settled as work");
-        assert_ne!(
+            .settled
+            .expect("the cancelled turn settled as work");
+        assert_eq!(
             settled.turn_id(),
-            Some(first.turn_id()),
-            "settlement names the cancelled queued turn, not the running one"
+            Some(second.turn_id()),
+            "settlement names the cancelled queued turn"
         );
-        assert_eq!(settled.agent_id, handle.agent_id());
         gate.open();
         assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
 
@@ -2547,12 +2546,33 @@ fn control_produces_no_outcome() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
         handle.push_control("pin".into(), "c1".into()).unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["pin"]);
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.latest, None, "control must not produce an outcome");
         assert_eq!(snapshot.queued, 0);
+        // A control retires no turn, so its settlement identity is recorded
+        // when it is popped rather than when an outcome is finalized.
+        loop {
+            match events.recv_async().await.unwrap() {
+                super::ActorEvent::Idle {
+                    settled: Some(settled),
+                    ..
+                } => {
+                    assert!(
+                        matches!(settled.kind, super::ActorWorkKind::Control { .. }),
+                        "the control settlement names the control"
+                    );
+                    break;
+                }
+                super::ActorEvent::Idle { settled: None, .. } => {
+                    panic!("the control settlement must carry its identity");
+                }
+                _ => {}
+            }
+        }
         handle.close();
         task.await;
     });
