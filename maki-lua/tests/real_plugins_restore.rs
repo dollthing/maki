@@ -979,6 +979,10 @@ fn exec_bash_real(
     permissions: Arc<PermissionManager>,
     input: Value,
 ) -> Result<ToolOutput, String> {
+    // The plugin highlights the command header, and the first highlight in a
+    // process builds the syntax set. The TUI pays that on its startup thread,
+    // so pay it here rather than inside the managed-turn budget below.
+    maki_highlight::warmup();
     let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
     maki_agent::tools::test_support::set_session(&mut ctx, session.read().session_id());
     ctx.permissions = permissions;
@@ -1104,6 +1108,10 @@ fn automode_deny_blocks_and_approve_runs() {
     assert!(
         err.contains("stub deny reason"),
         "deny carries the reason: {err}"
+    );
+    assert!(
+        !deny.captured_tools().is_empty(),
+        "the deny verdict must come from the real classifier"
     );
 
     let approve = Arc::new(common::CannedProvider::new(vec![
