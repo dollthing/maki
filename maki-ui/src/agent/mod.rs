@@ -1,6 +1,5 @@
 mod agent_loop;
 mod command_router;
-pub(crate) mod orchestration;
 pub(crate) mod shared_queue;
 
 #[cfg(test)]

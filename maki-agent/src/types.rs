@@ -1356,15 +1356,6 @@ pub enum ActorWorkKind {
 }
 
 impl ActorWorkKind {
-    /// The actor's own operation counter value, shared across kinds.
-    pub fn operation_id(self) -> u64 {
-        match self {
-            Self::Turn { operation_id, .. }
-            | Self::Control { operation_id }
-            | Self::Compact { operation_id } => operation_id,
-        }
-    }
-
     pub fn turn_id(self) -> Option<TurnId> {
         match self {
             Self::Turn { turn_id, .. } => Some(turn_id),
@@ -1395,10 +1386,6 @@ impl ActorWorkIdentity {
             kind,
             presentation_id,
         }
-    }
-
-    pub fn operation_id(&self) -> u64 {
-        self.kind.operation_id()
     }
 
     pub fn turn_id(&self) -> Option<TurnId> {

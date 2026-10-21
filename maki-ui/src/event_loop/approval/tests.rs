@@ -1203,7 +1203,6 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
 
 fn final_ready(
     event_loop: &mut EventLoop<'_>,
-    _clear_context: bool,
     requests: &flume::Receiver<RecordedRequest>,
 ) -> InternalEvent {
     loop {
@@ -1274,7 +1273,7 @@ fn clear_context_preserves_runtime_and_session_state() {
         event_loop.sessions[index].app.checkpoint_now();
         checkpoint(event_loop, index);
         approve(event_loop, index, true);
-        let ready = final_ready(event_loop, true, &requests);
+        let ready = final_ready(event_loop, &requests);
         event_loop.handle_internal(ready);
         assert!(requests.is_empty());
         let committed = next_ready(event_loop);
@@ -1444,7 +1443,7 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
         );
         entry.recv_timeout(WAIT).unwrap();
         approve(event_loop, index, fresh);
-        let ready = final_ready(event_loop, fresh, &requests);
+        let ready = final_ready(event_loop, &requests);
         event_loop.handle_internal(ready);
         assert!(
             event_loop.sessions[index].app.plan_approval_pending
@@ -1479,7 +1478,7 @@ fn lock_lost_while_waiting_keeps_lock_lost_message(fresh: bool) {
         );
         entry.recv_timeout(WAIT).unwrap();
         approve(event_loop, index, fresh);
-        let ready = final_ready(event_loop, fresh, &requests);
+        let ready = final_ready(event_loop, &requests);
         event_loop.handle_internal(ready);
         assert!(event_loop.sessions[index].app.plan_approval_pending);
         release.send(()).unwrap();
@@ -1634,7 +1633,7 @@ fn permission_change_before_publication_preserves_source() {
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         approve(event_loop, index, true);
-        let ready = final_ready(event_loop, true, &requests);
+        let ready = final_ready(event_loop, &requests);
         event_loop.sessions[index].app.permissions.toggle_yolo();
         event_loop.handle_internal(ready);
         assert_preserved(event_loop, index, &path, run, Some(APPROVAL_CHANGED));

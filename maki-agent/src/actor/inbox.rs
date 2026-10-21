@@ -88,7 +88,6 @@ pub(super) struct InstructionInbox {
     pub policy: Option<Arc<EffectiveAgentConfig>>,
     pub initial: Option<PendingSubmission>,
     pub operation: u64,
-    pub mergeable: bool,
     pub batch_key: Option<BatchKey>,
     pub correlations: Vec<String>,
 }
@@ -104,7 +103,6 @@ impl InstructionInbox {
             policy: None,
             initial: None,
             operation: 0,
-            mergeable: false,
             batch_key: None,
             correlations: Vec::new(),
         }

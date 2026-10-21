@@ -46,7 +46,7 @@ use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::orchestration::{
-    ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices,
+    AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices,
 };
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
@@ -81,7 +81,7 @@ fn claim_lock(dir: &Path, id: &MakiId) -> Result<ClaimedSessionLock> {
 use crate::AppSession;
 use crate::agent::{
     AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
-    SystemPromptOverride, orchestration::AgentOrchestration, shared_queue::QueueItem,
+    SystemPromptOverride, shared_queue::QueueItem,
 };
 use crate::app::EMPTY_PROMPT_ERR;
 use crate::app::session_state::SessionState;

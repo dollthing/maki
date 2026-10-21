@@ -2435,7 +2435,7 @@ mod tests {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
                 })
                 .unwrap();
-            let orchestration = Arc::new(crate::agent::orchestration::AgentOrchestration::new(
+            let orchestration = Arc::new(maki_lua::orchestration::AgentOrchestration::new(
                 Arc::new(arc_swap::ArcSwapOption::empty()),
             ));
             let pinned = TrustedTarget {

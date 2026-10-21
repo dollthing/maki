@@ -2139,7 +2139,6 @@ impl AgentActorHandle {
     ) -> Result<TurnTicket, ActorError> {
         let bytes = submission_bytes(&input)?;
         let batch_key = crate::batch_key(&input);
-        let mergeable = batch_key.is_some();
         if bytes > MAX_PENDING_INSTRUCTION_BYTES {
             return Err(ActorError::InstructionOverflow);
         }
@@ -2161,9 +2160,9 @@ impl AgentActorHandle {
                 .filter(|id| {
                     state.instructions.get(id).is_some_and(|inbox| {
                         inbox.open
-                            && inbox.mergeable
-                            && mergeable
-                            && inbox.batch_key == batch_key
+                            && batch_key
+                                .as_ref()
+                                .is_some_and(|key| inbox.batch_key.as_ref() == Some(key))
                             && match (&inbox.policy, &state.policy) {
                                 (Some(active), Some(current)) => Arc::ptr_eq(active, current),
                                 (None, None) => true,
@@ -2179,9 +2178,9 @@ impl AgentActorHandle {
                 .or_else(|| {
                     state.instructions.iter().find_map(|(id, inbox)| {
                         (inbox.open
-                            && inbox.mergeable
-                            && mergeable
-                            && inbox.batch_key == batch_key
+                            && batch_key
+                                .as_ref()
+                                .is_some_and(|key| inbox.batch_key.as_ref() == Some(key))
                             && inbox.submit_operation == Some(state.next_operation_id))
                         .then_some(*id)
                     })
@@ -2213,8 +2212,9 @@ impl AgentActorHandle {
                         || state.lifecycle != ActorLifecycle::Open
                         || state.instructions.get(&target).is_none_or(|inbox| {
                             !inbox.open
-                                || !inbox.mergeable
-                                || inbox.batch_key != batch_key
+                                || batch_key
+                                    .as_ref()
+                                    .is_none_or(|key| inbox.batch_key.as_ref() != Some(key))
                                 || (inbox.submit_operation != Some(operation_boundary)
                                     && (state
                                         .operations
@@ -2318,7 +2318,6 @@ impl AgentActorHandle {
             inbox.drained.push((ticket.provenance().clone(), bytes));
             inbox.submit_operation = Some(id);
             inbox.operation = id;
-            inbox.mergeable = mergeable;
             inbox.batch_key = batch_key.clone();
             inbox.initial = Some(state.pending_submission(
                 turn_id,
