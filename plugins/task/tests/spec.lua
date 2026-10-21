@@ -20,8 +20,11 @@ case("maki_agent_has_expected_functions", function()
     "system_prompt",
     "tools",
     "call_tool",
-    "session",
-    "report_task_result",
+    "spawn",
+    "current",
+    "root",
+    "list",
+    "get",
   }
   for _, fn_name in ipairs(expected) do
     eq(type(maki.agent[fn_name]), "function", "maki.agent." .. fn_name .. " must be a function")

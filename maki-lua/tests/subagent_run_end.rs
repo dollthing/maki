@@ -71,26 +71,26 @@ maki.api.register_tool({
 register_probe({
   name = "probe_spawn",
   handler = function(input, ctx)
-    local sess, err = maki.agent.session(ctx, { name = "probe", inherit_provider = true })
+    local sess, err = maki.agent.spawn(ctx, { name = "probe", inherit_provider = true })
     if not sess then
       return { llm_output = "spawn failed: " .. err, is_error = true }
     end
     session_holder.sess = sess
-    return maki.json.encode({ task_id = sess:session_id() })
+    return maki.json.encode({ task_id = assert(sess:id()) })
   end,
 })
 
 register_probe({
   name = "probe_status",
-  handler = function()
-    return maki.json.encode(session_holder.sess:status())
+  handler = function(input, ctx)
+    return maki.json.encode(assert(session_holder.sess:status(ctx)))
   end,
 })
 
 register_probe({
   name = "probe_send",
-  handler = function(input)
-    local _, err = session_holder.sess:send(input.message)
+  handler = function(input, ctx)
+    local _, err = session_holder.sess:enqueue(ctx, input.message)
     if err then
       return { llm_output = "send failed: " .. err, is_error = true }
     end
@@ -100,9 +100,20 @@ register_probe({
 
 register_probe({
   name = "probe_prompt",
-  handler = function(input)
+  handler = function(input, ctx)
     local opts = input.timeout and { timeout = input.timeout } or nil
-    local result, err = session_holder.sess:prompt(input.message, opts)
+    local ticket, admission_err = session_holder.sess:enqueue(ctx, input.message)
+    if not ticket then
+      return maki.json.encode({ error = admission_err })
+    end
+    local result, err = ticket:wait(ctx, opts)
+    if not result and err == "@TURN_WAIT_TIMEOUT@" then
+      local cancelled, cancel_err = ticket:cancel(ctx)
+      assert(cancelled, cancel_err)
+      local settled, wait_err = ticket:wait(ctx)
+      assert(settled, wait_err)
+      return maki.json.encode({ result = settled, error = err, timed_out = true })
+    end
     return maki.json.encode({ result = result, error = err })
   end,
 })
@@ -162,7 +173,14 @@ impl ActorBackend for IdleRoot {
 fn load_probe_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("probe", PROBE_SRC).unwrap();
+    host.load_source(
+        "probe",
+        &PROBE_SRC.replace(
+            "@TURN_WAIT_TIMEOUT@",
+            maki_lua::agent_errors::TURN_WAIT_TIMEOUT,
+        ),
+    )
+    .unwrap();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let root = manager
         .create_root(Vec::new(), None, Box::new(IdleRoot))
@@ -484,11 +502,8 @@ fn child_cancellation_keeps_session_open_for_recovery() {
     .unwrap();
 
     let cancelled = prompt.join().unwrap().unwrap();
-    assert!(
-        cancelled["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("cancel"))
-    );
+    assert!(cancelled["error"].is_null(), "got: {cancelled}");
+    assert_eq!(cancelled["result"]["status"], "cancelled");
     assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 1);
     loop {
         let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();
@@ -512,7 +527,7 @@ fn child_cancellation_keeps_session_open_for_recovery() {
 }
 
 /// A subagent spawned during a run must survive that run ending normally.
-/// `status()` should report it as `running`/`done`, never `closed`.
+/// `status()` should report it as `running`/`idle`, never `closed`.
 #[test]
 fn subagent_outlives_the_run_that_spawned_it() {
     let (ctx, run_trigger) = production_like_ctx();
@@ -534,7 +549,7 @@ fn subagent_outlives_the_run_that_spawned_it() {
     for _ in 0..20 {
         status = exec_probe(&reg, &handle, &ctx, "probe_status", json!({})).unwrap();
         eprintln!("status (after run end) -> {status}");
-        if status["status"] == "done" || status["status"] == "closed" {
+        if status["status"] == "idle" || status["status"] == "closed" {
             break;
         }
     }
@@ -563,7 +578,9 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
         json!({ "message": "fail this turn" }),
     )
     .expect("failed turn did not resolve");
-    assert_eq!(failed["error"], json!(PROVIDER_FAILURE));
+    assert!(failed["error"].is_null(), "got: {failed}");
+    assert_eq!(failed["result"]["status"], "failed");
+    assert_eq!(failed["result"]["error"], json!(PROVIDER_FAILURE));
     // `prompt` resolves its ticket inside `finalize_turn`, which runs before
     // the actor flips to idle, so a status read straight afterwards can still
     // see the turn running and carry no error. `status` is a polling API, so
@@ -571,7 +588,7 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
     let deadline = Instant::now() + TURN_TIMEOUT;
     let status = loop {
         let status = exec_probe(&reg, &handle, &ctx, "probe_status", json!({})).unwrap();
-        if status["status"] == json!("done") {
+        if status["status"] == json!("idle") {
             break status;
         }
         assert!(
@@ -580,7 +597,7 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
         );
         std::thread::park_timeout(Duration::from_millis(1));
     };
-    assert_eq!(status["error"], json!(PROVIDER_FAILURE));
+    assert_eq!(status["status"], "idle");
     // The parent channel also carries subagent activity, so scan for the
     // history envelope rather than assuming it arrives first.
     loop {
@@ -605,7 +622,7 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
 }
 
 #[test]
-fn prompt_timeout_cancels_in_flight_provider_request() {
+fn prompt_timeout_ticket_cancels_in_flight_provider_request() {
     let (dropped_tx, dropped_rx) = flume::bounded(1);
     let provider = Arc::new(PendingProvider { dropped_tx });
     let (ctx, _parent_rx, _run_trigger) = ctx_with_provider(provider);
@@ -622,7 +639,9 @@ fn prompt_timeout_cancels_in_flight_provider_request() {
     )
     .expect("timed prompt did not resolve");
 
-    assert_eq!(result["error"], "session prompt timed out after 1s");
+    assert_eq!(result["error"], maki_lua::agent_errors::TURN_WAIT_TIMEOUT);
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["result"]["status"], "cancelled");
     dropped_rx
         .recv_timeout(TURN_TIMEOUT)
         .expect("provider request remained alive after prompt timeout");

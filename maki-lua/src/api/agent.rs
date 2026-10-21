@@ -1,7 +1,6 @@
 //! `maki.agent` exposes subagent primitives to Lua plugins. Policy (retries,
 //! validation, concurrency) lives in the task plugin, not here.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -23,13 +22,13 @@ use handles::{
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
-    ActorBackend, ActorLifecycle, ActorStatus, AdmissionPolicyConstraint, AdmissionPreparation,
-    AgentContextSnapshot, BackendResult, EffectiveAgentConfig, ModeCeiling, TurnContext, WorkKind,
+    ActorBackend, AdmissionPreparation, AgentContextSnapshot, BackendResult, EffectiveAgentConfig,
+    ModeCeiling, TurnContext, WorkKind,
 };
 use maki_agent::agent::{
     Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
 };
-use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
+use maki_agent::cancel::{CancelMap, CancelToken};
 use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::offload::OffloadStore;
@@ -45,10 +44,10 @@ use maki_agent::{
     AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History,
     HistorySnapshot, McpSession, ModeDef, Post, RunLedger, RunSettings, SubagentCancel,
     SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId,
-    TurnOutcome, TurnResult,
+    TurnOutcome,
 };
-use maki_config::{ModelPolicy, ToolKey};
-use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use maki_config::ToolKey;
+use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost};
@@ -58,28 +57,23 @@ use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
 use crate::agent_errors::{
-    BLANK_POST, INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_PLUGIN_AUTHORITY,
-    NO_TASK_AUTHORITY, ORCHESTRATION_SERVICES_EXPIRED, POST_TARGET_NOT_STARTED, POST_TARGET_SILENT,
-    SHOW_SILENT_AGENT, SHOW_TOOL_AGENT, SHOW_UNTRUSTED_PARENT, STRUCTURED_OUTPUT_CONFLICT,
+    BLANK_POST, INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_TASK_AUTHORITY,
+    POST_TARGET_NOT_STARTED, POST_TARGET_SILENT, SHOW_SILENT_AGENT, SHOW_TOOL_AGENT,
+    SHOW_UNTRUSTED_PARENT, STRUCTURED_OUTPUT_CONFLICT,
 };
-use crate::api::r#async::LuaSemaphore;
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::host_root::HostRootServices;
 use crate::orchestration::{OrchestrationServices, TrustedContext};
-use crate::runtime::{CANCELLED_MSG, Request};
+use crate::runtime::Request;
 
 const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
-const SESSION_CLOSED_ERR: &str = "session closed";
 const COMPACT_PARAMS_MISSING_ERR: &str = "compaction requires initialized agent parameters";
 const COMPACT_CONFIG_MISSING_ERR: &str =
     "compaction was admitted without an effective agent configuration";
 const INVALID_SHOW_OPTION: &str = "show must be a boolean or string";
-const SESSION_POLICY_CHANGED_ERR: &str = "session creation policy changed";
-const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 const PROMPT_SLOTS_CLOSED: &str = "prompt slots channel closed";
 const UNNAMED_AGENT_LABEL: &str = "agent";
 const SPAWN_OPTIONS: &[&str] = &[
@@ -91,7 +85,6 @@ const SPAWN_OPTIONS: &[&str] = &[
     "model",
     "name",
     "output_schema",
-    "semaphore",
     "show",
     "silent",
     "system",
@@ -101,11 +94,7 @@ const SPAWN_OPTIONS: &[&str] = &[
 pub type SessionProviderPreparer =
     Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
 
-/// Build the `(model, provider)` pair that backs a `maki.agent.session` spawn.
-/// `inherit_provider` (or an absent `model.spec`) reuses the parent model and
-/// provider so a test-side wrapper can drive a real spawned session through a
-/// caller-provided provider without network. Otherwise build a provider for the
-/// given `model.spec`.
+/// Resolve a child's model and provider, optionally reusing the parent's provider.
 async fn build_session_provider(
     model_spec: &Option<String>,
     inherit_provider: bool,
@@ -131,17 +120,6 @@ async fn build_session_provider(
     }
 }
 
-#[derive(Default)]
-struct StandaloneChildren {
-    closed: bool,
-    actors: Vec<(Weak<AgentActorHandle>, Weak<LuaActorState>)>,
-}
-
-type StandaloneOwner = (Weak<CancelMap<String>>, Arc<Mutex<StandaloneChildren>>);
-
-#[derive(Default)]
-struct StandaloneActors(Vec<StandaloneOwner>);
-
 /// Shared backend state, owned by the adapter and cloned into the actor's
 /// backend. Runs are transient: the [`actor::Runner`](maki_agent::actor) owns
 /// the [`History`], while every per-session capability that must outlive a
@@ -152,7 +130,6 @@ struct StandaloneActors(Vec<StandaloneOwner>);
 /// a `Mutex`/`Sender`/`OnceLock` the borrowed shell can touch. `prompt` and
 /// `status` never read through this struct; they speak to the actor handle.
 struct LuaActorState {
-    children: Arc<Mutex<StandaloneChildren>>,
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
     prompt_requests: Option<flume::Sender<Request>>,
@@ -178,10 +155,6 @@ struct LuaActorState {
     structured: Option<Arc<StructuredOutput>>,
     name: String,
     commit: Arc<Mutex<Option<JsonValue>>>,
-    semaphore: Option<Arc<async_lock::Semaphore>>,
-    /// The `semaphore` permit held by the running turn, released for the
-    /// length of a blocking wait from that turn.
-    turn_permit: Mutex<Option<async_lock::SemaphoreGuardArc>>,
     start: Instant,
     /// Set only after the adapter backend has actually entered a turn. A
     /// queued admission never sets it, so close cannot mistake queued work for
@@ -194,21 +167,6 @@ struct LuaActorState {
 }
 
 impl LuaActorState {
-    /// Releases the running turn's permit, so the children a blocking wait
-    /// observes can take it. Returns whether the turn held one.
-    fn release_turn_permit(&self) -> bool {
-        self.turn_permit.lock().unwrap().take().is_some()
-    }
-
-    async fn reacquire_turn_permit(&self, cancel: &CancelToken) -> Result<(), String> {
-        let Some(semaphore) = &self.semaphore else {
-            return Ok(());
-        };
-        let permit = cancel.race(Arc::clone(semaphore).acquire_arc()).await?;
-        *self.turn_permit.lock().unwrap() = Some(permit);
-        Ok(())
-    }
-
     fn init_subagent_info(&self, first_message: &str) {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
@@ -309,37 +267,6 @@ impl LuaActorState {
     fn notify_closed_ordered(&self) {
         if let Some(envelope) = self.take_close_notification() {
             let _ = self.chip_event_tx.send_envelope(envelope);
-        }
-    }
-
-    fn cancel_subtree(&self, actor: &AgentActorHandle) {
-        let children = self.children.lock().unwrap();
-        actor.cancel_existing();
-        for (actor, state) in &children.actors {
-            if let (Some(actor), Some(state)) = (actor.upgrade(), state.upgrade()) {
-                state.cancel_subtree(&actor);
-            }
-        }
-    }
-
-    /// Idempotent cancellation close: notify the UI immediately, retire the
-    /// subtree, and resolve queued/parked waiters as Closed.
-    fn close_with(&self, actor: &AgentActorHandle) {
-        self.notify_closed_direct();
-        let mut children = self.children.lock().unwrap();
-        children.closed = true;
-        actor.close();
-        for (actor, state) in children.actors.drain(..) {
-            if let (Some(actor), Some(state)) = (actor.upgrade(), state.upgrade()) {
-                state.close_with(&actor);
-            }
-        }
-        drop(children);
-        if !self
-            .execution_started
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.relay_snapshot_if_pending();
         }
     }
 }
@@ -488,36 +415,6 @@ impl ActorBackend for LuaActorBackend {
                 %turn_id,
                 "lua actor turn"
             );
-            // The semaphore gates the turn, racing close/shutdown so a blocked
-            // acquire cannot strand after the actor closes. The permit is
-            // dropped on every path; a race loss yields an EnteredRun Cancelled
-            // (the outcome truth), never a dead actor.
-            let permit = match &state.semaphore {
-                Some(semaphore) => {
-                    let semaphore = Arc::clone(semaphore);
-                    let cancel = context.cancel.clone();
-                    match cancel.race(semaphore.acquire_arc()).await {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            let cancelled = TurnOutcome::cancelled(
-                                context.agent_id,
-                                turn_id,
-                                TokenUsage::default(),
-                                0,
-                                context
-                                    .cancel_reason
-                                    .reason()
-                                    .unwrap_or(TurnCancellationReason::User),
-                            );
-                            state.relay_history(history);
-                            return BackendResult::EnteredRun(cancelled);
-                        }
-                    }
-                }
-                None => None,
-            };
-            *state.turn_permit.lock().unwrap() = permit;
-
             let mut params = state
                 .params
                 .get()
@@ -538,7 +435,6 @@ impl ActorBackend for LuaActorBackend {
                             None
                         }
                         Err(_) => {
-                            state.release_turn_permit();
                             return BackendResult::EnteredRun(TurnOutcome::cancelled(
                                 context.agent_id,
                                 turn_id,
@@ -620,7 +516,6 @@ impl ActorBackend for LuaActorBackend {
             }
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
-            state.turn_permit.lock().unwrap().take();
 
             if let Some(structured) = &state.structured {
                 structured.finish_turn();
@@ -899,7 +794,7 @@ async fn system_prompt(
 }
 
 /// Get the list of tool definitions for a given audience. Pass the result
-/// straight into `maki.agent.session()` or use it to inspect what tools are
+/// straight into `maki.agent.spawn()` or use it to inspect what tools are
 /// available.
 ///
 /// @param ctx LuaCtx Agent context.
@@ -1197,83 +1092,6 @@ async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<boo
     Ok((Some(agent.permissions.is_yolo()), None))
 }
 
-/// Create a new subagent session. The session inherits the parent model and
-/// MCP handle unless you override them. You get back a `Session` object that
-/// you can send messages to with `:prompt()`.
-///
-/// Trusted sessions remain usable by same-plugin handlers until host/plugin
-/// revocation. Tool-created sessions expire when their creating invocation ends.
-/// Passing a Session to another coroutine does not transfer authority.
-///
-/// This is the main way to spin up a sub-conversation with its own history
-/// and tool set.
-///
-/// @param ctx LuaCtx Agent context.
-/// @param opts table Optional fields:
-///   `model` (string|table?) - a spec string or a `{spec, thinking, fast}`
-///     selection, validated like `Agent:set_model`. Omitted fields inherit the
-///     parent's; thinking is capped at the parent's level. A query result from
-///     `Agent:model` can be passed as is.
-///   `system` (string?) - custom text appended after the admitted mode's prompt contribution. Defaults to empty; does not inherit the parent's full system prompt.
-///   `tools` (table?) - tool definitions array (from `maki.agent.tools()`).
-///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
-///     requires `description` (string), `input_schema` (table), and
-///     `handler` (function). The handler receives the input table and must return
-///     `(string)` or `(nil, err)`. Set `capture_input` to surface a successful
-///     call's input as `captured` in the turn result.
-///   `name` (string?) - display name for logs and UI.
-///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
-///   `mcp` (boolean?) - give the session access to MCP tools. Their
-///     definitions are injected automatically each turn (deferred behind
-///     `tool_search`), so don't put MCP definitions in `tools`. The session
-///     starts with no loaded tools of its own. Default: `true`.
-///   `inherit_provider` (boolean?) - reuse the parent model and provider instead
-///     of building one from `model.spec`. Used by tests (and tools that want to
-///     thread a caller-provided provider) to drive a real spawned session without
-///     hitting the network. `model.spec` is ignored when this is `true`. Default: `false`.
-///   `silent` (boolean?) - do not relay the session's turns, annotations, or
-///     usage into the parent session's UI or event stream. The session still
-///     completes and `:prompt()` still returns its result (including a commit
-///     set via a `local_tools` handler). Use for hidden one-shot classification.
-///   `show` (boolean|string?) - post a row for the session in its parent's
-///     chat; a string adds a description. Default: `true` for trusted parents,
-///     `false` otherwise. Silent sessions and sessions opened by a tool call,
-///     which already have a tool row, cannot be shown.
-///   `auto_deliver` (boolean?) - for managed children, queue a structured
-///     lifecycle observation per settled turn to the recorded parent, independently
-///     of `prompt()` or ticket waits. Nested children notify their own parent,
-///     and a managed child's turn does not settle while a child reporting to it
-///     is still running, unless its request budget runs out. Silent children
-///     disable delivery. Rejection and discard are observable in
-///     host logs; delivery is in-memory, without retry. Default: `true`.
-///   `semaphore` (maki.async.Semaphore?) - concurrency limit acquired by the
-///     driver immediately before each unmanaged turn and released when that turn
-///     ends. Managed sessions ignore it and use the parent manager's limit.
-/// Any other option key is an error.
-/// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
-/// @example
-/// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-/// local sess, err = maki.agent.session(ctx, {
-///   system = "You are a research assistant.",
-///   tools = tools,
-///   name = "researcher",
-/// })
-/// if err then error(err) end
-/// local result = sess:prompt("Summarize this file.")
-/// sess:close()
-#[lua_fn]
-async fn session(
-    lua: Lua,
-    ctx: mlua::UserDataRef<LuaCtx>,
-    opts: Table,
-) -> LuaResult<Pair<mlua::AnyUserData>> {
-    let (session, error) = build_session(lua.clone(), ctx, opts, false).await?;
-    match session {
-        Some(session) => Ok((Some(lua.create_userdata(session)?), error)),
-        None => Ok((None, error)),
-    }
-}
-
 fn request_tools_json(lua: &Lua, value: &LuaValue) -> LuaResult<JsonValue> {
     if let LuaValue::Table(table) = value
         && table.is_empty()
@@ -1293,7 +1111,6 @@ struct SessionParent {
     context: AgentContext,
     trusted: Option<TrustedContext>,
     managed_turn: Option<CurrentManagedTurn>,
-    authority: SessionAuthority,
     agent_id: Option<AgentId>,
     is_root: bool,
 }
@@ -1303,7 +1120,6 @@ impl SessionParent {
         ctx.validate_origin(lua)?;
         let trusted = ctx.trusted(lua).ok().cloned();
         let context = Self::agent_context(lua, ctx, trusted.as_ref())?;
-        let authority = SessionAuthority::capture(lua, trusted.as_ref(), &context)?;
         let managed_turn = match (
             &context.managed_turn,
             crate::runtime::current_managed_turn(lua),
@@ -1312,6 +1128,9 @@ impl SessionParent {
             (None, None) => None,
             _ => return Err(MANAGED_AUTHORITY_INACTIVE.into()),
         };
+        if managed_turn.is_none() && trusted.is_none() {
+            return Err(MANAGED_AUTHORITY_INACTIVE.into());
+        }
         let agent_id = managed_turn
             .as_ref()
             .map(|current| current.agent_id())
@@ -1324,7 +1143,6 @@ impl SessionParent {
             context,
             trusted,
             managed_turn,
-            authority,
             agent_id,
             is_root,
         })
@@ -1371,7 +1189,7 @@ impl SessionParent {
         if let Some(trusted) = &self.trusted {
             trusted.validate_target(lua, &trusted.target)?;
         }
-        self.authority.validate(lua, None)
+        Ok(())
     }
 
     /// The parent's callable tool context, with turn bindings captured fresh
@@ -1394,7 +1212,6 @@ impl SessionParent {
 }
 
 struct SessionOptions {
-    inherit_defaults: bool,
     selection: ModelSelection,
     system: Option<String>,
     tools: Option<LuaValue>,
@@ -1406,19 +1223,13 @@ struct SessionOptions {
     mcp: bool,
     silent: bool,
     auto_deliver: bool,
-    semaphore: Option<Arc<async_lock::Semaphore>>,
     /// `Some` posts a row for the child in its parent's chat, with an
     /// optional description.
     show: Option<Option<String>>,
 }
 
 impl SessionOptions {
-    fn parse(
-        lua: &Lua,
-        opts: &Table,
-        parent: &SessionParent,
-        inherit_defaults: bool,
-    ) -> LuaResult<Result<Self, String>> {
+    fn parse(lua: &Lua, opts: &Table, parent: &SessionParent) -> LuaResult<Result<Self, String>> {
         for pair in opts.pairs::<LuaValue, LuaValue>() {
             let (key, _) = pair?;
             let known =
@@ -1447,8 +1258,7 @@ impl SessionOptions {
                 Some(audience) => audience,
                 None => return Ok(Err(format!("unknown audience: {s}"))),
             },
-            None if inherit_defaults => parent.context.audience,
-            None => DEFAULT_SESSION_AUDIENCE,
+            None => parent.context.audience,
         };
         let inherit_provider = opts
             .get::<Option<bool>>("inherit_provider")?
@@ -1490,19 +1300,7 @@ impl SessionOptions {
                 )));
             }
         };
-        let semaphore = if parent.managed_turn.is_some() {
-            None
-        } else {
-            opts.get::<Option<mlua::AnyUserData>>("semaphore")?
-                .map(|value| {
-                    value
-                        .borrow::<LuaSemaphore>()
-                        .map(|semaphore| Arc::clone(&semaphore.sem))
-                })
-                .transpose()?
-        };
         Ok(Ok(Self {
-            inherit_defaults,
             selection,
             system,
             tools,
@@ -1514,19 +1312,12 @@ impl SessionOptions {
             mcp,
             silent,
             auto_deliver,
-            semaphore,
             show,
         }))
     }
 
     fn workflow(&self, parent: &SessionParent) -> bool {
-        self.inherit_defaults && parent.context.workflow
-    }
-
-    fn inherits_parent_mode(&self, parent: &SessionParent) -> bool {
-        self.inherit_defaults
-            || parent.restricts_writes()
-            || matches!(&parent.context.mode, AgentMode::Custom(_))
+        parent.context.workflow
     }
 }
 
@@ -1568,13 +1359,10 @@ impl SessionTools {
         let (parent_tools, parent_allowed) = parent.callable_tools();
         let mut definitions = match &options.tools {
             Some(value) => request_tools_json(lua, value)?,
-            None if options.inherit_defaults => {
-                match inherited_tool_definitions(&parent.context, model, &parent_allowed) {
-                    Ok(definitions) => definitions,
-                    Err(error) => return Ok(Err(error)),
-                }
-            }
-            None => JsonValue::Array(vec![]),
+            None => match inherited_tool_definitions(&parent.context, model, &parent_allowed) {
+                Ok(definitions) => definitions,
+                Err(error) => return Ok(Err(error)),
+            },
         };
         let structured = match opts.get::<Option<LuaValue>>("output_schema")? {
             Some(value) => match StructuredOutput::compile(lua_to_json(lua, &value)?) {
@@ -1583,7 +1371,7 @@ impl SessionTools {
             },
             None => None,
         };
-        let mut local = if options.inherit_defaults && options.tools.is_none() {
+        let mut local = if options.tools.is_none() {
             inherited_local_tools(&parent.context, &definitions)
         } else {
             HashMap::new()
@@ -1608,17 +1396,16 @@ impl SessionTools {
         // The array is the caller's, and the filter comes out of it, so whatever
         // the caller left out is also a name this session cannot dispatch or bind
         // inside its sandbox.
-        if options.inherits_parent_mode(parent) {
+        {
             let initial =
                 RequestTools::assembled(definitions.clone(), &parent.context.config, model);
             let mut child_tools = parent_tools;
             child_tools.audience = options.audience;
             child_tools.tool_filter = Arc::clone(initial.filter());
-            let within_parent = options.inherit_defaults || parent.restricts_writes();
             let mut allowed: HashSet<_> = tool_dispatch::callable(&child_tools)
                 .into_iter()
                 .map(|tool| tool.name)
-                .filter(|name| !within_parent || parent_allowed.contains(name))
+                .filter(|name| parent_allowed.contains(name))
                 .collect();
             allowed.extend(local.keys().cloned());
             definitions
@@ -1743,7 +1530,6 @@ struct ChildSettings {
     provider: Arc<dyn provider::Provider>,
     opts: RequestOptions,
     mode: AgentMode,
-    inherits_parent_mode: bool,
 }
 
 impl ChildSettings {
@@ -1763,32 +1549,22 @@ impl ChildSettings {
             fast: options.fast,
         }
         .clamped(&model);
-        let inherits_parent_mode = options.inherits_parent_mode(parent);
-        let mode = if inherits_parent_mode {
-            parent.context.mode.clone()
-        } else {
-            AgentMode::Build
-        };
+        let mode = parent.context.mode.clone();
         Self {
             model,
             provider,
             opts,
             mode,
-            inherits_parent_mode,
         }
     }
 
     fn mode_definition(&self, parent: &SessionParent) -> ModeDef {
-        if self.inherits_parent_mode {
-            parent
-                .context
-                .mode_def
-                .as_deref()
-                .cloned()
-                .unwrap_or_else(|| parent.context.modes.current(&self.mode))
-        } else {
-            parent.context.modes.current(&self.mode)
-        }
+        parent
+            .context
+            .mode_def
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| parent.context.modes.current(&self.mode))
     }
 
     fn tool_template(
@@ -1890,11 +1666,7 @@ fn agent_params(
         modes: Arc::clone(&context.modes),
         subagent_cancels: Arc::new(CancelMap::new()),
         ledger: RunLedger::child(&context.ledger),
-        registry: if options.inherit_defaults {
-            Arc::clone(&context.registry)
-        } else {
-            Arc::clone(ToolRegistry::global_arc())
-        },
+        registry: Arc::clone(&context.registry),
         audience: options.audience,
         question_mode: context.question_mode,
         model_policy: Arc::clone(&context.model_policy),
@@ -1904,8 +1676,7 @@ fn agent_params(
     }
 }
 
-/// Spawns the child under the managed turn or trusted target when there is
-/// one, otherwise as a free actor keyed into the parent's `subagent_cancels`.
+/// Spawn under the active managed turn or trusted target.
 fn spawn_session_actor(
     lua: &Lua,
     parent: &SessionParent,
@@ -1926,26 +1697,6 @@ fn spawn_session_actor(
             "session parameters must only be initialized once"
         );
     };
-    if parent.managed_turn.is_none() && parent.trusted.is_none() {
-        let agent_id = AgentId::generate();
-        init_params(agent_id);
-        let cancel_slot = parent
-            .context
-            .subagent_cancels
-            .insert(state.ui_id.clone(), child_trigger);
-        let (actor, task) = AgentActorHandle::spawn(agent_id, Vec::new(), None, backend());
-        actor
-            .initialize_config(initial_config)
-            .map_err(|error| error.to_string())?;
-        task.detach();
-        return Ok((
-            actor,
-            SessionControl::Unmanaged {
-                parent_cancels: Arc::clone(&parent.context.subagent_cancels),
-                cancel_slot,
-            },
-        ));
-    }
     let metadata = maki_agent::AgentMetadata {
         label: (!state.name.is_empty()).then_some(state.name.clone()),
         spawned_by_tool_use_id: parent.context.tool_use_id.clone(),
@@ -1973,7 +1724,7 @@ fn spawn_session_actor(
     }
     Ok((
         actor,
-        SessionControl::Managed {
+        SessionControl {
             agent: child,
             _child_trigger: child_trigger,
         },
@@ -1984,17 +1735,9 @@ fn spawn_session_actor(
 /// Permanent closure aborts running turns and terminalizes queued turns;
 /// managed sessions close their subtree. A normal close stops the relay first,
 /// through the returned sender.
-fn spawn_close_relay(
-    actor: &AgentActorHandle,
-    control: &SessionControl,
-    state: &Arc<LuaActorState>,
-) -> flume::Sender<()> {
+fn spawn_close_relay(control: &SessionControl, state: &Arc<LuaActorState>) -> flume::Sender<()> {
     let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
-    let actor = actor.clone();
-    let managed_agent = match control {
-        SessionControl::Managed { agent, .. } => Some(agent.clone()),
-        SessionControl::Unmanaged { .. } => None,
-    };
+    let managed_agent = control.agent.clone();
     let child_cancel = state.child_cancel.clone();
     let close_state = Arc::clone(state);
     smol::spawn(async move {
@@ -2006,61 +1749,22 @@ fn spawn_close_relay(
         )
         .await;
         close_state.notify_closed_direct();
-        if let Some(agent) = managed_agent {
-            let _ = agent.close_subtree();
-        } else {
-            close_state.close_with(&actor);
-        }
+        let _ = managed_agent.close_subtree();
     })
     .detach();
     relay_stop_tx
 }
 
-/// Publishes a managed child as a trusted target, ties a delegated unmanaged
-/// session to its invocation's lifetime, and records its owner. A failed step
-/// closes the session.
 fn register_session(
     lua: &Lua,
     sess: LuaSession,
     child_template: ToolContext,
-    inherit_defaults: bool,
 ) -> Result<LuaSession, String> {
     let _ = sess.state.template.set(child_template.clone());
-    if let SessionControl::Unmanaged { parent_cancels, .. } = &sess.control {
-        if lua.app_data_ref::<StandaloneActors>().is_none() {
-            lua.set_app_data(StandaloneActors::default());
-        }
-        let mut actors = lua.app_data_mut::<StandaloneActors>().unwrap();
-        actors.0.retain(|(map, _)| map.strong_count() > 0);
-        let parent = actors
-            .0
-            .iter()
-            .find(|(map, _)| map.ptr_eq(&Arc::downgrade(parent_cancels)));
-        if let Some((_, parent)) = parent {
-            let mut children = parent.lock().unwrap();
-            children
-                .actors
-                .retain(|(actor, _)| actor.strong_count() > 0);
-            if children.closed {
-                sess.state.close_with(&sess.actor);
-            } else {
-                children
-                    .actors
-                    .push((Arc::downgrade(&sess.actor), Arc::downgrade(&sess.state)));
-            }
-        }
-        if let Some(params) = sess.state.params.get() {
-            actors.0.push((
-                Arc::downgrade(&params.subagent_cancels),
-                Arc::clone(&sess.state.children),
-            ));
-        }
-    }
-    if let SessionControl::Managed { agent, .. } = &sess.control
-        && let Some(service) = crate::orchestration::services(lua)
+    if let Some(service) = crate::orchestration::services(lua)
         && let Err(error) = service.register_child_target(
             crate::orchestration::TrustedTarget {
-                target: agent.clone(),
+                target: sess.control.agent.clone(),
                 template: child_template,
             },
             sess.state.ui_id.clone(),
@@ -2069,23 +1773,6 @@ fn register_session(
         sess.close_controlled();
         return Err(error.to_string());
     }
-    if !inherit_defaults
-        && matches!(sess.authority, SessionAuthority::Delegated { .. })
-        && matches!(sess.control, SessionControl::Unmanaged { .. })
-    {
-        let actor = Arc::clone(&sess.actor);
-        let state = Arc::clone(&sess.state);
-        if let Err(error) = crate::runtime::register_defer_close(
-            lua,
-            Box::new(move || {
-                state.close_with(&actor);
-            }),
-        ) {
-            sess.close_controlled();
-            return Err(error.to_string());
-        }
-    }
-    register_session_owner(lua, &sess);
     Ok(sess)
 }
 
@@ -2093,27 +1780,17 @@ async fn build_session(
     lua: Lua,
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
-    inherit_defaults: bool,
 ) -> LuaResult<Pair<LuaSession>> {
     let parent = try_pair!(SessionParent::resolve(&lua, &ctx));
-    let mut options = try_pair!(SessionOptions::parse(
-        &lua,
-        &opts,
-        &parent,
-        inherit_defaults
-    )?);
+    let mut options = try_pair!(SessionOptions::parse(&lua, &opts, &parent)?);
 
     let required_output = opts.get::<Option<LuaValue>>("output_schema")?.is_some();
-    let initial_mode_def = if options.inherits_parent_mode(&parent) {
-        parent
-            .context
-            .mode_def
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| parent.context.modes.current(&parent.context.mode))
-    } else {
-        parent.context.modes.current(&AgentMode::Build)
-    };
+    let initial_mode_def = parent
+        .context
+        .mode_def
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| parent.context.modes.current(&parent.context.mode));
     try_pair!(validate_required_output_mode(
         required_output,
         Some(&initial_mode_def)
@@ -2177,7 +1854,6 @@ async fn build_session(
     });
     let state = Arc::new(LuaActorState {
         template: OnceLock::new(),
-        children: Arc::default(),
         params: OnceLock::new(),
         prompt_requests: lua
             .app_data_ref::<crate::runtime::RequestTx>()
@@ -2186,10 +1862,7 @@ async fn build_session(
         tools: tools.request,
         opts: child.opts,
         mode: child.mode,
-        mode_def: child
-            .inherits_parent_mode
-            .then(|| parent.context.mode_def.clone())
-            .flatten(),
+        mode_def: parent.context.mode_def.clone(),
         mcp: parent
             .context
             .mcp
@@ -2212,8 +1885,6 @@ async fn build_session(
         structured: tools.structured,
         name: options.name.clone(),
         commit,
-        semaphore: options.semaphore.take(),
-        turn_permit: Mutex::default(),
         start: Instant::now(),
         execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
@@ -2253,26 +1924,17 @@ async fn build_session(
     .detach();
 
     *cancel_actor.lock().unwrap() = Some(actor.clone());
-    let relay_stop_tx = spawn_close_relay(&actor, &control, &state);
+    let relay_stop_tx = spawn_close_relay(&control, &state);
 
     let sess = LuaSession {
         id: ui_id,
         agent_id: actor.agent_id(),
-        policy_constraint: actor.effective_config().map(|ceiling| {
-            session_policy_constraint(Arc::clone(&child_template.model_policy), ceiling)
-        }),
         actor: Arc::new(actor),
         state,
         control,
         relay_stop_tx,
-        authority: parent.authority,
     };
-    let session = try_pair!(register_session(
-        &lua,
-        sess,
-        child_template,
-        inherit_defaults
-    ));
+    let session = try_pair!(register_session(&lua, sess, child_template));
     if let (Some(description), Some(trusted)) = (options.show, &parent.trusted) {
         let label = if options.name.is_empty() {
             UNNAMED_AGENT_LABEL
@@ -2321,24 +1983,24 @@ lua_table! {
     ///
     /// This module gives you the building blocks: resolve which model to use,
     /// build a system prompt, list available tools, call a tool directly, or
-    /// open a full session with its own conversation history.
+    /// spawn an agent with its own conversation history.
     ///
     /// Policy like retries, validation, and concurrency lives in the calling
     /// plugin, not here.
     ///
     /// ```lua
     /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-    /// local sess = maki.agent.session(ctx, {
+    /// local agent = assert(maki.agent.spawn(ctx, {
     ///   system = "You are a helpful assistant.",
     ///   tools = tools,
-    /// })
-    /// local r = sess:prompt("Hello!")
+    /// }))
+    /// local r = assert(agent:prompt(ctx, "Hello!"))
     /// print(r.text)
-    /// sess:close()
+    /// agent:close(ctx)
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt, is_yolo, session,
-        report_task_result, current, root, list, get, spawn,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt, is_yolo,
+        current, root, list, get, spawn,
     ]
 }
 
@@ -2433,18 +2095,15 @@ impl InvocationGuard {
 
     fn validate(&self, lua: &Lua) -> Result<(), String> {
         let task = self.task.upgrade().ok_or(INVOCATION_EXPIRED)?;
-        let current = lua
-            .app_data_ref::<crate::runtime::TaskHandle>()
-            .map(|task| Arc::clone(&task))
-            .ok_or(NO_TASK_AUTHORITY)?;
-        let cell = crate::runtime::lock_cell(&task);
-        if !cell.is_live() {
-            return Err(INVOCATION_EXPIRED.into());
+        {
+            let cell = crate::runtime::lock_cell(&task);
+            if !cell.is_live() {
+                return Err(INVOCATION_EXPIRED.into());
+            }
         }
-        if !Arc::ptr_eq(&task, &current) {
+        if !crate::runtime::same_invocation(lua, &task) {
             return Err("context belongs to another invocation".into());
         }
-        drop(cell);
         if let Some((plugin, owner)) = &self.plugin
             && !Arc::ptr_eq(
                 owner,
@@ -2457,275 +2116,29 @@ impl InvocationGuard {
     }
 }
 
-#[derive(Clone)]
-enum SessionAuthority {
-    Trusted {
-        plugin: Arc<str>,
-        generation: u64,
-        owner: Arc<crate::orchestration::PluginAuthority>,
-        services: Arc<dyn crate::orchestration::OrchestrationServices>,
-    },
-    Delegated {
-        invocation: InvocationGuard,
-        turn: Option<Box<CurrentManagedTurn>>,
-        parent: Option<Weak<CancelMap<String>>>,
-        generation: Option<u64>,
-    },
-}
-
-impl SessionAuthority {
-    fn capture(
-        lua: &Lua,
-        trusted: Option<&TrustedContext>,
-        context: &AgentContext,
-    ) -> Result<Self, String> {
-        if let Some(trusted) = trusted {
-            return Ok(Self::Trusted {
-                plugin: trusted.plugin.clone(),
-                generation: trusted.generation,
-                owner: crate::orchestration::plugin_authority(lua, trusted.plugin.clone()),
-                services: trusted.services(lua)?.clone(),
-            });
-        }
-        Ok(Self::Delegated {
-            invocation: InvocationGuard::capture(lua)?,
-            turn: context.managed_turn.clone().map(Box::new),
-            generation: crate::runtime::current_plugin(lua).map(|(_, generation)| generation),
-            parent: crate::runtime::lock_cell(&crate::runtime::active_task(lua))
-                .agent_parent
-                .as_ref()
-                .map(Arc::downgrade),
-        })
-    }
-
-    fn validate(&self, lua: &Lua, child: Option<AgentId>) -> Result<(), String> {
-        match self {
-            Self::Trusted {
-                plugin,
-                generation,
-                owner,
-                services,
-            } => {
-                InvocationGuard::capture(lua)?.validate(lua)?;
-                crate::runtime::current_plugin(lua).ok_or(NO_PLUGIN_AUTHORITY)?;
-                if !crate::orchestration::holds_plugin_grant(lua, plugin, *generation, owner) {
-                    return Err("session belongs to another plugin generation".into());
-                }
-                let current =
-                    crate::orchestration::services(lua).ok_or(ORCHESTRATION_SERVICES_EXPIRED)?;
-                if !Arc::ptr_eq(services, &current) {
-                    return Err("session belongs to another host scope".into());
-                }
-                if crate::runtime::lock_cell(&crate::runtime::active_task(lua))
-                    .delegated_tool
-                    .is_some()
-                {
-                    return Err("trusted session requires trusted coroutine authority".into());
-                }
-            }
-            Self::Delegated {
-                invocation,
-                turn,
-                parent,
-                generation,
-            } => {
-                let active = InvocationGuard::capture(lua)?;
-                if *generation
-                    != crate::runtime::current_plugin(lua).map(|(_, generation)| generation)
-                {
-                    return Err("session belongs to another plugin generation".into());
-                }
-                match (&invocation.plugin, &active.plugin) {
-                    (Some((plugin, owner)), Some((current, current_owner)))
-                        if plugin == current && Arc::ptr_eq(owner, current_owner) => {}
-                    (None, None) => {}
-                    _ => return Err("session belongs to another plugin generation".into()),
-                }
-                match (turn, crate::runtime::current_managed_turn(lua)) {
-                    (Some(expected), Some(current)) if expected.same_authority(&current) => {
-                        current
-                            .validate_active()
-                            .map_err(|error| error.to_string())?;
-                        if let Some(child) = child {
-                            current
-                                .validate_descendant(child)
-                                .map_err(|error| error.to_string())?;
-                        }
-                    }
-                    (None, None) => {
-                        if let Some(parent) = parent {
-                            let expected =
-                                parent.upgrade().ok_or("session parent scope expired")?;
-                            let task = crate::runtime::active_task(lua);
-                            let cell = crate::runtime::lock_cell(&task);
-                            if !cell
-                                .agent_parent
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(&expected, current))
-                            {
-                                return Err("session belongs to another parent scope".into());
-                            }
-                        } else {
-                            invocation.validate(lua)?;
-                        }
-                    }
-                    _ => {
-                        return Err(MANAGED_AUTHORITY_INACTIVE.into());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct SessionOwner {
-    plugin: Arc<str>,
-    actor: Weak<AgentActorHandle>,
-    state: Weak<LuaActorState>,
-    agent: Option<maki_agent::AgentRef>,
-}
-
-#[derive(Default)]
-struct SessionOwners(Vec<SessionOwner>);
-
-fn register_session_owner(lua: &Lua, session: &LuaSession) {
-    let plugin = match &session.authority {
-        SessionAuthority::Trusted { plugin, .. } => Some(plugin.clone()),
-        SessionAuthority::Delegated { invocation, .. } => {
-            invocation.plugin.as_ref().map(|(plugin, _)| plugin.clone())
-        }
-    };
-    let Some(plugin) = plugin else { return };
-    if lua.app_data_ref::<SessionOwners>().is_none() {
-        lua.set_app_data(SessionOwners::default());
-    }
-    if let Some(mut owners) = lua.app_data_mut::<SessionOwners>() {
-        owners.0.retain(|owner| owner.actor.strong_count() > 0);
-        owners.0.push(SessionOwner {
-            plugin,
-            actor: Arc::downgrade(&session.actor),
-            state: Arc::downgrade(&session.state),
-            agent: match &session.control {
-                SessionControl::Managed { agent, .. } => Some(agent.clone()),
-                SessionControl::Unmanaged { .. } => None,
-            },
-        });
-    }
-}
-
 pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
     handles::close_plugin_agents(lua, plugin);
-    let retired = lua
-        .app_data_mut::<SessionOwners>()
-        .map(|mut owners| {
-            let (retired, retained): (Vec<_>, Vec<_>) = owners
-                .0
-                .drain(..)
-                .partition(|owner| owner.plugin.as_ref() == plugin);
-            owners.0 = retained;
-            retired
-        })
-        .unwrap_or_default();
-    for owner in retired {
-        if let Some(agent) = owner.agent {
-            let _ = agent.close_subtree();
-        } else if let Some(actor) = owner.actor.upgrade() {
-            if let Some(state) = owner.state.upgrade() {
-                state.close_with(&actor);
-            } else {
-                actor.close();
-            }
-        }
-    }
 }
 
-enum SessionControl {
-    Managed {
-        agent: maki_agent::AgentRef,
-        _child_trigger: CancelTrigger,
-    },
-    Unmanaged {
-        parent_cancels: Arc<CancelMap<String>>,
-        cancel_slot: CancelSlot,
-    },
+struct SessionControl {
+    agent: maki_agent::AgentRef,
+    _child_trigger: CancelTrigger,
 }
 
-/// Compatibility child capability. Effects require current same-plugin authority.
-/// Trusted creation survives handler return within one host generation; delegated
-/// creation expires with its invocation. Reload/unload closes owned children.
 struct LuaSession {
     id: String,
     agent_id: AgentId,
-    /// Agent actor data; used for `agent_id`.
-    ///
-    /// This is a separate Arc so prompt/send/status can keep the session
-    /// alive while the actor is being torn down (the actor owns its own
-    /// backend Arc).
     actor: Arc<AgentActorHandle>,
     state: Arc<LuaActorState>,
     control: SessionControl,
-    /// Stops the CancelSubagent->close relay so a normal close (not a
-    /// cancellation) does not double-close.
     relay_stop_tx: flume::Sender<()>,
-    authority: SessionAuthority,
-    policy_constraint: Option<AdmissionPolicyConstraint>,
-}
-
-fn session_policy_matches(
-    model_policy: &ModelPolicy,
-    ceiling: &EffectiveAgentConfig,
-    current: &EffectiveAgentConfig,
-) -> bool {
-    model_policy.allows(&current.model.spec()) && mode_policy_is_within(ceiling, current)
-}
-
-fn session_policy_constraint(
-    model_policy: Arc<ModelPolicy>,
-    ceiling: Arc<EffectiveAgentConfig>,
-) -> AdmissionPolicyConstraint {
-    Arc::new(move |current| {
-        if session_policy_matches(&model_policy, &ceiling, current) {
-            Ok(())
-        } else {
-            Err(SESSION_POLICY_CHANGED_ERR.to_owned())
-        }
-    })
-}
-
-fn mode_policy_is_within(ceiling: &EffectiveAgentConfig, current: &EffectiveAgentConfig) -> bool {
-    ceiling
-        .mode_authority()
-        .unwrap_or_else(|| ModeCeiling::from_mode(&ceiling.mode, ceiling.mode_def.as_ref()))
-        .validate(&current.mode, current.mode_def.as_ref())
-        .is_ok()
 }
 
 impl LuaSession {
-    fn validate(&self, lua: &Lua) -> Result<(), String> {
-        self.authority.validate(lua, Some(self.agent_id))
-    }
-
     fn close_controlled(&self) {
         self.state.notify_closed_ordered();
         let _ = self.relay_stop_tx.try_send(());
-        match &self.control {
-            SessionControl::Managed { agent, .. } => {
-                let _ = agent.close_subtree();
-            }
-            SessionControl::Unmanaged { .. } => self.state.close_with(&self.actor),
-        }
-        self.retire_fallback();
-    }
-
-    fn retire_fallback(&self) {
-        if let SessionControl::Unmanaged {
-            parent_cancels,
-            cancel_slot,
-        } = &self.control
-        {
-            parent_cancels.retire(&self.id, *cancel_slot);
-        }
+        let _ = self.control.agent.close_subtree();
     }
 }
 
@@ -2747,334 +2160,7 @@ impl Drop for LuaSession {
     }
 }
 
-/// Send a message to the subagent and wait for its full response. The agent
-/// loop runs to completion, calling tools as needed. Conversation history is
-/// kept across calls, so you can have a multi-turn conversation. This is a
-/// blocking compatibility wrapper over `send` + the completion notifier; the
-/// async `send`/`status` pair is preferred for background work.
-///
-/// In a managed invocation, `prompt` validates the current turn and temporarily
-/// yields its manager permit while the child runs. Without a current managed
-/// invocation, the same managed session uses an ordinary exact-turn wait. The
-/// child still uses manager capacity, but no parent permit is yielded. A timeout
-/// closes the child's managed subtree.
-///
-/// The returned table has fields: `text` (string), `captured` (optional value),
-/// `input_tokens` (integer), `output_tokens` (integer). Counters are cumulative
-/// for the session, unlike AgentTurn's per-turn counters. `text` is an empty
-/// string when the subagent produced no text block (e.g. it only called
-/// tools).
-///
-/// @param message string User message to send.
-/// @param opts table? Optional fields:
-///   `timeout` (integer?) - maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
-/// @return (table?, string?) Result table on success, or `(nil, err)` on
-/// failure. A run cut short after streaming some text hands you both: the
-/// error and a `{ text = <what it streamed> }` table.
-/// @example
-/// local r, err = sess:prompt("What files are in this project?")
-/// if err then error(err) end
-/// print(r.text)
-/// print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
-#[lua_fn]
-async fn prompt(
-    lua: Lua,
-    this: mlua::UserDataRef<LuaSession>,
-    message: String,
-    opts: Option<Table>,
-) -> LuaResult<Pair<Table>> {
-    try_pair!(this.validate(&lua));
-    let authority = this.authority.clone();
-    let policy_constraint = this.policy_constraint.clone();
-    let provenance = session_provenance(&lua);
-    let child_id = this.agent_id;
-    let actor = Arc::clone(&this.actor);
-    let state = Arc::clone(&this.state);
-    let (managed_child, fallback_cancel) = match &this.control {
-        SessionControl::Managed { agent, .. } => (Some(agent.clone()), None),
-        SessionControl::Unmanaged {
-            parent_cancels,
-            cancel_slot,
-        } => (
-            None,
-            Some((Arc::clone(parent_cancels), this.id.clone(), *cancel_slot)),
-        ),
-    };
-    let timeout = opts
-        .map(|opts| opts.get::<Option<u64>>("timeout"))
-        .transpose()?
-        .flatten();
-    let managed_wait = match (
-        managed_child.as_ref().map(maki_agent::AgentRef::id),
-        crate::runtime::current_managed_turn(&lua),
-    ) {
-        (Some(child_id), Some(current)) => {
-            try_pair!(current.validate_descendant(child_id));
-            Some((current, child_id))
-        }
-        _ => None,
-    };
-    if timeout == Some(0) {
-        return Ok(err_pair("timeout must be greater than zero"));
-    }
-    drop(this);
-    let input = AgentInput {
-        message,
-        mode: state.mode.clone(),
-        images: Vec::new(),
-        preamble: Vec::new(),
-        thinking: state.opts.thinking,
-        fast: state.opts.fast,
-        workflow: false,
-        prompt: None,
-        cancel: None,
-    };
-    let result = if let Some((current, child_id)) = managed_wait {
-        let admission = maki_agent::manager::PromptAdmission {
-            input,
-            event_sender: None,
-            correlation: String::new(),
-        };
-        let admitted = match current.lease().admit_and_wait_for_descendant_with_options(
-            &current,
-            child_id,
-            &actor,
-            admission,
-            timeout.map(Duration::from_secs),
-            maki_agent::TurnAdmissionOptions {
-                provenance,
-                policy_constraint,
-                ..Default::default()
-            },
-        ) {
-            Ok(Some(admitted)) => admitted,
-            Ok(None) => return Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
-            Err(error) => return Ok(err_pair(error.to_string())),
-        };
-        let (_, wait) = admitted;
-        match wait.wait_result().await {
-            Ok(outcome) => outcome,
-            Err(maki_agent::PromptWaitError::Timeout) => {
-                let seconds = timeout.expect("managed timeout requires a configured duration");
-                return Ok(err_pair(format!(
-                    "session prompt timed out after {seconds}s"
-                )));
-            }
-            Err(maki_agent::PromptWaitError::Cancelled) => {
-                return Ok(err_pair(CANCELLED_MSG));
-            }
-        }
-    } else {
-        let Ok(ticket) = actor.admit_turn_with_options(
-            input,
-            None,
-            String::new(),
-            maki_agent::TurnAdmissionOptions {
-                provenance,
-                policy_constraint,
-                ..Default::default()
-            },
-        ) else {
-            return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-        };
-        match timeout {
-            Some(seconds) => {
-                let outcome =
-                    futures_lite::future::race(async { Some(ticket.wait_result().await) }, async {
-                        smol::Timer::after(Duration::from_secs(seconds)).await;
-                        None
-                    })
-                    .await;
-                let Some(outcome) = outcome else {
-                    if let Some(agent) = &managed_child {
-                        let _ = agent.close_subtree();
-                    } else {
-                        state.close_with(&actor);
-                    }
-                    if let Some((parent_cancels, id, cancel_slot)) = &fallback_cancel {
-                        parent_cancels.retire(id, *cancel_slot);
-                    }
-                    return Ok(err_pair(format!(
-                        "session prompt timed out after {seconds}s"
-                    )));
-                };
-                outcome
-            }
-            None => ticket.wait_result().await,
-        }
-    };
-    try_pair!(authority.validate(&lua, Some(child_id)));
-    let cumulative = actor.snapshot().cumulative_usage;
-    build_prompt_result(&lua, result, cumulative)
-}
-
-fn session_result_table(lua: &Lua, result: &TurnResult, usage: TokenUsage) -> LuaResult<Table> {
-    let tbl = lua.create_table()?;
-    tbl.set("text", result.text.clone())?;
-    tbl.set("input_tokens", usage.total_input())?;
-    tbl.set("output_tokens", usage.output)?;
-    if let Some(captured) = result.output.last() {
-        tbl.set("captured", json_to_lua(lua, captured)?)?;
-    }
-    Ok(tbl)
-}
-
-fn session_result_error(outcome: &TurnOutcome) -> Option<String> {
-    match outcome {
-        TurnOutcome::Completed { .. } => None,
-        TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
-        TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
-    }
-}
-
-fn build_prompt_result(lua: &Lua, result: TurnResult, usage: TokenUsage) -> LuaResult<Pair<Table>> {
-    let error = session_result_error(&result.outcome);
-    let table = if error.is_some() && result.text.is_empty() && result.output.is_empty() {
-        None
-    } else {
-        Some(session_result_table(lua, &result, usage)?)
-    };
-    Ok((table, error))
-}
-
-fn session_provenance(lua: &Lua) -> maki_agent::TurnProvenance {
-    let plugin = crate::runtime::current_plugin(lua);
-    let turn = crate::runtime::current_managed_turn(lua);
-    maki_agent::TurnProvenance {
-        origin: maki_agent::TurnOrigin::Plugin,
-        plugin: plugin.as_ref().map(|(name, _)| name.to_string()),
-        plugin_generation: plugin.map(|(_, generation)| generation),
-        source_agent: turn.as_ref().map(CurrentManagedTurn::agent_id),
-        source_turn: turn.as_ref().map(CurrentManagedTurn::turn_id),
-    }
-}
-
-fn actor_is_busy(status: ActorStatus, queued: usize) -> bool {
-    matches!(status, ActorStatus::Running(_)) || queued > 0
-}
-
-/// Non-blocking: enqueue a message to the subagent's driver and return
-/// immediately. Poll `status()` for the result.
-///
-/// @param message string User message to send.
-/// @return (boolean?, string?) `true` on success, or `(nil, err)` if the session is closed.
-#[lua_fn]
-async fn send(
-    lua: Lua,
-    this: mlua::UserDataRef<LuaSession>,
-    message: String,
-) -> LuaResult<Pair<bool>> {
-    try_pair!(this.validate(&lua));
-    let actor = Arc::clone(&this.actor);
-    let state = Arc::clone(&this.state);
-    let policy_constraint = this.policy_constraint.clone();
-    drop(this);
-    match actor.admit_turn_with_options(
-        AgentInput {
-            message,
-            mode: state.mode.clone(),
-            images: Vec::new(),
-            preamble: Vec::new(),
-            thinking: state.opts.thinking,
-            fast: state.opts.fast,
-            workflow: false,
-            prompt: None,
-            cancel: None,
-        },
-        None,
-        String::new(),
-        maki_agent::TurnAdmissionOptions {
-            provenance: session_provenance(&lua),
-            policy_constraint,
-            ..Default::default()
-        },
-    ) {
-        Ok(_) => Ok((Some(true), None)),
-        Err(_) => Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
-    }
-}
-
-/// Read the subagent's current status without blocking.
-///
-/// @return (table?, string?) Table with status ("running", "done", or "closed").
-///   When done, result contains text, input_tokens, output_tokens (cumulative
-///   session counters), and optional captured. error is present on failure or
-///   cancellation; retryable is present on failure. Authority failure returns nil
-///   and an error instead of a status table.
-#[lua_fn]
-async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<Table>> {
-    try_pair!(this.authority.validate(&lua, Some(this.agent_id)));
-    let actor = Arc::clone(&this.actor);
-    drop(this);
-    let snapshot = actor.snapshot();
-    let tbl = lua.create_table()?;
-    match snapshot.lifecycle {
-        ActorLifecycle::Open => {
-            // A newer turn admitted behind the latest outcome keeps the session
-            // running: the old SessionState reported Running while pending > 0,
-            // so only an idle queue with a retained latest outcome is "done".
-            let busy = actor_is_busy(snapshot.status, snapshot.queued);
-            if busy {
-                tbl.set("status", "running")?;
-            } else if let Some(outcome) = snapshot.latest {
-                tbl.set("status", "done")?;
-                if let Some(result) = actor
-                    .turn_ticket(outcome.turn_id())
-                    .and_then(|ticket| ticket.peek_result())
-                {
-                    tbl.set(
-                        "result",
-                        session_result_table(&lua, &result, snapshot.cumulative_usage)?,
-                    )?;
-                }
-                if let Some(error) = session_result_error(&outcome) {
-                    tbl.set("error", error)?;
-                }
-                if let TurnOutcome::Failed { failure, .. } = &outcome {
-                    tbl.set("retryable", failure.retryable)?;
-                }
-            } else {
-                tbl.set("status", "running")?;
-            }
-        }
-        ActorLifecycle::Closed | ActorLifecycle::Shutdown => {
-            tbl.set("status", "closed")?;
-        }
-    }
-    Ok((Some(tbl), None))
-}
-
-/// Close the session and flush its history back to the parent agent. You can
-/// call this multiple times safely. If you forget, it runs automatically when
-/// the session is garbage collected. Firing the cancel token wakes the driver
-/// so it flushes, even if it is parked on the input queue.
-///
-/// @return
-#[lua_fn]
-async fn close(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<bool>> {
-    try_pair!(this.authority.validate(&lua, Some(this.agent_id)));
-    this.close_controlled();
-    Ok((Some(true), None))
-}
-
-/// Return this session's stable id, used as a `task_id` by the task plugin.
-///
-/// @return (string) The session's id.
-#[lua_fn]
-fn session_id(lua: &Lua, this: &LuaSession) -> LuaResult<String> {
-    let _ = lua;
-    Ok(this.id.clone())
-}
-
 enum TaskOwnerAuthority {
-    Session(Box<SessionAuthority>),
-    StandaloneAgent {
-        plugin: Arc<str>,
-        generation: u64,
-        owner: Arc<crate::orchestration::PluginAuthority>,
-        parent: Arc<CancelMap<String>>,
-        host_root: Option<Arc<HostRootServices>>,
-    },
     Agent {
         plugin: Arc<str>,
         generation: u64,
@@ -3086,7 +2172,6 @@ enum TaskOwnerAuthority {
 struct LuaTaskOwner {
     owner_id: Option<AgentId>,
     authority: TaskOwnerAuthority,
-    child_id: AgentId,
 }
 
 impl mlua::UserData for LuaTaskOwner {
@@ -3101,46 +2186,6 @@ impl mlua::UserData for LuaTaskOwner {
         });
         methods.add_method("_maki_can_control", |lua, this, ()| {
             match &this.authority {
-                TaskOwnerAuthority::Session(authority) => {
-                    if authority.validate(lua, Some(this.child_id)).is_err() {
-                        return Ok(false);
-                    }
-                }
-                TaskOwnerAuthority::StandaloneAgent {
-                    plugin,
-                    generation,
-                    owner,
-                    parent,
-                    host_root,
-                } => {
-                    if host_root
-                        .as_ref()
-                        .is_some_and(|services| services.validate(&services.reference()).is_err())
-                    {
-                        return Ok(false);
-                    }
-                    if InvocationGuard::capture(lua).is_err()
-                        || !crate::orchestration::holds_plugin_grant(
-                            lua,
-                            plugin,
-                            *generation,
-                            owner,
-                        )
-                        || crate::runtime::current_managed_turn(lua).is_some()
-                    {
-                        return Ok(false);
-                    }
-                    let scope = crate::runtime::active_task(lua);
-                    let cell = crate::runtime::lock_cell(&scope);
-                    if cell.delegated_tool.is_none() {
-                        return Ok(true);
-                    }
-                    drop(cell);
-                    return Ok(crate::runtime::lock_cell(&scope)
-                        .agent_parent
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(parent, current)));
-                }
                 TaskOwnerAuthority::Agent {
                     plugin,
                     generation,
@@ -3183,57 +2228,6 @@ impl mlua::UserData for LuaTaskOwner {
     }
 }
 
-fn session_internal_methods<M: mlua::UserDataMethods<LuaSession>>(methods: &mut M) {
-    methods.add_method("_maki_managed", |_, this, ()| {
-        Ok(matches!(this.control, SessionControl::Managed { .. }))
-    });
-    methods.add_method("_maki_task_owner", |_, this, ()| {
-        Ok(LuaTaskOwner {
-            authority: TaskOwnerAuthority::Session(Box::new(this.authority.clone())),
-            child_id: this.agent_id,
-            owner_id: matches!(this.control, SessionControl::Managed { .. })
-                .then_some(this.state.parent_agent_id)
-                .flatten(),
-        })
-    });
-}
-
-lua_class! {
-    /// A compatibility subagent session with its own conversation history.
-    /// Context-free methods validate current host-assigned coroutine authority.
-    /// Trusted-created sessions require the same plugin and host generation;
-    /// delegated-created sessions expire with their creating invocation.
-    /// Operations cannot widen the immutable creation policy ceiling. Plugin
-    /// revocation cancels owned work; passing userdata does not transfer authority.
-    ///
-    /// Create one with `maki.agent.session()`, then send messages with
-    /// `:prompt()` or `:send()`. The session remembers previous turns, so you
-    /// can have a multi-step conversation. Call `:close()` when you are done,
-    /// or let garbage collection handle it.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, send, status, close, session_id]
-    extra session_internal_methods
-}
-
-/// Commit a result to the session whose local tool is currently executing.
-///
-/// @param value table The result to commit.
-/// @return (boolean?, string?) `true` while a session-local tool is active.
-#[lua_fn]
-fn report_task_result(lua: &Lua, value: LuaValue) -> LuaResult<Pair<bool>> {
-    ACTIVE_COMMIT.with_borrow(|active| {
-        let Some(slot) = active else {
-            return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-        };
-        let json = lua_to_json(lua, &value).map_err(|e| mlua::Error::runtime(e.to_string()))?;
-        *slot.lock().unwrap() = Some(json);
-        Ok((Some(true), None))
-    })
-}
-
-thread_local! {
-    static ACTIVE_COMMIT: RefCell<Option<Arc<Mutex<Option<JsonValue>>>>> = const { RefCell::new(None) };
-}
-
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
 fn call_local_tool(
     weak: &mlua::WeakLua,
@@ -3244,9 +2238,7 @@ fn call_local_tool(
 ) -> Result<String, String> {
     let lua = weak.try_upgrade().ok_or("Lua runtime shut down")?;
     let arg = json_to_lua(&lua, input).map_err(|e| e.to_string())?;
-    let previous = ACTIVE_COMMIT.replace(commit.cloned());
     let values = f.call::<mlua::MultiValue>(arg);
-    ACTIVE_COMMIT.replace(previous);
     let result = lua_tool_result(values.map_err(|e| e.to_string())?);
     if result.is_ok()
         && capture_input
@@ -3261,10 +2253,12 @@ fn call_local_tool(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use maki_agent::actor::ActorLifecycle;
     use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::stub_ctx;
     use maki_agent::{
-        AgentId, AgentParams, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome, TurnTicket,
+        AgentId, AgentParams, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome, TurnResult,
+        TurnTicket,
     };
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -3412,7 +2406,7 @@ mod tests {
         smol::block_on(async {
             const SUMMARY: &str = "compacted child history";
             let provider = Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(SUMMARY)]));
-            let (actor, state, session, events) = session_with_provider(provider, None, None);
+            let (actor, state, session, events) = session_with_provider(provider, None);
             let params = state.params.get().unwrap();
             let policy = configured.then(|| {
                 Arc::new(EffectiveAgentConfig::new(
@@ -3472,7 +2466,7 @@ mod tests {
 
     /// A provider that never resolves, so a running turn parks until its
     /// cancel fires. Deterministic for close/cancel tests.
-    struct HangingProvider;
+    pub(super) struct HangingProvider;
 
     impl Provider for HangingProvider {
         fn stream_message<'a>(
@@ -3496,18 +2490,35 @@ mod tests {
         }
     }
 
-    /// A canned `LuaActorState` + actor harness. Runs park on the hanging
-    /// provider until their cancel fires, so close/cancel tests are
-    /// deterministic.
-    fn canned_state(
-        semaphore: Option<Arc<async_lock::Semaphore>>,
-    ) -> (
+    pub(super) struct BackendFixture {
+        pub(super) actor: Arc<AgentActorHandle>,
+        pub(super) state: Arc<LuaActorState>,
+        relay_stop_tx: flume::Sender<()>,
+        _child_trigger: CancelTrigger,
+    }
+
+    impl BackendFixture {
+        pub(super) fn close_controlled(&self) {
+            self.state.notify_closed_ordered();
+            let _ = self.relay_stop_tx.try_send(());
+            self.actor.close();
+        }
+    }
+
+    impl Drop for BackendFixture {
+        fn drop(&mut self) {
+            self.close_controlled();
+        }
+    }
+
+    /// A backend fixture whose provider parks until cancellation.
+    fn canned_state() -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
-        LuaSession,
+        BackendFixture,
         flume::Receiver<Envelope>,
     ) {
-        session_with_provider(Arc::new(HangingProvider), semaphore, None)
+        session_with_provider(Arc::new(HangingProvider), None)
     }
 
     /// A provider whose turns answer with one canned reply.
@@ -3550,15 +2561,14 @@ mod tests {
     /// actually executes.
     pub(super) fn session_with_provider(
         provider: Arc<dyn Provider>,
-        semaphore: Option<Arc<async_lock::Semaphore>>,
         relay_gate: Option<flume::Receiver<()>>,
     ) -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
-        LuaSession,
+        BackendFixture,
         flume::Receiver<Envelope>,
     ) {
-        session_with_provider_and_parent(provider, semaphore, relay_gate, None)
+        session_with_provider_and_parent(provider, relay_gate, None)
     }
 
     pub(super) fn session_with_provider_for_agent(
@@ -3567,42 +2577,34 @@ mod tests {
     ) -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
-        LuaSession,
+        BackendFixture,
         flume::Receiver<Envelope>,
     ) {
-        session_fixture(provider, None, None, None, agent_id)
+        session_fixture(provider, None, None, agent_id)
     }
 
     fn session_with_provider_and_parent(
         provider: Arc<dyn Provider>,
-        semaphore: Option<Arc<async_lock::Semaphore>>,
         relay_gate: Option<flume::Receiver<()>>,
         parent_raw_tx: Option<flume::Sender<Envelope>>,
     ) -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
-        LuaSession,
+        BackendFixture,
         flume::Receiver<Envelope>,
     ) {
-        session_fixture(
-            provider,
-            semaphore,
-            relay_gate,
-            parent_raw_tx,
-            AgentId::generate(),
-        )
+        session_fixture(provider, relay_gate, parent_raw_tx, AgentId::generate())
     }
 
     fn session_fixture(
         provider: Arc<dyn Provider>,
-        semaphore: Option<Arc<async_lock::Semaphore>>,
         relay_gate: Option<flume::Receiver<()>>,
         parent_raw_tx: Option<flume::Sender<Envelope>>,
         agent_id: AgentId,
     ) -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
-        LuaSession,
+        BackendFixture,
         flume::Receiver<Envelope>,
     ) {
         let (fallback_tx, parent_rx) = flume::unbounded();
@@ -3635,20 +2637,15 @@ mod tests {
             subagent_cancels: Arc::new(CancelMap::new()),
             ledger: Arc::new(RunLedger::default()),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
-            audience: DEFAULT_SESSION_AUDIENCE,
+            audience: ToolAudience::GENERAL_SUB,
             question_mode: ctx.question_mode,
             model_policy: Arc::clone(&ctx.model_policy),
             file_write_locks: Arc::clone(&ctx.file_write_locks),
             offload: ctx.offload.clone(),
             managed_turn: None,
         };
-        let (parent_cancels, cancel_slot) = {
-            let map = Arc::new(CancelMap::new());
-            (Arc::clone(&map), map.insert(ui_id.clone(), child_trigger))
-        };
         let state = Arc::new(LuaActorState {
             template: OnceLock::new(),
-            children: Arc::default(),
             params: OnceLock::from(params),
             prompt_requests: None,
             custom_system: String::new(),
@@ -3676,8 +2673,6 @@ mod tests {
             structured: None,
             name: "probe".to_owned(),
             commit: Arc::new(Mutex::new(None)),
-            semaphore,
-            turn_permit: Mutex::default(),
             start: Instant::now(),
             execution_started: std::sync::atomic::AtomicBool::new(false),
             history_relayed: std::sync::atomic::AtomicBool::new(false),
@@ -3703,28 +2698,11 @@ mod tests {
         );
         task.detach();
         let actor = Arc::new(actor);
-        let sess = LuaSession {
-            id: ui_id,
-            agent_id,
+        let sess = BackendFixture {
             actor: Arc::clone(&actor),
-            policy_constraint: actor
-                .effective_config()
-                .map(|ceiling| session_policy_constraint(Arc::clone(&ctx.model_policy), ceiling)),
             state: Arc::clone(&state),
-            control: SessionControl::Unmanaged {
-                parent_cancels,
-                cancel_slot,
-            },
             relay_stop_tx,
-            authority: SessionAuthority::Delegated {
-                invocation: InvocationGuard {
-                    task: Weak::new(),
-                    plugin: None,
-                },
-                turn: None,
-                parent: None,
-                generation: None,
-            },
+            _child_trigger: child_trigger,
         };
         (actor, state, sess, parent_rx)
     }
@@ -3790,8 +2768,7 @@ mod tests {
     fn managed_missing_policy_returns_visible_failure_without_provider_request() {
         smol::block_on(async {
             let provider: Arc<dyn Provider> = Arc::new(HangingProvider);
-            let (_unused_actor, state, _session, _events) =
-                session_with_provider(provider, None, None);
+            let (_unused_actor, state, _session, _events) = session_with_provider(provider, None);
             let params = state.params.get().unwrap();
             let config = EffectiveAgentConfig::new(
                 RunSettings {
@@ -3815,9 +2792,9 @@ mod tests {
             let outcome = ticket.wait().await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             let result = ticket.peek_result().unwrap();
-            assert_eq!(
-                session_result_error(&result.outcome).as_deref(),
-                Some(MANAGED_POLICY_MISSING_ERR)
+            assert!(
+                matches!(&result.outcome, TurnOutcome::Failed { failure, .. }
+                if failure.diagnostic == MANAGED_POLICY_MISSING_ERR)
             );
             manager.shutdown(Duration::from_secs(1)).await;
         });
@@ -3840,91 +2817,16 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_session_authority_follows_parent_scope() {
-        const WRONG_PARENT: &str = "session belongs to another parent scope";
-        const NO_ACTIVE_AUTHORITY: &str = NO_TASK_AUTHORITY;
-        let lua = Lua::new();
-        let parent = Arc::new(CancelMap::new());
-        let creator = crate::runtime::TaskScope::detached(&lua);
-        crate::runtime::lock_cell(creator.handle()).agent_parent = Some(Arc::clone(&parent));
-        let authority = SessionAuthority::capture(
-            &lua,
-            None,
-            &AgentContext::from(&stub_ctx(&AgentMode::Build)),
-        )
-        .unwrap();
-        drop(creator);
-        let sibling = crate::runtime::TaskScope::detached(&lua);
-        crate::runtime::lock_cell(sibling.handle()).agent_parent = Some(Arc::clone(&parent));
-        assert!(authority.validate(&lua, None).is_ok());
-        crate::runtime::lock_cell(sibling.handle()).agent_parent = Some(Arc::new(CancelMap::new()));
-        assert_eq!(authority.validate(&lua, None).unwrap_err(), WRONG_PARENT);
-        drop(sibling);
-        assert_eq!(
-            authority.validate(&lua, None).unwrap_err(),
-            NO_ACTIVE_AUTHORITY
-        );
-    }
-
-    #[test]
-    fn session_policy_allows_refresh_but_rejects_changed_restrictions() {
-        let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
-        let ceiling = EffectiveAgentConfig::new(
-            RunSettings {
-                provider: Arc::clone(&ctx.provider),
-                model: ctx.model.as_ref().clone(),
-                thinking: ThinkingConfig::Off,
-                fast: false,
-                workflow: false,
-            },
-            AgentMode::Build,
-        );
-        let policy = ModelPolicy::new(&[ceiling.model.spec()], &[]).unwrap();
-        let mut current = ceiling.clone();
-        assert!(session_policy_matches(&policy, &ceiling, &current));
-        current.settings = RunSettings {
-            fast: true,
-            ..current.settings.clone()
-        };
-        assert!(session_policy_matches(&policy, &ceiling, &current));
-        current = ceiling.clone();
-        current.mode = AgentMode::Plan(std::path::PathBuf::from("/project/plan.md"));
-        assert!(session_policy_matches(&policy, &ceiling, &current));
-        current = ceiling.clone();
-        let mut model = current.settings.model.clone();
-        model.id.push_str("-different");
-        current.settings = RunSettings {
-            model,
-            ..current.settings.clone()
-        };
-        assert!(!session_policy_matches(&policy, &ceiling, &current));
-    }
-
-    #[test]
     fn send_returns_during_policy_update() {
         smol::block_on(async {
             const MESSAGE: &str = "queued";
             const REPLY: &str = "accepted";
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
-            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
             let reservation = actor.reserve_config_update().unwrap();
-            let lua = Lua::new();
-            let _scope = crate::runtime::TaskScope::detached(&lua);
-            let mut sess = sess;
-            sess.authority = SessionAuthority::Delegated {
-                invocation: InvocationGuard::capture(&lua).unwrap(),
-                turn: None,
-                parent: None,
-                generation: None,
-            };
-            let userdata = lua.create_userdata(sess).unwrap();
-            assert_eq!(
-                send(lua.clone(), userdata.borrow().unwrap(), MESSAGE.into())
-                    .await
-                    .unwrap(),
-                (Some(true), None)
-            );
+            let ticket = admit(&state, &actor, MESSAGE);
+            assert!(ticket.peek().is_none());
             drop(reservation);
             while actor.snapshot().latest.is_none() {
                 smol::future::yield_now().await;
@@ -3945,50 +2847,16 @@ mod tests {
                 canned_reply_with_usage(FIRST_REPLY, FIRST_USAGE),
                 canned_reply_with_usage(SECOND_REPLY, SECOND_USAGE),
             ]));
-            let (actor, _state, sess, _events) = session_with_provider(provider, None, None);
-            let lua = Lua::new();
-            let scope = crate::runtime::TaskScope::detached(&lua);
-            let mut sess = sess;
-            sess.authority = SessionAuthority::Delegated {
-                invocation: InvocationGuard::capture(&lua).unwrap(),
-                turn: None,
-                parent: None,
-                generation: None,
-            };
-            let userdata = lua.create_userdata(sess).unwrap();
-
-            scope
-                .scope_future(async {
-                    let (first, first_error) = prompt(
-                        lua.clone(),
-                        userdata.borrow().unwrap(),
-                        "first request".into(),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(first_error, None);
-                    assert_eq!(first.unwrap().get::<String>("text").unwrap(), FIRST_REPLY);
-
-                    let (second, second_error) = prompt(
-                        lua.clone(),
-                        userdata.borrow().unwrap(),
-                        "follow-up request".into(),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(second_error, None);
-                    let second = second.unwrap();
-                    assert_eq!(second.get::<String>("text").unwrap(), SECOND_REPLY);
-                    assert_eq!(second.get::<u32>("input_tokens").unwrap(), 150);
-                    assert_eq!(second.get::<u32>("output_tokens").unwrap(), 30);
-                    let Some(TurnOutcome::Completed { usage, .. }) = actor.snapshot().latest else {
-                        panic!("expected completed second turn");
-                    };
-                    assert_eq!(usage, SECOND_USAGE);
-                })
+            let (actor, state, _fixture, _events) = session_with_provider(provider, None);
+            let first = admit(&state, &actor, "first request").wait_result().await;
+            assert_eq!(first.text, FIRST_REPLY);
+            assert_eq!(first.outcome.usage(), FIRST_USAGE);
+            let second = admit(&state, &actor, "follow-up request")
+                .wait_result()
                 .await;
+            assert_eq!(second.text, SECOND_REPLY);
+            assert_eq!(second.outcome.usage(), SECOND_USAGE);
+            assert_eq!(actor.snapshot().cumulative_usage, CUMULATIVE_USAGE);
         });
     }
 
@@ -3999,39 +2867,25 @@ mod tests {
             const REPLY: &str = "accepted";
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
-            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
             let reservation = actor.reserve_config_update().unwrap();
-            let lua = Lua::new();
-            let scope = crate::runtime::TaskScope::detached(&lua);
-            let mut sess = sess;
-            sess.authority = SessionAuthority::Delegated {
-                invocation: InvocationGuard::capture(&lua).unwrap(),
-                turn: None,
-                parent: None,
-                generation: None,
-            };
-            let userdata = lua.create_userdata(sess).unwrap();
-            let mut pending = Box::pin(scope.scope_future(prompt(
-                lua.clone(),
-                userdata.borrow().unwrap(),
-                MESSAGE.into(),
-                None,
-            )));
+            let ticket = admit(&state, &actor, MESSAGE);
+            let mut pending = Box::pin(ticket.wait_result());
             assert!(
                 futures_lite::future::poll_once(&mut pending)
                     .await
                     .is_none()
             );
             drop(reservation);
-            let (result, error) = pending.await.unwrap();
-            assert_eq!(error, None);
-            assert_eq!(result.unwrap().get::<String>("text").unwrap(), REPLY);
+            let result = pending.await;
+            assert_eq!(result.text, REPLY);
+            assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
         });
     }
 
     #[test]
     fn close_rejects_new_admission_and_closes_actor() {
-        let (actor, state, _sess, _rx) = canned_state(None);
+        let (actor, state, _sess, _rx) = canned_state();
         actor.close();
         assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Closed));
         assert!(
@@ -4057,9 +2911,9 @@ mod tests {
 
     #[test]
     fn queued_only_close_does_not_relay_history() {
-        let (actor, state, _sess, parent_rx) = canned_state(None);
+        let (actor, state, sess, parent_rx) = canned_state();
         let _ticket = admit(&state, &actor, "queued");
-        state.close_with(&actor);
+        sess.close_controlled();
         assert!(
             parent_rx
                 .drain()
@@ -4069,7 +2923,7 @@ mod tests {
 
     #[test]
     fn admitted_and_closed_turn_resolves_as_cancelled() {
-        let (actor, state, _sess, _rx) = canned_state(None);
+        let (actor, state, _sess, _rx) = canned_state();
         let ticket = admit(&state, &actor, "waiting");
         let turn_id = ticket.turn_id();
         actor.close();
@@ -4078,23 +2932,6 @@ mod tests {
             outcome,
             TurnOutcome::Cancelled { turn_id: id, reason: TurnCancellationReason::Closed, .. }
                 if id == turn_id
-        ));
-    }
-
-    #[test]
-    fn close_resolves_semaphore_blocked_turn_as_cancelled() {
-        let semaphore = Arc::new(async_lock::Semaphore::new(0));
-        let (actor, state, _sess, _rx) = canned_state(Some(semaphore));
-        let ticket = admit(&state, &actor, "blocked on semaphore");
-        let turn_id = ticket.turn_id();
-        // The acquire is parked; closing the actor fires the per-turn cancel
-        // and the run must settle as Cancelled rather than strand.
-        actor.close();
-        let outcome = smol::block_on(ticket.wait());
-        assert!(matches!(
-            outcome,
-            TurnOutcome::Cancelled { turn_id: id, reason, .. }
-                if id == turn_id && reason == TurnCancellationReason::Closed
         ));
     }
 
@@ -4123,11 +2960,11 @@ mod tests {
             }
         }
         let (started_tx, started_rx) = flume::bounded(1);
-        let (actor, state, _sess, parent_rx) =
-            session_with_provider(Arc::new(StartedProvider(started_tx)), None, None);
+        let (actor, state, sess, parent_rx) =
+            session_with_provider(Arc::new(StartedProvider(started_tx)), None);
         let ticket = admit(&state, &actor, "cancel me");
         smol::block_on(started_rx.recv_async()).unwrap();
-        state.close_with(&actor);
+        sess.close_controlled();
         assert!(matches!(
             smol::block_on(ticket.wait()),
             TurnOutcome::Cancelled {
@@ -4149,7 +2986,7 @@ mod tests {
                 .drain()
                 .all(|envelope| !matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
         );
-        state.close_with(&actor);
+        sess.close_controlled();
         assert!(
             parent_rx
                 .drain()
@@ -4162,7 +2999,7 @@ mod tests {
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
             canned_reply_with_usage("done", FIRST_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
         let ticket = admit(&state, &actor, "run me");
         assert!(matches!(
             smol::block_on(ticket.wait()),
@@ -4193,8 +3030,7 @@ mod tests {
             let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
                 canned_reply_with_usage(REPLY, FIRST_USAGE),
             ]));
-            let (actor, state, sess, parent_rx) =
-                session_with_provider(provider, None, Some(release_rx));
+            let (actor, state, sess, parent_rx) = session_with_provider(provider, Some(release_rx));
             let ticket = admit(&state, &actor, "run me");
 
             assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
@@ -4310,7 +3146,7 @@ mod tests {
             )]));
         let (turn_tx, turn_rx) = flume::unbounded();
         let (actor, state, session, _relayed) =
-            session_with_provider_and_parent(provider, None, None, Some(turn_tx.clone()));
+            session_with_provider_and_parent(provider, None, Some(turn_tx.clone()));
         let ticket = admit(&state, &actor, "run me");
         let outcome = smol::block_on(ticket.wait());
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
@@ -4379,7 +3215,7 @@ mod tests {
             canned_reply_with_usage("the answer", FIRST_USAGE),
             canned_reply_with_usage("the follow-up", SECOND_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
         let first = admit(&state, &actor, "run me");
         let first_id = first.turn_id();
         let first_outcome = smol::block_on(first.wait());
@@ -4389,7 +3225,10 @@ mod tests {
         ));
         let first_result = first.peek_result().unwrap();
         assert_eq!(first_result.text, "the answer");
-        assert_eq!(session_result_error(&first_result.outcome), None);
+        assert!(matches!(
+            first_result.outcome,
+            TurnOutcome::Completed { .. }
+        ));
 
         let second = admit(&state, &actor, "follow up");
         let second_id = second.turn_id();
@@ -4410,15 +3249,32 @@ mod tests {
 
     #[test]
     fn status_stays_running_while_turn_is_active_or_queued() {
-        assert!(actor_is_busy(ActorStatus::Running(TurnId::generate()), 0));
-        assert!(actor_is_busy(ActorStatus::Idle, 1));
-        assert!(!actor_is_busy(ActorStatus::Idle, 0));
+        let (actor, state, sess, _rx) = canned_state();
+        assert!(actor.snapshot().active_turn.is_none());
+        assert_eq!(actor.snapshot().queued, 0);
+
+        let _active = admit(&state, &actor, "active");
+        smol::block_on(async {
+            while actor.snapshot().active_turn.is_none() {
+                smol::future::yield_now().await;
+            }
+        });
+        assert_eq!(actor.snapshot().queued, 0);
+
+        let _queued = admit(&state, &actor, "queued");
+        assert!(actor.snapshot().active_turn.is_some());
+        assert_eq!(
+            actor.snapshot().queued,
+            1,
+            "a second admission waits behind the running turn"
+        );
+        drop(sess);
     }
 
     #[test]
     fn lua_backend_prepares_mode_at_admission() {
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
-        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let (actor, state, session, _events) = session_with_provider(provider, None);
         let modes = &state.params.get().unwrap().modes;
         modes
             .define(maki_agent::ModeDefSpec {
@@ -4482,7 +3338,7 @@ mod tests {
     fn lua_admission_pins_cwd_and_tool_inheritance() {
         let directory = tempfile::tempdir().unwrap();
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
-        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let (actor, state, session, _events) = session_with_provider(provider, None);
         let params = state.params.get().unwrap();
         let config = EffectiveAgentConfig::new(
             RunSettings {
@@ -4532,7 +3388,7 @@ mod tests {
     fn failed_turn_keeps_session_open_for_later_turn() {
         let fail = Arc::new(FailOnceProvider::default());
         let provider: Arc<dyn Provider> = fail.clone();
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
 
         let ticket = admit(&state, &actor, "fail this turn");
         let turn_id = ticket.turn_id();
@@ -4541,8 +3397,11 @@ mod tests {
             failed,
             TurnOutcome::Failed { turn_id: id, .. } if id == turn_id
         ));
+        let TurnOutcome::Failed { failure, .. } = ticket.peek_result().unwrap().outcome else {
+            panic!("failed turn must retain a failure outcome");
+        };
         assert!(
-            session_result_error(&ticket.peek_result().unwrap().outcome).is_some(),
+            !failure.diagnostic.is_empty(),
             "failed turn must present an error"
         );
 
@@ -4554,7 +3413,7 @@ mod tests {
             TurnOutcome::Completed { turn_id: id, .. } if id == recovered_id
         ));
         assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Open));
-        drop(sess);
+        sess.close_controlled();
         assert_eq!(
             parent_rx
                 .drain()
@@ -4563,7 +3422,7 @@ mod tests {
             2,
             "each executed turn relays history once"
         );
-        state.close_with(&actor);
+        sess.close_controlled();
         assert!(
             parent_rx
                 .drain()
@@ -4572,42 +3431,13 @@ mod tests {
     }
 
     #[test]
-    fn status_done_result_keeps_cumulative_compatibility_usage() {
-        let lua = Lua::new();
-        let cumulative = tokens(150, 30);
-        let (result, error) = build_prompt_result(
-            &lua,
-            TurnResult {
-                outcome: TurnOutcome::completed(
-                    AgentId::generate(),
-                    TurnId::generate(),
-                    tokens(10, 2),
-                    1,
-                    maki_agent::DoneReason::EndTurn,
-                ),
-                text: "done".into(),
-                output: Vec::new(),
-                provenance: Default::default(),
-                duration_ms: 0,
-            },
-            cumulative,
-        )
-        .unwrap();
-
-        assert!(error.is_none());
-        let result = result.unwrap();
-        assert_eq!(result.get::<u32>("input_tokens").unwrap(), 150);
-        assert_eq!(result.get::<u32>("output_tokens").unwrap(), 30);
-    }
-
-    #[test]
     fn prompt_result_preserves_partial_text_and_captured_output_with_error() {
         const FAILURE: &str = "provider failed";
         const PARTIAL: &str = "partial output";
         let lua = Lua::new();
-        let (result, error) = build_prompt_result(
+        let result = handles::projection::result_table(
             &lua,
-            TurnResult {
+            &TurnResult {
                 outcome: TurnOutcome::failed(
                     AgentId::generate(),
                     TurnId::generate(),
@@ -4625,11 +3455,8 @@ mod tests {
                 provenance: Default::default(),
                 duration_ms: 0,
             },
-            TokenUsage::default(),
         )
         .unwrap();
-
-        let result = result.unwrap();
         assert_eq!(result.get::<String>("text").unwrap(), PARTIAL);
         assert_eq!(
             result
@@ -4639,36 +3466,8 @@ mod tests {
                 .unwrap(),
             42
         );
-        assert_eq!(error.as_deref(), Some(FAILURE));
-    }
-
-    #[test]
-    fn prompt_empty_closed_result_returns_only_error() {
-        let lua = Lua::new();
-        let agent_id = AgentId::generate();
-        let turn_id = TurnId::generate();
-        let outcome = TurnOutcome::cancelled(
-            agent_id,
-            turn_id,
-            TokenUsage::default(),
-            0,
-            TurnCancellationReason::Closed,
-        );
-        let usage = outcome.usage();
-        let (result, error) = build_prompt_result(
-            &lua,
-            TurnResult {
-                outcome,
-                text: String::new(),
-                output: Vec::new(),
-                provenance: Default::default(),
-                duration_ms: 0,
-            },
-            usage,
-        )
-        .unwrap();
-        assert!(result.is_none());
-        assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+        assert_eq!(result.get::<String>("status").unwrap(), "failed");
+        assert_eq!(result.get::<String>("error").unwrap(), FAILURE);
     }
 
     struct FailOnceProvider {

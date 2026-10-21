@@ -2,18 +2,29 @@
 //!
 //! The reviewer is spawned via the real task plugin (`subagent_type =
 //! "plan_reviewer"`), which gates it to plan mode and hands it a `research_sub`
-//! (read-only) tool set. These tests drive the real `maki.agent.session` (wrapped
-//! only to set `inherit_provider = true`) against a canned provider, so the
+//! (read-only) tool set. These tests drive real managed children (with
+//! `inherit_provider = true`) against a canned provider, so the
 //! verdict text and the tool set the reviewer actually received are observable.
 //! The plan-mode UI flow on a fail verdict is UI behavior, intentionally not
 //! tested here.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::agent::RunSettings;
+use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{AgentId, AgentMode};
+use maki_agent::{
+    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
+    ControlWork, CurrentManagedTurn, History, TurnCancellationReason, TurnContext, TurnOutcome,
+    WorkKind,
+};
 use maki_lua::PluginHost;
 use maki_lua::host_root::HostRootServices;
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_providers::TokenUsage;
 use serde_json::{Value, json};
 
 mod common;
@@ -25,7 +36,7 @@ const TASK_SPAWN_TOOL: &str = "task_spawn";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_FAMILY: [&str; 4] = [TASK_SPAWN_TOOL, TASK_WAIT_TOOL, "task_send", "task_despawn"];
 
-/// Wrap the real `maki.agent.session` to reuse the parent (canned) provider, and
+/// Wrap `maki.agent.spawn` to reuse the parent (canned) provider, and
 /// stub the model/system lookups so no real model resolution or file read is
 /// needed. `maki.agent.tools` is left real when `real_tools` is set (so the
 /// reviewer's tool set can be inspected); otherwise it is stubbed to empty.
@@ -85,17 +96,110 @@ fn load_reviewer_host(real_tools: bool) -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
-fn bind_host_root(host: &PluginHost, ctx: &mut ToolContext, mode: AgentMode) {
+struct FixtureRoot {
+    turn: flume::Sender<CurrentManagedTurn>,
+    cancel: CancelToken,
+}
+
+impl ActorBackend for FixtureRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        ctx: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
+            self.cancel.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                ctx.agent_id,
+                ctx.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
+                TurnCancellationReason::User,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn bind_host_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, mode: AgentMode) {
     ctx.mode = mode;
-    let id = AgentId::generate();
-    ctx.execution_agent_id = Some(id);
+    let policy = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&ctx.provider),
+            model: (*ctx.model).clone(),
+            fast: ctx.opts.fast,
+            workflow: ctx.workflow,
+            thinking: ctx.opts.thinking,
+        },
+        ctx.mode.clone(),
+    );
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let (turn_tx, turn_rx) = flume::bounded(1);
+    let root = manager
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(FixtureRoot {
+                turn: turn_tx,
+                cancel: ctx.cancel.clone(),
+            }) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    ctx.execution_agent_id = Some(root.id());
+    root.actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput {
+                message: "review fixture".into(),
+                mode: ctx.mode.clone(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: ctx.opts.thinking,
+                fast: ctx.opts.fast,
+                workflow: ctx.workflow,
+                prompt: None,
+                cancel: None,
+            },
+            None,
+            "plan-reviewer-policy-fixture".into(),
+        )
+        .unwrap();
+    ctx.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
+    let template = common::with_request_tools(reg, ctx);
     host.event_handle()
         .install_host_root_services(Arc::new(HostRootServices::fixed(
-            id,
+            root.id(),
             &ctx.model,
             ctx.opts,
             ctx.model_policy.clone(),
         )));
+    host.event_handle().install_orchestration_services(Arc::new(
+        AgentOrchestration::bind_fixed_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root,
+                template,
+            },
+        ),
+    ));
     host.wait_for_worker_barrier_for_test();
 }
 
@@ -131,7 +235,12 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
 
     let pass = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
     let (mut ctx_pass, _rx, _trigger) = ctx_with_provider(Arc::clone(&pass));
-    bind_host_root(&host, &mut ctx_pass, AgentMode::Plan("/plan.md".into()));
+    bind_host_root(
+        &host,
+        &reg,
+        &mut ctx_pass,
+        AgentMode::Plan("/plan.md".into()),
+    );
     let text =
         run_reviewer(&reg, &ctx_pass, "pass-review").expect("reviewer must run in plan mode");
     assert!(
@@ -143,7 +252,12 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
         "VERDICT: fail\n- finding: missing AC mapping",
     )]));
     let (mut ctx_fail, _rx, _trigger) = ctx_with_provider(Arc::clone(&fail));
-    bind_host_root(&host, &mut ctx_fail, AgentMode::Plan("/plan.md".into()));
+    bind_host_root(
+        &host,
+        &reg,
+        &mut ctx_fail,
+        AgentMode::Plan("/plan.md".into()),
+    );
     let text =
         run_reviewer(&reg, &ctx_fail, "fail-review").expect("reviewer must run in plan mode");
     assert!(
@@ -157,13 +271,13 @@ fn plan_reviewer_is_read_only_even_when_asked_to_write() {
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     let (reg, host) = load_reviewer_host(true);
-    bind_host_root(&host, &mut ctx, AgentMode::Plan("/plan.md".into()));
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(maki_agent::tools::TurnToolBindings::capture(
         &reg,
         &ctx.local_tools,
         ctx.mcp.as_ref(),
     ));
+    bind_host_root(&host, &reg, &mut ctx, AgentMode::Plan("/plan.md".into()));
     let parent = common::with_request_tools(&reg, &ctx);
     assert!(
         maki_agent::agent::tool_dispatch::callable(&parent)
@@ -200,7 +314,7 @@ fn plan_reviewer_only_in_plan_mode() {
     let provider = Arc::new(CannedProvider::new(vec![]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     let (reg, host) = load_reviewer_host(false);
-    bind_host_root(&host, &mut ctx, AgentMode::Build);
+    bind_host_root(&host, &reg, &mut ctx, AgentMode::Build);
 
     let err = run_reviewer(&reg, &ctx, "gated-review")
         .expect_err("plan_reviewer must be blocked outside plan mode");

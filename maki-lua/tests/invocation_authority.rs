@@ -2,10 +2,9 @@ mod common;
 
 use std::sync::Arc;
 
-use maki_agent::cancel::{CancelMap, CancelToken};
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentId, AgentMode};
-use maki_lua::agent_errors::{ORCHESTRATION_CONTEXT_EXPIRED, UNMANAGED_AUTHORITY_INACTIVE};
+use maki_lua::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
 use maki_lua::host_root::HostRootServices;
 use maki_lua::test_support::InMemoryFs;
 use maki_lua::{PluginHost, UiAction};
@@ -148,6 +147,9 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
     }));
 }
 
+/// A host-root invocation still resolves its own agent and mode, but it has no
+/// managed graph, so `maki.agent.spawn` must fail closed rather than minting an
+/// agent outside the manager's authority.
 #[test]
 fn standalone_control_and_mode_are_bound_to_live_root_invocations() {
     let registry = Arc::clone(ToolRegistry::global_arc());
@@ -156,28 +158,19 @@ fn standalone_control_and_mode_are_bound_to_live_root_invocations() {
         OWNER,
         &format!(
             r#"
-            local child, first
             maki.api.register_tool({{
-                name = '{PROBE}', description = 'exercise standalone control across turns',
+                name = '{PROBE}', description = 'host-root authority must fail closed',
                 schema = {{ type = 'object', properties = {{ stage = {{ type = 'string' }} }} }},
                 handler = function(input, ctx)
-                    assert(ctx:mode() == input.stage or input.stage ~= 'plan' and input.stage ~= 'build')
-                    if input.stage == 'plan' then
-                        child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                        first = assert(child:send(ctx, 'first'))
-                        assert(first:wait(ctx))
-                    elseif input.stage == 'foreign' then
-                        local value, err = child:status(ctx)
-                        assert(not value and err == '{UNMANAGED_AUTHORITY_INACTIVE}')
-                    elseif input.stage == 'retired' then
-                        local value, err = child:status(ctx)
-                        assert(not value and err == '{HOST_RETIRED}')
-                    else
-                        assert(first:wait(ctx))
-                        local turn = assert(child:send(ctx, 'second'))
-                        assert(turn:wait(ctx))
-                        assert(child:close(ctx))
+                    assert(ctx:mode() ~= nil, 'the invocation resolves its mode')
+                    if input.stage == 'retired' then
+                        local agent, err = maki.agent.current(ctx)
+                        assert(agent == nil and err == '{HOST_RETIRED}', err)
+                        return 'ok'
                     end
+                    local child, err = maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }})
+                    assert(child == nil, 'a host root must not spawn an agent')
+                    assert(err ~= nil, 'spawn must report an error')
                     return 'ok'
                 end,
             }})
@@ -200,25 +193,12 @@ fn standalone_control_and_mode_are_bound_to_live_root_invocations() {
         .install_host_root_services(services.clone());
     host.wait_for_worker_barrier_for_test();
     assert_eq!(
-        common::exec_tool_text(&registry, &first, PROBE, json!({"stage": "plan"})).unwrap(),
-        "ok"
-    );
-    let mut foreign = first.clone();
-    foreign.subagent_cancels = Arc::new(CancelMap::new());
-    assert_eq!(
-        common::exec_tool_text(&registry, &foreign, PROBE, json!({"stage": "foreign"})).unwrap(),
-        "ok"
-    );
-    let mut second = first.clone();
-    second.cancel = CancelToken::none();
-    second.mode = AgentMode::Build;
-    assert_eq!(
-        common::exec_tool_text(&registry, &second, PROBE, json!({"stage": "build"})).unwrap(),
+        common::exec_tool_text(&registry, &first, PROBE, json!({"stage": "spawn"})).unwrap(),
         "ok"
     );
     services.retire();
     assert_eq!(
-        common::exec_tool_text(&registry, &second, PROBE, json!({"stage": "retired"})).unwrap(),
+        common::exec_tool_text(&registry, &first, PROBE, json!({"stage": "retired"})).unwrap(),
         "ok"
     );
 }

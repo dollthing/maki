@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_agent::actor::DeliveryStatus;
-use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry, TurnToolBindings};
+use maki_agent::template::Vars;
+use maki_agent::tools::{
+    DescriptionContext, RequestTools, ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
+};
 use maki_agent::{
     ActorBackend, ActorEvent, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle,
     AgentMetadata, AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope,
@@ -12,7 +15,7 @@ use maki_agent::{
     TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
-use maki_lua::agent_errors::{INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE};
+use maki_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
 use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -37,7 +40,7 @@ const RETAIN_NESTED_TOOL_NAME: &str = "managed_session_retain_nested";
 const RETRY_NESTED_TOOL_NAME: &str = "managed_session_retry_nested";
 const CAPTURE_UNMANAGED_CTX_TOOL_NAME: &str = "capture_unmanaged_ctx";
 const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
-const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
+const TIMEOUT_ERROR: &str = TURN_WAIT_TIMEOUT;
 const NESTED_RESULT: &str = "nested child result";
 const NESTED_ASYNC_TOOL_NAME: &str = "nested_async_task";
 const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
@@ -71,12 +74,6 @@ maki.api.register_tool = function(spec)
   return real_register_tool(spec)
 end
 
-local real_session = maki.agent.session
-maki.agent.session = function(ctx, opts)
-  opts.inherit_provider = true
-  opts.auto_deliver = false
-  return real_session(ctx, opts)
-end
 local real_spawn = maki.agent.spawn
 maki.agent.spawn = function(ctx, opts)
   opts.inherit_provider = true
@@ -99,30 +96,31 @@ end
 
 const PLUGIN_SRC: &str = r#"
 local retained_session
+local retained_session_ctx
 local retained_task_id
 local managed_authority_turn = 0
 local release_async_worker
 local finish_async_wait
-local retained_unmanaged_ctx
+local retained_ctx
 
 maki.api.register_tool({
   name = "capture_unmanaged_ctx",
-  description = "retain an unmanaged invocation context",
+  description = "retain a managed invocation context",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    retained_unmanaged_ctx = ctx
+    retained_ctx = ctx
     return "ok"
   end,
 })
 
 maki.api.register_tool({
   name = "reject_foreign_unmanaged_ctx",
-  description = "reject an unmanaged context inside a managed invocation",
+  description = "reject a context from another managed invocation",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local session, err = maki.agent.session(retained_unmanaged_ctx, {
+    local session, err = maki.agent.spawn(retained_ctx, {
       audience = {},
       model = { spec = "not/a/model" },
     })
@@ -139,7 +137,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session = assert(maki.agent.session(ctx, {
+    local session = assert(maki.agent.spawn(ctx, {
       name = "managed-joined-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -147,10 +145,10 @@ maki.api.register_tool({
     local result, prompt_err
     maki.async.join(1, {
       function()
-        result, prompt_err = session:prompt("reply")
+        result, prompt_err = session:prompt(ctx, "reply")
       end,
     })
-    session:close()
+    assert(session:close(ctx))
     if not result then
       return { llm_output = prompt_err, is_error = true }
     end
@@ -229,11 +227,12 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    retained_session = assert(maki.agent.session(ctx, {
+    retained_session = assert(maki.agent.spawn(ctx, {
       name = "managed-retained-child",
       inherit_provider = true,
       auto_deliver = false,
     }))
+    retained_session_ctx = ctx
     return "ok"
   end,
 })
@@ -244,8 +243,8 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local result, err = retained_session:prompt("wait", { timeout = 1 })
-    if result ~= nil or err ~= "$MANAGED_AUTHORITY_ERROR" then
+    local result, err = retained_session:prompt(retained_session_ctx, "wait", { timeout = 1 })
+    if result ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected retained authority result: " .. tostring(err), is_error = true }
     end
     return "ok"
@@ -258,12 +257,13 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "general_sub" },
   handler = function(_, ctx)
-    retained_session = assert(maki.agent.session(ctx, {
+    retained_session = assert(maki.agent.spawn(ctx, {
       name = "managed-retained-nested-child",
       inherit_provider = true,
       auto_deliver = false,
     }))
-    local result, err = retained_session:prompt("nested initial prompt")
+    retained_session_ctx = ctx
+    local result, err = retained_session:prompt(ctx, "nested initial prompt")
     if not result then
       return { llm_output = err, is_error = true }
     end
@@ -277,8 +277,8 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local result, err = retained_session:prompt("must reject")
-    if result ~= nil or err ~= "$MANAGED_AUTHORITY_ERROR" then
+    local result, err = retained_session:prompt(retained_session_ctx, "must reject")
+    if result ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected retained close result: " .. tostring(err), is_error = true }
     end
     return "ok"
@@ -291,7 +291,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.session(ctx, {
+    local session, err = maki.agent.spawn(ctx, {
       name = "managed-timeout-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -299,10 +299,14 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt("wait", { timeout = 1 })
-    if result ~= nil or prompt_err ~= "session prompt timed out after 1s" then
-      return { llm_output = "unexpected timeout result", is_error = true }
-    end
+    local result, prompt_err = session:prompt(ctx, "wait", { timeout = 1 })
+    assert(result == nil and type(prompt_err) == "table")
+    assert(prompt_err.kind == "timeout" and prompt_err.message == "$TIMEOUT_ERROR")
+    assert(prompt_err.ticket:agent_id() == session:id())
+    assert(prompt_err.ticket:result(ctx) == nil)
+    local status = assert(session:status(ctx))
+    assert(status.active_turn == prompt_err.ticket:id())
+    assert(session:close(ctx))
     return "ok"
   end,
 })
@@ -313,7 +317,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.session(ctx, {
+    local session, err = maki.agent.spawn(ctx, {
       name = "managed-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -321,8 +325,8 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt("reply")
-    session:close()
+    local result, prompt_err = session:prompt(ctx, "reply")
+    assert(session:close(ctx))
     if not result then
       return { llm_output = prompt_err, is_error = true }
     end
@@ -336,7 +340,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.session(ctx, {
+    local session, err = maki.agent.spawn(ctx, {
       name = "managed-silent-child",
       inherit_provider = true,
       auto_deliver = false,
@@ -345,8 +349,8 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt("reply")
-    session:close()
+    local result, prompt_err = session:prompt(ctx, "reply")
+    assert(session:close(ctx))
     if not result then
       return { llm_output = prompt_err, is_error = true }
     end
@@ -433,7 +437,34 @@ maki.api.register_tool({
 fn session_plugin_source() -> String {
     PLUGIN_SRC
         .replace("$EXPIRED_CONTEXT_ERROR", INVOCATION_EXPIRED)
-        .replace("$MANAGED_AUTHORITY_ERROR", MANAGED_AUTHORITY_INACTIVE)
+        .replace("$TIMEOUT_ERROR", TIMEOUT_ERROR)
+}
+
+fn collect_request_tools(
+    context: &mut ToolContext,
+    registry: &Arc<ToolRegistry>,
+    audience: ToolAudience,
+) {
+    context.registry = Arc::clone(registry);
+    context.audience = audience;
+    let definitions = registry.definitions(
+        &Vars::new(),
+        &DescriptionContext {
+            filter: &context.tool_filter,
+            audience,
+            workflow: context.workflow,
+            mcp: context.mcp.is_some(),
+        },
+        context.model.supports_tool_examples(),
+    );
+    let tools = RequestTools::assembled(definitions, &context.config, &context.model);
+    context.tool_filter = Arc::clone(tools.filter());
+    context.request_tools = Some(tools);
+    context.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &context.registry,
+        &context.local_tools,
+        context.mcp.as_ref(),
+    ));
 }
 
 struct LuaToolBackend {
@@ -463,7 +494,7 @@ impl ActorBackend for LuaToolBackend {
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
             self.context.managed_turn = context.managed_turn;
-            self.context = common::with_request_tools(&self.registry, &self.context);
+            collect_request_tools(&mut self.context, &self.registry, ToolAudience::MAIN);
             let invocation = self
                 .registry
                 .get(self.tool_name)
@@ -537,8 +568,7 @@ impl ActorBackend for NestedTaskBackend {
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
             self.context.managed_turn = context.managed_turn;
-            self.context.audience = ToolAudience::GENERAL_SUB;
-            self.context = common::with_request_tools(&self.registry, &self.context);
+            collect_request_tools(&mut self.context, &self.registry, ToolAudience::GENERAL_SUB);
             let invocation = self
                 .registry
                 .get(self.tool_name)
@@ -834,12 +864,15 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 name = "spawn_nested",
                 description = "spawn a child from the executing configuration",
                 schema = { type = "object", properties = {} },
-                audiences = { "general_sub" },
+                audiences = { "main", "general_sub" },
                 handler = function(_, ctx)
-                    assert(ctx:workflow() == true)
-                    local nested = assert(maki.agent.session(ctx, { inherit_provider = true, auto_deliver = false }))
-                    local result = assert(nested:prompt("nested"))
-                    nested:close()
+                    if ctx:workflow() ~= true then error("nested handler saw stale workflow config") end
+                    local nested, spawn_err = maki.agent.spawn(ctx, { inherit_provider = true, auto_deliver = false })
+                    if not nested then error("nested spawn failed: " .. tostring(spawn_err)) end
+                    local result, prompt_err = nested:prompt(ctx, "nested")
+                    if not result then error("nested prompt failed: " .. tostring(prompt_err)) end
+                    local closed, close_err = nested:close(ctx)
+                    if not closed then error("nested close failed: " .. tostring(close_err)) end
                     return result.text
                 end,
             })
@@ -848,15 +881,17 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 description = "create and retain a configured child",
                 schema = { type = "object", properties = {} },
                 handler = function(_, ctx)
-                    local rejected, policy_err = maki.agent.session(ctx, { model = { spec = "openai/gpt-4.1" } })
+                    local rejected, policy_err = maki.agent.spawn(ctx, { model = { spec = "openai/gpt-4.1" } })
                     assert(rejected == nil and policy_err ~= nil)
-                    local failed, preparation_err = maki.agent.session(ctx, { model = { spec = "anthropic/claude-opus-5" } })
+                    local failed, preparation_err = maki.agent.spawn(ctx, { model = { spec = "anthropic/claude-opus-5" } })
                     assert(failed == nil and preparation_err == "$PREPARATION_ERROR")
-                    child = assert(maki.agent.session(ctx, {
+                    child = assert(maki.agent.spawn(ctx, {
                         model = { spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off" }, auto_deliver = false,
+                        audience = "general_sub",
                         tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},
                     }))
-                    assert(child:prompt("first"))
+                    local first_result, first_err = child:prompt(ctx, "first")
+                    if not first_result then error("parent prompt failed: " .. tostring(first_err)) end
                     return "ok"
                 end,
             })
@@ -942,12 +977,15 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         let requests: Vec<_> = updated_rx.try_iter().collect();
+        // The nested child inherits the provider of the configuration it was
+        // spawned from, so the updated provider serves its prompt too.
         assert_eq!(requests.len(), 3);
         for (model, opts) in requests {
             assert_eq!(model, updated.model.spec());
             assert!(!opts.fast);
             assert_eq!(opts.thinking, updated.thinking);
         }
+        manager.lookup(child_id).unwrap().close_subtree().unwrap();
         let nested_id = closed_child(&events, child_id).await;
         wait_for_runner_finished(&manager, nested_id).await;
         assert!(
@@ -2035,33 +2073,43 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
         host.load_source("managed-session", &session_plugin_source())
             .unwrap();
-        let (mut unmanaged_context, unmanaged_events, _cancel) = common::ctx_with_canned_provider();
+        let (mut context, events, _cancel) = common::ctx_with_canned_provider();
         let (live_tx, live_rx) = flume::unbounded();
-        unmanaged_context.live_sink = Some(live_tx);
-        let capture = registry
-            .get(CAPTURE_UNMANAGED_CTX_TOOL_NAME)
-            .unwrap()
-            .tool
-            .parse(&json!({}))
+        context.live_sink = Some(live_tx);
+        let origin_manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (captured_tx, captured_rx) = flume::bounded(1);
+        let origin = origin_manager
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
+                    registry: Arc::clone(&registry),
+                    context: context.clone(),
+                    completed: captured_tx,
+                    tool_name: CAPTURE_UNMANAGED_CTX_TOOL_NAME,
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
-        assert!(capture.execute(&unmanaged_context).await.output.is_ok());
+        let capture = origin
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+        assert_eq!(captured_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(
+            capture.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
 
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root_with_config(
-                Some(parent_policy(&unmanaged_context)),
-                Vec::new(),
-                None,
-                |_| {
-                    Ok::<_, String>(Box::new(LuaToolBackend {
-                        registry,
-                        context: unmanaged_context,
-                        completed: completed_tx,
-                        tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
-                    }) as Box<dyn ActorBackend>)
-                },
-            )
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
+                    registry,
+                    context,
+                    completed: completed_tx,
+                    tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         let before = manager.node(root.id()).unwrap();
         assert_eq!(manager.snapshot().len(), 1);
@@ -2087,10 +2135,15 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         assert_eq!(after.children, before.children);
         assert_eq!(after.graph_lifecycle, before.graph_lifecycle);
         assert_eq!(after.metadata, before.metadata);
-        assert!(unmanaged_events.is_empty());
+        assert!(events.is_empty());
         assert!(live_rx.is_empty());
+        let origin_after = origin.snapshot().unwrap();
+        assert!(origin_after.children.is_empty());
+        assert_eq!(origin_manager.snapshot().len(), 1);
 
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+        let report = origin_manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
 }
@@ -2251,7 +2304,7 @@ fn retained_managed_prompt_outside_turn_is_rejected_without_mutation() {
             .unwrap();
         assert!(
             invocation.execute(&context).await.output.is_ok(),
-            "{MANAGED_AUTHORITY_INACTIVE}"
+            "{INVOCATION_EXPIRED}"
         );
         let after = child.snapshot().unwrap();
         assert_eq!(after.graph_lifecycle, before.graph_lifecycle);
@@ -2286,11 +2339,7 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
             dropped: dropped_tx,
         });
         let (mut context, events, _cancel) = common::ctx_with_provider(provider);
-        let manager = AgentManagerHandle::new(AgentLimits {
-            max_concurrent_agent_turns: 1,
-            ..AgentLimits::default()
-        })
-        .unwrap();
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
             .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {

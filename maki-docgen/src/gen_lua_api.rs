@@ -42,7 +42,6 @@ mod tests {
     #[test_case("LuaCtx:agent()", "LuaCtx:agent()"; "context_agent")]
     #[test_case("LuaCtx:model()", "LuaCtx:model()"; "context_model")]
     #[test_case("LuaCtx:defer_close()", "LuaCtx:defer_close({agent})"; "context_defer_close")]
-    #[test_case("Session:status()", "Session:status()"; "session_status")]
     fn generated_docs_render_agent_api_sections(heading: &str, signature: &str) {
         let page = generate();
         let start = page

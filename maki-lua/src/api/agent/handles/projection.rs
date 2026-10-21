@@ -29,7 +29,7 @@ pub(super) fn selection_table(lua: &Lua, config: &EffectiveAgentConfig) -> mlua:
     )
 }
 
-pub(super) fn result_table(lua: &Lua, result: &TurnResult) -> mlua::Result<Table> {
+pub(in crate::api::agent) fn result_table(lua: &Lua, result: &TurnResult) -> mlua::Result<Table> {
     expect_table(
         json_to_lua(lua, &result_json(result))?,
         TURN_RESULT_NOT_TABLE,

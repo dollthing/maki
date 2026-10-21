@@ -186,7 +186,6 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                             (plugin, owner)
                         }),
                     managed_turn: None,
-                    agent_parent: None,
                     delegated_tool: None,
                     command_depth: 0,
                     command_invocation: None,

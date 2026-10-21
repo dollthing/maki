@@ -22,7 +22,7 @@ use super::subscriptions::{
     on_turn_start__register,
 };
 use super::tickets::ticket_wait;
-use super::{AgentRuntime, AgentSessions, LuaAgent, LuaAgentRef, LuaAgentTurn};
+use super::{AgentOwners, AgentRuntime, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
     RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT,
@@ -663,7 +663,7 @@ pub(crate) fn agent_defer_close(
     let manager = this.manager.clone();
     let id = this.id;
     let sessions = lua
-        .app_data_ref::<AgentSessions>()
+        .app_data_ref::<AgentOwners>()
         .map(|sessions| sessions.clone());
     try_pair!(register_defer_close(
         lua,
@@ -682,6 +682,7 @@ fn task_owner_authority(
     this: &LuaAgent,
     ctx: &LuaCtx,
 ) -> mlua::Result<TaskOwnerAuthority> {
+    authorize(lua, ctx, this).map_err(mlua::Error::runtime)?;
     let plugin_identity =
         || current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY));
     match &this.manager {
@@ -698,16 +699,6 @@ fn task_owner_authority(
             })
         }
         AgentRuntime::HostRoot { .. } => Err(mlua::Error::runtime(UNSUPPORTED_OPERATION_ERROR)),
-        AgentRuntime::Unmanaged { parent, .. } => {
-            let (plugin, generation) = plugin_identity()?;
-            Ok(TaskOwnerAuthority::StandaloneAgent {
-                owner: plugin_authority(lua, plugin.clone()),
-                plugin,
-                generation,
-                parent: parent.clone(),
-                host_root: ctx.host_root(lua).map_err(mlua::Error::runtime)?,
-            })
-        }
     }
 }
 
@@ -716,9 +707,6 @@ fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
         Ok(LuaTaskOwner {
             owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
             authority: task_owner_authority(lua, this, &ctx)?,
-            child_id: this
-                .id
-                .ok_or_else(|| mlua::Error::runtime(UNSUPPORTED_OPERATION_ERROR))?,
         })
     });
     methods.add_method("_maki_session_id", |_, this, ()| {

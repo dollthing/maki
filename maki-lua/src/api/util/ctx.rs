@@ -148,14 +148,11 @@ impl LuaCtx {
             .host_services
             .as_ref()
             .map(|services| services.reference().id());
-        self.pin_subject(lua);
+        self.pin_subject();
     }
 
     pub(crate) fn bind_origin(&mut self, task: &crate::runtime::TaskHandle) {
         self.origin = Some(task.clone());
-        if let Some(agent) = self.agent() {
-            lock_cell(task).agent_parent = Some(agent.subagent_cancels.clone());
-        }
     }
 
     pub(crate) fn delegated_tool(&self) -> crate::runtime::DelegatedTool {
@@ -595,17 +592,6 @@ impl UserData for LuaCtx {
             crate::api::agent::current(lua, ctx)
         });
 
-        methods.add_method("_maki_managed", |lua, this, ()| {
-            if this.validate_origin(lua).is_err() {
-                return Ok(false);
-            }
-            let Some(expected) = this.agent().and_then(|agent| agent.managed_turn.as_ref()) else {
-                return Ok(false);
-            };
-            Ok(crate::runtime::current_managed_turn(lua)
-                .is_some_and(|active| expected.same_authority(&active)))
-        });
-
         // The session that called this tool, which under concurrent
         // sessions is not always the focused one `maki.session.current()`
         // reports. Nil without an error when the run has no session, as in
@@ -855,15 +841,16 @@ fn validate_task_origin(
     cleanup: bool,
 ) -> Result<(), String> {
     let origin = origin.ok_or("context is not bound to an invocation")?;
-    let current = crate::runtime::active_task_id(lua);
-    let cell = lock_cell(origin);
-    if !cell.scope_alive || (!cleanup && !cell.is_live()) {
-        return Err(INVOCATION_EXPIRED.into());
+    {
+        let cell = lock_cell(origin);
+        if !cell.scope_alive || (!cleanup && !cell.is_live()) {
+            return Err(INVOCATION_EXPIRED.into());
+        }
+        if !cleanup {
+            cell.validate_plugin_effect()?;
+        }
     }
-    if !cleanup {
-        cell.validate_plugin_effect()?;
-    }
-    if current != Some(cell.id) {
+    if !crate::runtime::same_invocation(lua, origin) {
         return Err("context belongs to another invocation".into());
     }
     Ok(())

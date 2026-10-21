@@ -294,7 +294,7 @@ impl Fixture {
         host.load_source_with_opts(
             "runtime_alignment",
             &format!("{PRELUDE}\n{}", include_str!("../../plugins/task/init.lua")),
-            serde_json::Map::from_iter([("max_concurrent".into(), json!(1))]),
+            serde_json::Map::new(),
         )
         .unwrap();
         let (requests_tx, requests) = flume::unbounded();

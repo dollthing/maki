@@ -469,13 +469,6 @@ impl TrustedContext {
             .ok_or(NO_ORCHESTRATION_SERVICES)?
             .validate_target(target)
     }
-
-    pub(crate) fn services(&self, lua: &Lua) -> Result<&Arc<dyn OrchestrationServices>, String> {
-        self.validate(lua)?;
-        self.services
-            .as_ref()
-            .ok_or_else(|| NO_ORCHESTRATION_SERVICES.into())
-    }
 }
 
 impl ScopeAuthority {

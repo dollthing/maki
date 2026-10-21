@@ -62,11 +62,6 @@ Report findings classified by severity (critical / high / medium / low), quoting
 ]] .. plan_spec
 
 local opts = maki.api.register_options({
-  max_concurrent = {
-    default = 8,
-    min = 1,
-    desc = "Process-wide subagent turn limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns.",
-  },
   allow_model = {
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
@@ -186,9 +181,6 @@ local function prepare(input, ctx)
     nil
 end
 
--- Process-wide cap on concurrent subagents, released on despawn or gc.
-local semaphore = maki.async.semaphore(opts.max_concurrent)
-
 local function spawn_options(spec, input)
   return {
     model = { spec = spec.model.spec, thinking = input.thinking },
@@ -197,7 +189,6 @@ local function spawn_options(spec, input)
     output_schema = spec.output_schema,
     audience = spec.audience,
     name = input.description,
-    semaphore = semaphore,
   }
 end
 

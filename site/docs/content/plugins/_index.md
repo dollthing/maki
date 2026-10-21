@@ -111,7 +111,7 @@ The compatibility `Session` API has different lifetime and admission rules. A tr
 
 ### Migration from the previous task and Session APIs
 
-Both `maki.agent.spawn` and the retained `maki.agent.session` constructor use the shared model selection. Replace the old constructor options:
+`maki.agent.spawn` uses the shared model selection. Replace the old constructor options:
 
 ```lua
 { model_spec = "provider/model", thinking = "high", fast = false }

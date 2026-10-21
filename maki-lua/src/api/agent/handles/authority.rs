@@ -3,68 +3,17 @@ use std::sync::Arc;
 use maki_agent::{AgentId, AgentManagerHandle, CurrentManagedTurn};
 use mlua::Lua;
 
-use super::{AgentRuntime, AgentSessions, LuaAgent, session_state};
-use crate::agent_errors::{
-    MANAGED_AUTHORITY_INACTIVE, NO_TASK_AUTHORITY, NOT_DESCENDANT_OF_CALLER,
-    OTHER_PLUGIN_GENERATION, OTHER_RUNTIME, UNMANAGED_AUTHORITY_INACTIVE,
-};
+use super::{AgentOwners, AgentRuntime, LuaAgent, session_state};
+use crate::agent_errors::{MANAGED_AUTHORITY_INACTIVE, NOT_DESCENDANT_OF_CALLER, OTHER_RUNTIME};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::host_root::{HostRootServices, UNSUPPORTED_OPERATION_ERROR};
-use crate::orchestration::{self, holds_plugin_grant};
-use crate::runtime::{TaskHandle, current_managed_turn, lock_cell};
+use crate::orchestration;
+use crate::runtime::current_managed_turn;
 
 pub(super) fn retire_closed(lua: &Lua) {
-    if let Some(sessions) = lua.app_data_ref::<AgentSessions>() {
+    if let Some(sessions) = lua.app_data_ref::<AgentOwners>() {
         sessions.retire_settled();
     }
-}
-
-pub(super) fn task_authority(lua: &Lua) -> Result<TaskHandle, &'static str> {
-    lua.app_data_ref::<TaskHandle>()
-        .map(|task| Arc::clone(&task))
-        .ok_or(NO_TASK_AUTHORITY)
-}
-
-pub(super) fn validate_unmanaged(
-    lua: &Lua,
-    ctx: &LuaCtx,
-    runtime: &AgentRuntime,
-) -> Result<(), String> {
-    ctx.validate_origin(lua)?;
-    ctx.host_root(lua)?;
-    let AgentRuntime::Unmanaged {
-        parent,
-        plugin,
-        generation,
-        owner,
-        ..
-    } = runtime
-    else {
-        return Err("not an unmanaged agent".into());
-    };
-    let template = ctx
-        .trusted_host_root(lua)
-        .ok()
-        .and_then(|host| host.template.as_ref())
-        .map(AgentContext::from);
-    let context = ctx
-        .agent()
-        .or(template.as_ref())
-        .ok_or_else(|| ctx.cap_err("orchestration"))?;
-    let active = task_authority(lua)?;
-    if !holds_plugin_grant(lua, plugin, *generation, owner) {
-        return Err(OTHER_PLUGIN_GENERATION.into());
-    }
-    let cell = lock_cell(&active);
-    if !cell.is_live()
-        || context.cancel.is_cancelled()
-        || context.managed_turn.is_some()
-        || cell.managed_turn.is_some()
-        || !Arc::ptr_eq(parent, &context.subagent_cancels)
-    {
-        return Err(UNMANAGED_AUTHORITY_INACTIVE.into());
-    }
-    Ok(())
 }
 
 pub(super) fn host_agent(services: Arc<HostRootServices>) -> LuaAgent {
@@ -94,7 +43,6 @@ pub(super) fn validate_host_root(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> R
 fn validate_outside_graph(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Option<Result<(), String>> {
     match agent.manager {
         AgentRuntime::HostRoot { .. } => Some(validate_host_root(lua, ctx, agent)),
-        AgentRuntime::Unmanaged { .. } => Some(validate_unmanaged(lua, ctx, &agent.manager)),
         AgentRuntime::Managed(_) => None,
     }
 }
@@ -256,44 +204,28 @@ pub(super) fn lookup(
 }
 
 impl LuaCtx {
-    pub(crate) fn pin_subject(&mut self, lua: &Lua) {
-        if self.subject.is_some() {
-            return;
+    pub(crate) fn pin_subject(&mut self) {
+        if self.subject.is_none() {
+            self.subject = self.agent().and_then(|context| context.execution_agent_id);
         }
-        self.subject = self.agent().and_then(|context| context.execution_agent_id);
-        if self.subject.is_some() {
-            return;
-        }
-        self.subject = self.agent().and_then(|context| {
-            let sessions = lua.app_data_ref::<AgentSessions>()?;
-            sessions
-                .lock()
-                .values()
-                .find(|session| {
-                    session
-                        .state
-                        .params
-                        .get()
-                        .is_some_and(|params| Arc::ptr_eq(&params.ledger, &context.ledger))
-                })
-                .map(|session| session.agent_id)
-        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
 
     use futures_lite::future::race;
+    use maki_agent::actor::{ActorLifecycle, EffectiveAgentConfig};
+    use maki_agent::agent::RunSettings;
+    use maki_agent::tools::test_support::stub_ctx;
     use maki_agent::{
-        ActorBackend, ActorEvent, AgentActorHandle, AgentInput, AgentMode, BackendResult,
-        ControlWork, History, TurnContext, WorkKind,
+        ActorBackend, ActorEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
+        BackendResult, ControlWork, History, TurnContext, WorkKind,
     };
     use maki_providers::TokenUsage;
+    use maki_providers::provider::Provider;
     use smol::Timer;
 
     use super::*;
@@ -301,6 +233,7 @@ mod tests {
     use crate::api::agent::handles::tests::{REPLY, RETIRE_TIMEOUT};
     use crate::api::agent::tests::{
         StreamOnceProvider, canned_reply_with_usage, session_with_provider,
+        session_with_provider_for_agent,
     };
 
     struct SettlementGate {
@@ -352,29 +285,42 @@ mod tests {
                 output: 7,
                 ..Default::default()
             };
-            let provider = Arc::new(StreamOnceProvider::new_replies(vec![
+            let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
                 canned_reply_with_usage(REPLY, usage),
             ]));
-            let (original, state, mut session, _) = session_with_provider(provider, None, None);
+            let (original, _, _session, _) = session_with_provider(Arc::clone(&provider), None);
             original.close();
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            let (actor, runner) = AgentActorHandle::spawn(
-                session.agent_id,
-                Vec::new(),
-                None,
-                Box::new(SettlementGate {
-                    backend: LuaActorBackend::new(Arc::clone(&state)),
-                    entered: entered_tx,
-                    release: release_rx,
-                }),
+            let mut context = stub_ctx(&AgentMode::Build);
+            context.provider = Arc::clone(&provider);
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    model: (*context.model).clone(),
+                    provider: Arc::clone(&context.provider),
+                    thinking: context.opts.thinking,
+                    fast: context.opts.fast,
+                    workflow: false,
+                },
+                context.mode.clone(),
             );
-            runner.detach();
-            session.actor = Arc::new(actor.clone());
-            let lua = Lua::new();
-            let id = session.agent_id;
-            let sessions = AgentSessions(Arc::new(Mutex::new(HashMap::from([(id, session)]))));
-            lua.set_app_data(sessions.clone());
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let mut root_fixture = None;
+            let target = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |agent_id| {
+                    let (_, root_state, fixture, _) =
+                        session_with_provider_for_agent(Arc::clone(&context.provider), agent_id);
+                    root_fixture = Some(fixture);
+                    Ok::<_, String>(Box::new(SettlementGate {
+                        backend: LuaActorBackend::new(root_state),
+                        entered: entered_tx,
+                        release: release_rx,
+                    }))
+                })
+                .unwrap();
+            let _root_fixture = root_fixture.unwrap();
+            let actor = target.actor().unwrap();
+            let id = target.id();
             let events = actor.subscribe_events();
             let ticket = actor
                 .admit_turn(
@@ -396,10 +342,12 @@ mod tests {
             race(
                 async {
                     entered_rx.recv_async().await.unwrap();
-                    actor.close();
-                    assert!(actor.snapshot().active_turn.is_some());
-                    retire_closed(&lua);
-                    assert!(sessions.lock().contains_key(&id));
+                    target.close_subtree().unwrap();
+                    assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
+                    assert!(
+                        actor.snapshot().active_turn.is_some(),
+                        "a close during a running turn must not terminalize it"
+                    );
                     assert_eq!(actor.snapshot().cumulative_usage, TokenUsage::default());
                     release_tx.send(()).unwrap();
                     let mut ended = false;
@@ -411,7 +359,7 @@ mod tests {
                                 ended = true;
                             }
                             ActorEvent::Close { .. } => {
-                                assert!(ended);
+                                assert!(ended, "the billed end must land before the close");
                                 break;
                             }
                             _ => {}
@@ -425,10 +373,19 @@ mod tests {
             )
             .await;
             ticket.wait().await;
-            assert!(actor.snapshot().active_turn.is_none());
-            assert_eq!(actor.snapshot().cumulative_usage, usage);
-            retire_closed(&lua);
-            assert!(!sessions.lock().contains_key(&id));
+            let settled = actor.snapshot();
+            assert!(settled.active_turn.is_none());
+            assert_eq!(settled.cumulative_usage, usage);
+            assert_eq!(settled.lifecycle, ActorLifecycle::Closed);
+            // `manager.node(id)` is not durable: the manager reaps a closed,
+            // drained node from its graph. The reference retains the terminal
+            // snapshot, so it still reports the same agent after reaping.
+            assert_eq!(target.snapshot().unwrap().agent_id, id);
+            assert!(
+                manager.lookup(id).is_err(),
+                "a closed agent is no longer a live reference"
+            );
+            manager.shutdown(RETIRE_TIMEOUT).await;
         });
     }
 }

@@ -1,55 +1,116 @@
-//! Thinking reaches the model (AC.6).
+//! Thinking settings reach the provider through a managed child.
 //!
-//! The Lua `maki.agent.session` path parses `thinking` and threads it into the
-//! provider's `RequestOptions` unchanged. It does NOT consult
-//! `supports_thinking`/`requires_thinking`; enforcement (clamping to Off for a
-//! non-supporting model) is UI-owned. These tests drive the real session against
-//! a canned provider that records `RequestOptions.thinking`, so they assert what
-//! the model actually received.
+//! The provider records `RequestOptions.thinking`, including the agent layer's
+//! clamp to Off for models that do not support thinking.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use maki_agent::tools::ToolRegistry;
+use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::agent::RunSettings;
+use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::{
+    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, BackendResult, ControlWork, History,
+    TurnContext, WorkKind,
+};
 use maki_lua::PluginHost;
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::{Effort, Model, ThinkingConfig};
 use serde_json::{Value, json};
 
 mod common;
-use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool};
+use common::{CannedProvider, canned_reply, ctx_with_provider, with_request_tools};
+
+const TURN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PROBE_SRC: &str = r#"
-maki.api.register_tool({
-  name = "probe_thinking",
-  description = "spawn a session with a thinking setting",
-  schema = {
-    type = "object",
-    properties = { thinking = { description = "thinking setting" } },
-    additionalProperties = false,
-  },
-  audiences = { "main" },
-  handler = function(input, ctx)
-    local sess, err = maki.agent.session(ctx, {
+maki.api.register_command({
+  name = "/probe_thinking",
+  tui_only = false,
+  arguments = { raw = true, required = true },
+  handler = function(opts, ctx)
+    local input = assert(maki.json.decode(opts.args))
+    local child, err = maki.agent.spawn(ctx, {
       name = "probe",
       inherit_provider = true,
       model = { thinking = input.thinking },
     })
-    if not sess then
-      return { llm_output = "spawn failed: " .. tostring(err), is_error = true }
-    end
-    local result, serr = sess:prompt("hi")
-    sess:close()
-    if serr then
-      return { llm_output = "prompt failed: " .. tostring(serr), is_error = true }
-    end
-    return maki.json.encode({ ok = result ~= nil })
+    assert(child, err)
+    local result, serr = child:prompt(ctx, "hi")
+    assert(result, serr)
+    local closed, cerr = child:close(ctx)
+    assert(closed, cerr)
   end,
 })
 "#;
 
-fn load_thinking_host() -> (Arc<ToolRegistry>, PluginHost) {
+struct IdleRoot;
+
+impl ActorBackend for IdleRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn load_thinking_host(ctx: &mut ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("thinking_policy", PROBE_SRC).unwrap();
+    let policy = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&ctx.provider),
+            model: (*ctx.model).clone(),
+            fast: ctx.opts.fast,
+            workflow: ctx.workflow,
+            thinking: ctx.opts.thinking,
+        },
+        ctx.mode.clone(),
+    );
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(IdleRoot) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    ctx.execution_agent_id = Some(root.id());
+    let mut template = with_request_tools(&reg, ctx);
+    template.registry = Arc::clone(&reg);
+    host.event_handle().install_orchestration_services(Arc::new(
+        AgentOrchestration::bind_fixed_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root,
+                template,
+            },
+        ),
+    ));
+    host.wait_for_worker_barrier_for_test();
     (reg, host)
 }
 
@@ -69,29 +130,26 @@ fn wait_capture(provider: &CannedProvider) -> ThinkingConfig {
 #[test_case::test_case(json!("high"), ThinkingConfig::Effort(Effort::High) ; "high")]
 #[test_case::test_case(json!(4096), ThinkingConfig::Budget(4096) ; "budget")]
 fn thinking_effort_reaches_the_model(thinking: Value, expected: ThinkingConfig) {
-    let (reg, _host) = load_thinking_host();
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
+    let (_reg, host) = load_thinking_host(&mut ctx);
 
-    exec_tool(
-        &reg,
-        &ctx,
-        "probe_thinking",
-        json!({ "thinking": thinking }),
-    )
-    .unwrap();
+    host.event_handle()
+        .run_command_for_test(
+            Arc::from("thinking_policy"),
+            Arc::from("/probe_thinking"),
+            json!({ "thinking": thinking }).to_string(),
+            0,
+        )
+        .recv_timeout(TURN_TIMEOUT)
+        .unwrap()
+        .unwrap();
     assert_eq!(wait_capture(&provider), expected);
 }
 
-/// A non-thinking model receives `Off` at the provider regardless of the
-/// requested thinking: the agent run clamps via `RequestOptions::clamped(model)`
-/// before calling `stream_message`. This pins where enforcement actually lives
-/// (the agent layer, reached here through the real `maki.agent.session` path),
-/// so a future change that moves clamping is caught.
 #[test]
 fn thinking_clamped_to_off_for_non_supporting_model() {
-    let (reg, _host) = load_thinking_host();
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
@@ -101,8 +159,18 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
         "fixture model must not support thinking"
     );
     ctx.model = non_thinking;
+    let (_reg, host) = load_thinking_host(&mut ctx);
 
-    exec_tool(&reg, &ctx, "probe_thinking", json!({ "thinking": "high" })).unwrap();
+    host.event_handle()
+        .run_command_for_test(
+            Arc::from("thinking_policy"),
+            Arc::from("/probe_thinking"),
+            json!({ "thinking": "high" }).to_string(),
+            0,
+        )
+        .recv_timeout(TURN_TIMEOUT)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         wait_capture(&provider),
         ThinkingConfig::Off,

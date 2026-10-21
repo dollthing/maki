@@ -19,11 +19,11 @@ use maki_lua::{
     PluginHost, SessionRequest, UiAction,
     agent_errors::{
         AGENT_BUSY, DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION,
-        FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, MANAGED_AUTHORITY_INACTIVE, NO_FOCUSED_AGENT,
-        NOT_DESCENDANT_OF_CALLER, ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME,
-        OUTPUT_SCHEMA_NOT_OBJECT, RESTRICTED_MODE_CHANGE, SELF_TURN_WAIT, STALE_TURN,
-        STRUCTURED_OUTPUT_CONFLICT, TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED,
-        TRUSTED_TIMER_REQUIRED, TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
+        FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, NO_FOCUSED_AGENT, NOT_DESCENDANT_OF_CALLER,
+        ORCHESTRATION_CONTEXT_EXPIRED, OTHER_RUNTIME, OUTPUT_SCHEMA_NOT_OBJECT,
+        RESTRICTED_MODE_CHANGE, SELF_TURN_WAIT, STALE_TURN, STRUCTURED_OUTPUT_CONFLICT,
+        TRUSTED_RUN_COMMAND_REQUIRED, TRUSTED_SUBSCRIPTION_REQUIRED, TRUSTED_TIMER_REQUIRED,
+        TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
     orchestration::{
         AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver,
@@ -549,21 +549,6 @@ struct FixtureOptions {
     plugin_source: String,
     config_mutations: Option<ConfigMutationReserver>,
     invocation_cancel: Option<CancelToken>,
-}
-
-async fn settle_legacy_reply(manager: &AgentManagerHandle, request: &CapturedRequest, reply: &str) {
-    let child = manager
-        .snapshot()
-        .into_iter()
-        .find(|node| node.parent_id.is_some())
-        .expect("legacy Session child missing");
-    let events = manager.actor(child.agent_id).unwrap().subscribe_events();
-    request.reply.send(common::canned_reply(reply)).unwrap();
-    bounded(
-        async { while !matches!(events.recv_async().await.unwrap(), ActorEvent::Idle { .. }) {} },
-        "legacy Session idle publication",
-    )
-    .await;
 }
 
 async fn wait_for_child_reclamation(manager: &AgentManagerHandle, operation: &str) {
@@ -1488,35 +1473,24 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
                 handler = function(_, ctx)
                     local opts = {{ inherit_provider = true, silent = true, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}
                     local before = #assert(maki.agent.list(ctx))
-                    for _, constructor in ipairs({{ maki.agent.spawn, maki.agent.session }}) do
-                        local child, err = constructor(ctx, opts)
-                        assert(child == nil and err == {POLICY_ERROR:?}, err)
-                        assert(#assert(maki.agent.list(ctx)) == before)
-                    end
+                    local rejected, policy_err = maki.agent.spawn(ctx, opts)
+                    assert(rejected == nil and policy_err == {POLICY_ERROR:?}, policy_err)
+                    assert(#assert(maki.agent.list(ctx)) == before)
                     local root = assert(maki.agent.current(ctx))
                     assert(root:set_mode(ctx, "{ALLOWED_MODE}") == "{ALLOWED_MODE}")
                     local child = assert(maki.agent.spawn(ctx, opts))
                     local mode, err = child:set_mode(ctx, "{DENIED_MODE}")
                     assert(mode == nil and err == {POLICY_ERROR:?}, err)
                     assert(child:mode(ctx) == "{ALLOWED_MODE}")
+                    local controlled = assert(maki.agent.get(ctx, assert(child:ref())))
+                    local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
+                    assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
+                    assert(controlled:mode(ctx) == "{ALLOWED_MODE}")
                     local turn = assert(child:send(ctx, "required schema under allowed mode"))
                     local result = assert(turn:wait(ctx))
                     assert(result.status == "completed" and result.captured.answer == 42)
                     assert(child:close(ctx))
                     assert(assert(turn:result(ctx)).captured.answer == 42)
-                    local session = assert(maki.agent.session(ctx, opts))
-                    local found = false
-                    for _, reference in ipairs(assert(maki.agent.list(ctx))) do
-                        if reference:id() ~= root:id() then
-                            local controlled = assert(maki.agent.get(ctx, reference))
-                            local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
-                            assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
-                            assert(controlled:mode(ctx) == "{ALLOWED_MODE}")
-                            found = true
-                        end
-                    end
-                    assert(found)
-                    assert(session:close())
                 end,
             }})
         "#)).unwrap();
@@ -3753,315 +3727,80 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
 }
 
 #[test]
-fn retained_unmanaged_tool_context_cannot_authorize_another_invocation() {
-    let registry = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_session_provider_preparer(
-        Arc::clone(&registry),
-        Default::default(),
-        true,
-        Arc::new(InMemoryFs::new()),
-        None,
-        None,
-    )
-    .unwrap();
-    host.load_source("pr5_unmanaged_origin", &format!(r#"
-        local retained
-        maki.api.register_tool({{
-            name = "pr5_origin_capture", description = "retain an unmanaged invocation context",
-            schema = {{ type = "object", properties = {{}} }},
-            handler = function(_, ctx) retained = ctx; return "captured" end,
-        }})
-        maki.api.register_tool({{
-            name = "pr5_origin_check", description = "reject a context from another invocation",
-            schema = {{ type = "object", properties = {{}} }},
-            handler = function(_, ctx)
-                local stale, stale_err = maki.agent.spawn(retained, {{ inherit_provider = true, tools = {{}} }})
-                assert(stale == nil and stale_err == {INVOCATION_EXPIRED:?}, stale_err)
-                local fresh = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                local ticket = assert(fresh:send(ctx, "fresh unmanaged context"))
-                assert(assert(ticket:wait(ctx)).text == "fresh reply")
-                assert(fresh:close(ctx))
-                return "origin rejected"
-            end,
-        }})
-    "#)).unwrap();
-    let (context, _events, _cancel) =
-        common::ctx_with_replies(vec![common::canned_reply("fresh reply")]);
-    assert_eq!(
-        common::exec_tool_text(&registry, &context, "pr5_origin_capture", json!({})).unwrap(),
-        "captured"
-    );
-    assert_eq!(
-        common::exec_tool_text(&registry, &context, "pr5_origin_check", json!({})).unwrap(),
-        "origin rejected"
-    );
-}
-
-#[test]
-fn trusted_legacy_session_survives_commands_but_not_plugin_reload() {
+fn retained_tool_context_cannot_authorize_another_invocation() {
+    const TOOL: &str = "pr5_origin_check";
+    const PROMPT: &str = "fresh managed context";
+    const REPLY: &str = "fresh reply";
     smol::block_on(async {
-        const OWNER: &str = "pr6_legacy_session_owner";
-        const FOREIGN: &str = "pr6_legacy_session_foreign";
-        const CREATE: &str = "/pr6_legacy_session_create";
-        const SEND: &str = "/pr6_legacy_session_send";
-        const DENIED: &str = "/pr6_legacy_session_denied";
-        const REVOKED: &str = "/pr6_legacy_session_revoked";
-        const REPLY: &str = "trusted legacy reply";
-        const CHECKPOINT: &str = "trusted legacy status checkpoint";
-        const GENERATION_ERROR: &str = "session belongs to another plugin generation";
-        let fixture = Fixture::start("pr6_legacy_session_root", "");
-        assert_eq!(
-            bounded(fixture.completed.recv_async(), "legacy root completion")
-                .await
-                .unwrap(),
-            Ok(())
-        );
-        let handle = fixture._host.event_handle();
-        fixture._host.load_source(OWNER, &format!(r#"
-            maki.api.register_command({{
-                name = "{CREATE}", tui_only = false,
-                handler = function(_, ctx)
-                    local session = assert(maki.agent.session(ctx, {{
-                        inherit_provider = true, silent = true, auto_deliver = false, tools = {{}},
-                    }}))
-                    maki.store.register("pr6_legacy_sessions", "owner", session)
-                    assert(assert(session:prompt("create trusted legacy session")).text == "{REPLY}")
-                    local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                    assert(assert(checkpoint:prompt(ctx, "{CHECKPOINT}")).text == "{CHECKPOINT}")
-                    assert(checkpoint:close(ctx))
-                    local status = assert(session:status())
-                    assert(status.status == "done" and status.result and status.result.text == "{REPLY}", maki.json.encode(status))
-                end,
-            }})
-            maki.api.register_command({{
-                name = "{SEND}", tui_only = false,
-                handler = function()
-                    local session = assert(maki.store.collect("pr6_legacy_sessions").owner)
-                    assert(session:send("later trusted legacy command"))
-                    assert(assert(session:status()).status == "running")
-                end,
-            }})
-        "#)).unwrap();
-        let run = |plugin: &str, command: &str| {
-            handle.run_command_for_test(Arc::from(plugin), Arc::from(command), String::new(), 0)
-        };
-        let created = run(OWNER, CREATE);
-        let request = request_with_command_diagnostics(
-            &fixture.requests,
-            &created,
-            "trusted legacy creation request",
-        )
-        .await;
-        assert!(
-            serde_json::to_string(&request.messages)
-                .unwrap()
-                .contains("create trusted legacy session")
-        );
-        settle_legacy_reply(&fixture.manager, &request, REPLY).await;
-        let checkpoint = request_with_command_diagnostics(
-            &fixture.requests,
-            &created,
-            "trusted legacy status checkpoint",
-        )
-        .await;
-        assert!(
-            serde_json::to_string(&checkpoint.messages)
-                .unwrap()
-                .contains(CHECKPOINT)
-        );
-        checkpoint
-            .reply
-            .send(common::canned_reply(CHECKPOINT))
-            .unwrap();
-        assert_eq!(created.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
-        assert_eq!(run(OWNER, SEND).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
-        let gated = bounded(fixture.requests.recv_async(), "later legacy send request")
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_string(&gated.messages)
-                .unwrap()
-                .contains("later trusted legacy command")
-        );
-        let denied_source = format!(
-            r#"
-            local retained = assert(maki.store.collect("pr6_legacy_sessions").owner)
-            maki.api.register_command({{
-                name = "{DENIED}", tui_only = false,
-                handler = function()
-                    local session = retained
-                    for _, operation in ipairs({{ "send", "prompt", "status", "close" }}) do
-                        local value, err = session[operation](session, "forbidden legacy request")
-                        assert(value == nil and err == "{GENERATION_ERROR}", tostring(err))
-                    end
-                end,
-            }})
-        "#
-        );
-        fixture
-            ._host
-            .load_source(
-                FOREIGN,
-                &format!(
-                    "{denied_source}\nmaki.store.register('pr6_legacy_sessions', 'retained', retained)"
-                ),
-            )
-            .unwrap();
-        assert_eq!(
-            run(FOREIGN, DENIED).recv_timeout(TEST_TIMEOUT).unwrap(),
-            Ok(())
-        );
-        assert!(!gated.reply.is_disconnected());
-        assert!(
-            fixture.requests.is_empty(),
-            "foreign Session admitted a request"
-        );
-        fixture
-            ._host
-            .queue_load_source_for_test(
-                OWNER,
-                &denied_source
-                    .replace(DENIED, REVOKED)
-                    .replace(".owner)", ".retained)"),
-            )
-            .unwrap()
-            .recv_timeout(TEST_TIMEOUT)
-            .unwrap()
-            .unwrap();
-        wait_for_gate_drop(&gated, "legacy Session reload cancellation").await;
-        assert_eq!(
-            run(OWNER, REVOKED).recv_timeout(TEST_TIMEOUT).unwrap(),
-            Ok(())
-        );
-        wait_for_child_reclamation(
-            &fixture.manager,
-            "reload closes retained legacy Session child",
-        )
-        .await;
-        assert!(
-            fixture.requests.is_empty(),
-            "revoked Session admitted a request"
-        );
-        shutdown_manager(&fixture.manager).await;
-    });
-}
-
-#[test_case::test_case(false; "other_plugins")]
-#[test_case::test_case(true; "owner_reload")]
-fn delegated_legacy_session_expires_after_creating_managed_turn(reload: bool) {
-    smol::block_on(async {
-        const TOOL: &str = "pr6_delegated_legacy_session";
-        const CHECK: &str = "/pr6_delegated_legacy_expired";
-        const REPLY: &str = "delegated legacy reply";
-        const CHECKPOINT: &str = "delegated legacy status checkpoint";
-        const OTHER_PLUGIN: &str = "pr6_delegated_unrelated_plugin";
-        const SESSION_GENERATION_ERROR: &str = "session belongs to another plugin generation";
-        let checker_source = format!(
-            r#"
-            maki.api.register_command({{
-                name = "{CHECK}", tui_only = false,
-                handler = function()
-                    local session = assert(maki.store.collect("pr6_delegated_sessions").retained)
-                    for _, operation in ipairs({{ "send", "prompt", "status", "close" }}) do
-                        local value, err = session[operation](session, "expired legacy request")
-                        assert(value == nil and err == {MANAGED_AUTHORITY_INACTIVE:?}, tostring(err))
-                    end
-                end,
-            }})
-        "#
-        );
         let fixture = Fixture::start_with_options(
             TOOL,
             FixtureOptions {
-                plugin_source: checker_source.clone(),
-                bundled_tasks: true,
+                plugin_source: "local retained".into(),
                 ..Default::default()
             },
             &format!(
                 r#"
-            local session = assert(maki.agent.session(ctx, {{
-                inherit_provider = true, silent = true, auto_deliver = false, tools = {{}},
-            }}))
-            maki.store.register("pr6_delegated_sessions", "retained", session)
-            assert(assert(session:prompt("delegated legacy request")).text == "{REPLY}")
-            local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            assert(assert(checkpoint:prompt(ctx, "{CHECKPOINT}")).text == "{CHECKPOINT}")
-            assert(checkpoint:close(ctx))
-            local status = assert(session:status())
-            assert(status.status == "done" and status.result and status.result.text == "{REPLY}", maki.json.encode(status))
-        "#
+                if retained == nil then
+                    retained = ctx
+                else
+                    local before = #assert(maki.agent.list(ctx))
+                    local stale, stale_err = maki.agent.spawn(retained, {{ inherit_provider = true, tools = {{}} }})
+                    assert(stale == nil and stale_err == {INVOCATION_EXPIRED:?}, stale_err)
+                    assert(#assert(maki.agent.list(ctx)) == before)
+                    local fresh = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+                    local ticket = assert(fresh:send(ctx, "{PROMPT}"))
+                    assert(assert(ticket:wait(ctx)).text == "{REPLY}")
+                    assert(fresh:close(ctx))
+                end
+            "#
             ),
         );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "context capture")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert!(matches!(
+            bounded(fixture.root_ticket.wait(), "context capture settlement").await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert!(fixture.requests.is_empty());
+        assert_eq!(fixture.manager.snapshot().len(), 1);
+        let ticket = fixture
+            .manager
+            .root()
+            .unwrap()
+            .actor()
+            .unwrap()
+            .admit_turn(
+                AgentInput {
+                    message: PROMPT.into(),
+                    mode: AgentMode::Build,
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
+                    fast: false,
+                    workflow: false,
+                    prompt: None,
+                    cancel: None,
+                },
+                None,
+                TOOL.into(),
+            )
+            .unwrap();
         let request = fixture.request().await;
         assert!(
             serde_json::to_string(&request.messages)
                 .unwrap()
-                .contains("delegated legacy request")
+                .contains(PROMPT)
         );
-        settle_legacy_reply(&fixture.manager, &request, REPLY).await;
-        let checkpoint = fixture.request().await;
-        assert!(
-            serde_json::to_string(&checkpoint.messages)
-                .unwrap()
-                .contains(CHECKPOINT)
-        );
-        checkpoint
-            .reply
-            .send(common::canned_reply(CHECKPOINT))
-            .unwrap();
-        assert_eq!(
-            bounded(
-                fixture.completed.recv_async(),
-                "delegated legacy tool completion"
-            )
-            .await
-            .unwrap(),
-            Ok(())
-        );
+        request.reply.send(common::canned_reply(REPLY)).unwrap();
         assert!(matches!(
-            bounded(
-                fixture.root_ticket.wait(),
-                "delegated legacy turn settlement"
-            )
-            .await,
-            TurnOutcome::Completed { turn_id, .. } if turn_id == fixture.root_ticket.turn_id()
+            bounded(ticket.wait(), "fresh context settlement").await,
+            TurnOutcome::Completed { .. }
         ));
-        fixture
-            ._host
-            .load_source(
-                OTHER_PLUGIN,
-                r#"
-                local retained = assert(maki.store.collect("pr6_delegated_sessions").retained)
-                maki.store.register("pr6_delegated_sessions", "across_reload", retained)
-                "#,
-            )
-            .unwrap();
-        let run = || {
-            fixture
-                ._host
-                .event_handle()
-                .run_command_for_test(Arc::from(TOOL), Arc::from(CHECK), String::new(), 0)
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap()
-        };
-        assert_eq!(run(), Ok(()));
-        if reload {
-            fixture
-                ._host
-                .load_source(
-                    TOOL,
-                    &checker_source
-                        .replace(MANAGED_AUTHORITY_INACTIVE, SESSION_GENERATION_ERROR)
-                        .replace(".retained)", ".across_reload)"),
-                )
-                .unwrap();
-            assert_eq!(run(), Ok(()));
-        }
-        assert!(
-            fixture.requests.is_empty(),
-            "expired Session admitted a request"
-        );
-        shutdown_manager(&fixture.manager).await;
+        fixture.finish().await;
     });
 }
 
@@ -4328,7 +4067,8 @@ fn public_output_schema_missing_reports_exhaust_bounded_nudges() {
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
                 output_schema = { type = "object", properties = {}, additionalProperties = false },
             }))
-            local result = assert(assert(child:send(ctx, "never report")):wait(ctx))
+            local result, err = child:prompt(ctx, "never report")
+            assert(result ~= nil and err == nil)
             assert(result.status == "failed" and #result.output == 0)
             assert(result.error:find("without calling structured_output", 1, true))
             assert(child:close(ctx))
@@ -4655,9 +4395,8 @@ fn public_agent_ticket_cancel_stops_gated_request_and_keeps_actor_reusable() {
     });
 }
 
-#[test_case::test_case(true; "capture_input")]
-#[test_case::test_case(false; "explicit_report")]
-fn inherited_local_capture_belongs_to_executing_grandchild(capture_input: bool) {
+#[test]
+fn inherited_local_capture_belongs_to_executing_grandchild() {
     smol::block_on(async {
         let fixture = Fixture::start_with_options(
             "pr6_nested_capture",
@@ -4665,24 +4404,19 @@ fn inherited_local_capture_belongs_to_executing_grandchild(capture_input: bool) 
                 nested_capture: true,
                 ..Default::default()
             },
-            &format!(
-                r#"
-            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true,
-                tools = {{ {{ name = "pr6_spawn_grandchild", description = "spawn grandchild", input_schema = {{ type = "object" }} }} }},
-                local_tools = {{ inherited_capture = {{
-                    description = "capture answer", input_schema = {{ type = "object" }},
-                    capture_input = {capture_input},
-                    handler = function(input)
-                        if not {capture_input} then assert(maki.agent.report_task_result(input)) end
-                        return "captured"
-                    end,
-                }} }},
-            }}))
+            r#"
+            local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
+                tools = { { name = "pr6_spawn_grandchild", description = "spawn grandchild", input_schema = { type = "object" } } },
+                local_tools = { inherited_capture = {
+                    description = "capture answer", input_schema = { type = "object" },
+                    capture_input = true,
+                    handler = function() return "captured" end,
+                } },
+            }))
             local result = assert(assert(child:send(ctx, "spawn grandchild")):wait(ctx))
             assert(result.captured == nil and #result.output == 0, "grandchild capture leaked into parent")
             assert(child:close(ctx))
-        "#
-            ),
+        "#,
         );
         fixture
             .request()

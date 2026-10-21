@@ -90,7 +90,6 @@ The rules:
 | [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
-| [`maki.agent.Session`](#maki-agent-Session) | A compatibility subagent session with its own conversation history. |
 | [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning agent handle. |
 | [`maki.agent.AgentRef`](#maki-agent-AgentRef) | Visibility-only identity. |
 | [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | A revocable subscription. |
@@ -1241,20 +1240,20 @@ Subagent primitives for plugins that need to talk to an LLM.
 
 This module gives you the building blocks: resolve which model to use,
 build a system prompt, list available tools, call a tool directly, or
-open a full session with its own conversation history.
+spawn an agent with its own conversation history.
 
 Policy like retries, validation, and concurrency lives in the calling
 plugin, not here.
 
 ```lua
 local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-local sess = maki.agent.session(ctx, {
+local agent = assert(maki.agent.spawn(ctx, {
   system = "You are a helpful assistant.",
   tools = tools,
-})
-local r = sess:prompt("Hello!")
+}))
+local r = assert(agent:prompt(ctx, "Hello!"))
 print(r.text)
-sess:close()
+agent:close(ctx)
 ```
 
 ---
@@ -1336,7 +1335,7 @@ maki.agent.tools({ctx}, {opts})
 ```
 
 Get the list of tool definitions for a given audience. Pass the result
-straight into `maki.agent.session()` or use it to inspect what tools are
+straight into `maki.agent.spawn()` or use it to inspect what tools are
 available.
 
 **Parameters:**
@@ -1512,104 +1511,6 @@ than caching it.
 
 ---
 
-### `maki.agent.session()` {#maki-agent-session}
-
-```lua
-maki.agent.session({ctx}, {opts})
-```
-
-Create a new subagent session. The session inherits the parent model and
-MCP handle unless you override them. You get back a `Session` object that
-you can send messages to with `:prompt()`.
-
-Trusted sessions remain usable by same-plugin handlers until host/plugin
-revocation. Tool-created sessions expire when their creating invocation ends.
-Passing a Session to another coroutine does not transfer authority.
-
-This is the main way to spin up a sub-conversation with its own history
-and tool set.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
-- `{opts}` (`table`) Optional fields:
-  - `model` (`string|table?`) a spec string or a `{spec, thinking, fast}`
-    selection, validated like `Agent:set_model`. Omitted fields inherit the
-    parent's; thinking is capped at the parent's level. A query result from
-    `Agent:model` can be passed as is.
-  - `system` (`string?`) custom text appended after the admitted mode's prompt contribution. Defaults to empty; does not inherit the parent's full system prompt.
-  - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
-  - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
-    requires `description` (string), `input_schema` (table), and
-    `handler` (function). The handler receives the input table and must return
-    `(string)` or `(nil, err)`. Set `capture_input` to surface a successful
-    call's input as `captured` in the turn result.
-  - `name` (`string?`) display name for logs and UI.
-  - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
-  - `mcp` (`boolean?`) give the session access to MCP tools. Their
-    definitions are injected automatically each turn (deferred behind
-    `tool_search`), so don't put MCP definitions in `tools`. The session
-    starts with no loaded tools of its own. Default: `true`.
-  - `inherit_provider` (`boolean?`) reuse the parent model and provider instead
-    of building one from `model.spec`. Used by tests (and tools that want to
-    thread a caller-provided provider) to drive a real spawned session without
-    hitting the network. `model.spec` is ignored when this is `true`. Default: `false`.
-  - `silent` (`boolean?`) do not relay the session's turns, annotations, or
-    usage into the parent session's UI or event stream. The session still
-    completes and `:prompt()` still returns its result (including a commit
-    set via a `local_tools` handler). Use for hidden one-shot classification.
-  - `show` (`boolean|string?`) post a row for the session in its parent's
-    chat; a string adds a description. Default: `true` for trusted parents,
-    `false` otherwise. Silent sessions and sessions opened by a tool call,
-    which already have a tool row, cannot be shown.
-  - `auto_deliver` (`boolean?`) for managed children, queue a structured
-    lifecycle observation per settled turn to the recorded parent, independently
-    of `prompt()` or ticket waits. Nested children notify their own parent,
-    and a managed child's turn does not settle while a child reporting to it
-    is still running, unless its request budget runs out. Silent children
-    disable delivery. Rejection and discard are observable in
-    host logs; delivery is in-memory, without retry. Default: `true`.
-  - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
-    driver immediately before each unmanaged turn and released when that turn
-    ends. Managed sessions ignore it and use the parent manager's limit.
-
-  Any other option key is an error.
-
-
-**Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
-
-**Example:**
-
-```lua
-local tools = maki.agent.tools(ctx, { audience = "general_sub" })
-local sess, err = maki.agent.session(ctx, {
-  system = "You are a research assistant.",
-  tools = tools,
-  name = "researcher",
-})
-if err then error(err) end
-local result = sess:prompt("Summarize this file.")
-sess:close()
-```
-
----
-
-### `maki.agent.report_task_result()` {#maki-agent-report_task_result}
-
-```lua
-maki.agent.report_task_result({value})
-```
-
-Commit a result to the session whose local tool is currently executing.
-
-**Parameters:**
-
-- `{value}` (`table`) The result to commit.
-
-**Returns:** (`boolean?`, `string?`) `true` while a session-local tool is active.
-
----
-
 ### `maki.agent.current()` {#maki-agent-current}
 
 ```lua
@@ -1654,7 +1555,7 @@ List accessible live agents in this context's graph.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Array of visibility-only AgentRef values. Visibility does not grant control. Non-TUI hosts include their root and accessible live plugin-owned standalone children.
+**Returns:** (`table?`, `string?`) Array of visibility-only AgentRef values. Visibility does not grant control.
 
 ---
 
@@ -1686,8 +1587,7 @@ Spawn a child with a copy of its parent's configuration.
 Omitted tools inherit the parent's capability-filtered request tools and
 cannot widen the parent's audience or mode policy. `tools = {}` excludes
 all request tools. Explicit tools select the child's request definitions.
-Unlike spawn, the compatibility Session API defaults to no request tools.
-Unmanaged children use the current host task's authority, not a managed graph.
+Requires an active managed turn or a trusted manager-backed parent.
 
 **Parameters:**
 
@@ -1700,7 +1600,7 @@ Unmanaged children use the current host task's authority, not a managed graph.
   - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
   - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
     handler(input), and optional capture_input for successful input capture.
-  - `name` (`string`) display name. audience (string): defaults to "general_sub";
+  - `name` (`string`) display name. audience (string): defaults to the parent's audience;
     the child cannot widen the parent's capability ceiling.
   - `mcp` (`boolean`) defaults to true, subject to inherited restrictions.
   - `output_schema` (`table`) validated before creation; requires a valid final
@@ -1710,12 +1610,9 @@ Unmanaged children use the current host task's authority, not a managed graph.
     a string adds a description. Defaults to true for trusted parents and
     false otherwise. Silent children and children spawned by a tool call,
     which already have a tool row, cannot be shown.
-  - `auto_deliver` (`boolean`) defaults to true; managed children notify their
-    recorded parent once per settled turn. A wait in the
-    parent's own turn returns the result directly and withdraws the
-    queued notification.
-  - `semaphore` (`maki.async.Semaphore`) unmanaged concurrency limit; managed
-    children use their manager's capacity instead.
+  - `auto_deliver` (`boolean`) defaults to true; children notify their recorded
+    parent once per settled turn. A wait in the parent's own turn returns
+    the result directly and withdraws the queued notification.
   - `inherit_provider` (`boolean`) defaults to false; reuse the caller's provider
     and model, ignoring model.spec, when true.
 
@@ -1723,124 +1620,6 @@ Unmanaged children use the current host task's authority, not a managed graph.
 
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
-
-
-## maki.agent.Session {#maki-agent-Session}
-
-A compatibility subagent session with its own conversation history.
-Context-free methods validate current host-assigned coroutine authority.
-Trusted-created sessions require the same plugin and host generation;
-delegated-created sessions expire with their creating invocation.
-Operations cannot widen the immutable creation policy ceiling. Plugin
-revocation cancels owned work; passing userdata does not transfer authority.
-
-Create one with `maki.agent.session()`, then send messages with
-`:prompt()` or `:send()`. The session remembers previous turns, so you
-can have a multi-step conversation. Call `:close()` when you are done,
-or let garbage collection handle it.
-
----
-
-### `Session:prompt()` {#Session-prompt}
-
-```lua
-Session:prompt({message}, {opts?})
-```
-
-Send a message to the subagent and wait for its full response. The agent
-loop runs to completion, calling tools as needed. Conversation history is
-kept across calls, so you can have a multi-turn conversation. This is a
-blocking compatibility wrapper over `send` + the completion notifier; the
-async `send`/`status` pair is preferred for background work.
-
-In a managed invocation, `prompt` validates the current turn and temporarily
-yields its manager permit while the child runs. Without a current managed
-invocation, the same managed session uses an ordinary exact-turn wait. The
-child still uses manager capacity, but no parent permit is yielded. A timeout
-closes the child's managed subtree.
-
-The returned table has fields: `text` (string), `captured` (optional value),
-`input_tokens` (integer), `output_tokens` (integer). Counters are cumulative
-for the session, unlike AgentTurn's per-turn counters. `text` is an empty
-string when the subagent produced no text block (e.g. it only called
-tools).
-
-**Parameters:**
-
-- `{message}` (`string`) User message to send.
-- `{opts?}` (`table?`) Optional fields:
-  - `timeout` (`integer?`) maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
-
-**Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
-failure. A run cut short after streaming some text hands you both: the
-error and a `{ text = <what it streamed> }` table.
-
-**Example:**
-
-```lua
-local r, err = sess:prompt("What files are in this project?")
-if err then error(err) end
-print(r.text)
-print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
-```
-
----
-
-### `Session:send()` {#Session-send}
-
-```lua
-Session:send({message})
-```
-
-Non-blocking: enqueue a message to the subagent's driver and return
-immediately. Poll `status()` for the result.
-
-**Parameters:**
-
-- `{message}` (`string`) User message to send.
-
-**Returns:** (`boolean?`, `string?`) `true` on success, or `(nil, err)` if the session is closed.
-
----
-
-### `Session:status()` {#Session-status}
-
-```lua
-Session:status()
-```
-
-Read the subagent's current status without blocking.
-
-**Returns:** (`table?`, `string?`) Table with status ("running", "done", or "closed").
-  When done, result contains text, input_tokens, output_tokens (cumulative
-  session counters), and optional captured. error is present on failure or
-  cancellation; retryable is present on failure. Authority failure returns nil
-  and an error instead of a status table.
-
----
-
-### `Session:close()` {#Session-close}
-
-```lua
-Session:close()
-```
-
-Close the session and flush its history back to the parent agent. You can
-call this multiple times safely. If you forget, it runs automatically when
-the session is garbage collected. Firing the cancel token wakes the driver
-so it flushes, even if it is parked on the input queue.
-
----
-
-### `Session:session_id()` {#Session-session_id}
-
-```lua
-Session:session_id()
-```
-
-Return this session's stable id, used as a `task_id` by the task plugin.
-
-**Returns:** (`string`) The session's id.
 
 
 ## maki.agent.Agent {#maki-agent-Agent}

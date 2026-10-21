@@ -1,24 +1,21 @@
 mod agent_methods;
 mod authority;
 mod module_fns;
-mod projection;
+pub(super) mod projection;
 mod subscriptions;
 mod tickets;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use maki_agent::actor::ActorLifecycle;
-use maki_agent::cancel::CancelMap;
 use maki_agent::{AgentActorHandle, AgentId, AgentManagerHandle, AgentRef, TurnTicket};
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::Lua;
 
-use crate::agent_errors::OTHER_RUNTIME;
-use crate::api::agent::{LuaActorState, LuaSession, SessionOwners};
+use crate::api::agent::{LuaActorState, LuaSession};
 use crate::api::util::pair::Pair;
 use crate::host_root::{HostRootRef, HostRootServices, UNSUPPORTED_OPERATION_ERROR};
-use crate::orchestration::{PluginAuthority, plugin_authority};
 
 pub(crate) use agent_methods::{AGENT_DOCS, agent_defer_close};
 pub(crate) use module_fns::{current, focused_agent_ref};
@@ -36,14 +33,6 @@ enum AgentRuntime {
         reference: HostRootRef,
     },
     Managed(AgentManagerHandle),
-    Unmanaged {
-        actor: Arc<AgentActorHandle>,
-        state: Arc<LuaActorState>,
-        parent: Arc<CancelMap<String>>,
-        plugin: Arc<str>,
-        generation: u64,
-        owner: Arc<PluginAuthority>,
-    },
 }
 
 impl AgentRuntime {
@@ -51,24 +40,6 @@ impl AgentRuntime {
         Self::HostRoot {
             reference: services.reference(),
             services,
-        }
-    }
-
-    fn unmanaged(
-        lua: &Lua,
-        actor: Arc<AgentActorHandle>,
-        state: Arc<LuaActorState>,
-        parent: Arc<CancelMap<String>>,
-        plugin: Arc<str>,
-        generation: u64,
-    ) -> Self {
-        Self::Unmanaged {
-            actor,
-            state,
-            parent,
-            owner: plugin_authority(lua, plugin.clone()),
-            plugin,
-            generation,
         }
     }
 
@@ -83,7 +54,6 @@ impl AgentRuntime {
         match self {
             Self::Managed(manager) => Ok(manager),
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Unmanaged { .. } => Err("operation requires a managed graph".into()),
         }
     }
 
@@ -91,9 +61,7 @@ impl AgentRuntime {
         let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
         match self {
             Self::Managed(manager) => manager.actor(id).map_err(|error| error.to_string()),
-            Self::Unmanaged { actor, .. } if actor.agent_id() == id => Ok(actor.as_ref().clone()),
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Unmanaged { .. } => Err(OTHER_RUNTIME.into()),
         }
     }
 
@@ -109,10 +77,6 @@ impl AgentRuntime {
         match self {
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
             Self::Managed(manager) => manager.close_subtree(id).map_err(|error| error.to_string()),
-            Self::Unmanaged { actor, state, .. } => {
-                state.close_with(actor);
-                Ok(())
-            }
         }
     }
 
@@ -121,10 +85,6 @@ impl AgentRuntime {
         match self {
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
             Self::Managed(manager) => manager.cancel_agent(id).map_err(|error| error.to_string()),
-            Self::Unmanaged { actor, .. } => {
-                actor.cancel_existing();
-                Ok(())
-            }
         }
     }
 
@@ -135,10 +95,6 @@ impl AgentRuntime {
                 .cancel_subtree(id)
                 .map_err(|error| error.to_string()),
             Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Unmanaged { actor, state, .. } => {
-                state.cancel_subtree(actor);
-                Ok(())
-            }
         }
     }
 }
@@ -203,73 +159,116 @@ struct LuaAgentTurn {
 }
 
 #[derive(Clone, Default)]
-struct AgentSessions(Arc<Mutex<HashMap<AgentId, LuaSession>>>);
+struct AgentOwners(Arc<Mutex<HashMap<AgentId, AgentOwner>>>);
 
-impl AgentSessions {
-    fn lock(&self) -> MutexGuard<'_, HashMap<AgentId, LuaSession>> {
+/// A spawned child's session handle. Dropping it closes the child and emits
+/// its ordered close notification, so the registry keeps it alive until the
+/// record is retired.
+trait SessionHold {}
+
+impl SessionHold for LuaSession {}
+
+#[cfg(test)]
+impl SessionHold for crate::api::agent::tests::BackendFixture {}
+
+struct AgentOwner {
+    plugin: Option<Arc<str>>,
+    actor: Weak<AgentActorHandle>,
+    state: Weak<LuaActorState>,
+    /// Kept alive so that dropping the record closes the child.
+    hold: Option<Box<dyn SessionHold + Send + Sync>>,
+}
+
+impl AgentOwner {
+    /// Take the hold so a caller can drop it outside the registry lock.
+    fn take_hold(&mut self) -> Option<Box<dyn SessionHold + Send + Sync>> {
+        self.hold.take()
+    }
+}
+impl AgentOwners {
+    fn lock(&self) -> MutexGuard<'_, HashMap<AgentId, AgentOwner>> {
         self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Sessions are dropped after the lock is released.
+    /// Record a spawned child, keeping its session alive until it is retired.
+    fn insert(&self, session: LuaSession, plugin: Option<Arc<str>>) {
+        let id = session.agent_id;
+        let owner = AgentOwner {
+            plugin,
+            actor: Arc::downgrade(&session.actor),
+            state: Arc::downgrade(&session.state),
+            hold: Some(Box::new(session)),
+        };
+        self.lock().insert(id, owner);
+    }
+
+    /// Record a spawned child whose session handle is not a `LuaSession`.
+    #[cfg(test)]
+    fn record(
+        &self,
+        id: AgentId,
+        actor: Weak<AgentActorHandle>,
+        state: Weak<LuaActorState>,
+        hold: Box<dyn SessionHold + Send + Sync>,
+        plugin: Option<Arc<str>>,
+    ) {
+        let owner = AgentOwner {
+            plugin,
+            actor,
+            state,
+            hold: Some(hold),
+        };
+        self.lock().insert(id, owner);
+    }
+
+    /// Records are dropped after the lock is released, since dropping an
+    /// active session re-enters Lua.
     fn retire(&self, id: AgentId) {
-        let retired = self.lock().remove(&id);
+        let retired = self.lock().get_mut(&id).and_then(AgentOwner::take_hold);
         drop(retired);
     }
 
     fn retire_settled(&self) {
         let retired: Vec<_> = self
             .lock()
-            .extract_if(|_, session| session_settled_closed(session))
+            .extract_if(|_, owner| owner.settled_closed())
             .collect();
         drop(retired);
     }
+
+    fn state(&self, id: AgentId) -> Option<Arc<LuaActorState>> {
+        self.lock().get(&id).and_then(|owner| owner.state.upgrade())
+    }
 }
 
-#[derive(Default)]
-struct AgentOwners(HashMap<AgentId, Arc<str>>);
+impl AgentOwner {
+    fn settled_closed(&self) -> bool {
+        let Some(actor) = self.actor.upgrade() else {
+            return true;
+        };
+        let snapshot = actor.snapshot();
+        snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
+    }
+}
 
 pub(super) fn close_plugin_agents(lua: &Lua, plugin: &str) {
-    let ids: Vec<_> = {
-        let Some(mut owners) = lua.app_data_mut::<AgentOwners>() else {
-            return;
-        };
-        owners
-            .0
-            .extract_if(|_, owner| owner.as_ref() == plugin)
-            .map(|(id, _)| id)
-            .collect()
+    let Some(owners) = lua
+        .app_data_ref::<AgentOwners>()
+        .map(|owners| owners.clone())
+    else {
+        return;
     };
-    let retired = lua.app_data_ref::<AgentSessions>().map(|sessions| {
-        let mut sessions = sessions.lock();
-        ids.into_iter()
-            .filter_map(|id| sessions.remove(&id))
-            .collect::<Vec<_>>()
-    });
+    let retired: Vec<_> = owners
+        .lock()
+        .extract_if(|_, owner| owner.plugin.as_deref() == Some(plugin))
+        .map(|(_, owner)| owner)
+        .collect();
     drop(retired);
 }
 
-fn session_settled_closed(session: &LuaSession) -> bool {
-    let snapshot = session.actor.snapshot();
-    snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
-}
-
 pub(super) fn session_state(lua: &Lua, id: AgentId) -> Option<Arc<LuaActorState>> {
-    lua.app_data_ref::<AgentSessions>()
-        .and_then(|sessions| {
-            sessions
-                .lock()
-                .get(&id)
-                .map(|session| Arc::clone(&session.state))
-        })
-        .or_else(|| {
-            lua.app_data_ref::<SessionOwners>().and_then(|owners| {
-                owners
-                    .0
-                    .iter()
-                    .find(|owner| owner.agent.as_ref().is_some_and(|agent| agent.id() == id))
-                    .and_then(|owner| owner.state.upgrade())
-            })
-        })
+    lua.app_data_ref::<AgentOwners>()
+        .and_then(|owners| owners.state(id))
 }
 
 /// Read a reference's stable identity.
@@ -305,16 +304,14 @@ mod tests {
     use smol::Timer;
     use test_case::test_case;
 
-    use super::authority::validate_unmanaged;
     use super::*;
     use crate::UiAction;
     use crate::agent_errors::{
-        BLANK_POST, OTHER_PLUGIN_GENERATION, SHOW_SILENT_AGENT, SHOW_TOOL_AGENT,
-        UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION,
+        BLANK_POST, SHOW_SILENT_AGENT, SHOW_TOOL_AGENT, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION,
     };
     use crate::api::agent::structured_output::{StructuredOutput, TOOL_NAME};
     use crate::api::agent::tests::{
-        StreamOnceProvider, canned_reply_with_usage, session_with_provider,
+        HangingProvider, StreamOnceProvider, canned_reply_with_usage, session_with_provider,
         session_with_provider_for_agent,
     };
     use crate::api::agent::{LuaActorBackend, create_agent_table};
@@ -331,7 +328,6 @@ mod tests {
     pub(super) const REPLY: &str = "retained reply";
     pub(super) const RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
     const PLUGIN: &str = "agent-test";
-    const FOREIGN_PLUGIN: &str = "foreign-agent-test";
     const EDITOR_PATH: &str = "plan.md";
 
     struct EditorCommandHost;
@@ -345,7 +341,7 @@ mod tests {
     fn plugin_scope(lua: &Lua, plugin: &str) -> TaskScope {
         let scope = TaskScope::detached(lua);
         let plugin: Arc<str> = Arc::from(plugin);
-        let current = plugin_authority(lua, plugin.clone());
+        let current = crate::orchestration::plugin_authority(lua, plugin.clone());
         let owner = if current.is_alive() {
             current
         } else {
@@ -383,45 +379,48 @@ mod tests {
     }
 
     #[test]
-    fn standalone_current_returns_execution_child_not_installed_root() {
+    fn standalone_child_registration_is_rejected() {
         let lua = Lua::new();
         crate::orchestration::install_plugin_authority(&lua, Arc::from("child-tool"));
         let scope = TaskScope::detached(&lua);
         let provider = Arc::new(StreamOnceProvider::new_replies(Vec::new()));
-        let (actor, state, session, _) = session_with_provider(provider, None, None);
-        let id = session.agent_id;
-        let mut context = stub_ctx(&AgentMode::Build);
-        let services = Arc::new(HostRootServices::fixed(
+        let (actor, state, session, _) = session_with_provider(provider, None);
+        let id = actor.agent_id();
+        let service = Arc::new(HostRootServices::fixed(
             AgentId::generate(),
-            &context.model,
+            &stub_ctx(&AgentMode::Build).model,
             RequestOptions::default(),
             Arc::new(ModelPolicy::default()),
         ));
         lua.set_app_data(HostRootServicesSlot {
-            services: Some(services),
-            template: Some(context.clone()),
+            services: Some(service),
+            template: Some(stub_ctx(&AgentMode::Build)),
         });
+        let mut context = stub_ctx(&AgentMode::Build);
         context.ledger = state.params.get().unwrap().ledger.clone();
-        lua.set_app_data(AgentSessions(Arc::new(Mutex::new(HashMap::from([(
-            id, session,
-        )])))));
+        let owners = AgentOwners::default();
+        owners.record(
+            id,
+            Arc::downgrade(&actor),
+            Arc::downgrade(&state),
+            Box::new(session),
+            Some(Arc::from("child-tool")),
+        );
+        lua.set_app_data(owners);
         let mut ctx = LuaCtx::handler(&context);
         ctx.pin_host_root(&lua);
         ctx.bind_origin(scope.handle());
-        let plugin: Arc<str> = Arc::from("child-tool");
-        lock_cell(scope.handle()).plugin_origin = Some((plugin, 0));
+        lock_cell(scope.handle()).plugin_origin = Some((Arc::from("child-tool"), 0));
         lock_cell(scope.handle()).delegated_tool = Some(Default::default());
         let userdata = lua.create_userdata(ctx).unwrap();
         let (child, error) = current(&lua, userdata.borrow().unwrap()).unwrap();
-        assert!(error.is_none(), "{error:?}");
-        let child = child.unwrap();
-        assert_eq!(child.id, Some(id));
-        assert!(matches!(child.manager, AgentRuntime::Unmanaged { .. }));
+        assert!(error.is_some(), "bare host root must not resolve an agent");
+        assert!(child.is_none());
         actor.close();
     }
 
     #[test]
-    fn spawn_inherits_defaults_while_legacy_session_keeps_empty_tools() {
+    fn spawn_inherits_defaults_while_a_bare_root_cannot_spawn() {
         smol::block_on(async {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
@@ -461,23 +460,16 @@ mod tests {
                 &context.config,
                 &context.model,
             ));
-            let mut ctx = LuaCtx::handler(&context);
-            ctx.bind_origin(scope.handle());
-            lua.globals().set("ctx", ctx).unwrap();
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
-            let child: AnyUserData = scope
-                .scope_future(
-                    lua.load(
-                        r#"
+            let root = install_managed_root(&lua, &context);
+            let spawn_child = lua.load(
+                r#"
                 return assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
             "#,
-                    )
-                    .eval_async(),
-                )
-                .await
-                .unwrap();
+            );
+            let child: AnyUserData = scope.scope_future(spawn_child.eval_async()).await.unwrap();
             let child = child.borrow::<LuaAgent>().unwrap();
             let state = child.state.as_ref().unwrap();
             let template = state.template.get().unwrap();
@@ -520,33 +512,13 @@ mod tests {
                     .is_empty()
             );
             empty.manager.close_subtree(empty.id).unwrap();
-            let legacy: AnyUserData = scope
-                .scope_future(
-                    lua.load(
-                        r#"
-                return assert(agent_api.session(ctx, { inherit_provider = true, silent = true }))
-            "#,
-                    )
-                    .eval_async(),
-                )
-                .await
-                .unwrap();
-            let legacy = legacy.borrow::<LuaSession>().unwrap();
-            assert!(
-                legacy
-                    .state
-                    .tools
-                    .definitions()
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
-            );
             child.manager.close_subtree(child.id).unwrap();
+            root.shutdown();
         });
     }
 
     #[test]
-    fn unmanaged_spawn_uses_actor_tickets_and_rejects_foreign_plugin_and_runtime() {
+    fn managed_child_uses_actor_tickets_and_transcript() {
         smol::block_on(async {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
@@ -555,12 +527,10 @@ mod tests {
                 canned_reply_with_usage(REPLY, TokenUsage::default()),
             ]));
             context.request_tools = Some(RequestTools::default());
-            let mut ctx = LuaCtx::handler(&context);
-            ctx.bind_origin(scope.handle());
-            lua.globals().set("ctx", ctx).unwrap();
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
+            let root = install_managed_root(&lua, &context);
             let result: String = scope
                 .scope_future(
                     lua.load(
@@ -574,8 +544,6 @@ mod tests {
                 local result = assert(ticket:wait(ctx))
                 assert(ticket:result(ctx).text == result.text)
                 assert(child:transcript(ctx, { last_messages = 100, max_bytes = 65536 }))
-                local current, current_err = agent_api.current(ctx)
-                assert(current == nil and current_err ~= nil)
                 return result.text
             "#,
                     )
@@ -586,39 +554,34 @@ mod tests {
             assert_eq!(result, REPLY);
             drop(scope);
             let fresh = plugin_scope(&lua, PLUGIN);
-            let mut ctx = LuaCtx::handler(&context);
-            ctx.bind_origin(fresh.handle());
-            lua.globals().set("ctx", ctx).unwrap();
             let retained: AnyUserData = lua.globals().get("retained_child").unwrap();
             let child = retained.borrow::<LuaAgent>().unwrap();
-            let ctx: AnyUserData = lua.globals().get("ctx").unwrap();
-            assert!(validate_unmanaged(&lua, &ctx.borrow().unwrap(), &child.manager).is_ok());
-            {
-                let foreign = plugin_scope(&lua, FOREIGN_PLUGIN);
-                let mut ctx = LuaCtx::handler(&context);
-                ctx.bind_origin(foreign.handle());
-                assert_eq!(
-                    validate_unmanaged(&lua, &ctx, &child.manager).unwrap_err(),
-                    OTHER_PLUGIN_GENERATION
-                );
-            }
-            {
-                let other_lua = Lua::new();
-                let foreign = plugin_scope(&other_lua, PLUGIN);
-                let mut ctx = LuaCtx::handler(&context);
-                ctx.bind_origin(foreign.handle());
-                assert_eq!(
-                    validate_unmanaged(&other_lua, &ctx, &child.manager).unwrap_err(),
-                    OTHER_PLUGIN_GENERATION
-                );
-            }
             drop(child);
+            // A retained handle must still close with managed authority from a
+            // later plugin scope.
+            root.trusted_ctx(&lua);
             let closed: bool = fresh
                 .scope_future(lua.load("return retained_child:close(ctx)").eval_async())
                 .await
                 .unwrap();
             assert!(closed);
+            root.shutdown();
         });
+    }
+
+    /// A minimal admitted turn input for exercising manager/actor state.
+    fn turn_input() -> maki_agent::AgentInput {
+        maki_agent::AgentInput {
+            message: "turn".into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: false,
+            workflow: false,
+            prompt: None,
+            cancel: None,
+        }
     }
 
     #[test_case(false; "cancel_keeps_descendants_open")]
@@ -626,101 +589,101 @@ mod tests {
     fn standalone_nested_subtree_lifecycle(close: bool) {
         smol::block_on(async {
             let lua = Lua::new();
-            let scope = plugin_scope(&lua, PLUGIN);
+            // The trusted context below needs an active task scope.
+            let _scope = plugin_scope(&lua, PLUGIN);
             let mut context = stub_ctx(&AgentMode::Build);
-            context.provider = Arc::new(StreamOnceProvider::new_replies(vec![
-                canned_reply_with_usage(REPLY, TokenUsage::default()),
-                canned_reply_with_usage(REPLY, TokenUsage::default()),
-            ]));
-            context.request_tools = Some(RequestTools::default());
-            lua.globals()
-                .set("agent_api", create_agent_table(&lua).unwrap())
-                .unwrap();
-            let bind = |name: &str, context: &ToolContext| {
-                let mut ctx = LuaCtx::handler(context);
-                ctx.bind_origin(scope.handle());
-                lua.globals().set(name, ctx).unwrap();
+            // A parked provider keeps the leaf's turn running for the whole
+            // test, so cancellation is observable rather than already finished.
+            context.provider = Arc::new(HangingProvider);
+            let root = install_managed_root_with(
+                &lua,
+                &context,
+                AgentLimits {
+                    // One running turn at a time, so the leaf parks with its
+                    // turn active and a queued admission behind it.
+                    max_concurrent_agent_turns: 1,
+                    ..AgentLimits::default()
+                },
+            );
+            let manager = root.manager.clone();
+            let config = maki_agent::actor::EffectiveAgentConfig::new(
+                maki_agent::RunSettings {
+                    provider: Arc::clone(&context.provider),
+                    model: context.model.as_ref().clone(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            );
+            let mut fixtures = Vec::new();
+            let mut spawn = |parent: &AgentRef| {
+                let config = config.clone();
+                manager
+                    .spawn_child_trusted_with_config(
+                        parent,
+                        config,
+                        maki_agent::AgentMetadata::default(),
+                        Vec::new(),
+                        None,
+                        |id| {
+                            let (_, state, fixture, _) =
+                                session_with_provider_for_agent(Arc::clone(&context.provider), id);
+                            fixtures.push(fixture);
+                            Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+                        },
+                    )
+                    .unwrap()
             };
-            bind("ctx", &context);
-            scope.scope_future(async {
-                lua.load(r#"
-                    parent = assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
-                    sibling = assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
-                "#).exec_async().await.unwrap();
-                let parent: AnyUserData = lua.globals().get("parent").unwrap();
-                let parent = parent.borrow::<LuaAgent>().unwrap().clone();
-                let mut child_context = context.clone();
-                let params = parent.state.as_ref().unwrap().params.get().unwrap();
-                child_context.subagent_cancels = params.subagent_cancels.clone();
-                child_context.ledger = params.ledger.clone();
-                bind("child_ctx", &child_context);
-                lua.load(r#"
-                    child = assert(agent_api.spawn(child_ctx, { inherit_provider = true, silent = true }))
-                "#).exec_async().await.unwrap();
-                let child: AnyUserData = lua.globals().get("child").unwrap();
-                let child = child.borrow::<LuaAgent>().unwrap().clone();
-                let mut leaf_context = child_context.clone();
-                let params = child.state.as_ref().unwrap().params.get().unwrap();
-                leaf_context.subagent_cancels = params.subagent_cancels.clone();
-                leaf_context.ledger = params.ledger.clone();
-                bind("leaf_ctx", &leaf_context);
-                let semaphore = Arc::new(async_lock::Semaphore::new(1));
-                let permit = semaphore.acquire().await;
-                lua.globals().set("gate", crate::api::r#async::LuaSemaphore { sem: semaphore.clone() }).unwrap();
-                lua.load(r#"
-                    leaf = assert(agent_api.spawn(leaf_ctx, {
-                        inherit_provider = true, silent = true, semaphore = gate,
-                    }))
-                    active = assert(leaf:send(leaf_ctx, "active"))
-                    queued = assert(leaf:enqueue(leaf_ctx, "queued"))
-                "#).exec_async().await.unwrap();
-                let leaf: AnyUserData = lua.globals().get("leaf").unwrap();
-                let leaf = leaf.borrow::<LuaAgent>().unwrap().clone();
-                let state = leaf.state.as_ref().unwrap();
-                race(async {
-                    while !state.execution_started.load(std::sync::atomic::Ordering::Acquire) {
-                        smol::future::yield_now().await;
-                    }
-                }, async {
-                    Timer::after(RETIRE_TIMEOUT).await;
-                    panic!("leaf did not enter its turn");
-                }).await;
-                lua.globals().set("close_subtree", close).unwrap();
-                lua.load(r#"
-                    assert(parent:status(ctx).status == "idle")
-                    assert(parent:cancel(ctx))
-                    assert(leaf:status(leaf_ctx).status == "running")
-                    if close_subtree then
-                        assert(parent:close(ctx))
-                    else
-                        assert(parent:cancel_subtree(ctx))
-                    end
-                    assert(assert(active:wait(leaf_ctx, { timeout = 5 })).status == "cancelled")
-                    assert(assert(queued:wait(leaf_ctx, { timeout = 5 })).status == "cancelled")
-                    assert(sibling:status(ctx).status == "idle")
-                "#).exec_async().await.unwrap();
-                for agent in [&parent, &child, &leaf] {
-                    assert_eq!(agent.manager.actor(agent.id).unwrap().snapshot().lifecycle,
-                        if close { ActorLifecycle::Closed } else { ActorLifecycle::Open });
-                }
-                if !close {
-                    drop(permit);
-                    let text: String = lua.load(r#"
-                        return assert(leaf:prompt(leaf_ctx, "after cancellation", { timeout = 5 })).text
-                    "#).eval_async().await.unwrap();
-                    assert_eq!(text, REPLY);
-                }
-                lua.load("assert(parent:close(ctx)); assert(sibling:close(ctx))")
-                    .exec_async().await.unwrap();
-                lua.globals().set("parent", mlua::Value::Nil).unwrap();
-                drop(parent);
-                lua.gc_collect().unwrap();
-                // A retained parent-local map must still reject late child registration.
-                lua.load(r#"
-                    late = assert(agent_api.spawn(child_ctx, { inherit_provider = true, silent = true }))
-                    assert(late:status(child_ctx).status == "closed")
-                "#).exec_async().await.unwrap();
-            }).await;
+            let parent = spawn(&root.target.target);
+            let sibling = spawn(&root.target.target);
+            let child = spawn(&parent);
+            let leaf = spawn(&child);
+            let parent_actor = parent.actor().unwrap();
+            let child_actor = child.actor().unwrap();
+            let leaf_actor = leaf.actor().unwrap();
+            let open =
+                |actor: &AgentActorHandle| actor.snapshot().lifecycle == ActorLifecycle::Open;
+            for actor in [&parent_actor, &child_actor, &leaf_actor] {
+                assert!(open(actor), "every node starts open");
+            }
+            let active = leaf_actor
+                .admit_turn(turn_input(), None, "active".into())
+                .unwrap();
+            let queued = leaf_actor
+                .admit_turn(turn_input(), None, "queued".into())
+                .unwrap();
+            // Cancelling the parent must spare its descendants.
+            assert!(parent.cancel().is_ok());
+            let outcome = manager
+                .node(leaf.id())
+                .expect("leaf is a manager node")
+                .graph_lifecycle;
+            assert_eq!(
+                outcome,
+                maki_agent::manager::GraphLifecycle::Live,
+                "cancelling an ancestor keeps descendants live"
+            );
+            if close {
+                parent.close_subtree().unwrap();
+                assert!(leaf_actor.snapshot().lifecycle != ActorLifecycle::Open);
+            } else {
+                manager.cancel_subtree(parent.id()).unwrap();
+            }
+            for actor in [&parent_actor, &child_actor, &leaf_actor] {
+                assert_eq!(
+                    actor.snapshot().lifecycle,
+                    if close {
+                        ActorLifecycle::Closed
+                    } else {
+                        ActorLifecycle::Open
+                    },
+                    "cancel leaves the subtree open; close closes it"
+                );
+            }
+            assert!(sibling.close_subtree().is_ok());
+            drop((active, queued, fixtures));
+            root.shutdown();
         });
     }
 
@@ -1032,38 +995,96 @@ mod tests {
     const CHILD_NAME: &str = "reviewer";
     const POST_TEXT: &str = "review found issues";
 
+    /// A managed root installed in a Lua state, with the pieces a test needs to
+    /// drive it and shut it down.
+    struct ManagedRoot {
+        manager: AgentManagerHandle,
+        target: TrustedTarget,
+        fixture: Option<crate::api::agent::tests::BackendFixture>,
+        events: flume::Receiver<maki_agent::Envelope>,
+    }
+
+    impl ManagedRoot {
+        /// A trusted context for the same root, for code that runs outside the
+        /// first scope but still needs managed authority.
+        fn trusted_ctx(&self, lua: &Lua) -> AnyUserData {
+            let ctx = LuaCtx::trusted_context(lua, self.target.clone(), Arc::from(PLUGIN));
+            lua.globals().set("ctx", ctx).unwrap();
+            lua.globals().get("ctx").unwrap()
+        }
+
+        fn shutdown(self) {
+            // The manager must go down before the fixture: dropping the fixture
+            // first would terminalize turns the manager still tracks.
+            let Self {
+                manager,
+                fixture,
+                events,
+                ..
+            } = self;
+            drop(events);
+            smol::block_on(manager.shutdown(RETIRE_TIMEOUT));
+            drop(fixture);
+        }
+    }
+
+    /// Installs a managed root whose trusted context becomes the global `ctx`.
+    /// Children spawned through it are real manager nodes, which is the only
+    /// way `maki.agent.spawn` authorises a parent.
+    fn install_managed_root(lua: &Lua, context: &ToolContext) -> ManagedRoot {
+        install_managed_root_with(lua, context, AgentLimits::default())
+    }
+
+    fn install_managed_root_with(
+        lua: &Lua,
+        context: &ToolContext,
+        limits: AgentLimits,
+    ) -> ManagedRoot {
+        let (event_tx, event_rx) = flume::unbounded();
+        let mut rooted = context.clone();
+        rooted.event_tx = EventSender::new(event_tx, 0);
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let mut fixture = None;
+        let root = manager
+            .create_root_with_config(None, Vec::new(), None, |id| {
+                let (_, state, session, _) =
+                    session_with_provider_for_agent(Arc::clone(&rooted.provider), id);
+                fixture = Some(session);
+                Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
+            })
+            .unwrap();
+        let trusted_target = TrustedTarget {
+            target: root,
+            template: rooted,
+        };
+        lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
+            trusted_target.clone(),
+        )))));
+        let ctx = LuaCtx::trusted_context(lua, trusted_target.clone(), Arc::from(PLUGIN));
+        lua.globals().set("ctx", ctx).unwrap();
+        ManagedRoot {
+            manager,
+            target: trusted_target,
+            fixture,
+            events: event_rx,
+        }
+    }
+
     /// Runs {chunk} with `ctx` pinned to a trusted root and `agent_api` and
     /// `ui` in scope. Returns the chunk's string result and the posts the
     /// root's chat received.
     fn run_trusted(chunk: &str) -> (String, Vec<Post>) {
+        run_trusted_with(chunk, None)
+    }
+
+    /// Like [`run_trusted`], with the root's template carrying `tool_use_id`
+    /// so children spawned from its handler count as tool-spawned.
+    fn run_trusted_with(chunk: &str, tool_use_id: Option<&str>) -> (String, Vec<Post>) {
         smol::block_on(async {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
-            let (event_tx, event_rx) = flume::unbounded();
-            let context = stub_ctx_with(
-                &AgentMode::Build,
-                Some(&EventSender::new(event_tx, 0)),
-                None,
-            );
-            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-            let mut root_fixture = None;
-            let root = manager
-                .create_root_with_config(None, Vec::new(), None, |id| {
-                    let (_, state, session, _) =
-                        session_with_provider_for_agent(Arc::clone(&context.provider), id);
-                    root_fixture = Some(session);
-                    Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
-                })
-                .unwrap();
-            let trusted_target = TrustedTarget {
-                target: root,
-                template: context,
-            };
-            lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(TestServices(
-                trusted_target.clone(),
-            )))));
-            let ctx = LuaCtx::trusted_context(&lua, trusted_target, Arc::from(PLUGIN));
-            lua.globals().set("ctx", ctx).unwrap();
+            let context = stub_ctx_with(&AgentMode::Build, None, tool_use_id);
+            let root = install_managed_root(&lua, &context);
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -1077,15 +1098,15 @@ mod tests {
                 .scope_future(lua.load(chunk).eval_async())
                 .await
                 .unwrap();
-            let posts = event_rx
+            let posts = root
+                .events
                 .drain()
                 .filter_map(|envelope| match envelope.event {
                     AgentEvent::Post(post) => Some(post),
                     _ => None,
                 })
                 .collect();
-            manager.shutdown(RETIRE_TIMEOUT).await;
-            drop(root_fixture);
+            root.shutdown();
             (result, posts)
         })
     }
@@ -1134,43 +1155,23 @@ mod tests {
     #[test_case("true", Some(SHOW_TOOL_AGENT) ; "explicit_show_refused")]
     fn tool_spawned_children_keep_their_tool_row(show: &str, expected: Option<&str>) {
         const TOOL_USE_ID: &str = "call_review";
-        smol::block_on(async {
-            let lua = Lua::new();
-            let scope = plugin_scope(&lua, PLUGIN);
-            let (event_tx, event_rx) = flume::unbounded();
-            let context = stub_ctx_with(
-                &AgentMode::Build,
-                Some(&EventSender::new(event_tx, 0)),
-                Some(TOOL_USE_ID),
-            );
-            let mut ctx = LuaCtx::handler(&context);
-            ctx.bind_origin(scope.handle());
-            lua.globals().set("ctx", ctx).unwrap();
-            lua.globals()
-                .set("agent_api", create_agent_table(&lua).unwrap())
-                .unwrap();
-            let error: Option<String> = scope
-                .scope_future(
-                    lua.load(format!(
-                        r#"
-                local child, err = agent_api.spawn(ctx, {{
-                    inherit_provider = true, tools = {{}}, show = {show},
-                }})
-                if child then assert(child:close(ctx)) end
-                return err
-            "#
-                    ))
-                    .eval_async(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(error.as_deref(), expected);
-            assert!(
-                !event_rx
-                    .drain()
-                    .any(|envelope| matches!(envelope.event, AgentEvent::Post(_)))
-            );
-        });
+        let (error, posts) = run_trusted_with(
+            &format!(
+                r#"
+            local child, err = agent_api.spawn(ctx, {{
+                inherit_provider = true, tools = {{}}, show = {show},
+            }})
+            if child then assert(child:close(ctx)) end
+            return err or ""
+        "#
+            ),
+            Some(TOOL_USE_ID),
+        );
+        assert_eq!(error, expected.unwrap_or_default());
+        assert!(
+            posts.is_empty(),
+            "a child spawned by a tool call already has a tool row"
+        );
     }
 
     #[test]
@@ -1268,7 +1269,7 @@ mod tests {
             let child = child.borrow::<LuaAgent>().unwrap();
             let actor = child.manager.lookup(child.id).unwrap().actor().unwrap();
             assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
-            let sessions = lua.app_data_ref::<AgentSessions>().unwrap().clone();
+            let sessions = lua.app_data_ref::<AgentOwners>().unwrap().clone();
             assert!(sessions.lock().contains_key(&child.id.unwrap()));
             drop(scope);
             assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
@@ -1296,21 +1297,33 @@ mod tests {
         const OWNER: &str = "agent-owner";
         const OTHER_OWNER: &str = "other-owner";
         let provider = Arc::new(StreamOnceProvider::new_replies(Vec::new()));
-        let (actor, _, session, _) = session_with_provider(provider.clone(), None, None);
-        let (other_actor, _, other_session, _) = session_with_provider(provider, None, None);
+        let (actor, state, session, _) = session_with_provider(provider.clone(), None);
+        let (other_actor, other_state, other_session, _) = session_with_provider(provider, None);
         let lua = Lua::new();
-        lua.set_app_data(AgentOwners(HashMap::from([
-            (session.agent_id, Arc::from(OWNER)),
-            (other_session.agent_id, Arc::from(OTHER_OWNER)),
-        ])));
-        lua.set_app_data(AgentSessions(Arc::new(Mutex::new(HashMap::from([
-            (session.agent_id, session),
-            (other_session.agent_id, other_session),
-        ])))));
+        let owners = AgentOwners::default();
+        owners.record(
+            actor.agent_id(),
+            Arc::downgrade(&actor),
+            Arc::downgrade(&state),
+            Box::new(session),
+            Some(Arc::from(OWNER)),
+        );
+        owners.record(
+            other_actor.agent_id(),
+            Arc::downgrade(&other_actor),
+            Arc::downgrade(&other_state),
+            Box::new(other_session),
+            Some(Arc::from(OTHER_OWNER)),
+        );
+        lua.set_app_data(owners);
         revoke_plugin(&lua, OWNER);
         assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
         assert_eq!(other_actor.snapshot().lifecycle, ActorLifecycle::Open);
-        assert_eq!(lua.app_data_ref::<AgentSessions>().unwrap().lock().len(), 1);
+        assert_eq!(
+            lua.app_data_ref::<AgentOwners>().unwrap().lock().len(),
+            1,
+            "revocation drops only the revoked plugin's ownership record"
+        );
         revoke_plugin(&lua, OWNER);
         assert_eq!(other_actor.snapshot().lifecycle, ActorLifecycle::Open);
     }
@@ -1326,7 +1339,7 @@ mod tests {
             let provider = Arc::new(StreamOnceProvider::new_replies(vec![
                 canned_reply_with_usage(REPLY, usage),
             ]));
-            let (_standalone, state, legacy, _events) = session_with_provider(provider, None, None);
+            let (_standalone, state, legacy, _events) = session_with_provider(provider, None);
             let params = state.params.get().unwrap();
             let config = EffectiveAgentConfig::new(
                 RunSettings {

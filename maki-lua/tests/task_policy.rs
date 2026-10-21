@@ -2,16 +2,26 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
+use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::agent::RunSettings;
+use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
 };
-use maki_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
+use maki_agent::{
+    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
+    ControlWork, CurrentManagedTurn, History, ModeDef, ModeId, ToolOutput, TurnCancellationReason,
+    TurnContext, TurnOutcome, WorkKind,
+};
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -32,6 +42,16 @@ const MAX_STRUCTURED_RETRIES: usize = 2;
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 
 const TASK_SPAWN_TOOL: &str = "task_spawn";
+const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_SEND_TOOL: &str = "task_send";
+const TASK_DESPAWN_TOOL: &str = "task_despawn";
+/// The four task lifecycle tools a general child inherits from its parent.
+const NESTED_LIFECYCLE_TOOLS: [&str; 4] = [
+    TASK_SPAWN_TOOL,
+    TASK_WAIT_TOOL,
+    TASK_SEND_TOOL,
+    TASK_DESPAWN_TOOL,
+];
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";
 const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
@@ -42,9 +62,8 @@ const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
 const UNKNOWN_TASK_ERR: &str = "unknown task_id";
-const TASK_WAIT_TOOL: &str = "task_wait";
-/// Mirrors the task plugin's `max_concurrent` default.
-const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
+/// The fixture root holds one manager permit for the whole test.
+const FIXTURE_ROOT_TURNS: usize = 1;
 /// Mirrors the task plugin's per-task turn ticket cap.
 const RETAINED_TURN_LIMIT: usize = 64;
 const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
@@ -66,12 +85,6 @@ const SCENARIO_RAISE: &str = "raise";
 /// `maki.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
-
-local real_semaphore = maki.async.semaphore
-maki.async.semaphore = function(n)
-  recorder.sem_size = n
-  return real_semaphore(n)
-end
 
 maki.agent.resolve_model = function(ctx, opts)
   recorder.resolve_opts = opts
@@ -264,7 +277,6 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       output_schema = recorder.output_schema,
-      sem_size = recorder.sem_size,
     }
     if recorder.resolve_opts then
       snap.resolve_opts = recorder.resolve_opts
@@ -545,12 +557,6 @@ fn raising_prompt_preserves_error_and_next_spawn() {
     let err = exec_tool(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
     assert!(err.contains(RAISE_MSG), "got: {err}");
 
-    let snap = probe(&reg);
-    assert_eq!(
-        snap["sem_size"],
-        json!(TASK_DEFAULT_MAX_CONCURRENT),
-        "semaphore not sized from the default max_concurrent option"
-    );
     let result = spawn_and_wait_stub(&reg, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(result["text"], PLAIN_TEXT);
 }
@@ -558,12 +564,12 @@ fn raising_prompt_preserves_error_and_next_spawn() {
 // --- Four-tool async lifecycle (AC.1 - AC.5, AC.7) --------------------------
 
 #[test]
-fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
+fn managed_general_child_can_access_all_nested_lifecycle_tools() {
     let provider = Arc::new(common::CannedProvider::new(vec![common::canned_reply(
         "done",
     )]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
 
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
@@ -585,7 +591,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
                 .tool
                 .description(&description_ctx)
                 .is_empty(),
-            "unmanaged general child cannot invoke {name}"
+            "general child cannot invoke {name}"
         );
     }
 }
@@ -983,29 +989,142 @@ maki.api.register_tool({
 })
 "#;
 
-fn load_real_driver_host() -> (Arc<ToolRegistry>, PluginHost) {
-    load_real_driver_host_with_opts(serde_json::Map::new())
+struct FixtureRoot {
+    turn: flume::Sender<CurrentManagedTurn>,
+    cancel: CancelToken,
 }
 
-fn load_real_driver_host_with_opts(
-    opts: serde_json::Map<String, Value>,
-) -> (Arc<ToolRegistry>, PluginHost) {
-    load_real_driver_host_with_prelude(opts, "")
+impl ActorBackend for FixtureRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        ctx: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
+            self.cancel.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                ctx.agent_id,
+                ctx.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
+                TurnCancellationReason::User,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn load_real_driver_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
+    load_real_driver_host_with_capacity(ctx, AgentLimits::default().max_concurrent_agent_turns)
+}
+
+/// Builds a real-driver host whose manager admits `max_concurrent_agent_turns`
+/// turns. The fixture root keeps one permit for the test's duration, so callers
+/// pass `FIXTURE_ROOT_TURNS + n` to leave the task children `n` permits.
+fn load_real_driver_host_with_capacity(
+    ctx: &ToolContext,
+    max_concurrent_agent_turns: usize,
+) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
+    load_real_driver_host_with_prelude(ctx, max_concurrent_agent_turns, "")
 }
 
 fn load_real_driver_host_with_prelude(
-    opts: serde_json::Map<String, Value>,
+    ctx: &ToolContext,
+    max_concurrent_agent_turns: usize,
     extra_prelude: &str,
-) -> (Arc<ToolRegistry>, PluginHost) {
+) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source_with_opts(
         "task_policy_real",
         &format!("{REAL_DRIVER_PRELUDE}\n{extra_prelude}\n{TASK_PLUGIN_SRC}"),
-        opts,
+        serde_json::Map::new(),
     )
     .unwrap();
-    (reg, host)
+    let policy = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&ctx.provider),
+            model: (*ctx.model).clone(),
+            fast: ctx.opts.fast,
+            workflow: ctx.workflow,
+            thinking: ctx.opts.thinking,
+        },
+        ctx.mode.clone(),
+    )
+    .with_mode_def(ctx.mode_def.as_deref().cloned());
+    let manager = AgentManagerHandle::new(AgentLimits {
+        max_concurrent_agent_turns,
+        ..AgentLimits::default()
+    })
+    .unwrap();
+    let (turn_tx, turn_rx) = flume::bounded(1);
+    let root = manager
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(FixtureRoot {
+                turn: turn_tx,
+                cancel: ctx.cancel.clone(),
+            }) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let mut ctx = ctx.clone();
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    ctx.execution_agent_id = Some(root.id());
+    root.actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput {
+                message: TASK_PROMPT.into(),
+                mode: ctx.mode.clone(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: ctx.opts.thinking,
+                fast: ctx.opts.fast,
+                workflow: ctx.workflow,
+                prompt: None,
+                cancel: None,
+            },
+            None,
+            "task-policy-fixture".into(),
+        )
+        .unwrap();
+    ctx.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
+    let template = common::with_request_tools(&reg, &ctx);
+    host.event_handle().install_orchestration_services(Arc::new(
+        AgentOrchestration::bind_fixed_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root,
+                template,
+            },
+        ),
+    ));
+    host.wait_for_worker_barrier_for_test();
+    (reg, host, ctx)
 }
 
 struct GatedProvider {
@@ -1106,7 +1225,7 @@ fn steering_requires_fresh_structured_report(fresh_report: bool) {
             fresh_report,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host();
+        let (reg, _host, ctx) = load_real_driver_host(&ctx);
         let spawned = exec_tool_json_with_ctx(
             &reg,
             &ctx,
@@ -1161,7 +1280,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
     // general in plan mode -> blocked before any session is spawned.
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let mut general = task_input(SCENARIO_PLAIN, None);
     general["subagent_type"] = json!("general");
     let err =
@@ -1178,7 +1297,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     let mut build_ctx = ctx.clone();
     build_ctx.mode = AgentMode::Build;
     build_ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Build)));
-    let (reg_build, _host) = load_real_driver_host();
+    let (reg_build, _host_build, build_ctx) = load_real_driver_host(&build_ctx);
     let mut reviewer_build = task_input(SCENARIO_PLAIN, None);
     reviewer_build["subagent_type"] = json!("plan_reviewer");
     let err = spawn_and_wait(&reg_build, &build_ctx, reviewer_build)
@@ -1191,7 +1310,7 @@ fn task_policy_spawn_honors_mode_gating_real() {
     research["subagent_type"] = json!("research");
     spawn_and_wait(&reg, &ctx, research).expect("research must run in plan mode");
 
-    let (reg_build2, _host) = load_real_driver_host();
+    let (reg_build2, _host_build2, build_ctx) = load_real_driver_host(&build_ctx);
     let mut research_build = task_input(SCENARIO_PLAIN, None);
     research_build["subagent_type"] = json!("research");
     spawn_and_wait(&reg_build2, &build_ctx, research_build)
@@ -1230,7 +1349,7 @@ fn repeated_busy_sends_retain_one_ticket() {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host();
+        let (reg, _host, ctx) = load_real_driver_host(&ctx);
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
@@ -1306,7 +1425,7 @@ fn timed_out_task_wait_reports_running_and_preserves_child(timeout: u64) {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host();
+        let (reg, _host, ctx) = load_real_driver_host(&ctx);
         let spawned =
             exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = spawned["task_id"].as_str().unwrap();
@@ -1346,7 +1465,7 @@ fn task_wait_same_turn_includes_later_send(explicit_turn: bool) {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let (reg, _host) = load_real_driver_host();
+        let (reg, _host, ctx) = load_real_driver_host(&ctx);
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let task_id = first["task_id"].as_str().unwrap();
         assert!(first["turn_id"].is_string());
@@ -1419,9 +1538,7 @@ fn async_turns_acquire_capacity_only_when_the_driver_runs_them() {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let mut opts = serde_json::Map::new();
-        opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts(opts);
+        let (reg, _host, ctx) = load_real_driver_host_with_capacity(&ctx, FIXTURE_ROOT_TURNS + 1);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1490,9 +1607,7 @@ fn despawn_cancels_a_turn_waiting_for_capacity() {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let mut opts = serde_json::Map::new();
-        opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts(opts);
+        let (reg, _host, ctx) = load_real_driver_host_with_capacity(&ctx, FIXTURE_ROOT_TURNS + 1);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1541,9 +1656,7 @@ fn despawn_releases_capacity_from_an_active_turn() {
             release_rx,
         });
         let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-        let mut opts = serde_json::Map::new();
-        opts.insert("max_concurrent".into(), json!(1));
-        let (reg, _host) = load_real_driver_host_with_opts(opts);
+        let (reg, _host, ctx) = load_real_driver_host_with_capacity(&ctx, FIXTURE_ROOT_TURNS + 1);
 
         let first = exec_tool_json_with_ctx(&reg, &ctx, TASK_SPAWN_TOOL, task_input("first", None));
         let first_id = first["task_id"].as_str().unwrap();
@@ -1585,7 +1698,7 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     ctx.mode = AgentMode::Custom(ModeId::parse("audit"));
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ctx.mode.id())));
 
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["subagent_type"] = json!("general");
     let out = spawn_and_wait(&reg, &ctx, input).expect("general task must run in custom mode");
@@ -1594,9 +1707,13 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
     let captured_tools = provider.captured_tools();
     assert_eq!(captured_tools.len(), 1);
-    assert!(
-        common::tool_names(&captured_tools[0]).is_empty(),
-        "the custom-mode test harness offers no tools to the child"
+    let mut child_tools = common::tool_names(&captured_tools[0]);
+    child_tools.sort();
+    let mut expected = NESTED_LIFECYCLE_TOOLS.to_vec();
+    expected.sort();
+    assert_eq!(
+        child_tools, expected,
+        "the child inherits the parent's task lifecycle tools"
     );
 }
 
@@ -1610,7 +1727,7 @@ fn plan_mode_task_supports_structured_output_real_driver() {
     ctx.mode = AgentMode::Plan("/test/task-plan.md".into());
     ctx.mode_def = Some(Arc::new(ModeDef::default_for(ModeId::Plan)));
 
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let mut input = task_input(SCENARIO_HAPPY, Some(answer_schema()));
     input["subagent_type"] = json!("plan_reviewer");
     let out = spawn_and_wait(&reg, &ctx, input).expect("structured plan-mode task failed");
@@ -1634,7 +1751,7 @@ fn plan_mode_task_supports_structured_output_real_driver() {
 fn real_schema_validation_rejects_before_provider_request(schema: Value, expected: &str) {
     let provider = Arc::new(common::CannedProvider::new(vec![]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let error = spawn_and_wait(&reg, &ctx, task_input(SCENARIO_HAPPY, Some(schema))).unwrap_err();
     assert!(error.contains(expected), "got: {error}");
     assert!(provider.captured_tools().is_empty());
@@ -1648,7 +1765,7 @@ fn real_schema_invalid_report_recovers() {
         common::canned_reply("done"),
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let out = spawn_and_wait(
         &reg,
         &ctx,
@@ -1666,7 +1783,7 @@ fn real_schema_missing_report_fails_boundedly() {
         common::canned_reply("no report"),
     ]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
-    let (reg, _host) = load_real_driver_host();
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
     let error = spawn_and_wait(
         &reg,
         &ctx,
@@ -1761,16 +1878,16 @@ impl Provider for NestedTaskProvider {
     }
 }
 
-/// With one permit, an unmanaged general subagent that blocks in `task_wait`
-/// must hand its permit to the grandchild it waits on, or neither can finish.
+/// With one child permit, a general subagent blocked in `task_wait` must
+/// yield to the grandchild it waits on so both turns can finish.
 #[test]
-fn unmanaged_blocking_wait_yields_the_only_permit_to_its_child() {
-    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::new(NestedTaskProvider));
-    let mut opts = serde_json::Map::new();
-    opts.insert("max_concurrent".into(), json!(1));
-    let (reg, _host) = load_real_driver_host_with_prelude(opts, NESTED_LIFECYCLE_TOOLS_PRELUDE);
-    ctx.registry = Arc::clone(&reg);
-    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+fn managed_blocking_wait_yields_the_only_permit_to_its_child() {
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::new(NestedTaskProvider));
+    let (reg, _host, ctx) = load_real_driver_host_with_prelude(
+        &ctx,
+        FIXTURE_ROOT_TURNS + 1,
+        NESTED_LIFECYCLE_TOOLS_PRELUDE,
+    );
 
     let mut input = task_input("parent", None);
     input["subagent_type"] = json!("general");
