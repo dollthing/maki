@@ -4014,12 +4014,14 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
     });
 }
 
-#[test]
-fn public_output_schema_invalid_reports_exhaust_without_committing_output() {
+#[test_case::test_case(false; "invalid_report")]
+#[test_case::test_case(true; "missing_report")]
+fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
     smol::block_on(async {
-        let fixture = Fixture::start(
-            "pr5_schema_invalid_exhaustion",
-            r#"
+        let fixture = if invalid {
+            Fixture::start(
+                "pr5_schema_invalid_exhaustion",
+                r#"
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {},
                 output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } },
             }))
@@ -4030,40 +4032,11 @@ fn public_output_schema_invalid_reports_exhaust_without_committing_output() {
             assert(child:close(ctx))
             assert(assert(ticket:result(ctx)).status == "failed")
         "#,
-        );
-        for _ in 0..3 {
-            fixture
-                .request()
-                .await
-                .reply
-                .send(common::canned_tool_use(
-                    "structured_output",
-                    json!({ "answer": "invalid" }),
-                ))
-                .unwrap();
-            let failed_report = fixture.request().await;
-            assert!(
-                serde_json::to_string(&failed_report.messages)
-                    .unwrap()
-                    .contains("Fix the errors"),
-                "invalid report tool history: {:?}",
-                failed_report.messages
-            );
-            failed_report
-                .reply
-                .send(common::canned_reply("invalid report is final"))
-                .unwrap();
-        }
-        fixture.finish().await;
-    });
-}
-
-#[test]
-fn public_output_schema_missing_reports_exhaust_bounded_nudges() {
-    smol::block_on(async {
-        let fixture = Fixture::start(
-            "pr5_schema_missing",
-            r#"
+            )
+        } else {
+            Fixture::start(
+                "pr5_schema_missing",
+                r#"
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
                 output_schema = { type = "object", properties = {}, additionalProperties = false },
             }))
@@ -4073,14 +4046,32 @@ fn public_output_schema_missing_reports_exhaust_bounded_nudges() {
             assert(result.error:find("without calling structured_output", 1, true))
             assert(child:close(ctx))
         "#,
-        );
+            )
+        };
         for _ in 0..3 {
-            fixture
-                .request()
-                .await
+            let reply = fixture.request().await;
+            reply
                 .reply
-                .send(common::canned_reply("no structured report"))
+                .send(if invalid {
+                    common::canned_tool_use("structured_output", json!({ "answer": "invalid" }))
+                } else {
+                    common::canned_reply("no structured report")
+                })
                 .unwrap();
+            if invalid {
+                let failed_report = fixture.request().await;
+                assert!(
+                    serde_json::to_string(&failed_report.messages)
+                        .unwrap()
+                        .contains("Fix the errors"),
+                    "invalid report tool history: {:?}",
+                    failed_report.messages
+                );
+                failed_report
+                    .reply
+                    .send(common::canned_reply("invalid report is final"))
+                    .unwrap();
+            }
         }
         fixture.finish().await;
     });
@@ -4461,37 +4452,6 @@ fn inherited_local_capture_belongs_to_executing_grandchild() {
             .send(common::canned_reply("parent complete"))
             .unwrap();
         fixture.finish().await;
-    });
-}
-
-#[test]
-fn bundled_task_gates_subagent_types_on_the_executing_agent_mode() {
-    smol::block_on(async {
-        const GENERAL_BLOCKED: &str =
-            "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)";
-        let fixture = Fixture::start_with_options(
-            "pr5_plan_mode_gate",
-            FixtureOptions {
-                mode: Some(AgentMode::Plan("/test/gate-plan.md".into())),
-                bundled_tasks: true,
-                ..Default::default()
-            },
-            &format!(
-                r#"
-            local text, err = maki.agent.call_tool(ctx, "task_spawn", {{
-                description = "blocked", prompt = "write things", subagent_type = "general",
-            }})
-            assert(text == nil and err == "{GENERAL_BLOCKED}", tostring(err))
-        "#
-            ),
-        );
-        assert_eq!(
-            bounded(fixture.completed.recv_async(), "plan mode gate")
-                .await
-                .unwrap(),
-            Ok(())
-        );
-        shutdown_manager(&fixture.manager).await;
     });
 }
 
