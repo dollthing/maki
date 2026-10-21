@@ -179,7 +179,6 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
     pub model_policy: Arc<ModelPolicy>,
-    pub ledger: Arc<RunLedger>,
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
@@ -304,7 +303,7 @@ impl<'h> Agent<'h> {
             pending_instruction_request: false,
             cancel: CancelToken::none(),
             cancel_reason_source: None,
-            ledger: params.ledger,
+            ledger: Arc::new(RunLedger::default()),
             context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
@@ -2168,7 +2167,6 @@ mod tests {
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 modes: crate::ModeRegistry::builtin().into(),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                ledger: Arc::new(RunLedger::default()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 question_mode: crate::tools::QuestionMode::Tui,

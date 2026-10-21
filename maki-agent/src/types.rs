@@ -1243,36 +1243,22 @@ pub struct RunTotals {
     pub list_cost: Option<f64>,
 }
 
-/// Spend accumulator for one run, chained to the run that spawned it.
+/// Spend accumulator for one run.
 ///
-/// A round is added where it was paid for and walks up the chain, so every
-/// ledger holds its own subtree: a subagent reports its own spend, and the
-/// turn that spawned it still gets billed for the whole fan-out. Several
-/// subagents run at once, hence the lock.
+/// A round is added where it was paid for. The turn reports its own totals
+/// through `TurnOutcome`; subagent spend is reported on the subagent's own
+/// turn, so a ledger is never chained to the run that spawned it.
 #[derive(Debug, Default)]
 pub struct RunLedger {
     totals: Mutex<RunTotals>,
-    parent: Option<Arc<RunLedger>>,
 }
 
 impl RunLedger {
-    pub fn child(parent: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self {
-            totals: Mutex::default(),
-            parent: Some(Arc::clone(parent)),
-        })
-    }
-
     pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
-        {
-            let mut totals = self.locked();
-            totals.usage += usage;
-            add_cost(&mut totals.cost, cost);
-            add_cost(&mut totals.list_cost, list_cost);
-        }
-        if let Some(parent) = &self.parent {
-            parent.add(usage, cost, list_cost);
-        }
+        let mut totals = self.locked();
+        totals.usage += usage;
+        add_cost(&mut totals.cost, cost);
+        add_cost(&mut totals.list_cost, list_cost);
     }
 
     pub fn totals(&self) -> RunTotals {
@@ -2465,8 +2451,6 @@ mod tests {
     const SECOND_COST: f64 = 0.25;
     const FIRST_INPUT: u32 = 10;
     const SECOND_INPUT: u32 = 5;
-    const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
-    const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
 
     fn usage(input: u32) -> TokenUsage {
         TokenUsage {
@@ -2490,29 +2474,5 @@ mod tests {
         assert_eq!(totals.usage.input, FIRST_INPUT + SECOND_INPUT);
         assert_eq!(totals.cost, expected);
         assert_eq!(totals.list_cost, expected);
-    }
-
-    #[test]
-    fn ledger_child_spend_rolls_up_into_parent() {
-        let parent = Arc::new(RunLedger::default());
-        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), Some(FIRST_COST));
-        let child = RunLedger::child(&parent);
-        child.add(usage(SECOND_INPUT), Some(SECOND_COST), Some(SECOND_COST));
-
-        let own = child.totals();
-        assert_eq!(own.usage.input, SECOND_INPUT, "{OWN_SUBTREE_MSG}");
-        assert_eq!(own.cost, Some(SECOND_COST), "{OWN_SUBTREE_MSG}");
-
-        let rolled_up = parent.totals();
-        assert_eq!(
-            rolled_up.usage.input,
-            FIRST_INPUT + SECOND_INPUT,
-            "{ROLLUP_MSG}"
-        );
-        assert_eq!(
-            rolled_up.cost,
-            Some(FIRST_COST + SECOND_COST),
-            "{ROLLUP_MSG}"
-        );
     }
 }

@@ -1099,7 +1099,6 @@ mod tests {
             &services
         ));
         let mut child_template = template.clone();
-        child_template.ledger = maki_agent::RunLedger::child(&template.ledger);
         child_template.execution_agent_id = Some(maki_agent::AgentId::generate());
         let mut child = LuaCtx::handler(&child_template);
         child.pin_host_root(&lua);

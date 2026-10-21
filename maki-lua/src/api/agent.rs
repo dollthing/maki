@@ -42,9 +42,8 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History,
-    HistorySnapshot, McpSession, ModeDef, Post, RunLedger, RunSettings, SubagentCancel,
-    SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId,
-    TurnOutcome,
+    HistorySnapshot, McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo,
+    ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_fn, lua_table};
@@ -1648,7 +1647,6 @@ fn agent_params(
         prompt_slots: Arc::clone(&context.prompt_slots),
         modes: Arc::clone(&context.modes),
         subagent_cancels: Arc::new(CancelMap::new()),
-        ledger: RunLedger::child(&context.ledger),
         registry: Arc::clone(&context.registry),
         audience: options.audience,
         question_mode: context.question_mode,
@@ -2622,7 +2620,6 @@ mod tests {
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             modes: Arc::clone(&ctx.modes),
             subagent_cancels: Arc::new(CancelMap::new()),
-            ledger: Arc::new(RunLedger::default()),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience: ToolAudience::GENERAL_SUB,
             question_mode: ctx.question_mode,

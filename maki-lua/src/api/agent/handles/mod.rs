@@ -396,8 +396,7 @@ mod tests {
             services: Some(service),
             template: Some(stub_ctx(&AgentMode::Build)),
         });
-        let mut context = stub_ctx(&AgentMode::Build);
-        context.ledger = state.params.get().unwrap().ledger.clone();
+        let context = stub_ctx(&AgentMode::Build);
         let owners = AgentOwners::default();
         owners.record(
             id,
