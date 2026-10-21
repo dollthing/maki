@@ -33,7 +33,7 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 21. Controls and compaction are not turns. They have no `TurnId`, no managed turn admission, and no retained `TurnOutcome`.
 22. `AgentInput` has one ownership transfer from queue to backend. Do not clone input payloads to avoid fixing ownership or lifetime design.
 23. Each actor orders configuration and admission through one operation FIFO and executes materialized work through its execution queue. UI queue projections and interrupt extraction must use actor-owned work, not a shadow deque.
-24. Queue-empty publication must linearize with concurrent push so `QueueDrained` cannot race ahead of newly accepted work.
+24. Settlement publication must linearize with concurrent push so `QueueSettled` cannot race ahead of newly accepted work. The actor checks queue and ticket emptiness under its own lock before emitting the settled identity.
 
 ## Cancellation and closure
 
@@ -58,7 +58,7 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 38. Actor/backend factories run outside the graph lock. Returned errors, panics, concurrent closure, and failed commit all roll reservations back exactly once.
 39. Never hold the graph lock across an await, actor call, backend call, factory invocation, task join, or any path that can re-enter tool dispatch.
 40. Graph snapshots may include closed tombstones for the manager lifetime. They are in-memory observations, not persisted identity. `GraphLifecycle::Removed` currently has no observed transition and must not be presented as active behavior without implementing it.
-41. Managed TUI root and descendant construction must not fall back to direct `AgentActorHandle::spawn`. Direct construction is currently allowed only for actor/manager tests and explicitly deferred unmanaged frontends.
+41. Root and descendant construction must not fall back to direct `AgentActorHandle::spawn`. Direct construction is allowed only in actor and manager tests.
 
 ## Managed concurrency and descendant waits
 
@@ -81,10 +81,10 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 55. The actor exclusively owns mutable conversation history. Optional `SharedMessages` is a mirror, not a competing owner.
 56. Restored history is sanitized and published synchronously before an actor handle escapes.
 57. Presentation-only failure/notification text must not be inserted into provider history as model output.
-58. Structured child outcomes and history must retain the live child's `AgentId`; stale root `run_id` filtering must not discard later events from a reusable child.
+58. Structured child outcomes and history must retain the live child's `AgentId`; stale presentation filtering must not discard later events from a reusable child.
 59. Terminal child deduplication keys by `(AgentId, TurnId)`, not a task id alone. Reusing a child must allow later distinct turns through.
-60. Root `run_id` remains presentation and stale-event correlation. It must not become runtime identity, topology, or authorization.
-61. Managed sessions use only the manager's per-outer-session concurrency limit. The deprecated process-wide task semaphore applies only to unmanaged compatibility sessions; never enforce both.
+60. `ActorWorkIdentity` carries runtime identity through admission, events and settlement. A frontend `run_id` is presentation only and must not become runtime identity, topology, or authorization.
+61. Agents use only the manager's per-outer-session concurrency limit. Do not add a second process-wide turn semaphore.
 62. `maki.async.run` inherits only the originating turn's managed authority. Timer fires intentionally inherit none and must fail closed for managed operations.
 63. Session/task APIs may adapt actor state, result text, capture values, and cumulative usage, but they must not become a second lifecycle source.
 

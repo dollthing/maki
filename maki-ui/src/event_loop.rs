@@ -3141,8 +3141,8 @@ impl<'t> EventLoop<'t> {
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
         self.emit_notifications();
-        // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
-        // can never send it, so fail instead of hanging forever.
+        // An `exit_on_done` exit waits on the settled notification; a dead agent
+        // loop can never send it, so fail instead of hanging forever.
         if let Some(runtime) = self.sessions.iter().find(|rt| {
             rt.app.exit_request != ExitRequest::None
                 && rt.notifications.waiting_for_drain()

@@ -193,7 +193,7 @@ The manager enforces these per-outer-session limits:
 | `agent.max_children_per_agent` | 16 | Live or reserved direct children of one node |
 | `agent.max_live_agents` | 64 | Live, reserved, or closing nodes including root |
 
-Every value must be at least one. Limit checks and graph reservation are atomic. The deprecated `plugins.task.max_concurrent` is only an unmanaged-frontend compatibility fallback; managed TUI sessions do not apply both limits.
+Every value must be at least one. Limit checks and graph reservation are atomic. The manager's `max_concurrent_agent_turns` limiter is the only cross-agent turn limit.
 
 ### Managed turn authority
 
@@ -252,33 +252,33 @@ Dropping ordinary `AgentRef` or actor-handle clones does not cancel work.
 
 Each prepared TUI session runtime creates an `AgentManagerHandle`, creates exactly one root through it, and obtains the root actor from the returned `AgentRef`. The root backend still owns dynamic TUI preparation such as provider/model selection, prompts, tools, MCP state, cwd/instruction refresh, event stamping, and control handling.
 
-The TUI queue is a presentation facade over the actor's one scheduling queue. It must not become a shadow scheduler. Root `run_id` values remain stale-event and cancellation correlation only.
+The TUI queue is a presentation facade over the actor's one scheduling queue. It must not become a shadow scheduler. Every envelope carries the actor's `ActorWorkIdentity`, so `run_id` values are presentation and cancellation fences only.
 
 Live child routing uses `AgentId`; compatibility strings remain labels and protocol/history correlation. Restored child tabs without a live `AgentId` are display-only. The current UI remains a flat compatibility view, not a graph navigator.
 
 Session runtime replacement is prepared inertly and activated as a transaction. The new manager/root, mailbox, command target, provider, permissions, and session-lock lease are not partially published before activation. Old manager shutdown starts only after the replacement is active.
 
-### Lua compatibility sessions
+### Lua agent sessions
 
-`maki.agent.session(ctx, opts)` remains the existing public compatibility API.
+`maki.agent.spawn(ctx, opts)` is the only way to create a child agent. It requires an active managed turn or a trusted manager-backed invocation and fails closed otherwise.
 
-- In a managed TUI turn, it creates a child through `CurrentManagedTurn::spawn_child`.
-- In deferred unmanaged frontends, it still creates an unmanaged actor directly.
-- `prompt` admits one exact child turn and waits for that result.
-- `send` admits asynchronously through the same actor FIFO.
-- `status` adapts actor state and cumulative usage to the existing `running | done | closed` shape.
-- `close` and `task_despawn` permanently close the managed subtree.
-- Interactive child cancellation uses reusable actor cancellation and keeps the session available for later turns.
+- Spawn creates a child through the manager and returns an `Agent` handle.
+- `Agent:prompt` admits one idle-only turn and waits for its exact result.
+- `Agent:send` admits a turn only when the agent has no active, preparing or queued work.
+- `Agent:close` permanently closes the managed subtree.
+- Interactive child cancellation uses reusable actor cancellation and keeps the agent available for later turns.
+
+The removed `maki.agent.session` API, its `Session` userdata and `report_task_result` have no replacement shim: migrate plugins to `spawn`, tickets and input capture.
 
 A descendant's cancellation token is independent of the spawning parent turn. Background children can outlive that parent turn. Structured outcomes and history are stamped for TUI routing, while presentation notifications must not be inserted into provider history.
 
 `maki.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
 
-The bundled task API and current Session result shapes remain compatibility surfaces. Their ids are not graph identity.
+The bundled task API result shapes remain compatibility surfaces. Their ids are not graph identity.
 
-### Deferred unmanaged frontends
+### Frontend roots
 
-Headless, ACP, SDK, and print paths still construct low-level agents or unmanaged actors directly where applicable. This is an explicit migration exception, not permission for managed TUI roots or descendants to bypass the manager.
+TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution.
 
 ## Known implementation caveats
 
