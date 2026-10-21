@@ -86,13 +86,13 @@ pub(crate) enum QueueBackend {
     },
 }
 
-/// Reserves the next presentation id in the test fixture, mirroring the
-/// actor's policy of never reusing an id and never going below the floor.
+/// Reserves the next presentation id in the test fixture, using the actor's
+/// policy of never reusing an id and never going below the floor.
 #[cfg(test)]
 fn reserve_test_presentation(presentation: &AtomicU64, displayed: u64) -> u64 {
     let mut allocated = presentation.load(Ordering::Relaxed);
     loop {
-        let next = allocated.max(displayed) + 1;
+        let next = maki_agent::actor::next_presentation(allocated, displayed);
         match presentation.compare_exchange_weak(
             allocated,
             next,
