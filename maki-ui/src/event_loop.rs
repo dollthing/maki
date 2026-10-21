@@ -6227,7 +6227,6 @@ mod tests {
         with_event_loop(|event_loop| {
             let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let guard = actor.prepare_idle().unwrap();
             let commits = actor.subscribe_config_commits();
             let (reply, response) = flume::bounded(1);
             event_loop.handle_command(CommandEvent::Host {
@@ -6243,7 +6242,6 @@ mod tests {
                 reply,
             });
             assert_eq!(response.recv().unwrap().unwrap(), HostResponse::Completed);
-            drop(guard);
             loop {
                 let commit = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
                 if commit.config.workflow {
