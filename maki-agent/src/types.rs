@@ -925,7 +925,10 @@ pub enum AgentEvent {
         mcp_startup_notice: Option<usize>,
         already_displayed: bool,
     },
-    QueueDrained,
+    /// Actor work settled and the actor queue is empty. Emitted once per
+    /// settlement cycle under the actor state lock, carrying the identity of
+    /// the work that settled last.
+    QueueSettled,
     /// A run picked up a model that changed while it was in flight. Carries
     /// the spec now in use, so a frontend showing the run's model can stop
     /// reporting the one it started on.
@@ -1342,20 +1345,87 @@ impl fmt::Debug for EventObserver {
     }
 }
 
+/// Which kind of actor operation a [`ActorWorkIdentity`] belongs to. Turns
+/// carry the [`TurnId`] they settle into; control and compact work carry only
+/// the operation that identified them in the actor's FIFO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorWorkKind {
+    Turn { operation_id: u64, turn_id: TurnId },
+    Control { operation_id: u64 },
+    Compact { operation_id: u64 },
+}
+
+impl ActorWorkKind {
+    /// The actor's own operation counter value, shared across kinds.
+    pub fn operation_id(self) -> u64 {
+        match self {
+            Self::Turn { operation_id, .. }
+            | Self::Control { operation_id }
+            | Self::Compact { operation_id } => operation_id,
+        }
+    }
+
+    pub fn turn_id(self) -> Option<TurnId> {
+        match self {
+            Self::Turn { turn_id, .. } => Some(turn_id),
+            Self::Control { .. } | Self::Compact { .. } => None,
+        }
+    }
+}
+
+/// One admitted piece of actor work, from admission to settlement.
+///
+/// Stamped once when the work is admitted and then carried unchanged through
+/// the scheduler, [`TurnContext`](crate::actor::TurnContext), every event the
+/// backend sends, and the actor's settlement notification. `presentation_id`
+/// is the actor-owned id the frontend groups and fences on, so a late event
+/// can never be attributed to whichever presentation is current when it
+/// finally arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorWorkIdentity {
+    pub agent_id: AgentId,
+    pub kind: ActorWorkKind,
+    pub presentation_id: u64,
+}
+
+impl ActorWorkIdentity {
+    pub fn new(agent_id: AgentId, kind: ActorWorkKind, presentation_id: u64) -> Self {
+        Self {
+            agent_id,
+            kind,
+            presentation_id,
+        }
+    }
+
+    pub fn operation_id(&self) -> u64 {
+        self.kind.operation_id()
+    }
+
+    pub fn turn_id(&self) -> Option<TurnId> {
+        self.kind.turn_id()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: Sender<Envelope>,
-    run_id: u64,
+    identity: Option<ActorWorkIdentity>,
     output: Option<crate::TurnOutput>,
     #[cfg(test)]
     observer: Option<EventObserver>,
 }
 
 impl EventSender {
-    pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
+    /// A sender that stamps no actor work identity, for streams outside any
+    /// actor admission.
+    pub fn new(tx: Sender<Envelope>) -> Self {
+        Self::with_identity(tx, None)
+    }
+
+    pub fn with_identity(tx: Sender<Envelope>, identity: Option<ActorWorkIdentity>) -> Self {
         Self {
             tx,
-            run_id,
+            identity,
             output: None,
             #[cfg(test)]
             observer: None,
@@ -1377,9 +1447,13 @@ impl EventSender {
     }
 
     pub fn without_output(&self) -> Self {
+        self.clone_outputless()
+    }
+
+    fn clone_outputless(&self) -> Self {
         Self {
             tx: self.tx.clone(),
-            run_id: self.run_id,
+            identity: self.identity,
             output: None,
             #[cfg(test)]
             observer: self.observer.clone(),
@@ -1411,7 +1485,7 @@ impl EventSender {
             .try_send(Envelope {
                 event,
                 subagent: None,
-                run_id: self.run_id,
+                identity: self.identity,
             })
             .map_err(|_| AgentError::Channel)
     }
@@ -1426,24 +1500,30 @@ impl EventSender {
         let _ = self.tx.try_send(Envelope {
             event,
             subagent: None,
-            run_id: self.run_id,
+            identity: self.identity,
         });
     }
 
-    pub fn run_id(&self) -> u64 {
-        self.run_id
+    pub fn identity(&self) -> Option<ActorWorkIdentity> {
+        self.identity
+    }
+
+    /// The admitted work's presentation id, or `None` for a stream outside any
+    /// actor admission.
+    pub fn presentation_id(&self) -> Option<u64> {
+        self.identity.map(|identity| identity.presentation_id)
     }
 
     pub fn raw_tx(&self) -> &Sender<Envelope> {
         &self.tx
     }
 
-    /// Same stream, different run. Lets a session body stamp per-turn ids
-    /// without keeping the [`EventStreamGuard`] in scope.
-    pub fn with_run_id(&self, run_id: u64) -> Self {
+    /// Same stream, different admitted work. Lets a session body stamp
+    /// per-turn identity without keeping the [`EventStreamGuard`] in scope.
+    pub fn with_identity_of(&self, identity: Option<ActorWorkIdentity>) -> Self {
         Self {
             tx: self.tx.clone(),
-            run_id,
+            identity,
             output: self.output.clone(),
             #[cfg(test)]
             observer: self.observer.clone(),
@@ -1457,7 +1537,19 @@ pub struct Envelope {
     pub event: AgentEvent,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentInfo>,
-    pub run_id: u64,
+    /// Identity of the actor work that produced this event. Absent means the
+    /// event came from outside any actor admission, never that it came from a
+    /// root.
+    #[serde(skip)]
+    pub identity: Option<ActorWorkIdentity>,
+}
+
+impl Envelope {
+    /// The presentation this event belongs to, or `None` when it is not actor
+    /// work at all.
+    pub fn presentation(&self) -> Option<u64> {
+        self.identity.map(|identity| identity.presentation_id)
+    }
 }
 
 /// The only way to create a session event stream.
@@ -1487,8 +1579,8 @@ impl EventStreamGuard {
         &self.tx
     }
 
-    pub fn sender(&self, run_id: u64) -> EventSender {
-        EventSender::new(self.tx.clone(), run_id)
+    pub fn sender(&self) -> EventSender {
+        EventSender::new(self.tx.clone())
     }
 }
 
@@ -1497,7 +1589,7 @@ impl Drop for EventStreamGuard {
         let _ = self.tx.try_send(Envelope {
             event: AgentEvent::StreamClosed,
             subagent: None,
-            run_id: 0,
+            identity: None,
         });
     }
 }
@@ -1554,7 +1646,7 @@ mod tests {
         let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
         let (tx, rx) = flume::unbounded();
         drop(rx);
-        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        let sender = EventSender::new(tx).with_output(ticket.output());
         let emit = |event| {
             if best_effort {
                 sender.try_send(event);
@@ -1598,16 +1690,15 @@ mod tests {
     #[test_case(true; "disconnected_channel")]
     fn output_capture_preserves_channel_errors_in_derived_senders(disconnected: bool) {
         const TEXT: &str = "captured despite channel failure";
-        const RUN_ID: u64 = 7;
         let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
         let (tx, rx) = flume::bounded(1);
-        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        let sender = EventSender::new(tx).with_output(ticket.output());
         if disconnected {
             drop(rx);
         } else {
             sender.send(AgentEvent::Nudge).unwrap();
         }
-        let derived = sender.with_run_id(RUN_ID);
+        let derived = sender.with_identity_of(None);
         assert!(matches!(
             derived.send(AgentEvent::TextDelta { text: TEXT.into() }),
             Err(AgentError::Channel)
@@ -1631,14 +1722,14 @@ mod tests {
         const RELAYED: &str = "relayed child text";
         let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
         let (tx, _rx) = flume::unbounded();
-        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        let sender = EventSender::new(tx).with_output(ticket.output());
         sender
             .send_envelope(Envelope {
                 event: AgentEvent::TextDelta {
                     text: RELAYED.into(),
                 },
                 subagent: None,
-                run_id: 1,
+                identity: None,
             })
             .unwrap();
         ticket.resolve(TurnOutcome::cancelled(
@@ -1654,7 +1745,7 @@ mod tests {
     #[test]
     fn test_session_events_guard_emits_stream_closed_on_drop() {
         let (guard, mut events) = event_stream();
-        let sender = guard.sender(1);
+        let sender = guard.sender();
         sender.send(AgentEvent::Nudge).unwrap();
         drop(guard);
 
@@ -2281,15 +2372,25 @@ mod tests {
         assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
     }
 
-    const STREAM_RUN_IDS: [u64; 3] = [1, 2, 3];
+    const STREAM_PRESENTATIONS: [u64; 3] = [1, 2, 3];
     const STILL_PENDING: &str = "an empty stream must not resolve `next()`";
     const NO_LATE_EVENTS: &str = "events queued after the marker must stay invisible";
 
-    fn drain(events: &mut SessionEvents) -> Vec<u64> {
+    fn stamp(presentation: u64) -> ActorWorkIdentity {
+        ActorWorkIdentity::new(
+            AgentId::generate(),
+            ActorWorkKind::Control {
+                operation_id: presentation,
+            },
+            presentation,
+        )
+    }
+
+    fn drain(events: &mut SessionEvents) -> Vec<Option<u64>> {
         smol::block_on(async {
             let mut seen = Vec::new();
             while let Some(envelope) = events.next().await {
-                seen.push(envelope.run_id);
+                seen.push(envelope.identity.map(|identity| identity.presentation_id));
             }
             seen
         })
@@ -2311,12 +2412,20 @@ mod tests {
                 poll_once(pending.as_mut()).await.is_none(),
                 "{STILL_PENDING}"
             );
-            for run_id in STREAM_RUN_IDS {
-                guard.sender(run_id).send(AgentEvent::Nudge).unwrap();
+            for presentation in STREAM_PRESENTATIONS {
+                guard
+                    .sender()
+                    .with_identity_of(Some(stamp(presentation)))
+                    .send(AgentEvent::Nudge)
+                    .unwrap();
             }
         });
         drop(guard);
-        assert_eq!(drain(&mut events), STREAM_RUN_IDS);
+        assert_eq!(
+            drain(&mut events),
+            STREAM_PRESENTATIONS.map(Some),
+            "the stream preserves the identity each event was stamped with"
+        );
     }
 
     /// The marker is a point of no return, even for a reader that has not
@@ -2325,28 +2434,36 @@ mod tests {
     #[test]
     fn events_sent_after_the_close_are_never_observed() {
         let (guard, mut events) = event_stream();
-        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        let retained = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
         retained.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         retained.send(AgentEvent::Nudge).unwrap();
-        assert_eq!(drain(&mut events), [STREAM_RUN_IDS[0]], "{NO_LATE_EVENTS}");
+        assert_eq!(
+            drain(&mut events),
+            [Some(STREAM_PRESENTATIONS[0])],
+            "{NO_LATE_EVENTS}"
+        );
         assert!(smol::block_on(events.next()).is_none(), "{NO_LATE_EVENTS}");
     }
 
-    /// A derived sender is just another clone: it stamps its own run id on the
-    /// same FIFO, and dropping it neither ends nor extends the stream.
+    /// A derived sender is just another clone: it stamps its own work identity
+    /// on the same FIFO, and dropping it neither ends nor extends the stream.
     #[test]
-    fn with_run_id_restamps_without_forking_the_stream() {
+    fn with_identity_of_restamps_without_forking_the_stream() {
         let (guard, mut events) = event_stream();
-        let original = guard.sender(STREAM_RUN_IDS[0]);
-        let derived = original.with_run_id(STREAM_RUN_IDS[1]);
+        let original = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
+        let derived = original.with_identity_of(Some(stamp(STREAM_PRESENTATIONS[1])));
         derived.send(AgentEvent::Nudge).unwrap();
         drop(derived);
         original.send(AgentEvent::Nudge).unwrap();
         drop(guard);
         assert_eq!(
             drain(&mut events),
-            [STREAM_RUN_IDS[1], STREAM_RUN_IDS[0]],
+            [Some(STREAM_PRESENTATIONS[1]), Some(STREAM_PRESENTATIONS[0])],
             "{NO_LATE_EVENTS}"
         );
     }
@@ -2356,7 +2473,9 @@ mod tests {
     #[test]
     fn dropping_the_guard_after_the_reader_is_harmless() {
         let (guard, events) = event_stream();
-        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        let retained = guard
+            .sender()
+            .with_identity_of(Some(stamp(STREAM_PRESENTATIONS[0])));
         drop(events);
         drop(guard);
         assert!(matches!(

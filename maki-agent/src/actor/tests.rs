@@ -35,7 +35,10 @@ use crate::tools::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience, ToolInvocation,
     ToolSource,
 };
-use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
+use crate::types::{
+    ActorWorkIdentity, ActorWorkKind, AgentId, DoneReason, EventSender, TurnCancellationReason,
+    TurnId, TurnOutcome,
+};
 use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
 use std::borrow::Cow;
 
@@ -578,7 +581,7 @@ fn typed_actor_events_are_ordered_future_only_and_broadcast() {
                 matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == ticket.turn_id())
             );
             assert!(
-                matches!(events.recv_async().await.unwrap(), super::ActorEvent::Idle { agent_id } if agent_id == actor.agent_id())
+                matches!(events.recv_async().await.unwrap(), super::ActorEvent::Idle { agent_id, .. } if agent_id == actor.agent_id())
             );
             assert!(events.is_empty());
         }
@@ -1059,16 +1062,21 @@ fn presentation_counter_is_actor_owned_and_cancel_fences_late_allocation() {
         let ticket = actor
             .admit_turn(input(CORRELATION), None, CORRELATION.into())
             .unwrap();
+        // Admission stamps the work with its own presentation, so a later
+        // allocation only moves past it rather than reusing the displayed id.
+        let admitted = actor.presentation_id();
+        assert!(admitted > 9, "{admitted}");
         until(|| actor.processing_turn_id() == Some(ticket.turn_id())).await;
         assert_eq!(
             actor
-                .allocate_processing_presentation(ticket.turn_id(), Some(9))
+                .allocate_processing_presentation(ticket.turn_id(), Some(admitted))
                 .unwrap(),
-            9
+            admitted,
+            "a caller already displaying the current presentation keeps it"
         );
-        let (turn, fence) = actor.cancel_local(9);
+        let (turn, fence) = actor.cancel_local(admitted);
         assert_eq!(turn, Some(ticket.turn_id()));
-        assert_eq!(fence, 10);
+        assert_eq!(fence, admitted + 1);
         // The cut cancels the run, which may settle before this call; either
         // way the late allocation is refused.
         let refused = actor.allocate_processing_presentation(ticket.turn_id(), None);
@@ -1428,7 +1436,7 @@ fn pending_cancellation_publishes_end_before_single_idle(
         let ticket = handle
             .admit_turn(
                 input("pending"),
-                Some(EventSender::new(presentation_tx, 0)),
+                Some(EventSender::new(presentation_tx)),
                 "pending".into(),
             )
             .unwrap();
@@ -1500,7 +1508,7 @@ fn pending_cancellation_publishes_end_before_single_idle(
             assert!(matches!(transition, super::ActorEvent::Close { .. }));
         } else {
             assert!(
-                matches!(transition, super::ActorEvent::Idle { agent_id } if agent_id == handle.agent_id())
+                matches!(transition, super::ActorEvent::Idle { agent_id, .. } if agent_id == handle.agent_id())
             );
         }
         assert!(events.is_empty());
@@ -1783,7 +1791,7 @@ fn close_drains_queued_turns_and_cancels_active_with_closed_reason() {
         let t3 = handle
             .admit_turn(
                 input("queued-with-sink"),
-                Some(EventSender::new(tx, 0)),
+                Some(EventSender::new(tx)),
                 "t3".into(),
             )
             .unwrap();
@@ -1933,10 +1941,7 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         let (handle, task) = spawn(backend);
         let (popped, release) = handle.pause_after_next_pop();
         handle
-            .push_control(ControlWork {
-                name: "cancelled".into(),
-                correlation: "cancelled".into(),
-            })
+            .push_control("cancelled".into(), "cancelled".into())
             .unwrap();
 
         popped.recv_async().await.unwrap();
@@ -1946,10 +1951,7 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         assert!(state.controls.lock().unwrap().is_empty());
 
         handle
-            .push_control(ControlWork {
-                name: "surviving".into(),
-                correlation: "surviving".into(),
-            })
+            .push_control("surviving".into(), "surviving".into())
             .unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
@@ -1974,12 +1976,7 @@ fn compact_keeps_admitted_policy() {
         let change = handle.reserve_config_update().unwrap();
         change.resolve(Ok(fast_change(true))).unwrap();
         change.wait().await.unwrap();
-        handle
-            .push_control(ControlWork {
-                name: "fence".into(),
-                correlation: "fence".into(),
-            })
-            .unwrap();
+        handle.push_control("fence".into(), "fence".into()).unwrap();
         until(|| state.controls.lock().unwrap().len() == 1).await;
         assert_eq!(
             state.compact_policies.lock().unwrap().as_slice(),
@@ -2006,12 +2003,7 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
 
         handle.push_compact(2, None).unwrap();
-        handle
-            .push_control(ControlWork {
-                name: "fence".into(),
-                correlation: "fence".into(),
-            })
-            .unwrap();
+        handle.push_control("fence".into(), "fence".into()).unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
         handle.close();
@@ -2112,7 +2104,7 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool, close_bef
         let (retired, release) = handle.pause_after_next_finalization_retire();
         let (tx, rx) = flume::unbounded();
         let ticket = handle
-            .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "work".into())
+            .admit_turn(input("work"), Some(EventSender::new(tx)), "work".into())
             .unwrap();
         let turn_id = ticket.turn_id();
 
@@ -2203,7 +2195,7 @@ fn ui_terminal_observes_sealed_immutable_result(setup_failure: bool, cancel: boo
         let observed = Arc::new(AtomicUsize::new(0));
         let observed_count = Arc::clone(&observed);
         let (tx, rx) = flume::unbounded();
-        let sender = EventSender::new(tx, 0).with_observer(move |event| {
+        let sender = EventSender::new(tx).with_observer(move |event| {
             if let AgentEvent::TurnOutcome(outcome) = event {
                 let ticket = ticket_slot.lock().unwrap().clone().unwrap();
                 let sealed = ticket.peek_result().expect("UI terminal preceded sealing");
@@ -2241,7 +2233,7 @@ fn entered_run_is_never_emitted_twice() {
         let (handle, task) = spawn(backend);
         let (tx, rx) = flume::unbounded();
         let ticket = handle
-            .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
+            .admit_turn(input("work"), Some(EventSender::new(tx)), "w".into())
             .unwrap();
         ticket.wait().await;
         assert!(matches!(
@@ -2266,7 +2258,7 @@ fn event_sink_failure_still_retains() {
         let (tx, rx) = flume::unbounded();
         drop(rx); // receiver dropped before admission so delivery fails
         let ticket = handle
-            .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
+            .admit_turn(input("work"), Some(EventSender::new(tx)), "w".into())
             .unwrap();
         let outcome = ticket.wait().await;
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
@@ -2511,12 +2503,7 @@ fn snapshot_queued_excludes_controls_from_pending_work_count() {
             .admit_turn(input("running"), None, "running".into())
             .unwrap();
         until(|| handle.snapshot().status != ActorStatus::Idle).await;
-        handle
-            .push_control(ControlWork {
-                name: "pin".into(),
-                correlation: "control".into(),
-            })
-            .unwrap();
+        handle.push_control("pin".into(), "control".into()).unwrap();
         handle
             .submit(
                 input("queued"),
@@ -2543,12 +2530,7 @@ fn control_produces_no_outcome() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle
-            .push_control(ControlWork {
-                name: "pin".into(),
-                correlation: "c1".into(),
-            })
-            .unwrap();
+        handle.push_control("pin".into(), "c1".into()).unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["pin"]);
         let snapshot = handle.snapshot();
@@ -2625,7 +2607,7 @@ fn close_retains_billed_request_after_active_backend_unwinds(shutdown: bool, use
         };
         let gate = Gate::new();
         let (tx, presentation) = flume::unbounded();
-        let sender = EventSender::new(tx, 1);
+        let sender = EventSender::new(tx);
         let mut backend = CancellableBackend::new();
         backend.after_cancel = Some(Arc::clone(&gate));
         backend.billed_request = Some((USAGE, sender.clone()));
@@ -3390,6 +3372,11 @@ fn queue_drain_publication_is_ordered() {
         instructions: None,
         generation: 0,
         policy: None,
+        work: ActorWorkIdentity::new(
+            AgentId::generate(),
+            ActorWorkKind::Compact { operation_id: 1 },
+            1,
+        ),
     });
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(
@@ -3591,7 +3578,7 @@ fn precancel_marks_match_and_do_not_poison() {
         // once, without executing or stranding.
         let (tx, rx) = flume::unbounded();
         let ticket = handle
-            .admit_turn(input("late"), Some(EventSender::new(tx, 0)), "run-5".into())
+            .admit_turn(input("late"), Some(EventSender::new(tx)), "run-5".into())
             .unwrap();
         assert!(matches!(
             ticket.wait().await,
@@ -4533,12 +4520,7 @@ fn queued_submissions_do_not_cross_control_boundary() {
         let first = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
-        actor
-            .push_control(ControlWork {
-                name: TEXT.into(),
-                correlation: TEXT.into(),
-            })
-            .unwrap();
+        actor.push_control(TEXT.into(), TEXT.into()).unwrap();
         let next = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();

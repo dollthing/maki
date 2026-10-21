@@ -550,7 +550,7 @@ fn managed_child_approval_is_pinned(
                     agent: None,
                 }),
                 subagent: Some(info),
-                run_id: 0,
+                identity: None,
             }),
         );
         assert_eq!(
@@ -572,7 +572,7 @@ fn managed_child_approval_is_pinned(
             let event = child_events
                 .recv_timeout(idle_deadline.saturating_duration_since(Instant::now()))
                 .expect("pinned child setup did not become idle");
-            if matches!(event, ActorEvent::Idle { agent_id } if agent_id == child_id) {
+            if matches!(event, ActorEvent::Idle { agent_id, .. } if agent_id == child_id) {
                 break;
             }
         }

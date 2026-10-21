@@ -107,6 +107,10 @@ pub struct TurnAdmissionOptions {
     pub policy_constraint: Option<AdmissionPolicyConstraint>,
     pub already_displayed: bool,
     pub mcp_startup_notice: Option<usize>,
+    /// The presentation the frontend already associates with this submission.
+    /// When set, admission uses it verbatim instead of allocating one, because
+    /// the app has already drawn (or will draw) the bubble under that id.
+    pub displayed_presentation: Option<u64>,
 }
 
 #[derive(Default)]
@@ -152,6 +156,9 @@ pub enum ActorEvent {
     },
     Idle {
         agent_id: AgentId,
+        /// The work that settled last, or `None` when the actor went idle
+        /// without running any.
+        settled: Option<ActorWorkIdentity>,
     },
     Config(ConfigCommit),
     Close {
@@ -178,7 +185,10 @@ use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
 use crate::tools::offload::OffloadStore;
-use crate::types::{AgentEvent, AgentId, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
+use crate::types::{
+    ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, EventSender, TurnCancellationReason,
+    TurnId, TurnOutcome,
+};
 use crate::{AgentInput, AgentMode, CancelTrigger, History, ModeDef, RunSettings, SharedMessages};
 
 /// One scheduler operation. Every admitted turn settles into one outcome;
@@ -193,10 +203,21 @@ pub enum ActorWork {
         instructions: Option<String>,
         generation: u64,
         policy: Option<Arc<EffectiveAgentConfig>>,
+        work: ActorWorkIdentity,
     },
 }
 
 impl ActorWork {
+    /// The identity this work was admitted under.
+    pub(crate) fn identity(&self) -> Option<ActorWorkIdentity> {
+        match self {
+            Self::Turn(admission) => Some(admission.work),
+            Self::Control(control) => Some(control.work),
+            Self::Compact { work, .. } => Some(*work),
+            Self::HistoryEdit(_) => None,
+        }
+    }
+
     /// Every correlation targeted cancels can match this work by. Compacts
     /// re-derive theirs from the run id (see [`run_correlation`]), so they
     /// match cancels like run work but never retire precancel marks; see
@@ -337,6 +358,10 @@ pub(crate) struct ActorState {
     leased_event_observers: Vec<(flume::Sender<LeasedActorEvent>, Arc<CallbackDrain>)>,
     next_operation_id: u64,
     next_submission_id: u64,
+    /// Identity of the work that settled most recently, published with the
+    /// idle notification so a frontend can fence the settlement against the
+    /// presentation that actually produced it.
+    settled: Option<ActorWorkIdentity>,
 }
 
 struct ConfigOperation {
@@ -359,11 +384,13 @@ enum ActorOperation {
         correlation: String,
         ticket: TurnTicket,
         policy_constraint: Option<AdmissionPolicyConstraint>,
+        identity: ActorWorkIdentity,
     },
     Compact {
         id: u64,
         run_id: u64,
         instructions: Option<String>,
+        presentation_id: u64,
     },
 }
 
@@ -499,6 +526,7 @@ fn settle_deferred(
             event_sender,
             correlation,
             ticket,
+            identity,
             ..
         } = admission
         {
@@ -509,6 +537,7 @@ fn settle_deferred(
                 input: Some(input),
                 event_sender,
                 correlation,
+                work: identity,
                 generation: 0,
                 policy: None,
                 admission: None,
@@ -725,6 +754,7 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
         event_sender,
         correlation,
         ticket,
+        identity,
         ..
     } = work
     {
@@ -734,6 +764,7 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
             input: Some(input),
             event_sender,
             correlation,
+            work: identity,
             ticket,
             generation: 0,
             policy: None,
@@ -792,6 +823,7 @@ fn materialize(
             event_sender,
             correlation,
             ticket,
+            identity,
             ..
         } => {
             if let Some(config) = &state.policy {
@@ -831,6 +863,7 @@ fn materialize(
                 input: Some(input),
                 event_sender,
                 correlation,
+                work: identity,
                 ticket,
                 generation: state.policy_generation,
                 policy: state.policy.clone(),
@@ -841,12 +874,18 @@ fn materialize(
             id,
             run_id,
             instructions,
+            presentation_id,
         } => inner.queue.push(ActorWork::Compact {
             operation_id: id,
             run_id,
             instructions,
             generation: state.policy_generation,
             policy: state.policy.clone(),
+            work: ActorWorkIdentity::new(
+                inner.agent_id,
+                ActorWorkKind::Compact { operation_id: id },
+                presentation_id,
+            ),
         }),
         ActorOperation::Control { control, .. } => inner.queue.push(ActorWork::Control(control)),
         ActorOperation::Config(_) | ActorOperation::Prepared(_) => unreachable!(),
@@ -864,6 +903,25 @@ impl ActorState {
             return Err(ActorError::InstructionOverflow);
         }
         Ok(())
+    }
+
+    /// Allocates the next presentation id, never reusing or going below the
+    /// given floor.
+    fn reserve_presentation(&mut self, displayed: u64) -> u64 {
+        self.presentation = self.presentation.max(displayed) + 1;
+        self.presentation
+    }
+
+    /// Uses the presentation the frontend already holds, or allocates one.
+    /// The counter still moves past it so later work cannot reuse the id.
+    fn adopt_presentation(&mut self, displayed: Option<u64>) -> u64 {
+        match displayed {
+            Some(displayed) => {
+                self.presentation = self.presentation.max(displayed);
+                displayed
+            }
+            None => self.reserve_presentation(0),
+        }
     }
 
     fn pending_submission(
@@ -898,6 +956,7 @@ impl ActorState {
             self.idle_pending = false;
             self.emit(ActorEvent::Idle {
                 agent_id: inner.agent_id,
+                settled: self.settled,
             });
         }
     }
@@ -1057,6 +1116,7 @@ impl ActorState {
             leased_event_observers: Vec::new(),
             next_operation_id: 0,
             next_submission_id: 0,
+            settled: None,
         }
     }
 }
@@ -1686,6 +1746,7 @@ impl AgentActorHandle {
                         id,
                         run_id,
                         instructions,
+                        ..
                     } => vec![PendingQueueEntry::Compact {
                         operation_id: *id,
                         run_id: *run_id,
@@ -2234,6 +2295,15 @@ impl AgentActorHandle {
                 .with_provenance(options.provenance);
             state.next_operation_id = state.next_operation_id.wrapping_add(1);
             let id = state.next_operation_id;
+            let presentation_id = state.adopt_presentation(options.displayed_presentation);
+            let identity = ActorWorkIdentity::new(
+                self.inner.agent_id,
+                ActorWorkKind::Turn {
+                    operation_id: id,
+                    turn_id,
+                },
+                presentation_id,
+            );
             let mut inbox = inbox::InstructionInbox::new(ticket.clone());
             inbox.drained.push((ticket.provenance().clone(), bytes));
             inbox.submit_operation = Some(id);
@@ -2257,6 +2327,7 @@ impl AgentActorHandle {
                 correlation,
                 ticket: ticket.clone(),
                 policy_constraint: options.policy_constraint,
+                identity,
             };
             if let Some(reason) = reason {
                 state.instructions.remove(&turn_id);
@@ -2312,6 +2383,15 @@ impl AgentActorHandle {
             .insert(turn_id, inbox::InstructionInbox::new(ticket.clone()));
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
+        let presentation_id = state.adopt_presentation(options.displayed_presentation);
+        let identity = ActorWorkIdentity::new(
+            self.inner.agent_id,
+            ActorWorkKind::Turn {
+                operation_id: after,
+                turn_id,
+            },
+            presentation_id,
+        );
         let presentation = state.pending_submission(
             turn_id,
             &input,
@@ -2331,6 +2411,7 @@ impl AgentActorHandle {
             correlation,
             ticket: ticket.clone(),
             policy_constraint: options.policy_constraint,
+            identity,
         };
         self.inner.admit_ticket(turn_id, ticket.clone());
         if let Some(reason) = reason {
@@ -2457,16 +2538,26 @@ impl AgentActorHandle {
         Ok(generation)
     }
 
-    pub fn push_control(&self, control: ControlWork) -> Result<(), ActorError> {
+    pub fn push_control(&self, name: String, correlation: String) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let id = state.next_operation_id;
-        state
-            .operations
-            .push_back(ActorOperation::Control { id, control });
+        let presentation_id = state.reserve_presentation(0);
+        state.operations.push_back(ActorOperation::Control {
+            id,
+            control: ControlWork {
+                name,
+                correlation,
+                work: ActorWorkIdentity::new(
+                    self.inner.agent_id,
+                    ActorWorkKind::Control { operation_id: id },
+                    presentation_id,
+                ),
+            },
+        });
         drive_operations(&self.inner, &mut state);
         Ok(())
     }
@@ -2493,10 +2584,12 @@ impl AgentActorHandle {
         }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
+        let presentation_id = state.reserve_presentation(0);
         state.operations.push_back(ActorOperation::Compact {
             id: after,
             run_id,
             instructions,
+            presentation_id,
         });
         drive_operations(&self.inner, &mut state);
         Ok(())

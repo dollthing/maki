@@ -1576,7 +1576,7 @@ fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     finish_with_live_buf(&mut panel, "t1", "body", is_error);
     assert!(panel.watching("t1"));
 
@@ -1622,7 +1622,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
 
     render(&mut panel, 80, 24);
@@ -1668,7 +1668,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let mut ev = start("t1", BASH_TOOL_NAME);
     ev.raw_input = Some(serde_json::json!({ "command": "true" }));
     panel.tool_start(ev);
@@ -1702,7 +1702,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = Arc::new(maki_agent::SharedBuf::new());
     buf.set_lines(vec![snap_line("body")]);
     let mut ev = start("t1", BASH_TOOL_NAME);
@@ -1749,7 +1749,7 @@ fn restore_reply_stops_watching_buf() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
 
@@ -1796,7 +1796,7 @@ fn rebake_request_stops_watching_buf() {
         eh,
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.set_restore_channel(Some(EventSender::new(tx, 0)));
+    panel.set_restore_channel(Some(EventSender::new(tx)));
     finish_with_live_buf(&mut panel, "t1", "old-theme", false);
     assert!(panel.watching("t1"));
 
@@ -1961,7 +1961,7 @@ fn superseded_rebake_reply_is_dropped() {
 
 fn test_event_sender() -> maki_agent::EventSender {
     let (tx, _rx) = flume::unbounded();
-    maki_agent::EventSender::new(tx, 0)
+    maki_agent::EventSender::new(tx)
 }
 
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";

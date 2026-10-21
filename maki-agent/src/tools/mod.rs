@@ -912,7 +912,7 @@ pub fn interpreter_ctx(
 /// Allows everything, sends events to a dummy channel, uses no model.
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
-    let event_tx = crate::EventSender::new(tx, 0);
+    let event_tx = crate::EventSender::new(tx);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let project_config = maki_config::ProjectConfig::discover(&cwd);
     interpreter_ctx(
@@ -1053,7 +1053,7 @@ pub mod test_support {
         let event_tx = match event_tx {
             Some(tx) => tx,
             None => {
-                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0, 0);
+                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0);
                 &fallback_tx
             }
         };
@@ -1095,7 +1095,7 @@ pub mod test_support {
         permissions: Arc<PermissionManager>,
     ) -> ToolContext {
         let (tx, _rx) = flume::unbounded::<crate::Envelope>();
-        let event_tx = EventSender::new(tx, 0);
+        let event_tx = EventSender::new(tx);
         let mut ctx = interpreter_ctx(
             mode,
             &event_tx,

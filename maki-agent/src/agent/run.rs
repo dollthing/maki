@@ -2178,7 +2178,7 @@ mod tests {
             AgentRunParams {
                 history,
                 system: "system".into(),
-                event_tx: EventSender::new(raw_tx, 0),
+                event_tx: EventSender::new(raw_tx),
                 tools: RequestTools::default(),
             },
         );
@@ -2548,7 +2548,7 @@ mod tests {
                 tx.send(Envelope {
                     event: AgentEvent::Nudge,
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .unwrap();
             }

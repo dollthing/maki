@@ -545,12 +545,24 @@ fn agent_msg(event: AgentEvent) -> Msg {
     agent_msg_with_run_id(event, 1)
 }
 
-fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
+/// Actor work stamped with the given presentation. Tests use the presentation
+/// number as their run id, matching what admission now owns.
+fn agent_msg_with_run_id(event: AgentEvent, presentation: u64) -> Msg {
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: None,
-        run_id,
+        identity: Some(work_identity(presentation)),
     }))
+}
+
+pub(crate) fn work_identity(presentation: u64) -> maki_agent::ActorWorkIdentity {
+    maki_agent::ActorWorkIdentity::new(
+        AgentId::generate(),
+        maki_agent::ActorWorkKind::Control {
+            operation_id: presentation,
+        },
+        presentation,
+    )
 }
 
 fn done() -> AgentEvent {
@@ -633,7 +645,7 @@ fn post_msg(subagent: Option<SubagentInfo>) -> (Msg, Post) {
     let msg = Msg::Agent(Box::new(Envelope {
         event: AgentEvent::Post(post.clone()),
         subagent,
-        run_id: UNRELATED_RUN_ID,
+        identity: Some(work_identity(UNRELATED_RUN_ID)),
     }));
     (msg, post)
 }
@@ -692,12 +704,12 @@ fn subagent_msg_with_run_id(
     event: AgentEvent,
     parent_id: &str,
     name: Option<&str>,
-    run_id: u64,
+    presentation: u64,
 ) -> Msg {
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: Some(subagent_info(parent_id, name.unwrap_or("Agent"))),
-        run_id,
+        identity: Some(work_identity(presentation)),
     }))
 }
 
@@ -712,7 +724,7 @@ fn subagent_msg_with_prompt(
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     }))
 }
 
@@ -722,7 +734,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
     Msg::Agent(Box::new(Envelope {
         event,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     }))
 }
 
@@ -1125,7 +1137,7 @@ fn buffered_mixed_fifo_presentations_preserve_prior_bubbles_and_cancel_fence(can
             run_id,
         ));
         buffered.push(agent_msg_with_run_id(done(), run_id));
-        buffered.push(agent_msg_with_run_id(AgentEvent::QueueDrained, run_id));
+        buffered.push(agent_msg_with_run_id(AgentEvent::QueueSettled, run_id));
     }
     buffered.insert(
         4,
@@ -5441,7 +5453,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
             delay_ms: RETRY_DELAY.as_millis() as u64,
         },
         subagent: info.clone(),
-        run_id: app.run_id,
+        identity: Some(work_identity(app.run_id)),
     })));
     assert_eq!(app.focused_retry().unwrap().message, RETRY_MESSAGE);
     if child {
@@ -5452,7 +5464,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
             text: "request resumed".into(),
         },
         subagent: info,
-        run_id: app.run_id,
+        identity: Some(work_identity(app.run_id)),
     })));
     assert!(app.focused_retry().is_none());
 }
@@ -5953,7 +5965,7 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     (app, sub_rx, main_rx)
 }
@@ -6015,7 +6027,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::AuthRequired,
         subagent: None,
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert_eq!(app.pending_input, PendingInput::None);
     assert_eq!(app.chats[0].message_count(), count_before);
@@ -7565,7 +7577,7 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
             render_header: None,
         })),
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -7577,7 +7589,7 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
             written_path: None,
         })),
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.chats.len(), 2);
@@ -7593,7 +7605,7 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
             DoneReason::EndTurn,
         )),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(app.chats[1].is_finished());
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
@@ -7610,7 +7622,7 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
             text: "answer".into(),
         },
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(TurnOutcome::completed(
@@ -7621,7 +7633,7 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
             DoneReason::EndTurn,
         )),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     let count_after_outcome = app.chats[1].message_count();
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -7648,7 +7660,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         Msg::Agent(Box::new(Envelope {
             event: AgentEvent::TurnOutcome(outcome),
             subagent: Some(info.clone()),
-            run_id: 1,
+            identity: Some(work_identity(1)),
         }))
     };
     app.update(Msg::Agent(Box::new(Envelope {
@@ -7656,7 +7668,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
             text: "first".into(),
         },
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     app.update(envelope(TurnOutcome::completed(
@@ -7672,7 +7684,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
             text: "second turn".into(),
         },
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(!app.chats[1].is_finished());
     assert!(app.task_entries()[1].is_spinning());
@@ -7689,7 +7701,7 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
             }],
         },
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(app.queue.text_messages().is_empty());
     app.update(envelope(TurnOutcome::failed(
@@ -7793,7 +7805,7 @@ fn failed_subagent_is_presented_without_ui_delivery(parent_is_root: bool, auto_d
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(outcome),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
@@ -10180,7 +10192,7 @@ fn spawn_input_child_with_mode(
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     (target, rx)
 }
@@ -10324,7 +10336,7 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
         subagent: Some(subagent_info_for_agent(
             agent_id, TASK_ID, "research", None, input_tx,
         )),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert!(app.chats[app.active_chat].is_finished());
@@ -10349,7 +10361,7 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(app.active_subagent_closed());
     assert!(app.chats[chat_idx].is_finished());
@@ -10371,7 +10383,7 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
             },
         )),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(app.chats[chat_idx].is_finished());
     assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
@@ -10403,7 +10415,7 @@ fn subagent_closed_replaces_active_permission_with_live_root_request() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: permission(CHILD_PERMISSION_ID),
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.pending_input = PendingInput::AuthRetry {
         agent_id: Some(agent_id),
@@ -10415,7 +10427,7 @@ fn subagent_closed_replaces_active_permission_with_live_root_request() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert!(app.permission_active());
@@ -10441,7 +10453,7 @@ fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: permission(CHILD_PERMISSION_ID),
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
     assert_eq!(app.input_queue.len(), 2);
@@ -10451,7 +10463,7 @@ fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert!(app.permission_active());
@@ -10479,7 +10491,7 @@ fn subagent_closed_preserves_terminal_status(
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert!(app.chats[chat_idx].is_finished());
@@ -10508,7 +10520,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
@@ -10517,7 +10529,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
             messages: messages.clone(),
         },
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(
@@ -10552,12 +10564,12 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.update(Msg::Agent(Box::new(Envelope {
         event: turn_complete(usage, MODEL, Some(COST)),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.state.token_usage, usage);
@@ -10598,7 +10610,7 @@ fn turn_complete_after_root_cancel_preserves_child() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: turn_complete(usage, MODEL, Some(COST)),
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.state.token_usage, usage);
@@ -10634,7 +10646,7 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
         app.update(Msg::Agent(Box::new(Envelope {
             event: AgentEvent::SubagentClosed,
             subagent: Some(info.clone()),
-            run_id: 1,
+            identity: Some(work_identity(1)),
         })));
     }
     app.update(Msg::Agent(Box::new(Envelope {
@@ -10644,7 +10656,7 @@ fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool)
             messages: earlier.messages.as_ref().clone(),
         },
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     let projected = app
         .state
@@ -10674,7 +10686,7 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
         app.update(Msg::Agent(Box::new(Envelope {
             event,
             subagent: Some(info.clone()),
-            run_id: 1,
+            identity: Some(work_identity(1)),
         })));
     }
 
@@ -10695,7 +10707,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
             text: IN_PROGRESS.into(),
         },
         subagent: Some(info.clone()),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     assert!(!app.chats[app.active_chat].is_finished());
 
@@ -10708,7 +10720,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.chats.len(), chat_count);
@@ -10732,7 +10744,7 @@ fn subagent_closed_prunes_only_its_presentation_state() {
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert!(
@@ -10841,7 +10853,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
             }],
         },
         subagent: Some(grandchild),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
 
     assert_eq!(
@@ -10867,7 +10879,7 @@ fn task_picker_rows_show_snippet() {
             text: "progress line".into(),
         },
         subagent: Some(info),
-        run_id: 1,
+        identity: Some(work_identity(1)),
     })));
     app.chats[1].flush();
     app.open_tasks();

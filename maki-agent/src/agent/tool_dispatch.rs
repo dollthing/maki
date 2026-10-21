@@ -2128,7 +2128,7 @@ mod tests {
     fn local_tool_notify_emits_tool_start_with_raw_input() {
         smol::block_on(async {
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
+            let event_tx = crate::EventSender::new(tx);
             let mut ctx =
                 crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
             ctx.local_tools = Arc::new(HashMap::from([(
@@ -3211,7 +3211,7 @@ mod tests {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
+            let event_tx = crate::EventSender::new(tx);
             let (mut ctx, hook) = hooked_with(
                 crate::tools::test_support::stub_ctx_with(&plan, Some(&event_tx), None),
                 None,
@@ -3235,7 +3235,7 @@ mod tests {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
+            let event_tx = crate::EventSender::new(tx);
             let mut ctx = crate::tools::test_support::stub_ctx_with(&plan, Some(&event_tx), None);
             ctx.permissions =
                 ruled_ctx(&plan, ToolKey::native(HOOK_TOOL_NAME), Effect::Allow).permissions;
@@ -3257,7 +3257,7 @@ mod tests {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let event_tx = crate::EventSender::new(tx, 0);
+            let event_tx = crate::EventSender::new(tx);
             let permissions = ruled_ctx(
                 &plan,
                 ToolKey::parse(PROBE_QUALIFIED).unwrap(),

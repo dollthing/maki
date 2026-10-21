@@ -8,6 +8,7 @@ use super::{
     TurnResult, TurnTicket, drive_operations,
 };
 use crate::tools::offload::OffloadStore;
+use crate::types::{ActorWorkIdentity, ActorWorkKind};
 use crate::{AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
 
 pub const MAX_PENDING_DELIVERIES: usize = 64;
@@ -475,6 +476,15 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     state.delivery_runs.insert(turn_id, batch);
     state.next_operation_id = state.next_operation_id.wrapping_add(1);
     let id = state.next_operation_id;
+    let presentation_id = state.reserve_presentation(0);
+    let identity = ActorWorkIdentity::new(
+        inner.agent_id,
+        ActorWorkKind::Turn {
+            operation_id: id,
+            turn_id,
+        },
+        presentation_id,
+    );
     state.operations.push_back(ActorOperation::Turn {
         id,
         input: AgentInput::from_defaults(
@@ -487,6 +497,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
         correlation: "child-results".into(),
         ticket,
         policy_constraint: None,
+        identity,
     });
     drive_operations(inner, state);
 }

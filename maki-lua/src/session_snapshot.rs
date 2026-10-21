@@ -191,7 +191,7 @@ mod tests {
         Envelope {
             event,
             subagent: None,
-            run_id: 0,
+            identity: None,
         }
     }
 

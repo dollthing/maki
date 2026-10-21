@@ -11,12 +11,12 @@
 //! actor runner racing their assertions. It never compiles into production.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use std::sync::Arc;
 
 #[cfg(test)]
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -69,16 +69,6 @@ pub(crate) enum QueueItem {
     },
 }
 
-impl QueueItem {
-    pub(crate) fn run_id(&self) -> u64 {
-        match self {
-            Self::Message { run_id, .. } => *run_id,
-            #[cfg(test)]
-            Self::Compact { run_id, .. } => *run_id,
-        }
-    }
-}
-
 /// The actual storage behind a [`QueueSender`]. Production always uses
 /// [`QueueBackend::Actor`], delegating every operation to the actor's single
 /// queue. The test variant is compiled out of production builds.
@@ -87,9 +77,32 @@ pub(crate) enum QueueBackend {
     /// The actor's scheduling queue, via its handle.
     Actor(Arc<AgentActorHandle>),
     /// Presentation-only deque for deterministic App unit tests; never
-    /// compiled into production and never a scheduling source.
+    /// compiled into production and never a scheduling source. It owns its
+    /// own presentation counter because there is no actor to own one.
     #[cfg(test)]
-    Test(Arc<Mutex<VecDeque<QueueItem>>>),
+    Test {
+        items: Arc<Mutex<VecDeque<QueueItem>>>,
+        presentation: Arc<AtomicU64>,
+    },
+}
+
+/// Reserves the next presentation id in the test fixture, mirroring the
+/// actor's policy of never reusing an id and never going below the floor.
+#[cfg(test)]
+fn reserve_test_presentation(presentation: &AtomicU64, displayed: u64) -> u64 {
+    let mut allocated = presentation.load(Ordering::Relaxed);
+    loop {
+        let next = allocated.max(displayed) + 1;
+        match presentation.compare_exchange_weak(
+            allocated,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => allocated = current,
+        }
+    }
 }
 
 /// Actor-backed queue facade shared with the app. Clones all reference the
@@ -98,17 +111,12 @@ pub(crate) enum QueueBackend {
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     backend: QueueBackend,
-    /// App-visible run id of the most recent message/compact push, shared so
-    /// the backend can stamp controls/compacts that carry no correlation.
-    last_run_id: Arc<AtomicU64>,
 }
 
 /// Actor-backed facade used by production `AgentHandles`.
-pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>, run_id: Arc<AtomicU64>) -> QueueSender {
-    actor.observe_presentation(run_id.load(Ordering::Relaxed));
+pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>) -> QueueSender {
     QueueSender {
         backend: QueueBackend::Actor(actor),
-        last_run_id: run_id,
     }
 }
 
@@ -118,8 +126,10 @@ pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>, run_id: Arc<AtomicU64>) 
 pub(crate) fn queue() -> QueueSender {
     let items: Arc<Mutex<VecDeque<QueueItem>>> = Arc::new(Mutex::new(VecDeque::new()));
     QueueSender {
-        backend: QueueBackend::Test(items),
-        last_run_id: Arc::new(AtomicU64::new(0)),
+        backend: QueueBackend::Test {
+            items,
+            presentation: Arc::new(AtomicU64::new(0)),
+        },
     }
 }
 
@@ -135,55 +145,48 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
-    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
+    pub(crate) fn capture_cancel(&self, displayed: u64) -> (Option<TurnId>, u64) {
         match &self.backend {
-            QueueBackend::Actor(actor) => {
-                let cut = actor.cancel_local(displayed_run_id);
-                self.last_run_id.fetch_max(cut.1, Ordering::Relaxed);
-                cut
-            }
+            QueueBackend::Actor(actor) => actor.cancel_local(displayed),
             #[cfg(test)]
-            QueueBackend::Test(items) => {
-                let mut items = lock(items);
-                items.clear();
-                (None, self.reserve_run_id(displayed_run_id))
+            QueueBackend::Test {
+                items,
+                presentation,
+            } => {
+                lock(items).clear();
+                (None, reserve_test_presentation(presentation, displayed))
             }
         }
     }
 
+    /// The presentation the app should treat as current. Production asks the
+    /// actor, which owns the counter; the test fixture keeps its own.
     pub(crate) fn current_run_id(&self) -> u64 {
         match &self.backend {
             QueueBackend::Actor(actor) => actor.presentation_id(),
             #[cfg(test)]
-            QueueBackend::Test(_) => self.last_run_id.load(Ordering::Relaxed),
+            QueueBackend::Test { presentation, .. } => presentation.load(Ordering::Relaxed),
         }
     }
 
-    pub(crate) fn set_run_id(&self, run_id: u64) {
+    pub(crate) fn set_run_id(&self, displayed: u64) {
         match &self.backend {
-            QueueBackend::Actor(actor) => actor.observe_presentation(run_id),
+            QueueBackend::Actor(actor) => actor.observe_presentation(displayed),
             #[cfg(test)]
-            QueueBackend::Test(_) => {}
+            QueueBackend::Test { presentation, .. } => {
+                presentation.fetch_max(displayed, Ordering::Relaxed);
+            }
         }
-        self.last_run_id.fetch_max(run_id, Ordering::Relaxed);
     }
 
-    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
-        let id = match &self.backend {
-            QueueBackend::Actor(actor) => actor.reserve_presentation(displayed_run_id),
+    pub(crate) fn reserve_run_id(&self, displayed: u64) -> u64 {
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.reserve_presentation(displayed),
             #[cfg(test)]
-            QueueBackend::Test(_) => {
-                self.last_run_id
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
-                        Some(allocated.max(displayed_run_id) + 1)
-                    })
-                    .unwrap_or_else(|allocated| allocated)
-                    .max(displayed_run_id)
-                    + 1
+            QueueBackend::Test { presentation, .. } => {
+                reserve_test_presentation(presentation, displayed)
             }
-        };
-        self.last_run_id.fetch_max(id, Ordering::Relaxed);
-        id
+        }
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
@@ -193,13 +196,11 @@ impl QueueSender {
     }
 
     pub(crate) fn try_push(&self, entry: QueueItem) -> Result<(), ActorError> {
-        let run_id = entry.run_id();
         match &self.backend {
             #[cfg(test)]
-            QueueBackend::Test(items) => lock(items).push_back(entry),
+            QueueBackend::Test { items, .. } => lock(items).push_back(entry),
             QueueBackend::Actor(actor) => push_to_actor(actor, entry)?,
         }
-        self.set_run_id(run_id);
         Ok(())
     }
 
@@ -209,7 +210,7 @@ impl QueueSender {
     pub(crate) fn remove(&self, index: usize) -> bool {
         match &self.backend {
             #[cfg(test)]
-            QueueBackend::Test(items) => {
+            QueueBackend::Test { items, .. } => {
                 let mut items = lock(items);
                 let raw_index = items
                     .iter()
@@ -244,7 +245,7 @@ impl QueueSender {
     pub(crate) fn len(&self) -> usize {
         match &self.backend {
             #[cfg(test)]
-            QueueBackend::Test(items) => lock(items).len(),
+            QueueBackend::Test { items, .. } => lock(items).len(),
             QueueBackend::Actor(_) => self.projections().len(),
         }
     }
@@ -256,7 +257,7 @@ impl QueueSender {
     #[cfg(test)]
     pub(crate) fn clear(&self) {
         match &self.backend {
-            QueueBackend::Test(items) => lock(items).clear(),
+            QueueBackend::Test { items, .. } => lock(items).clear(),
             QueueBackend::Actor(actor) => {
                 let _ = actor.clear();
             }
@@ -267,7 +268,7 @@ impl QueueSender {
     pub(crate) fn clear_user_work(&self) {
         match &self.backend {
             #[cfg(test)]
-            QueueBackend::Test(items) => lock(items).clear(),
+            QueueBackend::Test { items, .. } => lock(items).clear(),
             QueueBackend::Actor(actor) => {
                 let _ = actor.clear_user_work();
             }
@@ -306,7 +307,7 @@ impl QueueSender {
     fn projections(&self) -> Vec<QueueProjection> {
         match &self.backend {
             #[cfg(test)]
-            QueueBackend::Test(items) => lock(items).iter().map(Into::into).collect(),
+            QueueBackend::Test { items, .. } => lock(items).iter().map(Into::into).collect(),
             QueueBackend::Actor(actor) => actor
                 .pending_queue()
                 .into_iter()
@@ -342,6 +343,9 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
                         ..Default::default()
                     },
                     already_displayed: displayed,
+                    // Only a bubble the UI already drew keeps its id; a
+                    // deferred item gets a fresh presentation when it runs.
+                    displayed_presentation: displayed.then_some(run_id),
                     ..Default::default()
                 },
             )?;
@@ -441,7 +445,11 @@ mod tests {
             *run_id = 9;
         }
         tx.try_push(item).unwrap();
-        assert_eq!(tx.current_run_id(), 9);
+        // Pushing no longer advances the counter: the app reserves the
+        // presentation it will use and pushes with that id.
+        assert_eq!(tx.current_run_id(), 0);
+        assert_eq!(tx.reserve_run_id(9), 10);
+        assert_eq!(tx.current_run_id(), 10);
         assert_eq!(tx.text_messages(), ["t"]);
         assert_eq!(tx.clone().panel_len(), 1);
     }

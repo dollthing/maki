@@ -14,8 +14,8 @@ use arc_swap::{ArcSwap, Guard};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
-    McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
+    AgentConfig, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot, McpCommand,
+    McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
     ToolOutputLines,
 };
 use maki_config::ModelPolicy;
@@ -443,8 +443,14 @@ impl AgentHandles {
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
-        let restore_tx =
-            maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
+        let restore_tx = maki_agent::EventSender::with_identity(
+            self.agent_tx.clone(),
+            Some(maki_agent::ActorWorkIdentity::new(
+                self.manager_and_root().1,
+                maki_agent::ActorWorkKind::Control { operation_id: 0 },
+                crate::app::RESTORE_PRESENTATION,
+            )),
+        );
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
             chat.set_restore_channel(Some(restore_tx.clone()));
@@ -616,8 +622,6 @@ fn spawn_agent_internal(
 
     let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
 
-    let (drain_tx, drain_rx) = flume::unbounded::<u64>();
-    let run_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let limits = AgentLimits {
         max_concurrent_agent_turns: config.max_concurrent_agent_turns,
         max_agent_depth: config.max_agent_depth,
@@ -675,8 +679,6 @@ fn spawn_agent_internal(
                     Arc::new(maki_agent::tools::FileWriteLocks::new()),
                     offload.clone(),
                     init_cancel,
-                    drain_tx,
-                    Arc::clone(&run_id),
                 );
                 orchestration_template = Some(backend.orchestration_template());
                 Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(backend))
@@ -686,7 +688,7 @@ fn spawn_agent_internal(
         .expect("root agent factory");
     let root_id = root.id();
     let actor = Arc::new(root.actor().expect("committed root actor"));
-    let queue_tx = actor_queue(Arc::clone(&actor), Arc::clone(&run_id));
+    let queue_tx = actor_queue(Arc::clone(&actor));
 
     spawn_command_router(
         cmd_rx,
@@ -695,21 +697,6 @@ fn spawn_agent_internal(
         Arc::clone(&subagent_cancels),
         init_trigger,
     );
-
-    // Drain driver: the actor's runner drains the queue; this task watches
-    // each completed item and publishes `QueueDrained` once, under the actor
-    // queue lock, correlated with the finishing item's run id.
-    let drain_actor = Arc::clone(&actor);
-    let drain_agent_tx = agent_tx.clone();
-    smol::spawn(async move {
-        while let Ok(run_id) = drain_rx.recv_async().await {
-            drain_actor.publish_if_empty(|| {
-                maki_agent::EventSender::new(drain_agent_tx.clone(), run_id)
-                    .try_send(AgentEvent::QueueDrained);
-            });
-        }
-    })
-    .detach();
 
     PreparedAgentHandles {
         handles: Some(AgentHandles {
@@ -990,8 +977,14 @@ mod tests {
     #[test]
     fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
         let (mut handles, model_slot, permissions) = stub_spawn();
-        let pre_gen1_sender =
-            maki_agent::EventSender::new(handles.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
+        let pre_gen1_sender = maki_agent::EventSender::with_identity(
+            handles.agent_tx.clone(),
+            Some(maki_agent::ActorWorkIdentity::new(
+                handles.manager_and_root().1,
+                maki_agent::ActorWorkKind::Control { operation_id: 0 },
+                crate::app::RESTORE_PRESENTATION,
+            )),
+        );
 
         let mut app = crate::app::tests::test_app();
         let run_id_before = app.run_id;
@@ -1026,9 +1019,20 @@ mod tests {
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
                 AgentEvent::QueueItemConsumed { ref text, .. } if text == RESTORED_TEXT => {
-                    assert_eq!(envelope.run_id, app.run_id + 1);
+                    // The restored item was admitted with its own presentation,
+                    // and the app adopts it as the run it is now showing.
+                    let presentation = envelope
+                        .presentation()
+                        .expect("restored work is stamped by admission");
                     app.adopt_actor_presentation(&envelope);
-                    assert_eq!(envelope.run_id, app.run_id);
+                    // Whether it was already current or adopted now, the app
+                    // agrees with the actor on which presentation is showing.
+                    assert_eq!(Some(presentation), envelope.presentation());
+                    assert!(
+                        presentation >= app.run_id,
+                        "a restored item never lands behind the display: {presentation} < {}",
+                        app.run_id
+                    );
                     restored_seen += 1;
                 }
                 _ => {}

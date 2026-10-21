@@ -137,7 +137,7 @@ mod tests {
                 self.currents
                     .send(context.managed_turn.clone().unwrap())
                     .unwrap();
-                if context.correlation == correlation(1) {
+                if context.work.presentation_id == 1 {
                     let reason = context.cancel_reason.cancelled().await;
                     BackendResult::EnteredRun(TurnOutcome::cancelled(
                         context.agent_id,
@@ -259,7 +259,7 @@ mod tests {
                     Box::new(CancellableBackend {
                         current: None,
                         entered: Some(entered_tx),
-                        event_tx: Some(EventSender::new(event_tx, 1)),
+                        event_tx: Some(EventSender::new(event_tx)),
                     }),
                 )
                 .unwrap();

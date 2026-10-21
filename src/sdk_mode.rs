@@ -2096,7 +2096,7 @@ impl EventPump {
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::ModelSwitched { .. }
-            | AgentEvent::QueueDrained
+            | AgentEvent::QueueSettled
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
@@ -2203,7 +2203,7 @@ impl EventPump {
                 shared.turn_active = false;
                 shared.active_cancel.take();
                 drop(shared);
-                self.terminal_run_id = Some(envelope.run_id);
+                self.terminal_run_id = envelope.presentation();
                 let result = mem::take(&mut self.result_text);
                 match outcome {
                     TurnOutcome::Completed {
@@ -2236,7 +2236,7 @@ impl EventPump {
                 shared.turn_active = false;
                 shared.active_cancel.take();
                 drop(shared);
-                if self.terminal_run_id == Some(envelope.run_id) {
+                if self.terminal_run_id == envelope.presentation() {
                     self.writer
                         .emit_system("warning", serde_json::json!({ "message": message }))?;
                 } else {
@@ -4012,7 +4012,7 @@ mod tests {
                 answer_tx: None,
                 cancel: None,
             }),
-            run_id: 9,
+            identity: None,
         })
         .unwrap();
 
@@ -4025,7 +4025,7 @@ mod tests {
         pump.handle(Envelope {
             event: AgentEvent::TurnOutcome(outcome()),
             subagent: None,
-            run_id: 9,
+            identity: None,
         })
         .unwrap();
         assert!(cancel.is_cancelled());
@@ -4078,7 +4078,7 @@ mod tests {
         pump.handle(Envelope {
             event: AgentEvent::TurnOutcome(outcome),
             subagent: None,
-            run_id: 9,
+            identity: None,
         })
         .unwrap();
         pump.handle(Envelope {
@@ -4086,7 +4086,7 @@ mod tests {
                 message: "checkpoint failed".into(),
             },
             subagent: None,
-            run_id: 9,
+            identity: None,
         })
         .unwrap();
 

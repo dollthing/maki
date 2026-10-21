@@ -770,7 +770,7 @@ fn restore_snapshot_text(
             clicks,
             state,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
 
@@ -1903,7 +1903,7 @@ fn warm_ctx(
     flume::Receiver<maki_agent::Envelope>,
 ) {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
         Some(&event_tx),
@@ -1945,7 +1945,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
         WARM_ID.to_owned(),
         0,
         warm_restore_item(WARM_ID, vec![0]),
-        maki_agent::EventSender::new(fb_tx, 0),
+        maki_agent::EventSender::new(fb_tx),
     );
     barrier(&host);
 
@@ -1970,7 +1970,7 @@ fn click_fallback_restores_when_warm_missing() {
         GONE_ID.to_owned(),
         0,
         warm_restore_item(GONE_ID, vec![0]),
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     barrier(&host);
 
@@ -1997,7 +1997,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
         WARM_ID.to_owned(),
         0,
         warm_restore_item(WARM_ID, vec![0]),
-        maki_agent::EventSender::new(fb_tx, 0),
+        maki_agent::EventSender::new(fb_tx),
     );
     barrier(&host);
 
@@ -2023,7 +2023,7 @@ fn restore_evicts_warm_handle() {
     let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
@@ -4296,7 +4296,7 @@ const BASH_PARTIAL_CMD: &str = "printf '%s%s\\n' X Y && sleep 30";
 #[test]
 fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (tx, events) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let (trigger, token) = maki_agent::CancelToken::new();
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
@@ -4343,7 +4343,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
 
     let bash_item = |id: &str| maki_lua::RestoreItem {
         tool: Arc::from("bash"),
@@ -4434,7 +4434,7 @@ fn restore_rebuilds_body_from_input_content(
             clicks: vec![0],
             state: None,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
 
@@ -4934,7 +4934,7 @@ fn run_start_in_mode(
     mode: &maki_agent::AgentMode,
 ) -> flume::Receiver<maki_agent::Envelope> {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
         mode,
         Some(&event_tx),
@@ -5184,7 +5184,7 @@ fn question_tool_elicits_from_the_host_in_elicitation_mode() {
     let (event_tx, _event_rx) = flume::unbounded::<maki_agent::Envelope>();
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
-        Some(&maki_agent::EventSender::new(event_tx, 0)),
+        Some(&maki_agent::EventSender::new(event_tx)),
         None,
     );
     ctx.question_mode = QuestionMode::Elicitation;
@@ -5205,7 +5205,7 @@ fn question_tool_dismissed_by_the_host() {
     let (event_tx, _event_rx) = flume::unbounded::<maki_agent::Envelope>();
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
-        Some(&maki_agent::EventSender::new(event_tx, 0)),
+        Some(&maki_agent::EventSender::new(event_tx)),
         None,
     );
     ctx.question_mode = QuestionMode::Elicitation;
@@ -7206,7 +7206,7 @@ fn write_new_file_with_preview_cut_marker_is_rejected() {
 #[test]
 fn cancelled_bash_large_output_keeps_partial_marker_last() {
     let (tx, events) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let (trigger, token) = maki_agent::CancelToken::new();
     let (result_tx, result_rx) = flume::bounded(1);
     let dir = tempfile::tempdir().unwrap();
@@ -7342,7 +7342,7 @@ fn code_execution_cancel_deferred_output_offloads() {
     let (trigger, token) = maki_agent::CancelToken::new();
     ctx.cancel = token;
     let (events_tx, events_rx) = flume::unbounded();
-    ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
+    ctx.event_tx = maki_agent::EventSender::new(events_tx);
     ctx.tool_use_id = Some("interpreter-cancel-output".to_owned());
     let invocation = reg.get("code_execution").unwrap().tool.parse(&json!({
         "code": format!("print({})\nawait {CODE_EXECUTION_BLOCKED_TOOL}()", json!(CODE_EXECUTION_CANCEL_BODY)),

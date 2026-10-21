@@ -4091,7 +4091,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         CancelToken::none(),
         Some(Instant::now() + RESTORE_ITEM_TIMEOUT),
         Some(LiveCtx {
-            event_tx: maki_agent::EventSender::new(dummy_tx, 0),
+            event_tx: maki_agent::EventSender::new(dummy_tx),
             tool_use_id: item.tool_use_id.clone(),
         }),
     );
@@ -6043,7 +6043,7 @@ mod tests {
 
         let (tx, _rx) = flume::unbounded();
         let with_live = task_cell(Some(LiveCtx {
-            event_tx: maki_agent::EventSender::new(tx, 0),
+            event_tx: maki_agent::EventSender::new(tx),
             tool_use_id: "tool_abc".into(),
         }));
 

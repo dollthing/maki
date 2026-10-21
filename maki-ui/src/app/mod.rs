@@ -117,9 +117,11 @@ use session_state::SessionState;
 pub(crate) use session_state::stored_to_rules;
 
 const CANCEL_MSG: &str = "Cancelled.";
-/// Bypasses the per-run staleness filter because re-bake replies
-/// don't belong to any real agent run.
-pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
+/// Presentation reserved for re-bake replies. They belong to no agent run, so
+/// the staleness filter skips them outright.
+pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
+/// Presentation reserved for re-bake replies. It is not actor work, so it
+/// carries no work identity and bypasses the per-run staleness filter.
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
@@ -2092,20 +2094,25 @@ impl App {
     }
 
     pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
+        let Some(presentation) = envelope.presentation() else {
+            return;
+        };
         if envelope.subagent.is_none()
             && matches!(
                 envelope.event,
                 AgentEvent::QueueItemConsumed { .. } | AgentEvent::ModelSwitched { .. }
             )
-            && envelope.run_id > self.run_id
-            && self.queue.accepts_actor_presentation(envelope.run_id)
+            && presentation > self.run_id
+            && self.queue.accepts_actor_presentation(presentation)
         {
-            self.record_run_start(envelope.run_id);
+            self.record_run_start(presentation);
         }
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
-        if envelope.run_id == RESTORE_RUN_ID {
+        // Re-bake replies belong to no run and arrive on the restore channel,
+        // so they skip the staleness filter outright.
+        if envelope.presentation() == Some(RESTORE_PRESENTATION) {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
                     id,
@@ -2134,7 +2141,8 @@ impl App {
             return vec![];
         }
         self.adopt_actor_presentation(&envelope);
-        if envelope.subagent.is_none() && envelope.run_id != self.run_id {
+        let presentation = envelope.presentation();
+        if envelope.subagent.is_none() && presentation != Some(self.run_id) {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -2142,9 +2150,9 @@ impl App {
             {
                 tracing::debug!(
                     tool_id = %id,
-                    event_run_id = envelope.run_id,
+                    ?presentation,
                     current_run_id = self.run_id,
-                    "tool render event dropped: stale run_id"
+                    "tool render event dropped: stale presentation"
                 );
             }
             return vec![];

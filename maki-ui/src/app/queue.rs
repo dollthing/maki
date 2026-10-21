@@ -405,6 +405,8 @@ impl App {
                     origin: TurnOrigin::User,
                     ..Default::default()
                 },
+                // The app already chose the id it will draw and fence under.
+                displayed_presentation: Some(run_id),
                 ..Default::default()
             },
         ) {

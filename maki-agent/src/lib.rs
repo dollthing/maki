@@ -63,12 +63,12 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentCancel,
-    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCancellationReason, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
-    event_stream,
+    ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope,
+    EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock,
+    NO_FILES_FOUND, RunLedger, RunTotals, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
+    SpanStyle, SubagentCancel, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, TurnCancellationReason, TurnCompleteEvent, TurnFailure, TurnFailureKind,
+    TurnId, TurnOutcome, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

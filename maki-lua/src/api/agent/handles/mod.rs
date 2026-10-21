@@ -1042,7 +1042,7 @@ mod tests {
     ) -> ManagedRoot {
         let (event_tx, event_rx) = flume::unbounded();
         let mut rooted = context.clone();
-        rooted.event_tx = EventSender::new(event_tx, 0);
+        rooted.event_tx = EventSender::new(event_tx);
         let manager = AgentManagerHandle::new(limits).unwrap();
         let mut fixture = None;
         let root = manager

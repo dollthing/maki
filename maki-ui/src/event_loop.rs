@@ -239,7 +239,7 @@ impl RunNotificationState {
         self.pending_completion = None;
     }
 
-    /// True between `Done`/`Error` and the run's `QueueDrained`. An exit must
+    /// True between `Done`/`Error` and the run's `QueueSettled`. An exit must
     /// not fire in that window: a queued follow-up may still start a new run.
     fn waiting_for_drain(&self) -> bool {
         matches!(
@@ -300,7 +300,7 @@ fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
 }
 
 fn is_current_top_level(current_run_id: u64, envelope: &Envelope) -> bool {
-    envelope.run_id == current_run_id && envelope.subagent.is_none()
+    envelope.presentation() == Some(current_run_id) && envelope.subagent.is_none()
 }
 
 fn select_notification(
@@ -2561,7 +2561,10 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
-            Wake::Actor(i, event) => self.sessions[i].app.handle_actor_event(event),
+            Wake::Actor(i, event) => {
+                self.handle_actor_settlement(i, &event);
+                self.sessions[i].app.handle_actor_event(event)
+            }
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Command(command) => self.handle_command(command),
@@ -3053,6 +3056,24 @@ impl<'t> EventLoop<'t> {
         dirty
     }
 
+    /// The actor settled: publish the one identity-bearing queue-settled
+    /// notification on the same guaranteed agent channel every other frontend
+    /// event uses. The actor already checked emptiness and ticket drain under
+    /// its own lock, so this never races a concurrent push.
+    fn handle_actor_settlement(&mut self, idx: usize, event: &maki_agent::actor::ActorEvent) {
+        let maki_agent::actor::ActorEvent::Idle {
+            settled: Some(identity),
+            ..
+        } = event
+        else {
+            return;
+        };
+        let rt = &mut self.sessions[idx];
+        let _ =
+            maki_agent::EventSender::with_identity(rt.handles.agent_tx.clone(), Some(*identity))
+                .send(AgentEvent::QueueSettled);
+    }
+
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
         rt.app.adopt_actor_presentation(&envelope);
@@ -3070,7 +3091,7 @@ impl<'t> EventLoop<'t> {
         }
         let current = is_current_top_level(rt.app.run_id, &envelope);
         match &envelope.event {
-            AgentEvent::QueueDrained => {
+            AgentEvent::QueueSettled => {
                 if current {
                     rt.notifications.on_drain();
                 }
@@ -7426,7 +7447,7 @@ mod tests {
                     answer_tx: None,
                     cancel: None,
                 }),
-                run_id: event_loop.sessions[0].app.run_id,
+                identity: None,
             }),
         );
         let app = &mut event_loop.sessions[0].app;
@@ -8562,7 +8583,7 @@ mod tests {
                     message: OBSERVATION.into(),
                 },
                 subagent: None,
-                run_id: app.run_id,
+                identity: Some(crate::app::tests::work_identity(app.run_id)),
             })));
             assert!(app.holds_recovery_text());
             assert!(actor.pending_submissions().is_empty());

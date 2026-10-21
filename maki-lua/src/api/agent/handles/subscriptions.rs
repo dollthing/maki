@@ -48,8 +48,11 @@ fn event_payload(kind: EventKind, event: ActorEvent, target: AgentId) -> Option<
             "selection": config.map(|commit| selection_json(&commit.config)),
         }),
         (EventKind::End, ActorEvent::End(result)) => result_json(&result),
-        (EventKind::Idle, ActorEvent::Idle { agent_id }) => {
-            json!({ "agent_id": agent_id.to_string() })
+        (EventKind::Idle, ActorEvent::Idle { agent_id, settled }) => {
+            json!({
+                "agent_id": agent_id.to_string(),
+                "settled": settled.map(|work| work.presentation_id),
+            })
         }
         (EventKind::Config, ActorEvent::Config(commit)) => json!({
             "agent_id": target.to_string(),

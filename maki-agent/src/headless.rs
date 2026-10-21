@@ -241,10 +241,7 @@ impl InteractiveControlSender {
         {
             let mut pending = controls.lock().unwrap_or_else(|error| error.into_inner());
             pending.insert(key.clone(), control);
-            if let Err(error) = actor.push_control(ControlWork {
-                name: key.clone(),
-                correlation: key.clone(),
-            }) {
+            if let Err(error) = actor.push_control(key.clone(), key.clone()) {
                 pending.remove(&key);
                 return Err(error.to_string());
             }
@@ -253,19 +250,24 @@ impl InteractiveControlSender {
         smol::spawn(async move {
             let completion = async {
                 while let Ok(event) = events.recv_async().await {
-                    if !controls
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .contains_key(&key)
-                    {
+                    let mut pending = controls.lock().unwrap_or_else(|error| error.into_inner());
+                    if !pending.contains_key(&key) {
                         return;
                     }
                     if matches!(event, crate::actor::ActorEvent::Close { .. }) {
-                        controls
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .remove(&key);
+                        pending.remove(&key);
                         return;
+                    }
+                    if matches!(event, crate::actor::ActorEvent::Idle { .. }) {
+                        let snapshot = actor.snapshot();
+                        pending.retain(|key, _| {
+                            snapshot.queue.iter().any(|work| {
+                                matches!(
+                                    work,
+                                    crate::actor::QueueProjection::Control(name) if name == key
+                                )
+                            })
+                        });
                     }
                 }
             };
@@ -340,7 +342,7 @@ impl InteractiveInputSender {
             &actor,
             &self.modes,
             input,
-            EventSender::new(self.events.clone(), run),
+            EventSender::new(self.events.clone()),
             format!("run:{run}"),
         )
         .await?;
@@ -480,14 +482,7 @@ struct HeadlessBackend {
 
 impl HeadlessBackend {
     fn event_sender(&self, context: &TurnContext) -> EventSender {
-        EventSender::new(
-            self.raw_tx.clone(),
-            context
-                .correlation
-                .strip_prefix("run:")
-                .and_then(|run| run.parse().ok())
-                .unwrap_or_default(),
-        )
+        EventSender::with_identity(self.raw_tx.clone(), Some(context.work))
     }
 
     async fn config(&self, context: &TurnContext) -> Result<Arc<EffectiveAgentConfig>, String> {
@@ -542,7 +537,7 @@ impl HeadlessBackend {
             execution_agent_id: Some(self.params.agent_id),
             provider: Arc::clone(&config.provider),
             model: Arc::new(config.model.clone()),
-            event_tx: EventSender::new(self.raw_tx.clone(), 0),
+            event_tx: EventSender::new(self.raw_tx.clone()),
             mode: config.mode.clone(),
             mode_def: config.mode_def.clone().map(Arc::new),
             question_mode: self.params.question_mode,
@@ -626,25 +621,6 @@ impl HeadlessBackend {
 }
 
 impl ActorBackend for HeadlessBackend {
-    fn on_work_settled(&mut self) {
-        let Some(Ok(root)) = self.root.0.result.get() else {
-            return;
-        };
-        let Ok(actor) = root.actor() else {
-            return;
-        };
-        let mut pending = self
-            .controls
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let snapshot = actor.snapshot();
-        pending.retain(|key, _| {
-            snapshot.queue.iter().any(
-                |work| matches!(work, crate::actor::QueueProjection::Control(name) if name == key),
-            )
-        });
-    }
-
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         self.params.offload.clone()
     }
@@ -1152,7 +1128,7 @@ fn spawn_managed(
                                         &actor,
                                         &modes,
                                         input,
-                                        EventSender::new(admission_events, 0),
+                                        EventSender::new(admission_events),
                                         "run:0".into(),
                                     )
                                     .await
@@ -1162,7 +1138,7 @@ fn spawn_managed(
                             match result {
                                 Ok(ticket) => Some(ticket),
                                 Err(message) => {
-                                    let _ = EventSender::new(raw_tx.clone(), 0)
+                                    let _ = EventSender::new(raw_tx.clone())
                                         .send(AgentEvent::ControlError { message });
                                     None
                                 }
@@ -1190,7 +1166,7 @@ fn spawn_managed(
                 }
                 Err(message) => {
                     root.finish(Err(message.clone()));
-                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError { message });
+                    let _ = EventSender::new(raw_tx).send(AgentEvent::ControlError { message });
                 }
             }
             manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;

@@ -129,7 +129,7 @@ fn restore_as(
             clicks,
             state,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     handle.wait_restore_complete_for_test();
     // The empty LoadSource drains the async gate, so spawned highlight tasks
@@ -335,7 +335,7 @@ fn exec_live_with(
     shape: impl FnOnce(&mut ToolContext),
 ) -> Live {
     let (tx, rx) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &maki_agent::AgentMode::Build,
         Some(&event_tx),
@@ -779,7 +779,7 @@ fn exec_verdict_prompt(
     answer: Option<&str>,
 ) -> Verdict {
     let (tx, rx) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
         &maki_agent::AgentMode::Build,
         Some(&event_tx),

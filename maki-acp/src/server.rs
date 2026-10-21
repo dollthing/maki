@@ -2233,12 +2233,12 @@ fn start_event_pump(
         let mut cost_total = initial_cost;
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Ok(Envelope {
-            event,
-            subagent,
-            run_id,
-        }) = event_rx.recv_async().await
+        while let Ok(envelope) = event_rx.recv_async().await
         {
+            // ACP fences on the presentation the actor stamped, which is the
+            // same identity the rest of the frontend uses.
+            let run_id = envelope.presentation().unwrap_or_default();
+            let (event, subagent) = (envelope.event, envelope.subagent);
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
             }
@@ -4124,7 +4124,7 @@ mod tests {
                         scopes: vec!["echo first".to_string()],
                     },
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -4155,7 +4155,7 @@ mod tests {
                         scopes: vec!["echo stale".to_string()],
                     },
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -4189,7 +4189,7 @@ mod tests {
                         usage: TokenUsage::default(),
                     },
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -4393,7 +4393,7 @@ mod tests {
                     .send_async(Envelope {
                         event,
                         subagent: None,
-                        run_id: 0,
+                        identity: None,
                     })
                     .await
                     .unwrap();
@@ -4507,7 +4507,7 @@ mod tests {
                             usage: TokenUsage::default(),
                         },
                         subagent: None,
-                        run_id: 0,
+                        identity: None,
                     })
                     .await
                     .unwrap();
@@ -4680,7 +4680,7 @@ mod tests {
                     }]),
                 },
                 subagent: None,
-                run_id: 0,
+                identity: None,
             })
             .unwrap();
 
@@ -4727,7 +4727,7 @@ mod tests {
                     questions: serde_json::json!({ "not": "an array" }),
                 },
                 subagent: None,
-                run_id: 0,
+                identity: None,
             })
             .unwrap();
 
@@ -4800,7 +4800,13 @@ mod tests {
                     maki_agent::DoneReason::EndTurn,
                 )),
                 subagent: None,
-                run_id,
+                identity: Some(maki_agent::ActorWorkIdentity::new(
+                    maki_agent::AgentId::generate(),
+                    maki_agent::ActorWorkKind::Control {
+                        operation_id: run_id,
+                    },
+                    run_id,
+                )),
             };
             event_tx.send_async(completed(OLD_RUN_ID)).await.unwrap();
             assert_eq!(out_rx.recv_async().await.unwrap()["id"], 41);
@@ -4819,7 +4825,13 @@ mod tests {
                         message: "failed to checkpoint completed turn".into(),
                     },
                     subagent: None,
-                    run_id: OLD_RUN_ID,
+                    identity: Some(maki_agent::ActorWorkIdentity::new(
+                        maki_agent::AgentId::generate(),
+                        maki_agent::ActorWorkKind::Control {
+                            operation_id: OLD_RUN_ID,
+                        },
+                        OLD_RUN_ID,
+                    )),
                 })
                 .await
                 .unwrap();
@@ -4885,7 +4897,7 @@ mod tests {
                 .send(Envelope {
                     event,
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .unwrap();
         }
@@ -4955,7 +4967,7 @@ mod tests {
             .send(Envelope {
                 event: turn_complete(ROOT_COST),
                 subagent: None,
-                run_id: 0,
+                identity: None,
             })
             .unwrap();
 
@@ -5083,14 +5095,14 @@ mod tests {
                     text: "first".to_string(),
                 },
                 subagent: None,
-                run_id: 0,
+                identity: None,
             })
             .unwrap();
         event_tx
             .send(Envelope {
                 event: AgentEvent::ThinkingBlockEnd,
                 subagent: None,
-                run_id: 0,
+                identity: None,
             })
             .unwrap();
 
@@ -5270,7 +5282,7 @@ mod tests {
                 answer_tx,
                 cancel: None,
             }),
-            run_id: 0,
+            identity: None,
         }
     }
 
@@ -6008,7 +6020,7 @@ mod tests {
                         usage: TokenUsage::default(),
                     },
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -6838,7 +6850,7 @@ mod tests {
                 .send_async(Envelope {
                     event: AgentEvent::AuthRequired,
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -6938,7 +6950,7 @@ mod tests {
                         output: None,
                     })),
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();
@@ -6951,7 +6963,7 @@ mod tests {
                         scopes: vec!["/project/file.txt".to_string()],
                     },
                     subagent: None,
-                    run_id: 0,
+                    identity: None,
                 })
                 .await
                 .unwrap();

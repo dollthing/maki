@@ -10,6 +10,7 @@ use maki_storage::sessions::HistorySnapshot;
 
 use crate::agent::TurnAdmissionSnapshot;
 use crate::cancel::PublicationRegistration;
+use crate::types::{ActorWorkIdentity, ActorWorkKind};
 use crate::{AgentInput, CancelToken, CancelTrigger, EventSender, TurnId};
 
 use super::{
@@ -107,6 +108,9 @@ pub(super) struct PreparedOperation {
     cancel: CancelToken,
     _trigger: CancelTrigger,
     publication: Option<PublicationRegistration>,
+    /// Presentation reserved at admission. The turn id is stamped when this
+    /// operation commits into a real turn.
+    identity: ActorWorkIdentity,
 }
 
 pub struct PreparedOperationTicket {
@@ -135,6 +139,12 @@ impl AgentActorHandle {
         }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let id = state.next_operation_id;
+        let presentation_id = state.reserve_presentation(0);
+        let identity = ActorWorkIdentity::new(
+            self.inner.agent_id,
+            ActorWorkKind::Control { operation_id: id },
+            presentation_id,
+        );
         let failure = Arc::new(Mutex::new(None));
         let (trigger, cancel) = CancelToken::new();
         state.idle_pending = true;
@@ -150,6 +160,7 @@ impl AgentActorHandle {
                 cancel,
                 _trigger: trigger,
                 publication: None,
+                identity,
             })));
         Ok(PreparedOperationTicket {
             inner: Arc::clone(&self.inner),
@@ -486,6 +497,14 @@ impl PreparedOperation {
                     correlation: turn.correlation,
                     ticket: ticket.clone(),
                     policy_constraint: None,
+                    identity: ActorWorkIdentity::new(
+                        inner.agent_id,
+                        ActorWorkKind::Turn {
+                            operation_id: self.id,
+                            turn_id,
+                        },
+                        self.identity.presentation_id,
+                    ),
                 },
                 snapshot,
             );

@@ -236,7 +236,7 @@ impl LuaActorState {
             Some(subagent) => self.parent_event_tx.send_envelope(Envelope {
                 event,
                 subagent: Some(subagent.clone()),
-                run_id: self.parent_event_tx.run_id(),
+                identity: self.parent_event_tx.identity(),
             }),
             None => self.parent_event_tx.send(event),
         };
@@ -254,7 +254,7 @@ impl LuaActorState {
         Some(Envelope {
             event: AgentEvent::SubagentClosed,
             subagent: Some(subagent.clone()),
-            run_id: self.parent_event_tx.run_id(),
+            identity: self.parent_event_tx.identity(),
         })
     }
 
@@ -1869,7 +1869,7 @@ async fn build_session(
             .as_ref()
             .filter(|_| options.mcp)
             .map(McpSession::fresh),
-        chip_event_tx: EventSender::new(sub_tx, parent.context.event_tx.run_id()),
+        chip_event_tx: EventSender::with_identity(sub_tx, parent.context.event_tx.identity()),
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
@@ -1973,7 +1973,7 @@ pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Resul
         .send_envelope(Envelope {
             event,
             subagent: Some(subagent.clone()),
-            run_id: state.parent_event_tx.run_id(),
+            identity: state.parent_event_tx.identity(),
         })
         .map_err(|error| error.to_string())
 }
@@ -2385,7 +2385,7 @@ mod tests {
         Envelope {
             event,
             subagent: None,
-            run_id: RUN_ID,
+            identity: None,
         }
     }
 
@@ -2428,7 +2428,14 @@ mod tests {
                 provenance: Default::default(),
                 cancel: CancelToken::none(),
                 cancel_reason,
-                correlation: String::new(),
+                work: maki_agent::ActorWorkIdentity::new(
+                    params.agent_id,
+                    maki_agent::ActorWorkKind::Turn {
+                        operation_id: 0,
+                        turn_id: maki_agent::TurnId::generate(),
+                    },
+                    0,
+                ),
                 generation: 0,
                 policy,
                 interrupt: None,
@@ -2657,12 +2664,22 @@ mod tests {
             mode: AgentMode::Build,
             mode_def: None,
             mcp: None,
-            chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
+            chip_event_tx: EventSender::new(chip_raw_tx),
             child_cancel,
             answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
             answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
-            parent_event_tx: EventSender::new(parent_raw_tx.clone(), RUN_ID),
+            parent_event_tx: EventSender::with_identity(
+                parent_raw_tx.clone(),
+                Some(maki_agent::ActorWorkIdentity::new(
+                    agent_id,
+                    maki_agent::ActorWorkKind::Turn {
+                        operation_id: 0,
+                        turn_id: maki_agent::TurnId::generate(),
+                    },
+                    RUN_ID,
+                )),
+            ),
             cancel: SubagentCancel::new(|| {}),
             parent_agent_id: None,
             parent_is_root: false,
@@ -2682,7 +2699,17 @@ mod tests {
         if let Some((sub_rx, gate)) = relay {
             smol::spawn(relay_session_events(
                 sub_rx,
-                EventSender::new(parent_raw_tx.clone(), RUN_ID),
+                EventSender::with_identity(
+                    parent_raw_tx.clone(),
+                    Some(maki_agent::ActorWorkIdentity::new(
+                        agent_id,
+                        maki_agent::ActorWorkKind::Turn {
+                            operation_id: 0,
+                            turn_id: maki_agent::TurnId::generate(),
+                        },
+                        RUN_ID,
+                    )),
+                ),
                 Arc::clone(&state.subagent_info),
                 None,
                 false,
@@ -3165,14 +3192,14 @@ mod tests {
                     text: "visible completion".into(),
                 },
                 subagent: None,
-                run_id: RUN_ID,
+                identity: None,
             })
             .unwrap();
         turn_tx
             .send(Envelope {
                 event: AgentEvent::TurnOutcome(root_outcome),
                 subagent: None,
-                run_id: RUN_ID,
+                identity: None,
             })
             .unwrap();
         drop(turn_tx);
@@ -3195,7 +3222,7 @@ mod tests {
                 Envelope {
                     event: AgentEvent::TextDelta { ref text },
                     subagent: None,
-                    run_id: RUN_ID,
+                    identity: None,
                 } if text == "visible completion"
             ) {}
             assert!(
@@ -3549,7 +3576,7 @@ mod tests {
 
         smol::block_on(relay_session_events(
             sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
+            EventSender::new(parent_raw_tx),
             subagent_info,
             Some(live_tx),
             false,
@@ -3625,14 +3652,14 @@ mod tests {
                     messages: Vec::new(),
                 },
                 subagent: Some(grandchild_info),
-                run_id: RUN_ID,
+                identity: None,
             })
             .unwrap();
         drop(sub_tx);
 
         smol::block_on(relay_session_events(
             sub_rx,
-            EventSender::new(parent_raw_tx, RUN_ID),
+            EventSender::new(parent_raw_tx),
             parent_info,
             None,
             false,

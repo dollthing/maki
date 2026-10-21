@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::tools::offload::OffloadStore;
-use crate::types::{AgentId, TurnId, TurnOutcome};
+use crate::types::{ActorWorkIdentity, AgentId, TurnId, TurnOutcome};
 use crate::{AgentMode, InterruptSource, RunSettings};
 
 #[derive(Clone)]
@@ -94,16 +94,19 @@ pub enum WorkKind {
 /// cooperatively. The reasoned token records the first cancellation reason;
 /// `Agent::run` reads it once when constructing its terminal outcome. The
 /// interrupt source processes compact commands between model requests.
+///
+/// `work` is the identity of the admitted work this execution is running,
+/// stamped at admission and never re-derived, so every event it emits carries
+/// the presentation it was admitted under.
 #[derive(Clone)]
 pub struct TurnContext {
     pub agent_id: AgentId,
     pub turn_id: Option<TurnId>,
+    pub work: ActorWorkIdentity,
     pub output: super::TurnOutput,
     pub provenance: super::TurnProvenance,
     pub cancel: CancelToken,
     pub cancel_reason: ReasonedCancelToken,
-    /// Adapter-local correlation (the sink's run id or the control's key).
-    pub correlation: String,
     pub generation: u64,
     pub policy: Option<Arc<EffectiveAgentConfig>>,
     /// Extracts compatible compaction work while the turn is active.
@@ -134,12 +137,13 @@ pub enum BackendResult {
     CompactDone,
 }
 
-/// A standalone control operation. Compact correlation only: the host's
-/// control key, enough to route the result back.
+/// A standalone control operation. Carries the actor admission that identified
+/// it so its events settle under the same identity.
 #[derive(Debug, Clone)]
 pub struct ControlWork {
     pub name: String,
     pub correlation: String,
+    pub work: ActorWorkIdentity,
 }
 
 /// A turn admitted by the host. Holds the agent input plus the admission's
@@ -150,6 +154,7 @@ pub struct TurnAdmission {
     pub input: Option<crate::AgentInput>,
     pub event_sender: Option<crate::EventSender>,
     pub correlation: String,
+    pub work: ActorWorkIdentity,
     pub(crate) generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,
@@ -224,8 +229,6 @@ pub trait ActorBackend: Send {
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         None
     }
-
-    fn on_work_settled(&mut self) {}
 
     fn prepared_readiness(&self) -> Option<PreparedReadiness> {
         None

@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
@@ -25,9 +24,10 @@ use maki_agent::template::Vars;
 use maki_agent::tools::offload::OffloadStore;
 use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    SessionMailbox, ToolOutputLines, TurnCancellationReason, TurnId, TurnOutcome,
+    ActorWorkIdentity, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams,
+    AgentRunParams, CancelMap, CancelToken, Envelope, EventSender, History, Instructions,
+    McpCommand, PromptRole, SessionMailbox, ToolOutputLines, TurnCancellationReason, TurnId,
+    TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -38,19 +38,8 @@ use tracing::{info, warn};
 use super::ProviderSlot;
 use super::SystemPromptOverride;
 
-/// Correlation prefix stamped on TUI root/turn admissions. Parsed back into a
-/// run id for event envelope correlation.
-pub(crate) const ROOT_CORRELATION_PREFIX: &str = "r";
 const PROMPT_SLOTS_CLOSED: &str = "the Lua plugin runtime stopped before returning prompt slots";
 const PROMPT_INPUTS_CLOSED: &str = "prompt input preparation stopped before it finished";
-
-/// Parses an actor correlation string back into the TUI run id.
-pub(crate) fn correlation_to_run_id(correlation: &str) -> u64 {
-    correlation
-        .strip_prefix(ROOT_CORRELATION_PREFIX)
-        .and_then(|rest| rest.parse().ok())
-        .unwrap_or_default()
-}
 
 /// The TUI's root-actor backend.
 pub(crate) struct TuiActorBackend {
@@ -78,11 +67,6 @@ pub(crate) struct TuiActorBackend {
     /// Startup cancellation: races env/instruction/MCP initialization.
     init_cancel: CancelToken,
     initialized: bool,
-    /// App-visible current run id. Bumped by the app on each run; the backend
-    /// reads it to stamp compact/control events that carry no correlation.
-    run_id: Arc<AtomicU64>,
-    /// Signals the drain driver after actor settlement and End publication.
-    drain_tx: flume::Sender<u64>,
     vars: Vars,
     instructions: Instructions,
     tools: RequestTools,
@@ -111,8 +95,6 @@ pub(super) fn new_backend(
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     offload: Option<Arc<OffloadStore>>,
     init_cancel: CancelToken,
-    drain_tx: flume::Sender<u64>,
-    run_id: Arc<AtomicU64>,
 ) -> TuiActorBackend {
     let mcp = mcp_handle.map(|h| McpSession::new(h, initial_history));
     let vars = template::env_vars_for(&cwd.load());
@@ -139,8 +121,6 @@ pub(super) fn new_backend(
         mcp,
         init_cancel,
         initialized: false,
-        run_id,
-        drain_tx,
         vars,
         instructions: Instructions::default(),
         tools: RequestTools::default(),
@@ -180,7 +160,7 @@ impl TuiActorBackend {
             AgentRunParams {
                 history: &mut history,
                 system: String::new(),
-                event_tx: EventSender::new(self.agent_tx.clone(), 0),
+                event_tx: EventSender::new(self.agent_tx.clone()),
                 tools,
             },
         )
@@ -399,18 +379,25 @@ impl TuiActorBackend {
     /// the error here or the prompt vanishes with no feedback at all.
     fn report_setup_failure(
         &self,
-        run_id: u64,
+        work: ActorWorkIdentity,
         turn_id: TurnId,
         context: &str,
         error: &AgentError,
     ) {
         info!(error = %error, %turn_id, "{context}");
-        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(AgentEvent::ControlError {
-            message: format!("{context}: {}", error.user_message()),
-        });
+        let _ = EventSender::with_identity(self.agent_tx.clone(), Some(work)).send(
+            AgentEvent::ControlError {
+                message: format!("{context}: {}", error.user_message()),
+            },
+        );
     }
 
-    fn cancel_setup(&self, context: &TurnContext, turn_id: TurnId, run_id: u64) -> TurnOutcome {
+    fn cancel_setup(
+        &self,
+        context: &TurnContext,
+        turn_id: TurnId,
+        work: ActorWorkIdentity,
+    ) -> TurnOutcome {
         if let Some(inbox) = &context.inbox {
             inbox.close();
         }
@@ -426,7 +413,10 @@ impl TuiActorBackend {
         );
         context
             .output
-            .set_terminal_sender(EventSender::new(self.agent_tx.clone(), run_id));
+            .set_terminal_sender(EventSender::with_identity(
+                self.agent_tx.clone(),
+                Some(work),
+            ));
         outcome
     }
 
@@ -439,7 +429,7 @@ impl TuiActorBackend {
         context: &TurnContext,
         mut input: AgentInput,
         turn_id: TurnId,
-        run_id: u64,
+        work: ActorWorkIdentity,
     ) -> Option<TurnOutcome> {
         let setup = context
             .cancel
@@ -449,7 +439,7 @@ impl TuiActorBackend {
                         message: "turn was admitted without an effective agent configuration"
                             .into(),
                     };
-                    self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
+                    self.report_setup_failure(work, turn_id, "agent turn setup failed", &error);
                     return None;
                 };
                 let provider = Arc::clone(&policy.settings.provider);
@@ -464,12 +454,7 @@ impl TuiActorBackend {
                 {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        self.report_setup_failure(
-                            run_id,
-                            turn_id,
-                            "agent turn setup failed",
-                            &error,
-                        );
+                        self.report_setup_failure(work, turn_id, "agent turn setup failed", &error);
                         return None;
                     }
                 };
@@ -478,9 +463,8 @@ impl TuiActorBackend {
             .await;
         let (provider, model, (system, tools, prompt_slots)) = match setup {
             Ok(prepared) => prepared?,
-            Err(_) => return Some(self.cancel_setup(context, turn_id, run_id)),
+            Err(_) => return Some(self.cancel_setup(context, turn_id, work)),
         };
-        self.run_id.fetch_max(run_id, Ordering::Relaxed);
         let mut agent = Agent::for_actor_turn(
             AgentParams {
                 agent_id: self.agent_id,
@@ -508,7 +492,7 @@ impl TuiActorBackend {
             AgentRunParams {
                 history,
                 system,
-                event_tx: EventSender::new(self.agent_tx.clone(), run_id),
+                event_tx: EventSender::with_identity(self.agent_tx.clone(), Some(work)),
                 tools,
             },
             context,
@@ -552,12 +536,6 @@ impl TuiActorBackend {
     fn publish_btw_system(&mut self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         let system = self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots, None);
         self.btw_system.store(Arc::new(system));
-    }
-
-    /// Run id for control-event correlation. Controls carry no turn, so the
-    /// backend stamps them with the app's current run id.
-    fn current_run_id(&self) -> u64 {
-        self.run_id.load(Ordering::Relaxed)
     }
 }
 
@@ -620,10 +598,6 @@ async fn prepare_prompt_inputs(
 impl ActorBackend for TuiActorBackend {
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         self.offload.clone()
-    }
-
-    fn on_work_settled(&mut self) {
-        let _ = self.drain_tx.try_send(self.current_run_id());
     }
 
     fn prepared_readiness(&self) -> Option<maki_agent::actor::PreparedReadiness> {
@@ -720,80 +694,43 @@ impl ActorBackend for TuiActorBackend {
         work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            let mut context = context;
+            let context = context;
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
-            let admission_run_id = correlation_to_run_id(&context.correlation);
+            // The actor stamped this work at admission, so every event below
+            // carries the presentation it was admitted under.
+            let work_identity = context.work;
             if context.cancel.is_cancelled() {
                 return BackendResult::EnteredRun(self.cancel_setup(
                     &context,
                     turn_id,
-                    admission_run_id,
+                    work_identity,
                 ));
             }
-            let explicit = matches!(&work, WorkKind::Turn)
-                && !context.correlation.starts_with(ROOT_CORRELATION_PREFIX);
-            let undisplayed_submission = context.managed_turn.as_ref().is_some_and(|current| {
-                current
-                    .manager()
-                    .actor(context.agent_id)
-                    .is_ok_and(|actor| {
-                        actor
-                            .pending_submissions()
-                            .into_iter()
-                            .find(|entry| entry.turn_id == turn_id)
-                            .is_some_and(|entry| !entry.already_displayed)
-                    })
-            });
-            let standalone_presentation = explicit || undisplayed_submission;
-            let run_id = if standalone_presentation {
-                if let Some(current) = &context.managed_turn {
-                    let allocated = current.manager().actor(context.agent_id).and_then(|actor| {
-                        actor
-                            .allocate_processing_presentation(turn_id, None)
-                            .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
-                    });
-                    match allocated {
-                        Ok(run_id) => {
-                            self.run_id.fetch_max(run_id, Ordering::Relaxed);
-                            run_id
-                        }
-                        Err(_) => {
-                            return BackendResult::EnteredRun(self.cancel_setup(
-                                &context,
-                                turn_id,
-                                admission_run_id,
-                            ));
-                        }
-                    }
-                } else {
-                    self.run_id.fetch_add(1, Ordering::Relaxed) + 1
-                }
-            } else {
-                correlation_to_run_id(&context.correlation)
-            };
             context
                 .output
-                .set_terminal_sender(EventSender::new(self.agent_tx.clone(), run_id));
-            if standalone_presentation {
-                if let Some(current) = &context.managed_turn {
-                    let bound = current.manager().actor(context.agent_id).and_then(|actor| {
-                        actor
-                            .bind_active_correlation(
-                                turn_id,
-                                format!("{ROOT_CORRELATION_PREFIX}{run_id}"),
-                            )
-                            .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
-                    });
-                    if bound.is_err() || context.cancel.is_cancelled() {
-                        return BackendResult::EnteredRun(
-                            self.cancel_setup(&context, turn_id, run_id),
-                        );
-                    }
+                .set_terminal_sender(EventSender::with_identity(
+                    self.agent_tx.clone(),
+                    Some(work_identity),
+                ));
+            if let Some(current) = &context.managed_turn {
+                let bound = current.manager().actor(context.agent_id).and_then(|actor| {
+                    actor
+                        .bind_active_correlation(
+                            turn_id,
+                            crate::agent::shared_queue::correlation(work_identity.presentation_id),
+                        )
+                        .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
+                });
+                if bound.is_err() || context.cancel.is_cancelled() {
+                    return BackendResult::EnteredRun(self.cancel_setup(
+                        &context,
+                        turn_id,
+                        work_identity,
+                    ));
                 }
-                context.correlation = format!("{ROOT_CORRELATION_PREFIX}{run_id}");
             }
-            if standalone_presentation && let Some(policy) = &context.policy {
-                EventSender::new(self.agent_tx.clone(), run_id).try_send(
+            if let Some(policy) = &context.policy {
+                EventSender::with_identity(self.agent_tx.clone(), Some(work_identity)).try_send(
                     AgentEvent::ModelSwitched {
                         spec: policy.settings.model.spec(),
                     },
@@ -807,7 +744,7 @@ impl ActorBackend for TuiActorBackend {
                 }
             } else if let Err(_) | Ok(false) = context.cancel.race(self.initialize()).await {
                 if context.cancel.is_cancelled() {
-                    BackendResult::EnteredRun(self.cancel_setup(&context, turn_id, run_id))
+                    BackendResult::EnteredRun(self.cancel_setup(&context, turn_id, work_identity))
                 } else {
                     BackendResult::SetupFailed {
                         agent_id: context.agent_id,
@@ -818,11 +755,11 @@ impl ActorBackend for TuiActorBackend {
                 info!(
                     agent_id = %context.agent_id,
                     %turn_id,
-                    %run_id,
+                    presentation = work_identity.presentation_id,
                     "tui actor turn"
                 );
                 match self
-                    .execute_agent(history, &context, input, turn_id, run_id)
+                    .execute_agent(history, &context, input, turn_id, work_identity)
                     .await
                 {
                     Some(outcome) => BackendResult::EnteredRun(outcome),
@@ -881,8 +818,7 @@ impl ActorBackend for TuiActorBackend {
             // emitted by `agent::compact` itself. In-turn compaction never
             // reaches here: the active `Agent` folds it through its interrupt
             // source and emits `CompactionDone`.
-            let run_id = self.current_run_id();
-            let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+            let event_tx = EventSender::with_identity(self.agent_tx.clone(), Some(context.work));
             let Some(settings) = context.policy.as_deref().map(|config| &config.settings) else {
                 let _ = event_tx.send(AgentEvent::ControlError {
                     message: "compaction was admitted without an effective agent configuration"
@@ -997,6 +933,45 @@ mod tests {
     use super::*;
     use crate::agent::ProviderSlot;
 
+    use crate::app::tests::work_identity;
+
+    /// Waits for the actor's own settlement publication and asserts it names
+    /// the presentation that settled last. Settlement is the actor's, never
+    /// re-derived from a frontend mirror.
+    async fn await_settlement(
+        events: &flume::Receiver<maki_agent::actor::ActorEvent>,
+        presentation: u64,
+    ) -> maki_agent::ActorWorkIdentity {
+        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&seen);
+        // Earlier settlements stay published, so skip past them rather than
+        // assuming the next idle belongs to the work under test.
+        futures_lite::future::or(
+            async {
+                loop {
+                    let event = events.recv_async().await.unwrap();
+                    if let maki_agent::actor::ActorEvent::Idle { settled, .. } = event {
+                        observed.lock().unwrap().push(settled);
+                        if let Some(settled) = settled
+                            && settled.presentation_id == presentation
+                        {
+                            break settled;
+                        }
+                    }
+                }
+            },
+            async {
+                smol::Timer::after(TEST_TIMEOUT).await;
+                panic!(
+                    "waiting for settlement of presentation {presentation}; saw {:?}",
+                    seen.lock().unwrap()
+                );
+            },
+        )
+        .await
+    }
+
     #[test_case(false, false; "explicit_complete")]
     #[test_case(true, false; "explicit_cancel")]
     #[test_case(false, true; "mixed_fifo_complete")]
@@ -1012,11 +987,6 @@ mod tests {
             input.prompt = None;
             let (release, released) = flume::bounded(1);
             let provider = Arc::new(ExplicitProvider { release: released });
-            let (drain_tx, drain_rx) = flume::unbounded();
-            let agent_tx = backend.agent_tx.clone();
-            backend.drain_tx = drain_tx;
-            backend.run_id.store(RUN_ID - 1, Ordering::Relaxed);
-            let actor_run_id = Arc::clone(&backend.run_id);
             let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
             let root = manager
                 .create_root_with_config(
@@ -1044,11 +1014,11 @@ mod tests {
                 )
                 .unwrap();
             let actor = root.actor().unwrap();
+            // The prior UI turn already displayed RUN_ID - 1, so the explicit
+            // turn after it is the one that allocates its own presentation.
+            actor.observe_presentation(RUN_ID - 1);
             let mut app = crate::app::tests::actor_presentation_app(
-                crate::agent::shared_queue::actor_queue(
-                    Arc::new(actor.clone()),
-                    Arc::clone(&actor_run_id),
-                ),
+                crate::agent::shared_queue::actor_queue(Arc::new(actor.clone())),
                 RUN_ID - 1,
             );
             let make_input = |text: &str| {
@@ -1060,23 +1030,31 @@ mod tests {
                 )
             };
             if deferred {
-                actor_run_id.store(RUN_ID - 2, Ordering::Relaxed);
-                actor.observe_presentation(RUN_ID - 1);
+                actor.observe_presentation(RUN_ID - 2);
+                // The UI already drew this deferred submission, so admission
+                // keeps the id the bubble is under.
                 actor
                     .submit(
                         make_input("successor"),
                         None,
-                        format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
+                        crate::agent::shared_queue::correlation(RUN_ID - 1),
                         TurnAdmissionOptions {
                             already_displayed: true,
+                            displayed_presentation: Some(RUN_ID - 1),
                             ..Default::default()
                         },
                     )
                     .unwrap();
+                // The deferred successor is admitted with the presentation the
+                // app already drew, so its stream keeps that id.
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    assert_eq!(envelope.run_id, RUN_ID - 1);
                     if matches!(envelope.event, AgentEvent::TextDelta { .. }) {
+                        assert_eq!(
+                            envelope.presentation(),
+                            Some(RUN_ID - 1),
+                            "the deferred successor streams under the id the UI drew"
+                        );
                         break;
                     }
                 }
@@ -1085,7 +1063,7 @@ mod tests {
                     .submit(
                         make_input("folded user input"),
                         None,
-                        format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID - 1),
+                        crate::agent::shared_queue::correlation(RUN_ID - 1),
                         TurnAdmissionOptions {
                             already_displayed: false,
                             ..Default::default()
@@ -1124,16 +1102,14 @@ mod tests {
                 let mut folded_bubble = false;
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    assert_eq!(envelope.run_id, RUN_ID - 1);
+                    assert_eq!(envelope.presentation(), Some(RUN_ID - 1));
                     folded_bubble |= matches!(envelope.event, AgentEvent::QueueItemConsumed { .. });
                     if matches!(envelope.event, AgentEvent::TextDelta { .. }) {
                         break;
                     }
                 }
                 assert!(folded_bubble);
-                assert_eq!(actor_run_id.load(Ordering::Relaxed), RUN_ID - 1);
                 release.send(()).unwrap();
-                assert_eq!(drain_rx.recv_async().await.unwrap(), RUN_ID - 1);
                 events.drain().for_each(drop);
             }
             let ticket = actor
@@ -1152,16 +1128,13 @@ mod tests {
                 .unwrap();
             let successor = if deferred {
                 let barrier = actor.reserve_config_update().unwrap();
-                let queue = crate::agent::shared_queue::actor_queue(
-                    Arc::new(actor.clone()),
-                    Arc::clone(&actor_run_id),
-                );
+                let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
                 for text in ["earlier deferred", "final deferred"] {
                     let input = make_input(text);
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: text.into(),
                         input,
-                        run_id: RUN_ID - 1,
+                        run_id: RUN_ID + 1,
                         displayed: false,
                     });
                 }
@@ -1180,6 +1153,13 @@ mod tests {
                         .unwrap(),
                 )
             };
+            // The explicit turn is admitted right after the prior UI turn, so
+            // the actor stamps it with RUN_ID; the successor queued behind it
+            // takes the next presentation.
+            // Both paths queue their successor behind the explicit turn, so it
+            // takes the next presentation.
+            const SUCCESSOR_PRESENTATION: u64 = RUN_ID + 1;
+            let mut explicit_presentation = None;
             let mut visible = Vec::new();
             const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             loop {
@@ -1187,24 +1167,40 @@ mod tests {
                     smol::Timer::after(TEST_TIMEOUT).await;
                     panic!("waiting for explicit streaming: actor={:?}, outcome={:?}, events={visible:?}", actor.snapshot(), ticket.peek());
                 }).await.unwrap();
-                assert_eq!(envelope.run_id, RUN_ID);
-                let streamed =
-                    matches!(&envelope.event, AgentEvent::TextDelta { text } if text == RESPONSE);
-                visible.push(matches!(
-                    envelope.event,
-                    AgentEvent::QueueItemConsumed { .. }
-                ));
-                app.update(crate::app::Msg::Agent(Box::new(envelope)));
-                if streamed {
-                    break;
+                // Identity names the turn, so the deferred successor sharing
+                // this stream is never mistaken for the explicit turn.
+                let identity = envelope.identity.expect("admitted work is stamped");
+                if identity.turn_id() == Some(ticket.turn_id()) {
+                    let presentation = identity.presentation_id;
+                    assert_eq!(
+                        *explicit_presentation.get_or_insert(presentation),
+                        presentation,
+                        "one turn never spans two presentations"
+                    );
+                    visible.push(matches!(
+                        envelope.event,
+                        AgentEvent::QueueItemConsumed { .. }
+                    ));
+                    let streamed = matches!(
+                        &envelope.event,
+                        AgentEvent::TextDelta { text } if text == RESPONSE
+                    );
+                    app.update(crate::app::Msg::Agent(Box::new(envelope)));
+                    if streamed {
+                        break;
+                    }
                 }
             }
             assert!(visible.iter().any(|consumed| *consumed));
+            let explicit_presentation =
+                explicit_presentation.expect("the explicit turn emitted events");
             if cancel {
+                // Cancel the explicit turn under the presentation it was
+                // admitted with, not the successor queued behind it.
                 manager
                     .cancel_correlation(
                         root.id(),
-                        &format!("{ROOT_CORRELATION_PREFIX}{RUN_ID}"),
+                        &crate::agent::shared_queue::correlation(explicit_presentation),
                         TurnCancellationReason::User,
                     )
                     .unwrap();
@@ -1230,15 +1226,6 @@ mod tests {
                 ),
                 cancel
             );
-            assert_eq!(
-                futures_lite::future::or(drain_rx.recv_async(), async {
-                    smol::Timer::after(TEST_TIMEOUT).await;
-                    panic!("waiting for backend drain: actor={:?}", actor.snapshot());
-                })
-                .await
-                .unwrap(),
-                RUN_ID
-            );
             let mut terminal = false;
             let mut successor_bubbles = Vec::new();
             loop {
@@ -1251,14 +1238,14 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                if envelope.run_id == RUN_ID + 1
+                if envelope.presentation() == Some(SUCCESSOR_PRESENTATION)
                     && let AgentEvent::QueueItemConsumed { text, .. } = &envelope.event
                 {
                     successor_bubbles.push(text.clone());
                 }
-                terminal |= envelope.run_id == RUN_ID
+                terminal |= envelope.presentation() == Some(explicit_presentation)
                     && matches!(&envelope.event, AgentEvent::TurnOutcome(_));
-                let streamed = envelope.run_id == RUN_ID + 1
+                let streamed = envelope.presentation() == Some(SUCCESSOR_PRESENTATION)
                     && matches!(&envelope.event, AgentEvent::TextDelta { .. });
                 app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 if streamed {
@@ -1278,12 +1265,17 @@ mod tests {
             );
             if deferred {
                 assert_eq!(successor_bubbles, ["earlier deferred", "final deferred"]);
-                assert_eq!(actor_run_id.load(Ordering::Relaxed), RUN_ID + 1);
             }
+            assert_eq!(explicit_presentation, RUN_ID);
+            assert_eq!(
+                actor.presentation_id(),
+                SUCCESSOR_PRESENTATION,
+                "the actor owns the presentation counter"
+            );
             manager
                 .cancel_correlation(
                     root.id(),
-                    &format!("{ROOT_CORRELATION_PREFIX}{RUN_ID}"),
+                    &crate::agent::shared_queue::correlation(RUN_ID),
                     TurnCancellationReason::User,
                 )
                 .unwrap();
@@ -1294,71 +1286,73 @@ mod tests {
                 manager
                     .cancel_correlation(
                         root.id(),
-                        &format!("{ROOT_CORRELATION_PREFIX}{}", RUN_ID + 1),
+                        &crate::agent::shared_queue::correlation(RUN_ID + 1),
                         TurnCancellationReason::User,
                     )
                     .unwrap();
             } else {
                 release.send(()).unwrap();
             }
-            if let Some(successor) = successor {
-                assert!(matches!(
-                    futures_lite::future::or(successor.wait(), async {
-                        smol::Timer::after(TEST_TIMEOUT).await;
-                        panic!("waiting for successor settlement");
-                    })
-                    .await,
-                    TurnOutcome::Completed { .. }
-                ));
+            let successor_outcome = match successor {
+                Some(successor) => {
+                    // The successor makes its own request, so it needs its own
+                    // release before it can produce an outcome.
+                    release.send(()).unwrap();
+                    Some(
+                        futures_lite::future::or(successor.wait(), async {
+                            smol::Timer::after(TEST_TIMEOUT).await;
+                            panic!(
+                                "waiting for successor settlement: actor={:?}",
+                                actor.snapshot()
+                            );
+                        })
+                        .await,
+                    )
+                }
+                None => None,
+            };
+            // The queued successor settles into its own outcome under its own
+            // presentation; the shared stream only ever carries the explicit
+            // turn's terminal event.
+            if let Some(outcome) = successor_outcome {
+                assert!(
+                    matches!(
+                        outcome,
+                        TurnOutcome::Cancelled {
+                            reason: TurnCancellationReason::User,
+                            ..
+                        }
+                    ) == (deferred && cancel),
+                    "{outcome:?}"
+                );
             }
-            assert_eq!(drain_rx.recv_async().await.unwrap(), RUN_ID + 1);
-            let settled = events.drain().collect::<Vec<_>>();
-            assert!(settled.iter().any(|envelope| {
-                envelope.run_id == RUN_ID + 1
-                    && matches!(&envelope.event, AgentEvent::TurnOutcome(outcome)
-                        if matches!(outcome, TurnOutcome::Cancelled { reason: TurnCancellationReason::User, .. }) == (deferred && cancel))
-            }));
-            for envelope in settled {
-                app.update(crate::app::Msg::Agent(Box::new(envelope)));
-            }
-            assert_eq!(app.status, crate::components::Status::Idle);
-            if !(deferred && cancel) {
-                crate::app::tests::assert_actor_response(&mut app, RESPONSE);
-            }
+            // Every event the shared stream carried for the explicit turn was
+            // stamped with its one presentation; the outcome itself arrived on
+            // the ticket the actor settles.
+            // The app is only idle once every admitted turn has settled, so
+            // keep folding the stream until it stops streaming.
             futures_lite::future::or(
                 async {
-                    loop {
-                        let mut published = false;
-                        actor.publish_if_empty(|| {
-                            EventSender::new(agent_tx.clone(), RUN_ID + 1)
-                                .try_send(AgentEvent::QueueDrained);
-                            published = true;
-                        });
-                        if published {
+                    while app.status == crate::components::Status::Streaming {
+                        let Ok(envelope) = events.recv_async().await else {
                             break;
-                        }
-                        smol::future::yield_now().await;
+                        };
+                        app.update(crate::app::Msg::Agent(Box::new(envelope)));
                     }
                 },
                 async {
                     smol::Timer::after(TEST_TIMEOUT).await;
-                    panic!("waiting for empty actor queue");
+                    panic!(
+                        "app never left the streaming state: actor={:?}",
+                        actor.snapshot()
+                    );
                 },
             )
             .await;
-            assert!(matches!(
-                futures_lite::future::or(events.recv_async(), async {
-                    smol::Timer::after(TEST_TIMEOUT).await;
-                    panic!("waiting for queue drained: actor={:?}", actor.snapshot());
-                })
-                .await
-                .unwrap(),
-                Envelope {
-                    run_id,
-                    event: AgentEvent::QueueDrained,
-                    ..
-                } if run_id == RUN_ID + 1
-            ));
+            assert_eq!(app.status, crate::components::Status::Idle);
+            if !(deferred && cancel) {
+                crate::app::tests::assert_actor_response(&mut app, RESPONSE);
+            }
             actor.close();
             assert!(
                 manager
@@ -1393,8 +1387,6 @@ mod tests {
                 let provider = Arc::new(ExplicitProvider {
                     release: released.clone(),
                 });
-                backend.run_id.store(FIRST_RUN - 1, Ordering::Relaxed);
-                let actor_run_id = Arc::clone(&backend.run_id);
                 let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
                 let root = manager
                     .create_root_with_config(
@@ -1422,16 +1414,16 @@ mod tests {
                     )
                     .unwrap();
                 let actor = root.actor().unwrap();
-                let queue = crate::agent::shared_queue::actor_queue(
-                    Arc::new(actor.clone()),
-                    Arc::clone(&actor_run_id),
-                );
+                // Seat the actor where the app believes the display is, so the
+                // first admission lands on FIRST_RUN.
+                actor.observe_presentation(FIRST_RUN - 1);
+                let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
                 let mut app =
                     crate::app::tests::actor_presentation_app(queue.clone(), FIRST_RUN - 1);
                 let first = actor.admit_turn(make_input(), None, String::new()).unwrap();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    assert_eq!(envelope.run_id, FIRST_RUN);
+                    assert_eq!(envelope.presentation(), Some(FIRST_RUN));
                     let streaming = matches!(envelope.event, AgentEvent::TextDelta { .. });
                     app.update(crate::app::Msg::Agent(Box::new(envelope)));
                     if streaming {
@@ -1464,7 +1456,7 @@ mod tests {
                 let mut buffered = Vec::new();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    let second_streaming = envelope.run_id == SECOND_RUN
+                    let second_streaming = envelope.presentation() == Some(SECOND_RUN)
                         && matches!(envelope.event, AgentEvent::TextDelta { .. });
                     buffered.push(envelope);
                     if second_streaming {
@@ -1477,21 +1469,22 @@ mod tests {
                         .unwrap()
                 });
                 assert!(buffered.iter().any(|envelope| {
-                    envelope.run_id == SECOND_RUN
+                    envelope.presentation() == Some(SECOND_RUN)
                         && matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })
                 }));
                 assert_eq!(app.run_id, FIRST_RUN);
                 assert_eq!(app.status, crate::components::Status::Streaming);
-                assert_eq!(actor_run_id.load(Ordering::Relaxed), SECOND_RUN);
                 assert!(second.peek().is_none());
-                const PENDING_RUN: u64 = SECOND_RUN + 1;
+                // A displayed bubble pushes under the id the UI already shows,
+                // so admission keeps it and the counter does not move.
+                let displayed_presentation = queue.current_run_id();
                 queue.push(crate::agent::shared_queue::QueueItem::Message {
                     text: "pending successor".into(),
                     input: make_input(),
-                    run_id: PENDING_RUN,
+                    run_id: displayed_presentation,
                     displayed: true,
                 });
-                assert_eq!(queue.current_run_id(), PENDING_RUN);
+                assert_eq!(queue.current_run_id(), displayed_presentation);
                 assert_eq!(actor.snapshot().active_turn, Some(second.turn_id()));
                 assert!(
                     actor
@@ -1511,7 +1504,12 @@ mod tests {
                 assert_eq!(*turn_id, Some(second.turn_id()));
                 assert_eq!(*run_id, FIRST_RUN);
                 let cancelled_turn_id = turn_id.unwrap();
-                assert_eq!(app.run_id, PENDING_RUN + 1);
+                // Cancellation fences every presentation at or below the id the
+                // actor held when it cut, so the app never lands behind it.
+                assert!(
+                    app.run_id >= displayed_presentation,
+                    "cancel must fence at or past the pending presentation"
+                );
                 assert!(matches!(
                     second.wait().await,
                     TurnOutcome::Cancelled {
@@ -1524,7 +1522,6 @@ mod tests {
                 for envelope in buffered {
                     app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 }
-                assert_eq!(app.run_id, PENDING_RUN + 1);
                 assert_eq!(app.status, crate::components::Status::Idle);
 
                 let future = if deferred {
@@ -1542,9 +1539,10 @@ mod tests {
                             .unwrap(),
                     )
                 };
+                let future_presentation = queue.current_run_id();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    let streaming = envelope.run_id == PENDING_RUN + 2
+                    let streaming = envelope.presentation() == Some(future_presentation)
                         && matches!(envelope.event, AgentEvent::TextDelta { .. });
                     app.update(crate::app::Msg::Agent(Box::new(envelope)));
                     if streaming {
@@ -1556,7 +1554,6 @@ mod tests {
                         .turn_ticket(actor.snapshot().active_turn.unwrap())
                         .unwrap()
                 });
-                assert_eq!(app.run_id, PENDING_RUN + 2);
                 assert_eq!(app.status, crate::components::Status::Streaming);
                 assert!(actor.cancel_turn(cancelled_turn_id).is_err());
                 assert!(future.peek().is_none());
@@ -1597,7 +1594,6 @@ mod tests {
                 let (mut backend, _, events) = failing_backend();
                 let (requests_tx, requests) = flume::unbounded();
                 let (release, released) = flume::bounded(1);
-                let run_id = Arc::clone(&backend.run_id);
                 let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
                 let config = maki_agent::EffectiveAgentConfig::new(
                     maki_agent::RunSettings {
@@ -1642,7 +1638,8 @@ mod tests {
                         .unwrap()
                 };
                 let actor = target.actor().unwrap();
-                let queue = actor_queue(Arc::new(actor.clone()), run_id);
+                let queue = actor_queue(Arc::new(actor.clone()));
+                let settlements = actor.subscribe_events();
                 let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
                 app.update(crate::app::Msg::Paste(INITIAL.into()));
                 let actions = app.update(crate::app::Msg::Key(crate::components::key(
@@ -1738,8 +1735,16 @@ mod tests {
                 assert!(queue.is_empty());
                 release.send(()).unwrap();
                 assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+                // The actor itself publishes the settled identity once its queue
+                // is empty; the frontend never re-derives it from a mirror.
+                let settled = await_settlement(&settlements, submitted_run).await;
+                assert_eq!(
+                    settled.agent_id,
+                    actor.agent_id(),
+                    "settlement names the actor that ran the work"
+                );
                 for envelope in events.drain() {
-                    assert_eq!(envelope.run_id, submitted_run);
+                    assert_eq!(envelope.presentation(), Some(submitted_run));
                     app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 }
                 let chat = app.main_chat();
@@ -2087,9 +2092,6 @@ mod tests {
             const RESPONSE: &str = "visible explicit response";
             let (mut backend, _, events) = failing_backend();
             let (release, released) = flume::bounded(1);
-            let (drain_tx, drain_rx) = flume::unbounded();
-            backend.drain_tx = drain_tx;
-            let run_id = Arc::clone(&backend.run_id);
             let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
             let root = manager
                 .create_root_with_config(
@@ -2118,10 +2120,7 @@ mod tests {
                 .unwrap();
             let actor = root.actor().unwrap();
             let lifecycle = actor.subscribe_events();
-            let queue = crate::agent::shared_queue::actor_queue(
-                Arc::new(actor.clone()),
-                Arc::clone(&run_id),
-            );
+            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
             let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
             let host = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
             host.load_source(
@@ -2148,13 +2147,15 @@ mod tests {
             let submitted_run = app.run_id;
             let text = input.message.clone();
             if root_work {
+                // The app already reserved and displayed this presentation.
                 actor
                     .submit(
                         *input,
                         None,
-                        format!("{ROOT_CORRELATION_PREFIX}{submitted_run}"),
+                        crate::agent::shared_queue::correlation(submitted_run),
                         TurnAdmissionOptions {
                             already_displayed: true,
+                            displayed_presentation: Some(submitted_run),
                             ..Default::default()
                         },
                     )
@@ -2174,7 +2175,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                assert_eq!(envelope.run_id, submitted_run);
+                assert_eq!(envelope.presentation(), Some(submitted_run));
                 let streamed = matches!(&envelope.event, AgentEvent::TextDelta { .. });
                 app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 if streamed {
@@ -2182,24 +2183,29 @@ mod tests {
                 }
             }
             release.send(()).unwrap();
-            let drained = futures_lite::future::or(drain_rx.recv_async(), async {
-                smol::Timer::after(std::time::Duration::from_secs(10)).await;
-                panic!("waiting for immediate turn settlement");
-            })
-            .await
-            .unwrap();
-            assert_eq!(drained, submitted_run);
-            assert!(
-                lifecycle
-                    .drain()
-                    .any(|event| matches!(event, maki_agent::actor::ActorEvent::End(_)))
-            );
+            // Settlement is the actor's own publication: wait for its End
+            // rather than racing a non-blocking drain.
+            futures_lite::future::or(
+                async {
+                    loop {
+                        match lifecycle.recv_async().await {
+                            Ok(maki_agent::actor::ActorEvent::End(_)) => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                    panic!("waiting for actor settlement: actor={:?}", actor.snapshot());
+                },
+            )
+            .await;
             for envelope in events.drain() {
-                assert_eq!(envelope.run_id, submitted_run);
+                assert_eq!(envelope.presentation(), Some(submitted_run));
                 app.update(crate::app::Msg::Agent(Box::new(envelope)));
             }
             assert_eq!(app.run_id, submitted_run);
-            assert_eq!(run_id.load(Ordering::Relaxed), submitted_run);
             host.wait_for_worker_barrier_for_test();
             assert_eq!(
                 host.event_handle()
@@ -2239,7 +2245,6 @@ mod tests {
             const LAST: &str = "after compact";
             const RUN_ID: u64 = 9;
             let (backend, _, _) = failing_backend();
-            let run_id = Arc::clone(&backend.run_id);
             let (actor, task) = maki_agent::actor::AgentActorHandle::spawn(
                 backend.agent_id,
                 Vec::new(),
@@ -2247,7 +2252,7 @@ mod tests {
                 Box::new(backend),
             );
             let boundary = actor.reserve_config_update().unwrap();
-            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()), run_id);
+            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
             let push = |text: &str| {
                 queue
                     .try_push(crate::agent::shared_queue::QueueItem::Message {
@@ -2296,12 +2301,9 @@ mod tests {
     fn submission_setup_respects_admission_cancellation(cancelled: bool) {
         smol::block_on(async {
             const ADMISSION_RUN: u64 = 1;
-            const ALLOCATED_RUN: u64 = 7;
             let (mut backend, mut input, events) = failing_backend();
             input.prompt = None;
             backend.initialized = false;
-            let allocated_run = ALLOCATED_RUN;
-            backend.run_id.store(allocated_run, Ordering::Relaxed);
             let (trigger, cancel) = CancelToken::new();
             let (reason_trigger, cancel_reason) = ReasonedCancelToken::new();
             if cancelled {
@@ -2319,7 +2321,7 @@ mod tests {
                 provenance: Default::default(),
                 cancel,
                 cancel_reason,
-                correlation: format!("{ROOT_CORRELATION_PREFIX}{ADMISSION_RUN}"),
+                work: work_identity(ADMISSION_RUN),
                 generation: 0,
                 policy: None,
                 admission: None,
@@ -2351,13 +2353,17 @@ mod tests {
                     .any(|envelope| { matches!(envelope.event, AgentEvent::TurnOutcome(_)) }),
                 "backend published before actor sealing"
             );
-            assert!(emitted.iter().all(|event| event.run_id == ADMISSION_RUN));
+            assert!(
+                emitted
+                    .iter()
+                    .all(|event| event.presentation() == Some(ADMISSION_RUN)),
+                "every event must carry the admitted presentation"
+            );
             assert!(
                 !emitted
                     .iter()
                     .any(|event| matches!(event.event, AgentEvent::QueueItemConsumed { .. }))
             );
-            assert_eq!(backend.run_id.load(Ordering::Relaxed), allocated_run);
         });
     }
 
@@ -2604,8 +2610,6 @@ mod tests {
             futures_lite::future::or(async {
                 let (mut backend, mut input, events) = failing_backend();
                 input.prompt = None;
-                backend.run_id.store(RUN_ID - 1, Ordering::Relaxed);
-                let run_id = Arc::clone(&backend.run_id);
                 let (release, released) = flume::unbounded();
                 let (requests, request_rx) = flume::unbounded();
                 let config = maki_agent::EffectiveAgentConfig::new(
@@ -2625,8 +2629,9 @@ mod tests {
                     },
                 ).unwrap();
                 let actor = root.actor().unwrap();
+                actor.observe_presentation(RUN_ID - 1);
                 let mut app = crate::app::tests::actor_presentation_app(
-                    crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()), run_id),
+                    crate::agent::shared_queue::actor_queue(Arc::new(actor.clone())),
                     RUN_ID - 1,
                 );
                 let actor_events = actor.subscribe_events();
@@ -2665,7 +2670,7 @@ mod tests {
                 let mut bubbles = 0;
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    assert_eq!(envelope.run_id, RUN_ID);
+                    assert_eq!(envelope.presentation(), Some(RUN_ID));
                     bubbles += usize::from(matches!(envelope.event, AgentEvent::QueueItemConsumed { .. }));
                     let streamed = matches!(envelope.event, AgentEvent::TextDelta { .. });
                     app.update(crate::app::Msg::Agent(Box::new(envelope)));
@@ -2988,7 +2993,6 @@ mod tests {
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let (agent_tx, _agent_rx) = flume::unbounded();
         let (_answer_tx, answer_rx) = flume::unbounded();
-        let (drain_tx, _drain_rx) = flume::unbounded();
         let (_init_trigger, init_cancel) = CancelToken::new();
         let cwd = Arc::new(ArcSwap::from_pointee(PathBuf::from("/tmp/admitted")));
         let mut backend = new_backend(
@@ -3018,8 +3022,6 @@ mod tests {
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
             init_cancel,
-            drain_tx,
-            Arc::new(AtomicU64::new(0)),
         );
         let mut input = AgentInput::from_defaults(
             "hello".into(),
@@ -3145,7 +3147,6 @@ mod tests {
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let (agent_tx, agent_rx) = flume::unbounded();
         let (_answer_tx, answer_rx) = flume::unbounded();
-        let (drain_tx, _drain_rx) = flume::unbounded();
         let (_init_trigger, init_cancel) = CancelToken::new();
         let agent_id = AgentId::generate();
         let mut backend = new_backend(
@@ -3176,8 +3177,6 @@ mod tests {
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
             None,
             init_cancel,
-            drain_tx,
-            Arc::new(AtomicU64::new(0)),
         );
         backend.initialized = true;
 
@@ -3209,7 +3208,7 @@ mod tests {
             provenance: Default::default(),
             cancel: CancelToken::none(),
             cancel_reason: ReasonedCancelToken::none(),
-            correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
+            work: work_identity(0),
             generation: 0,
             policy: policy.map(Arc::new),
             admission: None,
@@ -3223,7 +3222,7 @@ mod tests {
             &context,
             input,
             TurnId::generate(),
-            0,
+            context.work,
         ));
         drop(backend);
         (outcome, agent_rx.drain().collect())
@@ -3295,7 +3294,7 @@ mod tests {
                 provenance: Default::default(),
                 cancel,
                 cancel_reason,
-                correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
+                work: work_identity(0),
                 generation: 0,
                 policy: Some(Arc::clone(&policy)),
                 admission: Some(admission),
@@ -3314,7 +3313,12 @@ mod tests {
             let outcome = {
                 let mut run = pin!(backend.run_turn(&mut history, context, input, WorkKind::Turn));
                 assert!(poll_once(run.as_mut()).await.is_none());
-                assert!(events.is_empty());
+                // The model announcement is stamped from admission, so it is
+                // the one event a turn emits before it settles.
+                assert!(matches!(
+                    events.drain().next().map(|envelope| envelope.event),
+                    Some(AgentEvent::ModelSwitched { .. })
+                ));
                 reason_trigger.cancel(reason);
                 trigger.cancel();
                 let Some(BackendResult::EnteredRun(outcome)) = poll_once(run.as_mut()).await else {
@@ -3336,7 +3340,7 @@ mod tests {
                 provenance: Default::default(),
                 cancel: CancelToken::none(),
                 cancel_reason: ReasonedCancelToken::none(),
-                correlation: format!("{ROOT_CORRELATION_PREFIX}1"),
+                work: work_identity(1),
                 generation: 1,
                 policy: Some(policy),
                 admission: None,

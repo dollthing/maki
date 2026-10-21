@@ -314,7 +314,6 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
         const CORRELATION: &str = "cancelled-after-pop";
         const UNRELATED: &str = "unrelated";
         const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-        const RUN_ID: u64 = 7;
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (entered_tx, entered_rx) = flume::unbounded();
         let root = manager
@@ -332,7 +331,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                 actor
                     .admit_turn(
                         input(),
-                        Some(EventSender::new(event_tx, RUN_ID)),
+                        Some(EventSender::new(event_tx)),
                         CORRELATION.into(),
                     )
                     .unwrap(),
@@ -341,7 +340,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                 let operation = actor
                     .reserve_prepared_operation(Some(PreparedTurn {
                         input: input(),
-                        event_sender: Some(EventSender::new(event_tx, RUN_ID)),
+                        event_sender: Some(EventSender::new(event_tx)),
                         correlation: CORRELATION.into(),
                     }))
                     .unwrap();
@@ -353,7 +352,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                 actor
                     .submit(
                         input(),
-                        Some(EventSender::new(event_tx, RUN_ID)),
+                        Some(EventSender::new(event_tx)),
                         CORRELATION.into(),
                         TurnAdmissionOptions::default(),
                     )
@@ -3499,7 +3498,7 @@ fn managed_child_cancelled_while_waiting_for_permit_never_enters_backend() {
         let ticket = actor
             .admit_turn(
                 input(),
-                Some(EventSender::new(event_tx, 0)),
+                Some(EventSender::new(event_tx)),
                 "waiting-for-permit".into(),
             )
             .unwrap();

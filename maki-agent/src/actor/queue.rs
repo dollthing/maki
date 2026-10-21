@@ -301,6 +301,7 @@ mod tests {
     use super::ActorQueue;
     use crate::ExtractedCommand;
     use crate::actor::{ActorWork, ControlWork};
+    use crate::types::{ActorWorkIdentity, ActorWorkKind, AgentId};
 
     const INSTRUCTIONS: &str = "retain decisions";
     const CONTROL: &str = "boundary";
@@ -312,6 +313,13 @@ mod tests {
             instructions: Some(INSTRUCTIONS.into()),
             generation,
             policy: None,
+            work: ActorWorkIdentity::new(
+                AgentId::generate(),
+                ActorWorkKind::Compact {
+                    operation_id: generation,
+                },
+                generation,
+            ),
         }
     }
 
@@ -336,6 +344,11 @@ mod tests {
         queue.push(ActorWork::Control(ControlWork {
             name: CONTROL.into(),
             correlation: CONTROL.into(),
+            work: ActorWorkIdentity::new(
+                AgentId::generate(),
+                ActorWorkKind::Control { operation_id: 0 },
+                0,
+            ),
         }));
         queue.push(compact(1));
         assert!(queue.pop_interrupt(1).is_none());

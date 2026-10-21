@@ -13,7 +13,7 @@ use super::{
     ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
     settle_and_finalize_turn,
 };
-use crate::types::{TurnCancellationReason, TurnOutcome};
+use crate::types::{ActorWorkIdentity, TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
 #[cfg(test)]
@@ -125,6 +125,10 @@ impl Runner {
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
                     state.idle_pending = true;
+                    // Settlement is published while the work is still being
+                    // finalized, so the identity must be recorded here rather
+                    // than after `process` returns.
+                    state.settled = work.identity();
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(|work| {
@@ -170,7 +174,6 @@ impl Runner {
             if let Some(completion) = completion {
                 completion.send();
             }
-            self.backend.on_work_settled();
         }
         #[cfg(any(test, feature = "test-util"))]
         {
@@ -257,9 +260,10 @@ impl Runner {
                 instructions,
                 generation,
                 policy,
+                work,
                 ..
             } => {
-                self.run_compact(run_id, instructions.as_deref(), generation, policy)
+                self.run_compact(run_id, instructions.as_deref(), generation, policy, work)
                     .await
             }
         }
@@ -425,11 +429,11 @@ impl Runner {
             TurnContext {
                 agent_id,
                 turn_id: Some(turn_id),
+                work: admission.work,
                 output: admission.ticket.output(),
                 provenance: admission.ticket.provenance().clone(),
                 cancel: plain,
                 cancel_reason: reasoned.clone(),
-                correlation: admission.correlation.clone(),
                 generation: admission.generation,
                 policy: admission.policy.clone(),
                 interrupt: Some(Arc::new(InterruptQueue::new(
@@ -519,11 +523,11 @@ impl Runner {
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,
+                    work: control.work,
                     output: super::TurnOutput::default(),
                     provenance: super::TurnProvenance::default(),
                     cancel: plain,
                     cancel_reason: reasoned,
-                    correlation: control.correlation.clone(),
                     generation: 0,
                     policy: None,
                     interrupt: None,
@@ -553,6 +557,7 @@ impl Runner {
         instructions: Option<&str>,
         policy_generation: u64,
         policy: Option<Arc<super::EffectiveAgentConfig>>,
+        work: ActorWorkIdentity,
     ) {
         let correlation = super::run_correlation(run_id);
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
@@ -580,11 +585,11 @@ impl Runner {
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,
+                    work,
                     output: super::TurnOutput::default(),
                     provenance: super::TurnProvenance::default(),
                     cancel: plain,
                     cancel_reason: reasoned,
-                    correlation: correlation.clone(),
                     generation: policy_generation,
                     policy,
                     interrupt: None,

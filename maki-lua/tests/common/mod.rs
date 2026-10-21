@@ -156,7 +156,7 @@ where
 {
     let (run_trigger, run_cancel) = CancelToken::new();
     let (tx, rx) = flume::unbounded::<Envelope>();
-    let event_tx = EventSender::new(tx, 0);
+    let event_tx = EventSender::new(tx);
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.cancel = run_cancel;
     ctx.subagent_cancels = Arc::new(CancelMap::new());

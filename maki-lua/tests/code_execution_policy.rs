@@ -402,7 +402,7 @@ fn setup_script_rendering() -> (Arc<ToolRegistry>, PluginHost) {
 
 fn event_ctx(reg: &Arc<ToolRegistry>) -> (ToolContext, flume::Receiver<maki_agent::Envelope>) {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let event_tx = maki_agent::EventSender::new(tx);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
         &AgentMode::Build,
         Some(&event_tx),
@@ -562,7 +562,7 @@ fn restore_snapshot(
             clicks,
             state: None,
         },
-        maki_agent::EventSender::new(tx, 0),
+        maki_agent::EventSender::new(tx),
     );
     loop {
         let env = rx

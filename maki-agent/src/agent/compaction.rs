@@ -374,7 +374,7 @@ mod tests {
             const EXPECTED: &str = "assistant beforeassistant after";
             let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
             let (tx, _rx) = flume::unbounded();
-            let sender = EventSender::new(tx, 0).with_output(ticket.output());
+            let sender = EventSender::new(tx).with_output(ticket.output());
             sender
                 .send(AgentEvent::TextDelta {
                     text: BEFORE.into(),
@@ -420,7 +420,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -459,7 +459,7 @@ mod tests {
                 &*provider,
                 &model,
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -496,7 +496,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -533,7 +533,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &config,
                 Some(REQUEST_EXTRA),
@@ -613,7 +613,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -846,7 +846,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
@@ -890,7 +890,7 @@ mod tests {
                 &provider,
                 &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
+                &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,

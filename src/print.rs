@@ -614,7 +614,7 @@ pub fn run(
                                 | AgentEvent::ToolDone(_)
                                 | AgentEvent::QueueItemConsumed { .. }
                                 | AgentEvent::ModelSwitched { .. }
-                                | AgentEvent::QueueDrained
+                                | AgentEvent::QueueSettled
                                 | AgentEvent::AutoCompacting { .. }
                                 | AgentEvent::CompactionDone { .. }
                                 | AgentEvent::AuthRequired
@@ -838,7 +838,7 @@ mod tests {
                 answer_tx: None,
                 cancel: None,
             }),
-            run_id: 1,
+            identity: None,
         };
         let mut state = PrintTurnState {
             result_text: ROOT_RESPONSE.into(),
@@ -865,7 +865,7 @@ mod tests {
                 DoneReason::EndTurn,
             )),
             subagent: None,
-            run_id: 1,
+            identity: None,
         }));
         assert_eq!(state.result_text, ROOT_RESPONSE);
         assert!(!state.is_error);

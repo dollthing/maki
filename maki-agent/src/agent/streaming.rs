@@ -222,7 +222,7 @@ mod tests {
                 .unwrap();
             drop(prx_tx);
 
-            let sender = EventSender::new(event_tx, 0);
+            let sender = EventSender::new(event_tx);
             forward_provider_events(prx_rx, &sender).await;
 
             let events: Vec<AgentEvent> = event_rx.drain().map(|e| e.event).collect();
@@ -246,13 +246,13 @@ mod tests {
                     .send(crate::Envelope {
                         event: AgentEvent::Nudge,
                         subagent: None,
-                        run_id: 0,
+                        identity: None,
                     })
                     .unwrap();
             } else {
                 drop(event_rx);
             }
-            let sender = EventSender::new(event_tx, 0).with_output(ticket.output());
+            let sender = EventSender::new(event_tx).with_output(ticket.output());
             let (provider_tx, provider_rx) = flume::unbounded();
             for text in DELTAS {
                 provider_tx
@@ -355,7 +355,7 @@ mod tests {
             };
             let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
             let (tx, _rx) = flume::unbounded();
-            let sender = EventSender::new(tx, 0).with_output(ticket.output());
+            let sender = EventSender::new(tx).with_output(ticket.output());
             sender
                 .send(AgentEvent::TextDelta { text: PRIOR.into() })
                 .unwrap();
@@ -474,7 +474,7 @@ mod tests {
             &[Message::user("hi".into())],
             "",
             &json!([]),
-            &EventSender::new(tx, 0),
+            &EventSender::new(tx),
             &CancelToken::none(),
             RequestOptions::default(),
             None,

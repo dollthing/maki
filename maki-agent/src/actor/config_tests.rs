@@ -4,8 +4,8 @@ use maki_storage::checkpoint::CheckpointPublication;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
-    ActorError, ActorEvent, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig,
-    PendingQueueEntry, QueueProjection,
+    ActorError, ActorEvent, ConfigChange, ConfigPatch, EffectiveAgentConfig, PendingQueueEntry,
+    QueueProjection,
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
@@ -314,7 +314,7 @@ fn cancel_during_preparation_terminalizes_once() {
         let ticket = actor
             .admit_turn(
                 input("cancel"),
-                Some(EventSender::new(events_tx, 0)),
+                Some(EventSender::new(events_tx)),
                 "cancel".into(),
             )
             .unwrap();
@@ -1021,7 +1021,7 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
         let reservation = actor
             .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
                 input: input(WORK),
-                event_sender: Some(EventSender::new(events_tx, 0)),
+                event_sender: Some(EventSender::new(events_tx)),
                 correlation: WORK.into(),
             }))
             .unwrap();
@@ -1106,12 +1106,7 @@ fn control_waits_for_earlier_preparation(root: bool) {
             actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
         }
         entered_rx.recv_async().await.unwrap();
-        actor
-            .push_control(ControlWork {
-                name: CONTROL.into(),
-                correlation: CONTROL.into(),
-            })
-            .unwrap();
+        actor.push_control(CONTROL.into(), CONTROL.into()).unwrap();
         assert!(actor.inner.queue.is_empty());
         let snapshot = actor.snapshot();
         assert_eq!(snapshot.queue.len(), 2);
@@ -1157,11 +1152,8 @@ fn deferred_control_queue_operations(action: &str) {
         let (actor, task) = spawn(backend);
         let ticket = actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
         entered_rx.recv_async().await.unwrap();
-        let control = || ControlWork {
-            name: CONTROL.into(),
-            correlation: WORK.into(),
-        };
-        actor.push_control(control()).unwrap();
+        let control = || (CONTROL.to_string(), WORK.to_string());
+        actor.push_control(control().0, control().1).unwrap();
         assert!(actor.inner.queue.is_empty());
         assert!(
             matches!(&actor.pending_queue()[..], [PendingQueueEntry::Message(pending)] if pending.turn_id == ticket.turn_id())
@@ -1173,11 +1165,17 @@ fn deferred_control_queue_operations(action: &str) {
             "cancel_existing" => actor.cancel_existing(),
             "close" => {
                 actor.close();
-                assert_eq!(actor.push_control(control()), Err(ActorError::Closed));
+                assert_eq!(
+                    actor.push_control(control().0, control().1),
+                    Err(ActorError::Closed)
+                );
             }
             "shutdown" => {
                 actor.shutdown();
-                assert_eq!(actor.push_control(control()), Err(ActorError::Shutdown));
+                assert_eq!(
+                    actor.push_control(control().0, control().1),
+                    Err(ActorError::Shutdown)
+                );
             }
             "cancel_turn" => actor.cancel_turn(ticket.turn_id()).unwrap(),
             "cancel_correlation" => actor.cancel_correlation(WORK, TurnCancellationReason::User),
@@ -1324,7 +1322,7 @@ fn final_submitted_preparation_panic_publishes_end_before_idle_once() {
         ));
         assert!(matches!(
             events.recv_async().await.unwrap(),
-            ActorEvent::Idle { agent_id } if agent_id == actor.agent_id()
+            ActorEvent::Idle { agent_id, .. } if agent_id == actor.agent_id()
         ));
         assert!(matches!(failed.wait().await, TurnOutcome::Failed { .. }));
         assert!(observed.runs.lock().unwrap().is_empty());
