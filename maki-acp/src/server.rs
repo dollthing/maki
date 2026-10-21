@@ -767,25 +767,10 @@ fn acp_orchestration(
     session_id: MakiId,
     child_config: ConfigMutationReserver,
 ) -> AgentOrchestration {
-    let root_id = root.target.id();
-    AgentOrchestration::bind_root(models, root).with_config_mutations(Arc::new(
-        move |target, publication| {
-            if target.id() != root_id {
-                return child_config(target, publication);
-            }
-            let coordinator =
-                maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
-                    .map_err(|error| error.to_string())?;
-            let reservation = coordinator
-                .reserve_transaction(publication)
-                .map_err(|error| error.to_string())?;
-            Ok(Box::new(move |config, claim| {
-                reservation
-                    .prepare(config, claim, false)
-                    .map_err(|error| error.to_string())
-            }))
-        },
-    ))
+    maki_lua::orchestration::frontend_root(models, root, child_config, move || {
+        maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+            .map_err(|error| error.to_string())
+    })
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we

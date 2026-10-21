@@ -3,6 +3,7 @@ use crate::agent_errors::{
 };
 use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
+use arc_swap::ArcSwapOption;
 use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::{AgentRef, tools::ToolContext};
@@ -287,6 +288,40 @@ pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) 
         thinking: Some(config.thinking.into()),
         fast: config.fast,
     }
+}
+
+/// The orchestration a non-UI frontend binds to its root graph. The root's own
+/// config commits go through `root`, which resolves the coordinator; children
+/// go through `child_config`. `root` is a resolver rather than a handle because
+/// ACP publishes its root before the coordinator is registered while SDK holds
+/// one from the start.
+pub fn frontend_root(
+    models: Arc<ArcSwapOption<Vec<String>>>,
+    target: TrustedTarget,
+    child_config: ConfigMutationReserver,
+    root_coordinator: impl Fn() -> Result<
+        maki_agent::session_coordinator::SessionCoordinatorHandle,
+        String,
+    > + Send
+    + Sync
+    + 'static,
+) -> AgentOrchestration {
+    let root_id = target.target.id();
+    AgentOrchestration::bind_root(models, target).with_config_mutations(Arc::new(
+        move |target, publication| {
+            if target.id() != root_id {
+                return child_config(target, publication);
+            }
+            let reservation = root_coordinator()?
+                .reserve_transaction(publication)
+                .map_err(|error| error.to_string())?;
+            Ok(Box::new(move |config, claim| {
+                reservation
+                    .prepare(config, claim, false)
+                    .map_err(|error| error.to_string())
+            }))
+        },
+    ))
 }
 
 pub fn nonpersistent_config_mutation(

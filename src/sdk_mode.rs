@@ -36,9 +36,7 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::host_root::HostRootServices;
-use maki_lua::orchestration::{
-    AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver, TrustedTarget,
-};
+use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -732,23 +730,10 @@ fn sdk_orchestration(
     coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
     child_config: ConfigMutationReserver,
 ) -> AgentOrchestration {
-    let root_id = root.target.id();
     let models = Arc::new(Some(Arc::new(models)).into());
-    AgentOrchestration::bind_root(models, root).with_config_mutations(Arc::new(
-        move |target, publication| {
-            if target.id() != root_id {
-                return child_config(target, publication);
-            }
-            let reservation = coordinator
-                .reserve_transaction(publication)
-                .map_err(|error| error.to_string())?;
-            Ok(Box::new(move |config, claim| {
-                reservation
-                    .prepare(config, claim, false)
-                    .map_err(|error| error.to_string())
-            }) as ConfigMutationReservation)
-        },
-    ))
+    maki_lua::orchestration::frontend_root(models, root, child_config, move || {
+        Ok(coordinator.clone())
+    })
 }
 
 fn bind_sdk_actor(
