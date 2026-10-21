@@ -56,13 +56,6 @@ end
 
 local OPT = { auto_model = "test/model", auto_mode = true, auto_timeout_secs = 17 }
 
-case("defaults_off", function()
-  local d = bh.defaults()
-  eq(d.auto_mode, false)
-  eq(d.auto_model, nil, "no default model: unset means inherit the session model")
-  eq(d.auto_timeout_secs, 30)
-end)
-
 case("parse_verdict_approve", function()
   local verdict, reason, err = bh.parse_verdict('{"approved": true}')
   eq(verdict, "approve")

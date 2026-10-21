@@ -156,10 +156,6 @@ struct LuaActorState {
     name: String,
     commit: Arc<Mutex<Option<JsonValue>>>,
     start: Instant,
-    /// Set only after the adapter backend has actually entered a turn. A
-    /// queued admission never sets it, so close cannot mistake queued work for
-    /// an executed transcript.
-    execution_started: std::sync::atomic::AtomicBool,
     /// Prevents close/drop from duplicating the latest terminal relay.
     history_relayed: std::sync::atomic::AtomicBool,
     close_notified: std::sync::atomic::AtomicBool,
@@ -201,8 +197,6 @@ impl LuaActorState {
     }
 
     fn relay_history(&self, history: &History) {
-        self.execution_started
-            .store(true, std::sync::atomic::Ordering::Release);
         self.history_relayed
             .store(false, std::sync::atomic::Ordering::Release);
         *self.relay_snapshot.lock().unwrap() = history.snapshot().clone();
@@ -381,9 +375,6 @@ impl ActorBackend for LuaActorBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             let state = &*self.state;
-            state
-                .execution_started
-                .store(true, std::sync::atomic::Ordering::Release);
             // The finalizer uses the same relay sink after sealing the result.
             let event_tx = state
                 .chip_event_tx
@@ -1315,10 +1306,6 @@ impl SessionOptions {
             show,
         }))
     }
-
-    fn workflow(&self, parent: &SessionParent) -> bool {
-        parent.context.workflow
-    }
 }
 
 fn validate_required_output_mode(
@@ -1580,7 +1567,7 @@ impl ChildSettings {
         template.provider = Arc::clone(&self.provider);
         template.opts = self.opts;
         template.audience = options.audience;
-        template.workflow = options.workflow(parent);
+        template.workflow = parent.context.workflow;
         template.mode = self.mode.clone();
         template.mode_def = Some(Arc::new(self.mode_definition(parent)));
         template.tool_filter = Arc::clone(tools.request.filter());
@@ -1596,18 +1583,14 @@ impl ChildSettings {
         template
     }
 
-    fn initial_config(
-        &self,
-        parent: &SessionParent,
-        options: &SessionOptions,
-    ) -> EffectiveAgentConfig {
+    fn initial_config(&self, parent: &SessionParent) -> EffectiveAgentConfig {
         EffectiveAgentConfig::new(
             RunSettings {
                 provider: Arc::clone(&self.provider),
                 model: self.model.clone(),
                 thinking: self.opts.thinking,
                 fast: self.opts.fast,
-                workflow: options.workflow(parent),
+                workflow: parent.context.workflow,
             },
             self.mode.clone(),
         )
@@ -1818,7 +1801,7 @@ async fn build_session(
     let child = ChildSettings::new(&parent, &options, model, provider);
     let commit = Arc::new(Mutex::new(None));
     let child_template = child.tool_template(&parent, &options, &tools, &commit);
-    let initial_config = child.initial_config(&parent, &options);
+    let initial_config = child.initial_config(&parent);
     try_pair!(validate_required_output_mode(
         tools.structured.is_some(),
         initial_config.mode_def.as_ref(),
@@ -1873,7 +1856,7 @@ async fn build_session(
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
-        ui_id: ui_id.clone(),
+        ui_id,
         parent_event_tx: parent.context.event_tx.clone(),
         cancel,
         parent_agent_id: parent.agent_id,
@@ -1886,7 +1869,6 @@ async fn build_session(
         name: options.name.clone(),
         commit,
         start: Instant::now(),
-        execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
         close_notified: std::sync::atomic::AtomicBool::new(false),
         relay_snapshot: Mutex::default(),
@@ -1927,7 +1909,6 @@ async fn build_session(
     let relay_stop_tx = spawn_close_relay(&control, &state);
 
     let sess = LuaSession {
-        id: ui_id,
         agent_id: actor.agent_id(),
         actor: Arc::new(actor),
         state,
@@ -1944,7 +1925,7 @@ async fn build_session(
         let post = Post {
             text: description.map_or_else(|| label.to_owned(), |text| format!("{label}: {text}")),
             level: Default::default(),
-            agent: Some(session.id.clone()),
+            agent: Some(session.state.ui_id.clone()),
         };
         if let Err(error) = send_post(&lua, trusted, post) {
             warn!(name = %options.name, %error, "could not show spawned agent");
@@ -2126,7 +2107,6 @@ struct SessionControl {
 }
 
 struct LuaSession {
-    id: String,
     agent_id: AgentId,
     actor: Arc<AgentActorHandle>,
     state: Arc<LuaActorState>,
@@ -2691,7 +2671,6 @@ mod tests {
             name: "probe".to_owned(),
             commit: Arc::new(Mutex::new(None)),
             start: Instant::now(),
-            execution_started: std::sync::atomic::AtomicBool::new(false),
             history_relayed: std::sync::atomic::AtomicBool::new(false),
             close_notified: std::sync::atomic::AtomicBool::new(false),
             relay_snapshot: Mutex::default(),

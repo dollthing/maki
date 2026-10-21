@@ -1,6 +1,6 @@
 # Agent invariants
 
-These invariants cover the actor and manager from the first three Issue 24 deliveries. Later deliveries add configuration and Lua authority contracts documented in the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md). A change to an invariant should update its implementation, regression coverage, and applicable contract documentation.
+These invariants cover the actor, manager and agent frontends as they are currently implemented. A change to an invariant should update its implementation, regression coverage, and applicable contract documentation.
 
 ## Identity and authority
 
@@ -66,7 +66,7 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 43. Per-agent serialization stays in the actor. The manager limiter must not become a second scheduler.
 44. Managed permit acquisition happens after actor active cancellation is installed and before backend execution. Cancellation while waiting for capacity must settle without entering the backend.
 45. While unsuspended, every opaque backend poll holds physical permit ownership for the entire poll. Capacity must not be released from underneath cleanup or a concurrent suspension race.
-46. A blocking parent wait may yield capacity only after validating active authority, descendant relationship, child actor identity, and ticket ownership. The current admission-to-watcher ticket race documented in `agent-system.md` is a known defect to close, not behavior to preserve.
+46. A blocking parent wait may yield capacity only after validating active authority, descendant relationship, child actor identity, and ticket ownership. The admission-to-watcher ticket race is a known defect to close, not behavior to preserve; see `agent-system.md` for the mechanism.
 47. Multiple descendant waits from one parent share a reference-counted suspension. The first releases capacity; only the last retirement requires reacquisition.
 48. Suspension guard drop is synchronous and non-blocking. The managed execution poll gate is the only authority that reacquires the semaphore.
 49. A completed child waiter must not resume Lua/model/tool continuation until the parent lease reports ownership restored.
@@ -90,19 +90,10 @@ These invariants cover the actor and manager from the first three Issue 24 deliv
 
 ## Current scope boundary
 
-64. Do not assume that model, prompt, tools, permissions, modes, or request options are manager-owned per-agent state yet.
+64. Actor config covers model, prompt, tools, permissions, modes, and request options. Do not add a second writable copy of those values in a frontend or coordinator; read them from the actor.
 65. Do not assume agent graph topology, ids, queued work, outcomes, or notifications survive process restart.
-66. Do not expose proposal-only first-class Lua agent, graph navigation, preset, subscription, or public wait APIs as implemented behavior.
-67. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
+66. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
 
 ## Verification expectations
 
-Changes in this area should use deterministic channels, barriers, and fake providers. Avoid sleeps and polling in lifecycle/race tests. At minimum, test the layer whose invariant changed:
-
-- `maki-agent::agent::run` for terminal outcomes and provider/tool-loop behavior
-- `maki-agent::actor::tests` for FIFO, exact waits, cancellation cuts, closure, and retention
-- `maki-agent::manager::tests` for authority, limits, factory rollback, graph cuts, permits, waits, and reaping
-- `maki-lua` tests for managed invocation scope and Session/task compatibility
-- `maki-ui` tests for root queue behavior, replacement, child routing, and presentation correlation
-
-Run crate-scoped checks first, then the repository lint, test, formatting, and generated-document checks required by the project.
+Changes in this area should use deterministic channels, barriers, and fake providers. Avoid sleeps and polling in lifecycle/race tests. Test the layer whose invariant changed, and run crate-scoped checks before the project-wide lint, test, formatting, and generated-document checks.

@@ -12,10 +12,6 @@ local M = {}
 local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
 
-function M.defaults()
-  return { auto_mode = false, auto_timeout_secs = 30 }
-end
-
 -- Strict tri-state decoder: anything that is not `{approved: boolean}` (with an
 -- optional string `reason`) is "error" (never silently approve or deny).
 function M.parse_verdict(text)

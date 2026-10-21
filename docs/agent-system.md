@@ -1,6 +1,6 @@
 # Agent system
 
-The reliable turn lifecycle, shared actor, and per-outer-session agent manager below reflect the first three Issue 24 deliveries. Later deliveries add actor-owned configuration and the public Lua Agent API. The deferred-work list below reflects this earlier boundary, not current implementation status. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the current public contract.
+The reliable turn lifecycle, shared actor, and per-outer-session agent manager below describe the current implementation. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the public contract.
 
 ## Vocabulary
 
@@ -284,8 +284,8 @@ TUI, print, ACP and SDK all execute through a manager-owned root created by the 
 
 These are current code observations, not intended invariants:
 
-- Managed admit-and-wait has the fast-child ticket-registration race described above.
-- `ActorBackend::run_compact` is documented and checked by the runner as returning `BackendResult::CompactDone`, but the TUI backend currently returns `ControlDone` or `ControlFailed`. The user-facing compaction event comes from `agent::compact`, but the actor runner logs the backend result as unexpected.
+- Managed admit-and-wait has the fast-child ticket-registration race described under graph cancellation above.
+- `ActorBackend::run_compact` is documented and checked by the runner as returning `BackendResult::CompactDone`, but the TUI backend returns `ControlFailed` on the error path. The user-facing compaction event comes from `agent::compact`, but the actor runner logs the backend result as unexpected.
 - `GraphLifecycle::Removed` is defined but is not currently assigned by the manager.
 - Manager shutdown uses a bounded 10 ms poll for runner completion before joining or handing ownership to the reaper.
 
@@ -293,18 +293,12 @@ Keep these visible when touching the relevant code. Fixing them should update or
 
 ## Deferred work
 
-The following Issue 24 work is not part of the current implementation contract:
+The following work is not part of the current implementation contract:
 
-- moving model, provider binding, prompt, tools, permissions, mode, and request options into durable per-agent state
-- immutable queued policy snapshots and FIFO model/mode setter barriers
-- first-class public Lua `Agent` and visibility-only `AgentRef` userdata
-- public spawn, send, exact-turn wait, inspect, subscribe, and graph APIs
-- replacing task polling and all compatibility Session/task adapters
 - agent graph, outcome, pending-delivery, and policy persistence or restart recovery
 - guest-defined agent presets and complete guest-defined mode bundles
 - guest implementations of build and plan workflows
 - graph/tree UI, arbitrary-agent focus, and a uniform full promptbox for every focused agent
-- migration of headless, ACP, SDK, and print onto the manager
 - removal of the native mode enum and remaining host special cases
 - queue coalescing and contextual automode
 

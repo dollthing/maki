@@ -9,7 +9,7 @@ use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use maki_storage::sessions::HistorySnapshot;
+use maki_storage::sessions::{HistorySnapshot, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
 use std::{
     collections::HashMap,
@@ -20,6 +20,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use tracing::warn;
 
 mod targets;
 pub use targets::AgentOrchestration;
@@ -202,6 +203,91 @@ pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> 
 
 pub type TurnCompletion =
     Arc<dyn Fn(&AgentRef, HistorySnapshot<Message>) -> TurnCompletionFuture + Send + Sync>;
+
+/// Builds the child history/config persistence hooks every non-UI frontend binds
+/// to its root graph. `label` names the frontend in the closed-graph error.
+pub fn child_persistence(
+    label: &'static str,
+    services: Weak<AgentOrchestration>,
+    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
+) -> (ConfigMutationReserver, TurnCompletion) {
+    let destination = move |target: &AgentRef| -> Result<(String, String), String> {
+        let services = services
+            .upgrade()
+            .ok_or_else(|| format!("{label} orchestration is closed"))?;
+        let key = services.history_key(target)?;
+        let name = target
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .metadata
+            .label
+            .unwrap_or_default();
+        Ok((key, name))
+    };
+    let config_destination = destination.clone();
+    let completion_destination = destination;
+    let config_checkpoint = Arc::clone(&checkpoint);
+
+    let reserver: ConfigMutationReserver = Arc::new(move |target, publication| {
+        let (key, name) = config_destination(target)?;
+        let checkpoint = Arc::clone(&config_checkpoint);
+        Ok(Box::new(move |_, claim| {
+            Ok(PreparedTransaction {
+                publication,
+                publish: Box::new(move |ready, publication| {
+                    Box::pin(async move {
+                        checkpoint
+                            .checkpoint_child_config(
+                                child_metadata(key, name, &ready.config),
+                                publication,
+                                claim,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+                finalize: Box::new(|_| {}),
+            })
+        }))
+    });
+
+    let completion: TurnCompletion = Arc::new(move |target, history| {
+        let child = (|| {
+            let (key, name) = completion_destination(target)?;
+            let config = target
+                .effective_config()
+                .map_err(|error| error.to_string())?
+                .ok_or("child agent configuration is unavailable")?;
+            Ok::<_, String>(child_metadata(key, name, &config))
+        })();
+        let checkpoint = Arc::clone(&checkpoint);
+        Box::pin(async move {
+            let result = match child {
+                Ok(child) => checkpoint
+                    .checkpoint_child(child, history)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                warn!(%error, "{label} child history was not checkpointed");
+            }
+            Ok(())
+        })
+    });
+
+    (reserver, completion)
+}
+
+pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
+    StoredSubagent {
+        tool_use_id: key,
+        name,
+        model: Some(config.model.spec()),
+        thinking: Some(config.thinking.into()),
+        fast: config.fast,
+    }
+}
 
 pub fn nonpersistent_config_mutation(
     publication: CheckpointPublication,

@@ -439,24 +439,6 @@ fn default_preparation() -> ProviderPreparation {
     })
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    spawn_interactive_with_preparation(params, default_preparation())
-}
-
-pub fn spawn_interactive_with_history(
-    params: InteractiveParams,
-    history: crate::agent::HistorySnapshot,
-) -> InteractiveHandle {
-    spawn_interactive_with_binding(params, default_preparation(), Some(history), None)
-}
-
-pub fn spawn_interactive_with_preparation(
-    params: InteractiveParams,
-    prepare: ProviderPreparation,
-) -> InteractiveHandle {
-    spawn_interactive_with_binding(params, prepare, None, None)
-}
-
 pub fn spawn_interactive_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,

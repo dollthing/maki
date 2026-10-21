@@ -4,7 +4,7 @@ use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
     AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
@@ -19,7 +19,6 @@ use agent_client_protocol_schema::{
 };
 use arc_swap::ArcSwapOption;
 use flume::{Receiver, Sender, WeakSender};
-use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -34,16 +33,14 @@ use maki_commands::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_lua::host_root::{HostRootRetirementGuard, HostRootServices};
-use maki_lua::orchestration::{
-    AgentOrchestration, ConfigMutationReserver, TrustedTarget, TurnCompletion,
-};
+use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, StoredSubagent, StoredTokenUsage};
+use maki_storage::sessions::{SESSIONS_DIR, StoredTokenUsage};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -732,6 +729,9 @@ fn spawn_session_with_history(
 }
 
 #[cfg(test)]
+use maki_lua::orchestration::TurnCompletion;
+
+#[cfg(test)]
 fn orchestration_binding_with_completion(
     event_handle: maki_lua::EventHandle,
     models: Arc<ArcSwapOption<Vec<String>>>,
@@ -786,89 +786,6 @@ fn acp_orchestration(
             }))
         },
     ))
-}
-
-fn acp_child_destination(
-    services: &Weak<AgentOrchestration>,
-    target: &maki_agent::AgentRef,
-) -> Result<(String, String), String> {
-    let services = services.upgrade().ok_or("ACP orchestration is closed")?;
-    let key = services.history_key(target)?;
-    let name = target
-        .snapshot()
-        .map_err(|error| error.to_string())?
-        .metadata
-        .label
-        .unwrap_or_default();
-    Ok((key, name))
-}
-
-fn acp_child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
-    StoredSubagent {
-        tool_use_id: key,
-        name,
-        model: Some(config.model.spec()),
-        thinking: Some(config.thinking.into()),
-        fast: config.fast,
-    }
-}
-
-fn acp_child_config(
-    services: Weak<AgentOrchestration>,
-    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
-) -> ConfigMutationReserver {
-    Arc::new(move |target, publication| {
-        let (key, name) = acp_child_destination(&services, target)?;
-        let checkpoint = Arc::clone(&checkpoint);
-        Ok(Box::new(move |_, claim| {
-            Ok(PreparedTransaction {
-                publication,
-                publish: Box::new(move |ready, publication| {
-                    Box::pin(async move {
-                        checkpoint
-                            .checkpoint_child_config(
-                                acp_child_metadata(key, name, &ready.config),
-                                publication,
-                                claim,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())
-                    })
-                }),
-                finalize: Box::new(|_| {}),
-            })
-        }))
-    })
-}
-
-fn acp_child_completion(
-    services: Weak<AgentOrchestration>,
-    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
-) -> TurnCompletion {
-    Arc::new(move |target, history| {
-        let child = (|| {
-            let (key, name) = acp_child_destination(&services, target)?;
-            let config = target
-                .effective_config()
-                .map_err(|error| error.to_string())?
-                .ok_or("child agent configuration is unavailable")?;
-            Ok::<_, String>(acp_child_metadata(key, name, &config))
-        })();
-        let checkpoint = Arc::clone(&checkpoint);
-        Box::pin(async move {
-            let result = match child {
-                Ok(child) => checkpoint
-                    .checkpoint_child(child, history)
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                warn!(%error, "failed to checkpoint ACP child history");
-            }
-            Ok(())
-        })
-    })
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we
@@ -1187,15 +1104,20 @@ async fn install_session_with_lock(
     params
         .lua_event_handle
         .install_orchestration_services(Arc::new_cyclic(|weak| {
+            let persistence = maki_lua::orchestration::child_persistence(
+                "ACP",
+                weak.clone(),
+                Arc::clone(&checkpoint),
+            );
             acp_orchestration(
                 Arc::new(ArcSwapOption::from_pointee(available_model_specs(
                     &params.model_policy,
                 ))),
                 trusted_root.clone(),
                 handle.session_id.id(),
-                acp_child_config(weak.clone(), Arc::clone(&checkpoint)),
+                persistence.0,
             )
-            .with_completion(acp_child_completion(weak.clone(), Arc::clone(&checkpoint)))
+            .with_completion(persistence.1)
         }));
     let host_root = Arc::new(HostRootServices::coordinated(
         root.id(),
@@ -3160,7 +3082,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
         let session_id = MakiId::generate();
-        let mut handle = headless::spawn_interactive_with_preparation(
+        let mut handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
                 model: Model::from_spec(OFFLINE_SPEC).unwrap(),
                 config: Default::default(),
@@ -3191,6 +3113,8 @@ mod tests {
                     Ok((model, provider))
                 })
             }),
+            None,
+            None,
         );
         let root = smol::block_on(handle.initialized_root()).unwrap();
         handle.event_rx = flume::unbounded().1;

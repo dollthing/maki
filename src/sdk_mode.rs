@@ -12,13 +12,12 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
-use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
@@ -47,7 +46,7 @@ use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -752,89 +751,6 @@ fn sdk_orchestration(
     ))
 }
 
-fn sdk_child_destination(
-    services: &Weak<AgentOrchestration>,
-    target: &maki_agent::AgentRef,
-) -> Result<(String, String), String> {
-    let services = services.upgrade().ok_or("SDK orchestration is closed")?;
-    let key = services.history_key(target)?;
-    let name = target
-        .snapshot()
-        .map_err(|error| error.to_string())?
-        .metadata
-        .label
-        .unwrap_or_default();
-    Ok((key, name))
-}
-
-fn sdk_child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
-    StoredSubagent {
-        tool_use_id: key,
-        name,
-        model: Some(config.model.spec()),
-        thinking: Some(config.thinking.into()),
-        fast: config.fast,
-    }
-}
-
-fn sdk_child_config(
-    services: Weak<AgentOrchestration>,
-    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
-) -> ConfigMutationReserver {
-    Arc::new(move |target, publication| {
-        let (key, name) = sdk_child_destination(&services, target)?;
-        let checkpoint = Arc::clone(&checkpoint);
-        Ok(Box::new(move |_, claim| {
-            Ok(PreparedTransaction {
-                publication,
-                publish: Box::new(move |ready, publication| {
-                    Box::pin(async move {
-                        checkpoint
-                            .checkpoint_child_config(
-                                sdk_child_metadata(key, name, &ready.config),
-                                publication,
-                                claim,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())
-                    })
-                }),
-                finalize: Box::new(|_| {}),
-            })
-        }))
-    })
-}
-
-fn sdk_child_completion(
-    services: Weak<AgentOrchestration>,
-    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
-) -> maki_lua::orchestration::TurnCompletion {
-    Arc::new(move |target, history| {
-        let child = (|| {
-            let (key, name) = sdk_child_destination(&services, target)?;
-            let config = target
-                .effective_config()
-                .map_err(|error| error.to_string())?
-                .ok_or("child agent configuration is unavailable")?;
-            Ok::<_, String>(sdk_child_metadata(key, name, &config))
-        })();
-        let checkpoint = Arc::clone(&checkpoint);
-        Box::pin(async move {
-            let result = match child {
-                Ok(child) => checkpoint
-                    .checkpoint_child(child, history)
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                warn!(%error, "failed to checkpoint SDK child history");
-            }
-            Ok(())
-        })
-    })
-}
-
 fn bind_sdk_actor(
     coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
     handle: &InteractiveHandle,
@@ -1047,13 +963,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         Some(trusted_root.clone()),
     )?;
     lua_handle.install_orchestration_services(Arc::new_cyclic(|weak| {
-        sdk_orchestration(
-            models,
-            trusted_root,
-            coordinator.clone(),
-            sdk_child_config(weak.clone(), Arc::clone(&checkpoint)),
-        )
-        .with_completion(sdk_child_completion(weak.clone(), checkpoint))
+        let persistence = maki_lua::orchestration::child_persistence(
+            "SDK",
+            weak.clone(),
+            Arc::clone(&checkpoint),
+        );
+        sdk_orchestration(models, trusted_root, coordinator.clone(), persistence.0)
+            .with_completion(persistence.1)
     }));
     let host_root = Arc::new(HostRootServices::coordinated(
         root.id(),
@@ -3055,12 +2971,17 @@ mod tests {
             .unwrap(),
         );
         let services = Arc::new_cyclic(|weak| {
-            let persist = sdk_child_completion(weak.clone(), Arc::clone(&child_checkpoint));
+            let persistence = maki_lua::orchestration::child_persistence(
+                "SDK",
+                weak.clone(),
+                Arc::clone(&child_checkpoint),
+            );
+            let persist = persistence.1;
             sdk_orchestration(
                 vec![STARTUP_MODEL.into(), TARGET_MODEL.into()],
                 trusted_root.clone(),
                 coordinator.clone(),
-                sdk_child_config(weak.clone(), Arc::clone(&child_checkpoint)),
+                persistence.0,
             ).with_completion(Arc::new(move |target, history| {
             let save = persist(target, history.clone());
             let is_child = target.manager().node(target.id()).unwrap().parent_id == Some(root_id);
@@ -3237,7 +3158,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored,
-            &sdk_child_metadata(
+            &maki_lua::orchestration::child_metadata(
                 child_key.clone(),
                 child.metadata.label.clone().unwrap_or_default(),
                 &child_config,

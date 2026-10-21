@@ -668,17 +668,6 @@ impl SessionCoordinatorHandle {
         })
     }
 
-    pub fn prepare_transaction(
-        &self,
-        config: Arc<EffectiveAgentConfig>,
-        publication: CheckpointPublication,
-        claim: CheckpointClaim,
-        history_changed: bool,
-    ) -> Result<PreparedTransaction, SessionCoordinatorError> {
-        self.reserve_transaction(publication)?
-            .prepare(config, claim, history_changed)
-    }
-
     fn prepare_reserved_transaction(
         &self,
         config: Arc<EffectiveAgentConfig>,
