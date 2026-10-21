@@ -125,10 +125,6 @@ impl Runner {
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
                     state.idle_pending = true;
-                    // Settlement is published while the work is still being
-                    // finalized, so the identity must be recorded here rather
-                    // than after `process` returns.
-                    state.settled = work.identity();
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(|work| {

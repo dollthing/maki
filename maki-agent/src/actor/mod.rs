@@ -208,16 +208,6 @@ pub enum ActorWork {
 }
 
 impl ActorWork {
-    /// The identity this work was admitted under.
-    pub(crate) fn identity(&self) -> Option<ActorWorkIdentity> {
-        match self {
-            Self::Turn(admission) => Some(admission.work),
-            Self::Control(control) => Some(control.work),
-            Self::Compact { work, .. } => Some(*work),
-            Self::HistoryEdit(_) => None,
-        }
-    }
-
     /// Every correlation targeted cancels can match this work by. Compacts
     /// re-derive theirs from the run id (see [`run_correlation`]), so they
     /// match cancels like run work but never retire precancel marks; see
@@ -1312,6 +1302,16 @@ fn retire_and_publish(
     let presentation = admission
         .filter(|_| deliver)
         .and_then(|admission| admission.event_sender.as_ref());
+    if let Some(admission) = admission {
+        // Recorded here rather than at the pop site: a turn can be finalized
+        // without ever popping (targeted cancel, clear, deferred settlement),
+        // and settlement publishes during this same call.
+        inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settled = Some(admission.work);
+    }
     let mut outcome = outcome;
     if let Some(ticket) = retire_turn(inner, turn_id, &mut outcome, settle_runner, history_ready) {
         #[cfg(test)]

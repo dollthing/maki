@@ -2064,6 +2064,7 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
         let first = handle
             .admit_turn(input("first"), None, "shared".into())
             .unwrap();
@@ -2081,11 +2082,27 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
             }
         ));
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        // The queued turn never popped. Settlement must name the work that was
+        // finalized, so it can never report the still-running earlier turn.
+        let settled = handle
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settled;
+        let settled = settled.expect("the cancelled turn settled as work");
+        assert_ne!(
+            settled.turn_id(),
+            Some(first.turn_id()),
+            "settlement names the cancelled queued turn, not the running one"
+        );
+        assert_eq!(settled.agent_id, handle.agent_id());
         gate.open();
         assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
 
         handle.close();
         task.await;
+        drop(events);
     });
 }
 

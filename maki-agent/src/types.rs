@@ -1508,16 +1508,6 @@ impl EventSender {
         self.identity
     }
 
-    /// The admitted work's presentation id, or `None` for a stream outside any
-    /// actor admission.
-    pub fn presentation_id(&self) -> Option<u64> {
-        self.identity.map(|identity| identity.presentation_id)
-    }
-
-    pub fn raw_tx(&self) -> &Sender<Envelope> {
-        &self.tx
-    }
-
     /// Same stream, different admitted work. Lets a session body stamp
     /// per-turn identity without keeping the [`EventStreamGuard`] in scope.
     pub fn with_identity_of(&self, identity: Option<ActorWorkIdentity>) -> Self {
