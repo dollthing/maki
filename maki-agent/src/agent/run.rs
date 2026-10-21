@@ -435,18 +435,6 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         self.ledger = Arc::new(RunLedger::default());
 
-        if let Some(submission) = self
-            .turn_inbox
-            .as_ref()
-            .and_then(|inbox| inbox.take_initial_submission())
-        {
-            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
-                text: submission.text,
-                images: submission.images,
-                mcp_startup_notice: submission.mcp_startup_notice,
-                already_displayed: submission.already_displayed,
-            });
-        }
         let AgentInput {
             message,
             mode,
@@ -459,6 +447,20 @@ impl<'h> Agent<'h> {
             cancel: _,
         } = input;
         self.push_input_context(preamble);
+        // Observers read this event as "the turn has taken its input", so the
+        // preamble has to be in the history they read before it goes out.
+        if let Some(submission) = self
+            .turn_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.take_initial_submission())
+        {
+            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: submission.text,
+                images: submission.images,
+                mcp_startup_notice: submission.mcp_startup_notice,
+                already_displayed: submission.already_displayed,
+            });
+        }
         if !message.trim().is_empty() || !images.is_empty() {
             let mut user_message = Message::user_with_images(message.clone(), images);
             if let Some(count) = self
