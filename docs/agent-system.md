@@ -207,7 +207,7 @@ A manager-created actor receives an internal managed-admission hook. Before its 
 
 Clones carry a restricted token, not the unique activation guard. Validation checks the manager and the still-active exact turn. A token retained after the turn ends becomes unusable. Agent ids, parent links, TUI focus, task ids, and tool-use ids are never bearer authority.
 
-This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `maki.agent.session(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
+This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `maki.agent.spawn(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
 
 ### Cross-agent concurrency and blocking child waits
 

@@ -236,5 +236,5 @@ Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 ## Limits
 
 A layer has no agent context, so `maki.agent.call_tool` and
-`maki.agent.session` are out of reach inside one. Read files, run jobs, and
+`maki.agent.spawn` are out of reach inside one. Read files, run jobs, and
 decide from those.

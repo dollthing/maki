@@ -10217,7 +10217,7 @@ fn received_input(rx: &flume::Receiver<AgentInput>) -> AgentInput {
 }
 
 #[test]
-fn duplicate_compatibility_ids_route_by_agent_id() {
+fn duplicate_child_labels_route_by_agent_id() {
     let mut app = streaming_app();
     let (first, first_rx) = spawn_input_child(&mut app, "duplicate", "first");
     let (second, second_rx) = spawn_input_child(&mut app, "duplicate", "second");
