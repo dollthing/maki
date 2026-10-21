@@ -1,6 +1,7 @@
 use super::shell::ShellEvent;
 use super::*;
 use crate::agent::shared_queue;
+use crate::app::session_state::FastIntent;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
@@ -7427,14 +7428,14 @@ fn deferred_fast_toggle_flash_says_when_it_applies() {
 fn fast_toggle_on_off_on_opus() {
     let mut app = test_app();
     set_opus_model(&mut app);
-    assert!(!app.state.fast);
+    assert!(!app.state.fast.active());
 
     app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
-    assert!(app.state.fast);
+    assert!(app.state.fast.active());
     assert_eq!(app.status_bar.flash_text(), Some(FAST_ON_MSG));
 
     app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, false);
-    assert!(!app.state.fast);
+    assert!(!app.state.fast.active());
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
@@ -7452,15 +7453,15 @@ fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
     if cancel {
         app.set_fast(false).unwrap();
     }
-    assert!(!app.state.fast);
-    assert_eq!(app.state.pending_fast, !cancel);
+    assert!(!app.state.fast.active());
+    assert_eq!(app.state.fast.is_pending(), !cancel);
     assert_eq!(app.build_meta().fast, !cancel);
 
     let mut model = app.state.model.clone();
     model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
     app.update_model(&model);
-    assert_eq!(app.state.fast, !cancel);
-    assert!(!app.state.pending_fast);
+    assert_eq!(app.state.fast.active(), !cancel);
+    assert!(!app.state.fast.is_pending());
     assert_eq!(app.build_meta().fast, !cancel);
 }
 
@@ -7509,9 +7510,9 @@ fn fast_command_flashes_pending_while_discovery_runs() {
     for (enabled, expected) in [(true, FAST_PENDING_MSG), (false, FAST_OFF_MSG)] {
         app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, enabled);
         assert_eq!(app.status_bar.flash_text(), Some(expected));
-        assert!(!app.state.fast);
+        assert!(!app.state.fast.active());
     }
-    assert!(!app.state.pending_fast);
+    assert!(!app.state.fast.is_pending());
 }
 
 #[test]
@@ -7820,7 +7821,7 @@ fn fast_flashes_error_on_ineligible_model(spec: &str) {
     app.state.model = maki_providers::Model::from_spec(spec).unwrap();
 
     assert!(app.set_fast(true).is_err());
-    assert!(!app.state.fast);
+    assert!(!app.state.fast.active());
 }
 
 #[test]
@@ -7836,7 +7837,7 @@ fn fast_restored_from_session_meta() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert!(state.fast);
+    assert!(state.fast.active());
 }
 
 #[test]
@@ -7854,18 +7855,18 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert!(!state.fast);
+    assert!(!state.fast.active());
 }
 
 #[test]
 fn update_model_to_ineligible_resets_fast() {
     let mut app = test_app();
     set_opus_model(&mut app);
-    app.state.fast = true;
+    app.state.fast = FastIntent::Active;
 
     let sonnet = maki_providers::Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
     app.state.update_model(&sonnet);
-    assert!(!app.state.fast);
+    assert!(!app.state.fast.active());
 }
 
 #[test]

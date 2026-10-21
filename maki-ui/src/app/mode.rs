@@ -212,7 +212,7 @@ impl App {
             images: msg.images.clone(),
             preamble: Vec::new(),
             thinking: self.state.thinking,
-            fast: self.state.fast,
+            fast: self.state.fast.active(),
             workflow: self.state.workflow,
             prompt: None,
             cancel: None,

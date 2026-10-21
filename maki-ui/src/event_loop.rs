@@ -84,7 +84,7 @@ use crate::agent::{
     SystemPromptOverride, shared_queue::QueueItem,
 };
 use crate::app::EMPTY_PROMPT_ERR;
-use crate::app::session_state::SessionState;
+use crate::app::session_state::{FastIntent, SessionState};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
@@ -589,25 +589,17 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
     }
 }
 
+/// Projects the parts of a committed option snapshot that are not agent config.
+/// Thinking, fast and workflow are actor config and are written by
+/// `project_actor_config` alone; YOLO is permission state, which has no actor
+/// home.
 fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
-        match option.definition.id.as_ref() {
-            YOLO_OPTION_ID => {
-                let enabled = option.current_value.as_ref() == ENABLED_VALUE;
-                if app.permissions.is_yolo() != enabled {
-                    app.permissions.set_yolo(enabled);
-                }
+        if option.definition.id.as_ref() == YOLO_OPTION_ID {
+            let enabled = option.current_value.as_ref() == ENABLED_VALUE;
+            if app.permissions.is_yolo() != enabled {
+                app.permissions.set_yolo(enabled);
             }
-            FAST_OPTION_ID => app.state.fast = option.current_value.as_ref() == ENABLED_VALUE,
-            WORKFLOW_OPTION_ID => {
-                app.state.workflow = option.current_value.as_ref() == ENABLED_VALUE
-            }
-            THINKING_OPTION_ID => {
-                if let Ok(thinking) = option.current_value.parse() {
-                    app.state.thinking = thinking;
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -781,7 +773,7 @@ fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::
 fn project_actor_config(app: &mut App, config: &maki_agent::EffectiveAgentConfig) {
     app.update_model(&config.model);
     app.state.thinking = config.thinking;
-    app.state.fast = config.fast;
+    app.state.fast = FastIntent::clamp(config.fast, &config.model);
     app.state.workflow = config.workflow;
     let mode = match &config.mode {
         maki_agent::AgentMode::Build => {
@@ -4143,7 +4135,7 @@ impl<'t> EventLoop<'t> {
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
             model: app.state.model.spec(),
-            fast: app.state.fast,
+            fast: app.state.fast.active(),
             thinking: app.state.thinking.to_string(),
             mode: if app.state.mode == crate::app::mode::Mode::Plan {
                 MODE_PLAN
@@ -6076,6 +6068,15 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Projects every pending config commit the way the event loop's tick does,
+    /// so a test that mutates config without running a frame still sees what a
+    /// running UI would.
+    fn drain_config_commits(runtime: &mut SessionRuntime) {
+        while let Ok(commit) = runtime.config_commits.try_recv() {
+            runtime.project_config(&commit);
+        }
+    }
 
     async fn wait_projected_option(runtime: &SessionRuntime, id: &str, value: &str) {
         let read = runtime.coordinator.read();
@@ -8442,6 +8443,7 @@ mod tests {
         });
 
         project_committed_options(&mut runtime);
+        drain_config_commits(&mut runtime);
 
         assert!(runtime.app.permissions.is_yolo());
         assert!(runtime.app.state.workflow);

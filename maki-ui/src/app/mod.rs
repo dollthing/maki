@@ -113,8 +113,8 @@ use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
 pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
-use session_state::SessionState;
 pub(crate) use session_state::stored_to_rules;
+use session_state::{ConfigSource, SessionState};
 
 const CANCEL_MSG: &str = "Cancelled.";
 /// Presentation reserved for re-bake replies. They belong to no agent run, so
@@ -730,6 +730,27 @@ impl App {
             .target_agent(&self.command_target)
             .filter(|target| Some(target.id()) == self.selected_agent_id())
             .and_then(|target| target.effective_config().ok().flatten())
+    }
+
+    /// The request settings the visible chat is rendered with, resolved from
+    /// exactly one source so a frame cannot show one source's thinking next to
+    /// another's fast flag.
+    pub(crate) fn displayed_config(&self, chat_index: usize) -> ConfigSource {
+        let chat = &self.chats[chat_index];
+        if let Some(config) = self.focused_config() {
+            ConfigSource::Actor(config)
+        } else if let Some(options) = chat.opts {
+            ConfigSource::Chat {
+                options,
+                workflow: self.state.workflow,
+            }
+        } else {
+            ConfigSource::Seed {
+                thinking: self.state.thinking,
+                fast: self.state.fast,
+                workflow: self.state.workflow,
+            }
+        }
     }
 
     pub(super) fn focused_model_spec(&self) -> String {
@@ -2716,9 +2737,9 @@ impl App {
             }
             FAST_OPTION_ID => {
                 let _ = self.set_fast(enabled);
-                if self.state.pending_fast {
+                if self.state.fast.is_pending() {
                     FAST_PENDING_MSG
-                } else if self.state.fast {
+                } else if self.state.fast.active() {
                     FAST_ON_MSG
                 } else {
                     FAST_OFF_MSG

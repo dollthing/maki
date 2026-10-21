@@ -1,4 +1,4 @@
-use maki_providers::{RequestOptions, ThinkingConfigExt};
+use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -429,18 +429,7 @@ impl App {
                 .as_ref()
                 .map_or(model_id, |config| config.model.id.as_str())
         };
-        let opts = config.as_ref().map_or_else(
-            || {
-                chat.opts.unwrap_or(RequestOptions {
-                    thinking: self.state.thinking,
-                    fast: self.state.fast,
-                })
-            },
-            |config| RequestOptions {
-                thinking: config.thinking,
-                fast: config.fast,
-            },
-        );
+        let opts = self.displayed_config(render_chat).options();
         let status = if self.focused_streaming() {
             Status::Streaming
         } else if render_chat == 0 && matches!(self.status, Status::Error { .. }) {
@@ -472,9 +461,7 @@ impl App {
             retry_info: chat.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
-            workflow: config
-                .as_ref()
-                .map_or(self.state.workflow, |config| config.workflow),
+            workflow: self.displayed_config(render_chat).workflow(),
             yolo: self.permissions.is_yolo(),
             restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),

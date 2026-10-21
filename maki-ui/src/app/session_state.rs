@@ -13,6 +13,46 @@ use crate::AppSession;
 
 use super::mode::{Mode, PlanState};
 
+/// Where the status bar's request options come from: a focused agent's
+/// committed config, a subagent chat's own settings, or the session seed that
+/// exists before any actor answers. Resolving all three together keeps a frame
+/// from mixing one source's thinking with another's fast flag.
+pub(crate) enum ConfigSource {
+    Actor(Arc<maki_agent::EffectiveAgentConfig>),
+    Chat {
+        options: maki_providers::RequestOptions,
+        workflow: bool,
+    },
+    Seed {
+        thinking: ThinkingConfig,
+        fast: FastIntent,
+        workflow: bool,
+    },
+}
+
+impl ConfigSource {
+    pub(crate) fn options(&self) -> maki_providers::RequestOptions {
+        match self {
+            Self::Actor(config) => maki_providers::RequestOptions {
+                thinking: config.thinking,
+                fast: config.fast,
+            },
+            Self::Chat { options, .. } => *options,
+            Self::Seed { thinking, fast, .. } => maki_providers::RequestOptions {
+                thinking: *thinking,
+                fast: fast.active(),
+            },
+        }
+    }
+
+    pub(crate) fn workflow(&self) -> bool {
+        match self {
+            Self::Actor(config) => config.workflow,
+            Self::Chat { workflow, .. } | Self::Seed { workflow, .. } => *workflow,
+        }
+    }
+}
+
 pub(crate) struct SessionState {
     /// Shared with the writer thread, so a checkpoint is just a refcount bump.
     pub session: Arc<AppSession>,
@@ -39,27 +79,58 @@ pub(crate) struct SessionState {
     /// cannot drift from what the agent will actually send. They exist because a
     /// frame renders before it can ask the actor.
     pub thinking: ThinkingConfig,
-    /// What we actually bill and send.
-    pub fast: bool,
-    /// A wish parked until discovery answers, so a `/fast` typed while the
-    /// model list is still loading is not thrown on the floor.
-    pub pending_fast: bool,
+    /// What we bill and send, plus a `/fast` typed before discovery answered.
+    pub fast: FastIntent,
     pub workflow: bool,
 }
 
-const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
+/// A three-state value that was carried as a `(fast, pending_fast)` pair.
+/// `Active` bills and sends at twice the standard rate, `Pending` parks the
+/// request until model discovery says whether the model can honour it, and
+/// `Off` is neither. The pair could represent `(true, true)`, which nothing
+/// wanted, so the two booleans could disagree with each other and with the
+/// status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FastIntent {
+    #[default]
+    Off,
+    Active,
+    Pending,
+}
 
-fn clamp_fast(fast: bool, model: &Model) -> (bool, bool) {
-    if !fast {
-        (false, false)
-    } else if model.supports_fast() {
-        (true, false)
-    } else if model.fast_pending() {
-        (false, true)
-    } else {
-        (false, false)
+impl FastIntent {
+    /// Collapses the wish against what `model` can do, so a `/fast` typed while
+    /// the model list is still loading comes back as `Pending` instead of being
+    /// dropped.
+    pub fn clamp(wanted: bool, model: &Model) -> Self {
+        if !wanted {
+            Self::Off
+        } else if model.supports_fast() {
+            Self::Active
+        } else if model.fast_pending() {
+            Self::Pending
+        } else {
+            Self::Off
+        }
+    }
+
+    /// What gets billed and sent. A pending wish is not in effect yet.
+    pub fn active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// What the user asked for, whether or not the model can honour it yet.
+    /// This is the bit that gets persisted.
+    pub fn intent(self) -> bool {
+        matches!(self, Self::Active | Self::Pending)
+    }
+
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
     }
 }
+
+const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
 
 impl SessionState {
     pub fn from_session(
@@ -126,9 +197,14 @@ impl SessionState {
             plan.allocate_path(storage);
         }
 
-        let (fast, pending_fast) = clamp_fast(session.meta.fast, &model);
+        let fast = FastIntent::clamp(session.meta.fast, &model);
         let token_usage = session.token_usage;
-        let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
+        let cost = settle_session(
+            &token_usage,
+            session.usage_by_model_mut(),
+            &model,
+            fast.active(),
+        );
         let context_size = session.meta.context_size;
 
         Self {
@@ -136,7 +212,6 @@ impl SessionState {
             // Reconcile so the UI badge and agent always see the truth.
             thinking: resolve_thinking(&session, &model, storage),
             fast,
-            pending_fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
             model,
@@ -184,7 +259,7 @@ impl SessionState {
                 provider,
                 model: model.clone(),
                 thinking: self.thinking,
-                fast: self.fast,
+                fast: self.fast.active(),
                 workflow: self.workflow,
             },
             mode.clone(),
@@ -197,7 +272,7 @@ impl SessionState {
     /// config it just seeded the agent with, so the two cannot start apart.
     pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
         self.thinking = config.thinking;
-        (self.fast, self.pending_fast) = clamp_fast(config.fast, &config.model);
+        self.fast = FastIntent::clamp(config.fast, &config.model);
         self.workflow = config.workflow;
         self.mode = match &config.mode {
             AgentMode::Build => Mode::Build,
@@ -218,18 +293,18 @@ impl SessionState {
     /// What the user asked for, whether or not the model can honour it yet.
     /// This is the bit that gets persisted.
     pub fn fast_intent(&self) -> bool {
-        self.fast || self.pending_fast
+        self.fast.intent()
     }
 
     pub fn set_fast(&mut self, fast: bool) {
-        (self.fast, self.pending_fast) = clamp_fast(fast, &self.model);
+        self.fast = FastIntent::clamp(fast, &self.model);
     }
 
     pub fn update_model(&mut self, model: &Model) {
         if !model.supports_thinking() {
             self.thinking = ThinkingConfig::Off;
         }
-        (self.fast, self.pending_fast) = clamp_fast(self.fast_intent(), model);
+        self.fast = FastIntent::clamp(self.fast.intent(), model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
@@ -360,6 +435,38 @@ mod tests {
         SessionState::from_session(session, model, &storage, &ModelPolicy::default())
     }
 
+    /// `adopt` and `starting_config` need a provider, but only to carry it along.
+    fn state_provider() -> Arc<dyn Provider> {
+        use maki_providers::provider::{BoxFuture, Provider};
+        use maki_providers::{
+            AgentError, Message, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        };
+        use maki_storage::id::SessionRef;
+
+        struct UnusedProvider;
+
+        impl Provider for UnusedProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _: &'a Model,
+                _: &'a [Message],
+                _: &'a str,
+                _: &'a serde_json::Value,
+                _: &'a flume::Sender<ProviderEvent>,
+                _: RequestOptions,
+                _: Option<&'a SessionRef>,
+            ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+                Box::pin(std::future::pending())
+            }
+
+            fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        Arc::new(UnusedProvider)
+    }
+
     /// An old session: counters, no per-model breakdown.
     fn session_with_counters() -> AppSession {
         let mut session = AppSession::new("test-model", "/tmp");
@@ -409,14 +516,14 @@ mod tests {
 
         let state = resumed(session, &model);
 
-        assert_eq!(state.fast, fast, "{FAST_FLAG_LOST}");
+        assert_eq!(state.fast.active(), fast, "{FAST_FLAG_LOST}");
         state.cost
     }
 
-    #[test_case(FastSupport::Pending, false, true ; "pending_preserves_saved_intent")]
-    #[test_case(FastSupport::Supported, true, false ; "supported_restores_fast")]
-    #[test_case(FastSupport::Unsupported, false, false ; "unsupported_clears_saved_intent")]
-    fn resume_fast_support(support: FastSupport, fast: bool, pending: bool) {
+    #[test_case(FastSupport::Pending, FastIntent::Pending ; "pending_preserves_saved_intent")]
+    #[test_case(FastSupport::Supported, FastIntent::Active ; "supported_restores_fast")]
+    #[test_case(FastSupport::Unsupported, FastIntent::Off ; "unsupported_clears_saved_intent")]
+    fn resume_fast_support(support: FastSupport, expected: FastIntent) {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
@@ -426,30 +533,63 @@ mod tests {
             output: test_pricing().output,
         });
         let state = resumed(session, &model);
-        assert_eq!((state.fast, state.pending_fast), (fast, pending));
+        assert_eq!(state.fast, expected);
         assert_eq!(
             state.cost,
-            Some(if fast { FAST_INPUT_RATE } else { LIST_PRICE })
+            Some(if expected.active() {
+                FAST_INPUT_RATE
+            } else {
+                LIST_PRICE
+            })
         );
     }
 
-    #[test_case(FastSupport::Supported, false, true, false ; "discovery_enables_fast")]
-    #[test_case(FastSupport::Unsupported, false, false, false ; "discovery_rejects_fast")]
-    #[test_case(FastSupport::Pending, false, false, true ; "still_pending_keeps_intent")]
-    #[test_case(FastSupport::Supported, true, true, false ; "switch_keeps_pending_intent")]
-    fn pending_fast_model_update(support: FastSupport, switch: bool, fast: bool, pending: bool) {
+    #[test_case(FastSupport::Supported, false, FastIntent::Active ; "discovery_enables_fast")]
+    #[test_case(FastSupport::Unsupported, false, FastIntent::Off ; "discovery_rejects_fast")]
+    #[test_case(FastSupport::Pending, false, FastIntent::Pending ; "still_pending_keeps_intent")]
+    #[test_case(FastSupport::Supported, true, FastIntent::Active ; "switch_keeps_pending_intent")]
+    fn pending_fast_model_update(support: FastSupport, switch: bool, expected: FastIntent) {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
         model.supports_fast_override = Some(FastSupport::Pending);
         let mut state = resumed(session, &model);
-        assert_eq!((state.fast, state.pending_fast), (false, true));
+        assert_eq!(state.fast, FastIntent::Pending);
         if switch {
             model.id = UNRESOLVABLE_MODEL.into();
         }
         model.supports_fast_override = Some(support);
         state.update_model(&model);
-        assert_eq!((state.fast, state.pending_fast), (fast, pending));
+        assert_eq!(state.fast, expected);
+    }
+
+    /// A config commit arriving while a `/fast` is still parked must resolve that
+    /// wish, not run beside it. The pair this replaced could hold active and
+    /// pending at once, which showed both badges.
+    #[test_case(true, FastSupport::Supported, FastIntent::Active ; "pending_then_supported_commits")]
+    #[test_case(true, FastSupport::Pending, FastIntent::Pending ; "pending_then_still_pending")]
+    #[test_case(true, FastSupport::Unsupported, FastIntent::Off ; "pending_then_unsupported_clears")]
+    #[test_case(false, FastSupport::Supported, FastIntent::Off ; "off_then_supported_stays_off")]
+    fn adopt_resolves_a_parked_fast_wish(wanted: bool, support: FastSupport, expected: FastIntent) {
+        let mut model = test_model();
+        model.supports_fast_override = Some(FastSupport::Pending);
+        let mut state = resumed(session_with_counters(), &model);
+        state.set_fast(wanted);
+        assert_eq!(state.fast.is_pending(), wanted);
+
+        model.supports_fast_override = Some(support);
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: state_provider(),
+                model: model.clone(),
+                thinking: ThinkingConfig::default(),
+                fast: wanted,
+                workflow: false,
+            },
+            AgentMode::Build,
+        );
+        state.adopt(&config);
+        assert_eq!(state.fast, expected);
     }
 
     #[test]
