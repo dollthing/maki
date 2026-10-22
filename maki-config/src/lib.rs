@@ -840,20 +840,14 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         let table = toml::Table::deserialize(deserializer)?;
         let default = table
             .get("default")
-            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok())
-            .or_else(|| {
-                table
-                    .get("allow_all")?
-                    .as_bool()?
-                    .then_some(DefaultEffect::Allow)
-            });
+            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok());
 
         let mut tools = HashMap::new();
         let mut mcp_rules = Vec::new();
         let mut mcp_defaults = HashMap::new();
 
         for (k, v) in table.iter() {
-            if k.is_empty() || k == "allow_all" || k == "default" {
+            if k.is_empty() || k == "default" {
                 continue;
             }
             if k == "mcp" {
@@ -1864,13 +1858,6 @@ pub fn is_valid_server_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Validates the *tool* portion of an MCP qualified name.
-/// Currently identical to `is_valid_wire_name`, but kept distinct
-/// in case MCP tools need different constraints from native wire names.
-fn is_valid_tool_name(name: &str) -> bool {
-    is_valid_wire_name(name)
-}
-
 fn push_mcp_tool_rule(
     rules: &mut Vec<PermissionRule>,
     server_name: &str,
@@ -1969,16 +1956,6 @@ fn parse_mcp_server_table(
                                 push_mcp_tool_rule(rules, server_name, tool_name, effect);
                             }
                         }
-                    }
-                    toml::Value::Boolean(true) => {
-                        tracing::warn!(
-                            server = server_name,
-                            key = key.as_str(),
-                            "{key} = true is deprecated — use default = \"{key}\" instead; ignoring"
-                        );
-                    }
-                    toml::Value::Boolean(false) => {
-                        // No-op: explicitly disabled.
                     }
                     toml::Value::String(s) => {
                         let tool_name = s.as_str();
@@ -2172,7 +2149,7 @@ fn load_permissions_inner(
 ) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     for dir in global_dirs {
-        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE), true) {
+        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE)) {
             global_perms = p;
         }
     }
@@ -2180,11 +2157,9 @@ fn load_permissions_inner(
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
     // scopes when nobody vouched for the folder.
-    let mut project_perms = read_permissions_file(
-        &project_config.project_file(GatedFile::Permissions),
-        project_config.is_trusted(),
-    )
-    .unwrap_or_default();
+    let mut project_perms =
+        read_permissions_file(&project_config.project_file(GatedFile::Permissions))
+            .unwrap_or_default();
     if !project_config.is_trusted() {
         project_perms.restrict_to_deny_scopes();
     }
@@ -2192,164 +2167,8 @@ fn load_permissions_inner(
     build_permissions(global_perms, project_perms)
 }
 
-fn migrate_mcp_entry(
-    doc: &mut toml_edit::DocumentMut,
-    server_name: &str,
-    tool_name: &str,
-    item: &toml_edit::Item,
-) {
-    // Old format: ["mcp:server__tool"] with booleans or scope-string arrays.
-    // New format: [mcp.server] allow = ["tool_name"]. Old scope strings were
-    // dead code (MCP scopes are always wildcarded), so only the effect survives.
-    let mut push = |effect_key: &str| {
-        let res = child_table(doc.as_table_mut(), "mcp")
-            .and_then(|mcp| child_table(mcp, server_name))
-            .and_then(|server| push_unique(server, effect_key, tool_name));
-        if let Err(e) = res {
-            warn!(
-                server = server_name,
-                tool = tool_name,
-                error = %e,
-                "skipping MCP entry migration"
-            );
-        }
-    };
-
-    // Bare boolean: old format like [mcp]\ndeepwiki__search = true
-    // means "allow this tool".
-    if let Some(b) = item.as_bool() {
-        if b {
-            push("allow");
-        }
-        return;
-    }
-
-    if let Some(old_table) = item.as_table() {
-        for (key, value) in old_table.iter() {
-            match key {
-                "allow" | "deny" => {
-                    if value.as_bool() == Some(true) || value.as_array().is_some() {
-                        push(key);
-                    }
-                }
-                _ => {
-                    warn!(
-                        key,
-                        server = server_name,
-                        tool = tool_name,
-                        "dropping unknown key in old MCP entry during migration"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Migrates old permission formats and returns the (possibly rewritten)
-/// file content. The rewrite to disk is best-effort: loading uses the
-/// migrated content even when the write fails.
-fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
+fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
     let content = fs::read_to_string(path).ok()?;
-    let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return Some(content);
-    };
-    let mut migrated = false;
-
-    if let Some(item) = doc.remove("allow_all") {
-        migrated = true;
-        if item.as_bool() == Some(true) {
-            doc.insert("default", toml_edit::value("allow"));
-        }
-    }
-
-    // Migrate flat MCP keys: "mcp:server__tool" → [mcp.server]
-    // Two TOML representations to handle:
-    // 1. Quoted keys: ["mcp:server__tool"] → flat top-level key
-    // 2. Bare keys: [mcp:server__tool] → nested "mcp" → {"server__tool": ...}
-
-    // Path 1: Flat quoted keys starting with "mcp:" containing "__"
-    let flat_old_keys: Vec<String> = doc
-        .iter()
-        .filter_map(|(k, _)| {
-            k.strip_prefix("mcp:")
-                .and_then(|rest| rest.contains("__").then(|| k.to_string()))
-        })
-        .collect();
-
-    for old_key in flat_old_keys {
-        if let Some(item) = doc.remove(&old_key) {
-            let rest = &old_key[4..]; // strip "mcp:"
-            if let Some((server, tool)) = rest.split_once("__") {
-                if !is_valid_server_name(server) || !is_valid_tool_name(tool) {
-                    tracing::error!(
-                        key = old_key.as_str(),
-                        server = server,
-                        tool = tool,
-                        "SECURITY: skipping migration of malformed MCP key — \
-                         rules for this tool will not be restored"
-                    );
-                    continue;
-                }
-                migrate_mcp_entry(&mut doc, server, tool, &item);
-                migrated = true;
-            }
-        }
-    }
-
-    // Path 2: Nested "mcp" sub-table (bare key mcp: created nesting)
-    let nested_old_entries: Vec<(String, String, toml_edit::Item)> = {
-        let mut entries = Vec::new();
-        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp") {
-            for (key, _) in mcp_table.iter() {
-                if key.contains("__")
-                    && let Some((server, tool)) = key.split_once("__")
-                {
-                    let item = mcp_table.get(key).cloned();
-                    if let Some(item) = item {
-                        entries.push((server.to_string(), tool.to_string(), item));
-                    }
-                }
-            }
-        }
-        entries
-    };
-
-    for (server_name, tool_name, item) in nested_old_entries {
-        if !is_valid_server_name(&server_name) || !is_valid_tool_name(&tool_name) {
-            tracing::error!(
-                server = server_name.as_str(),
-                tool = &*tool_name,
-                "SECURITY: skipping migration of malformed nested MCP key — \
-                 rules for this tool will not be restored"
-            );
-            continue;
-        }
-        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get_mut("mcp") {
-            mcp_table.remove(&format!("{server_name}__{tool_name}"));
-        }
-        migrate_mcp_entry(&mut doc, &server_name, &tool_name, &item);
-        migrated = true;
-    }
-
-    // Clean up the now-empty "mcp" parent table if it has no children
-    if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp")
-        && mcp_table.is_empty()
-    {
-        doc.remove("mcp");
-    }
-
-    if !migrated {
-        return Some(content);
-    }
-    let new_content = doc.to_string();
-    if persist && let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
-        warn!(path = %path.display(), error = %e, "failed to persist migrated permissions file");
-    }
-    Some(new_content)
-}
-
-fn read_permissions_file(path: &Path, persist_migration: bool) -> Option<PermissionsFileConfig> {
-    let content = migrate_permissions_file(path, persist_migration)?;
     match toml::from_str(&content) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -3167,43 +2986,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_allow_all_migrated() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(
-            dir.path(),
-            "allow_all = true\n\n[bash]\nallow = [\"cargo *\"]\n",
-        );
-
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(perms.default, DefaultEffect::Allow);
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(!content.contains("allow_all"));
-        assert!(content.contains("default = \"allow\""));
-    }
-
-    #[test]
-    fn permissions_allow_all_false_migrated_removed() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "allow_all = false\n");
-
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(perms.default, DefaultEffect::Prompt);
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(!content.contains("allow_all"));
-        assert!(!content.contains("default"));
-    }
-
-    #[test]
     fn project_default_deny_allowed() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3737,62 +3519,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_mcp_server_wide_allow_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(perms.rules.len(), 0, "no rules generated");
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "deepwiki".into()
-            }),
-            "allow = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn permissions_mcp_deny_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            "deny = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn explicit_default_preserved_with_deprecated_deny_true() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(
-            dir.path(),
-            "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
-        );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(
-            perms.tool_defaults.get(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            Some(&DefaultEffect::Allow),
-            "explicit default still works; deprecated deny = true is ignored"
-        );
-    }
-
-    #[test]
     fn permissions_mcp_deny_rules() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3875,64 +3601,6 @@ mod tests {
     }
 
     #[test]
-    fn migrate_mcp_old_flat_keys() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        // Old maki format used quoted TOML keys for mcp:server__tool
-        fs::write(
-            global.join("permissions.toml"),
-            "[\"mcp:deepwiki__search\"]\nallow = true\n\
-             [\"mcp:github__issue\"]\nallow = [\"read\"]\n",
-        )
-        .unwrap();
-
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[mcp.deepwiki]"), "server table present");
-        assert!(content.contains("[mcp.github]"), "server table present");
-        assert!(content.contains("\"search\""), "tool name migrated");
-        assert!(content.contains("\"issue\""), "tool name migrated");
-        assert!(
-            !content.contains("mcp:deepwiki__search"),
-            "old flat key gone"
-        );
-        assert!(!content.contains("mcp:github__issue"), "old flat key gone");
-        assert!(!content.contains("__"), "no old __ separator remains");
-    }
-
-    #[test]
-    fn migrate_mcp_nested_bare_keys() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        // Bare TOML key [mcp.deepwiki__search] creates nested mcp → deepwiki__search
-        fs::write(
-            global.join("permissions.toml"),
-            "[mcp]\n\
-             deepwiki__search = true\n\
-             github__issue = true\n",
-        )
-        .unwrap();
-
-        let _perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-
-        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
-        assert!(content.contains("[mcp.deepwiki]"), "server table present");
-        assert!(content.contains("[mcp.github]"), "server table present");
-        assert!(content.contains("\"search\""), "tool name migrated");
-        assert!(content.contains("\"issue\""), "tool name migrated");
-        assert!(!content.contains("__"), "no old __ separator remains");
-    }
-
-    #[test]
     fn empty_tool_key_sections_ignored() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3943,37 +3611,6 @@ mod tests {
         );
         assert!(perms.rules.is_empty());
         assert!(perms.tool_defaults.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn migration_applies_in_memory_when_write_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        fs::create_dir_all(&global).unwrap();
-        fs::write(
-            global.join("permissions.toml"),
-            "[\"mcp:github__delete\"]\ndeny = true\n",
-        )
-        .unwrap();
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
-        if fs::write(global.join("probe"), b"x").is_ok() {
-            return; // running as root, cannot simulate a read-only dir
-        }
-
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(perms.rules.len(), 1);
-        assert_eq!(perms.rules[0].effect, Effect::Deny);
-        assert_eq!(
-            perms.rules[0].tool,
-            ToolKey::parse("github.delete").unwrap()
-        );
     }
 
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";

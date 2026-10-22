@@ -102,7 +102,7 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names, with `["*"]` for every tool on the server. Booleans are rejected there; use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) accept `allow = true` to cover the whole tool.
 
 ### The `default` key
 
