@@ -30,9 +30,7 @@ use maki_config::{
 use maki_lua::PluginHost;
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::{Message, StreamResponse};
-use maki_storage::checkpoint::{
-    CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-};
+use maki_storage::checkpoint::{CheckpointWriter, accept_all};
 use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 
@@ -672,15 +670,7 @@ fn batch_read_child_restores_highlighted_and_click_expands_it() {
 
 fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
     let id = MakiId::generate();
-    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-            Box::pin(async move {
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            }) as CheckpointFuture
-        });
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
     SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: id,
         catalog: host.event_handle().session_option_catalog(),

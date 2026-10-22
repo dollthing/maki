@@ -178,10 +178,7 @@ impl CheckpointWriter<SessionCheckpoint> for GatedConfigCheckpoint {
                 released.recv_async().await.unwrap();
             }
             std::fs::rename(staged, path).unwrap();
-            Ok(CheckpointAck {
-                session_id: request.session_id,
-                version: request.version,
-            })
+            Ok(CheckpointAck::for_request(&request))
         })
     }
 }

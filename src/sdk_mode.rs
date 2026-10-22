@@ -2175,10 +2175,7 @@ mod tests {
     use maki_providers::{
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
     };
-    use maki_storage::checkpoint::{
-        CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
-        CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use std::path::PathBuf;
     use std::time::Duration;
     use test_case::test_case;
@@ -2585,30 +2582,6 @@ mod tests {
         assert!(!second.cancel.unwrap().is_cancelled());
     }
 
-    struct GuardedSdkCheckpoint(Arc<dyn CheckpointWriter<SessionCheckpoint>>);
-
-    impl CheckpointWriter<SessionCheckpoint> for GuardedSdkCheckpoint {
-        fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
-            self.0.checkpoint(request)
-        }
-
-        fn checkpoint_guarded(
-            &self,
-            request: CheckpointRequest<SessionCheckpoint>,
-            publication: CheckpointPublication,
-            claim: CheckpointClaim,
-        ) -> CheckpointFuture {
-            let writer = Arc::clone(&self.0);
-            Box::pin(async move {
-                claim(&publication).map_err(|message| CheckpointError::Save {
-                    session_id: request.session_id,
-                    message,
-                })?;
-                writer.checkpoint(request).await
-            })
-        }
-    }
-
     struct RecordingSdkProvider {
         requests: Sender<(String, RequestOptions)>,
         grandchild_entered: Sender<()>,
@@ -2873,11 +2846,9 @@ mod tests {
                         terminal_started.send_async(()).await.unwrap();
                         terminal_resume.recv_async().await.unwrap();
                     }
+                    let ack = maki_storage::checkpoint::CheckpointAck::for_request(&request);
                     checkpointed.lock().unwrap().push(request.snapshot);
-                    Ok(maki_storage::checkpoint::CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
+                    Ok(ack)
                 }) as maki_storage::checkpoint::CheckpointFuture
             },
         );
@@ -2895,7 +2866,7 @@ mod tests {
                 ),
                 persisted_options: Default::default(),
                 model_policy: Arc::new(ModelPolicy::default()),
-                checkpoint: Arc::new(GuardedSdkCheckpoint(checkpoint)),
+                checkpoint: Arc::new(ClaimingWriter(checkpoint)),
                 mailbox: handle.mailbox.clone(),
             },
         )
@@ -3303,11 +3274,10 @@ mod tests {
                     >| {
                         let checkpointed = Arc::clone(&checkpointed_clone);
                         Box::pin(async move {
+                            let ack =
+                                maki_storage::checkpoint::CheckpointAck::for_request(&request);
                             checkpointed.lock().unwrap().push(request.snapshot);
-                            Ok(maki_storage::checkpoint::CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
+                            Ok(ack)
                         }) as maki_storage::checkpoint::CheckpointFuture
                     },
                 ),

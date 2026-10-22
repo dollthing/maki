@@ -765,10 +765,7 @@ mod tests {
     use maki_commands::ModelSelection;
     use maki_config::ModelPolicy;
     use maki_providers::{Effort, ThinkingConfig};
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
-        CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::ClaimingWriter;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -812,40 +809,6 @@ mod tests {
     }
 
     struct FakeCommandHost;
-    struct CommandCheckpoint;
-
-    impl CheckpointWriter<crate::session_coordinator::SessionCheckpoint> for CommandCheckpoint {
-        fn checkpoint(
-            &self,
-            request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>,
-        ) -> CheckpointFuture {
-            Box::pin(async move {
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            })
-        }
-
-        fn checkpoint_guarded(
-            &self,
-            request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>,
-            publication: CheckpointPublication,
-            claim: CheckpointClaim,
-        ) -> CheckpointFuture {
-            Box::pin(async move {
-                claim(&publication).map_err(|message| CheckpointError::Save {
-                    session_id: request.session_id,
-                    message,
-                })?;
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            })
-        }
-    }
-
     fn test_coordinator(
         model: &str,
         models: impl IntoIterator<Item = Arc<str>>,
@@ -853,7 +816,7 @@ mod tests {
         crate::session_coordinator::SessionCoordinatorHandle,
         crate::headless::InteractiveHandle,
     ) {
-        let checkpoint = Arc::new(CommandCheckpoint);
+        let checkpoint = ClaimingWriter::accept_all();
         let session_id = maki_storage::id::MakiId::generate();
         let coordinator = crate::session_coordinator::SessionCoordinatorHandle::register(
             crate::session_coordinator::SessionCoordinatorParams {

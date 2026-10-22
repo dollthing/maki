@@ -43,6 +43,7 @@ flume = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+maki-storage = { workspace = true, features = ["test-util"] }
 maki-config = { workspace = true, features = ["test-util"] }
 maki-lua = { workspace = true, features = ["test-support"] }
 test-case = { workspace = true }

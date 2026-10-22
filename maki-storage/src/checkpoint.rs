@@ -93,6 +93,15 @@ pub struct CheckpointAck {
     pub version: CheckpointVersion,
 }
 
+impl CheckpointAck {
+    pub fn for_request<S>(request: &CheckpointRequest<S>) -> Self {
+        Self {
+            session_id: request.session_id,
+            version: request.version,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CheckpointError {
     #[error("checkpoint writer closed for session {0}")]
@@ -130,6 +139,49 @@ where
 {
     fn checkpoint(&self, request: CheckpointRequest<S>) -> CheckpointFuture {
         self(request)
+    }
+}
+
+/// Acknowledges every ordinary checkpoint without saving it. Guarded
+/// publication still fails closed through the trait default.
+pub fn accept_all<S: Send + Sync + 'static>() -> Arc<dyn CheckpointWriter<S>> {
+    Arc::new(|request: CheckpointRequest<S>| {
+        let ack = CheckpointAck::for_request(&request);
+        Box::pin(async move { Ok(ack) }) as CheckpointFuture
+    })
+}
+
+/// Runs the publication claim, then delegates to an ordinary writer.
+#[cfg(any(test, feature = "test-util"))]
+pub struct ClaimingWriter<S>(pub Arc<dyn CheckpointWriter<S>>);
+
+#[cfg(any(test, feature = "test-util"))]
+impl<S: Send + Sync + 'static> ClaimingWriter<S> {
+    pub fn accept_all() -> Arc<dyn CheckpointWriter<S>> {
+        Arc::new(Self(accept_all()))
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl<S: Send + Sync + 'static> CheckpointWriter<S> for ClaimingWriter<S> {
+    fn checkpoint(&self, request: CheckpointRequest<S>) -> CheckpointFuture {
+        self.0.checkpoint(request)
+    }
+
+    fn checkpoint_guarded(
+        &self,
+        request: CheckpointRequest<S>,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> CheckpointFuture {
+        let writer = Arc::clone(&self.0);
+        Box::pin(async move {
+            claim(&publication).map_err(|message| CheckpointError::Save {
+                session_id: request.session_id,
+                message,
+            })?;
+            writer.checkpoint(request).await
+        })
     }
 }
 

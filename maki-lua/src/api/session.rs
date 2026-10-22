@@ -633,9 +633,7 @@ mod tests {
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, accept_all};
     use mlua::Value;
     use serde_json::json;
     use test_case::test_case;
@@ -649,15 +647,7 @@ mod tests {
 
     fn live_mailbox(id: MakiId) -> (SessionMailbox, SessionCoordinatorHandle) {
         let mailbox = SessionMailbox::new(id);
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            });
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
         let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog: Default::default(),

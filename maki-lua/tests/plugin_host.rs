@@ -169,20 +169,10 @@ fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCo
     use maki_agent::session_coordinator::{
         SessionCheckpoint, SessionCoordinatorParams, builtin_option_definitions,
     };
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, accept_all};
 
     let id = maki_storage::id::MakiId::generate();
-    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-            Box::pin(async move {
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            }) as CheckpointFuture
-        });
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
     maki_agent::session_coordinator::SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: id,
         catalog: host.event_handle().session_option_catalog(),

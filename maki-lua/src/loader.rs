@@ -1342,6 +1342,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        accept_all,
     };
     use maki_storage::id::MakiId;
     use std::collections::BTreeMap;
@@ -1379,15 +1380,7 @@ mod tests {
         catalog: SessionOptionCatalog,
         persisted_options: BTreeMap<String, String>,
     ) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            });
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
         test_coordinator_with_checkpoint(catalog, persisted_options, checkpoint)
     }
 
@@ -1764,10 +1757,7 @@ mod tests {
                                 message: Arc::from("deterministic unload failure"),
                             })
                         } else {
-                            Ok(CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
+                            Ok(CheckpointAck::for_request(&request))
                         }
                     }) as CheckpointFuture
                 })

@@ -1903,11 +1903,9 @@ mod tests {
                     session_id: request.session_id,
                     message,
                 })?;
+                let ack = CheckpointAck::for_request(&request);
                 lock(&saved).push(request.snapshot);
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
+                Ok(ack)
             })
         }
     }
@@ -2082,11 +2080,9 @@ mod tests {
                             if let Some(wait) = wait {
                                 wait.recv_async().await.unwrap();
                             }
+                            let ack = CheckpointAck::for_request(&request);
                             lock(&saved).push(request.snapshot);
-                            Ok(CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
+                            Ok(ack)
                         }) as CheckpointFuture
                     }
                 }),

@@ -3,6 +3,9 @@ name = "maki-storage"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 event-listener = { workspace = true }
 maki-domain = { workspace = true }

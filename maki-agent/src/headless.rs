@@ -14,6 +14,7 @@ use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, BoxFuture, Provider};
 use maki_providers::{RequestOptions, Timeouts};
+use maki_storage::checkpoint::accept_all;
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
@@ -1248,18 +1249,7 @@ fn spawn_one_shot(
         ),
         persisted_options: Default::default(),
         model_policy: Arc::clone(&params.model_policy),
-        checkpoint: Arc::new(
-            |request: maki_storage::checkpoint::CheckpointRequest<
-                crate::session_coordinator::SessionCheckpoint,
-            >| {
-                Box::pin(async move {
-                    Ok(maki_storage::checkpoint::CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as maki_storage::checkpoint::CheckpointFuture
-            },
-        ),
+        checkpoint: accept_all(),
         mailbox: SessionMailbox::new(session_id),
     })?;
     let session = SessionRef::from(session_id);
@@ -1547,16 +1537,7 @@ mod tests {
     }
 
     fn checkpoint() -> Checkpoint {
-        Arc::new(
-            |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            },
-        )
+        accept_all()
     }
 
     fn coordinator(session_id: MakiId, checkpoint: Checkpoint) -> SessionCoordinatorHandle {
@@ -1630,10 +1611,7 @@ mod tests {
                             .await
                             .unwrap();
                         released.recv_async().await.unwrap();
-                        Ok(CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
+                        Ok(CheckpointAck::for_request(&request))
                     }) as CheckpointFuture
                 },
             );
@@ -1748,10 +1726,7 @@ mod tests {
                                 message: Arc::from(SAVE_ERROR),
                             })
                         } else {
-                            Ok(CheckpointAck {
-                                session_id: request.session_id,
-                                version: request.version,
-                            })
+                            Ok(CheckpointAck::for_request(&request))
                         }
                     }) as CheckpointFuture
                 },

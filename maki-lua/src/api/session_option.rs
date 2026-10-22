@@ -525,24 +525,14 @@ mod tests {
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
-    use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-    };
+    use maki_storage::checkpoint::{CheckpointWriter, accept_all};
     use maki_storage::id::MakiId;
     use test_case::test_case;
 
     use super::*;
 
     fn coordinator(id: MakiId, catalog: &SessionOptionCatalog) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
-            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
-                Box::pin(async move {
-                    Ok(CheckpointAck {
-                        session_id: request.session_id,
-                        version: request.version,
-                    })
-                }) as CheckpointFuture
-            });
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog: catalog.clone(),

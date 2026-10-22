@@ -214,10 +214,7 @@ impl SessionLogCheckpoint {
             session: candidate,
             history_version,
         };
-        Ok(CheckpointAck {
-            session_id: request.session_id,
-            version: request.version,
-        })
+        Ok(CheckpointAck::for_request(&request))
     }
 
     fn save_child(
@@ -313,10 +310,7 @@ impl SessionLogCheckpoint {
             session: candidate,
             history_version,
         };
-        Ok(CheckpointAck {
-            session_id: request.session_id,
-            version: request.version,
-        })
+        Ok(CheckpointAck::for_request(&request))
     }
 
     fn publish_candidate(

@@ -5641,6 +5641,7 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::checkpoint::ClaimingWriter;
 
     /// Projects every pending config commit the way the event loop's tick does,
     /// so a test that mutates config without running a frame still sees what a
@@ -6678,50 +6679,6 @@ mod tests {
         }
     }
 
-    struct TestCheckpoint;
-
-    impl
-        maki_storage::checkpoint::CheckpointWriter<
-            maki_agent::session_coordinator::SessionCheckpoint,
-        > for TestCheckpoint
-    {
-        fn checkpoint(
-            &self,
-            request: maki_storage::checkpoint::CheckpointRequest<
-                maki_agent::session_coordinator::SessionCheckpoint,
-            >,
-        ) -> maki_storage::checkpoint::CheckpointFuture {
-            Box::pin(async move {
-                Ok(maki_storage::checkpoint::CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            })
-        }
-
-        fn checkpoint_guarded(
-            &self,
-            request: maki_storage::checkpoint::CheckpointRequest<
-                maki_agent::session_coordinator::SessionCheckpoint,
-            >,
-            publication: CheckpointPublication,
-            claim: maki_storage::checkpoint::CheckpointClaim,
-        ) -> maki_storage::checkpoint::CheckpointFuture {
-            Box::pin(async move {
-                claim(&publication).map_err(|message| {
-                    maki_storage::checkpoint::CheckpointError::Save {
-                        session_id: request.session_id,
-                        message,
-                    }
-                })?;
-                Ok(maki_storage::checkpoint::CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            })
-        }
-    }
-
     fn test_coordinator(session_id: MakiId) -> SessionCoordinatorHandle {
         PreparedSessionCoordinator::new(SessionCoordinatorParams {
             session_id,
@@ -6736,7 +6693,7 @@ mod tests {
             ),
             persisted_options: Default::default(),
             model_policy: Arc::default(),
-            checkpoint: Arc::new(TestCheckpoint),
+            checkpoint: ClaimingWriter::accept_all(),
             mailbox: maki_agent::SessionMailbox::new(session_id),
         })
         .expect("coordinator preparation")

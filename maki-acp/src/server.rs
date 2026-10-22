@@ -2343,6 +2343,7 @@ mod tests {
     use maki_commands::TargetCapabilities;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
+    use maki_storage::checkpoint::{ClaimingWriter, accept_all};
     use maki_storage::sessions::Session;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2818,62 +2819,12 @@ mod tests {
         }
     }
 
-    struct GuardedTestCheckpoint(
-        Arc<
-            dyn maki_storage::checkpoint::CheckpointWriter<
-                    maki_agent::session_coordinator::SessionCheckpoint,
-                >,
-        >,
-    );
-
-    impl
-        maki_storage::checkpoint::CheckpointWriter<
-            maki_agent::session_coordinator::SessionCheckpoint,
-        > for GuardedTestCheckpoint
-    {
-        fn checkpoint(
-            &self,
-            request: maki_storage::checkpoint::CheckpointRequest<
-                maki_agent::session_coordinator::SessionCheckpoint,
-            >,
-        ) -> maki_storage::checkpoint::CheckpointFuture {
-            self.0.checkpoint(request)
-        }
-
-        fn checkpoint_guarded(
-            &self,
-            request: maki_storage::checkpoint::CheckpointRequest<
-                maki_agent::session_coordinator::SessionCheckpoint,
-            >,
-            publication: maki_storage::checkpoint::CheckpointPublication,
-            claim: maki_storage::checkpoint::CheckpointClaim,
-        ) -> maki_storage::checkpoint::CheckpointFuture {
-            let writer = Arc::clone(&self.0);
-            Box::pin(async move {
-                claim(&publication).map_err(|message| {
-                    maki_storage::checkpoint::CheckpointError::Save {
-                        session_id: request.session_id,
-                        message,
-                    }
-                })?;
-                writer.checkpoint(request).await
-            })
-        }
-    }
-
     fn successful_checkpoint() -> Arc<
         dyn maki_storage::checkpoint::CheckpointWriter<
                 maki_agent::session_coordinator::SessionCheckpoint,
             >,
     > {
-        Arc::new(|request: maki_storage::checkpoint::CheckpointRequest<_>| {
-            Box::pin(async move {
-                Ok(maki_storage::checkpoint::CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            }) as maki_storage::checkpoint::CheckpointFuture
-        })
+        accept_all()
     }
 
     fn test_coordinator(
@@ -2919,7 +2870,7 @@ mod tests {
                 ),
                 persisted_options: Default::default(),
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
-                checkpoint: Arc::new(GuardedTestCheckpoint(checkpoint)),
+                checkpoint: Arc::new(ClaimingWriter(checkpoint)),
                 mailbox: maki_agent::SessionMailbox::new(session_id),
             },
         )
@@ -3585,10 +3536,9 @@ mod tests {
                 move |request: maki_storage::checkpoint::CheckpointRequest<_>| {
                     checkpoints.fetch_add(1, Ordering::Relaxed);
                     Box::pin(async move {
-                        Ok(maki_storage::checkpoint::CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
+                        Ok(maki_storage::checkpoint::CheckpointAck::for_request(
+                            &request,
+                        ))
                     }) as maki_storage::checkpoint::CheckpointFuture
                 },
             )
@@ -4248,10 +4198,9 @@ mod tests {
                     Box::pin(async move {
                         checkpoint_started_tx.send_async(()).await.unwrap();
                         checkpoint_release_rx.recv_async().await.unwrap();
-                        Ok(maki_storage::checkpoint::CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
+                        Ok(maki_storage::checkpoint::CheckpointAck::for_request(
+                            &request,
+                        ))
                     }) as maki_storage::checkpoint::CheckpointFuture
                 },
             );
@@ -5461,10 +5410,9 @@ mod tests {
                             started.send_async(()).await.unwrap();
                             release.recv_async().await.unwrap();
                         }
-                        Ok(maki_storage::checkpoint::CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
+                        Ok(maki_storage::checkpoint::CheckpointAck::for_request(
+                            &request,
+                        ))
                     }) as maki_storage::checkpoint::CheckpointFuture
                 },
             );
