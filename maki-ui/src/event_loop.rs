@@ -1197,7 +1197,7 @@ impl SessionRuntime {
         );
         self.app.update_model(&commit.config.model);
         if self.app.state.resolve_pending_fast(commit.config.fast) {
-            self.restore_pending_fast();
+            self.restore_pending_fast(commit.config.model.spec());
         }
         self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
@@ -1205,30 +1205,51 @@ impl SessionRuntime {
     }
 
     /// Commits a saved `/fast` that was restored while discovery was pending,
-    /// once discovery says the model supports it.
-    fn restore_pending_fast(&self) {
+    /// once discovery says `spec` supports it. The reservation takes over the
+    /// wish, and the patch does nothing if an earlier queued change already
+    /// moved the root off `spec` or turned fast on.
+    fn restore_pending_fast(&mut self, spec: String) {
         let (manager, root) = self.handles.manager_and_root();
-        let reservation = manager
+        let reservation = match manager
             .lookup(root)
             .map_err(|error| error.to_string())
-            .and_then(|target| reserve_config_change(&target, &self.coordinator, None));
-        let reservation = match reservation {
+            .and_then(|target| reserve_config_change(&target, &self.coordinator, None))
+        {
             Ok(reservation) => reservation,
             Err(error) => {
                 warn!(%error, "failed to reserve the restored fast mode");
                 return;
             }
         };
-        let change = ConfigChange::Patch(ConfigPatch {
-            fast: Some(true),
-            ..Default::default()
-        });
+        self.app.state.fast_pending = false;
         smol::spawn(async move {
-            if let Err(error) = commit_config_change(reservation, change).await {
+            let result = match reservation.operation.wait_predecessor().await {
+                Ok(current) if current.model.spec() == spec && !current.fast => {
+                    commit_config_change(
+                        reservation,
+                        ConfigChange::Patch(ConfigPatch {
+                            fast: Some(true),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = result {
                 warn!(%error, "failed to commit the restored fast mode");
             }
         })
         .detach();
+    }
+
+    /// An explicit choice of model or fast for the root replaces a restored
+    /// `/fast` wish. Returns whether one was pending.
+    fn drop_pending_fast(&mut self, target: &AgentRef) -> bool {
+        let (_, root) = self.handles.manager_and_root();
+        target.id() == root && std::mem::take(&mut self.app.state.fast_pending)
     }
 
     fn config(&self) -> Option<Arc<maki_agent::EffectiveAgentConfig>> {
@@ -3629,6 +3650,9 @@ impl<'t> EventLoop<'t> {
         if spec.is_some() {
             self.note_if_deferred(idx, "model");
         }
+        if spec.is_some() || fast.is_some() {
+            self.sessions[idx].app.state.fast_pending = false;
+        }
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let reservation = manager
             .lookup(root)
@@ -4685,7 +4709,7 @@ impl<'t> EventLoop<'t> {
     /// commit; a reservation refusal (such as a held idle guard) returns
     /// synchronously instead.
     fn dispatch_target_toggle(
-        &self,
+        &mut self,
         idx: usize,
         target: &AgentRef,
         id: &'static str,
@@ -4693,6 +4717,12 @@ impl<'t> EventLoop<'t> {
     ) -> Result<(), String> {
         self.target_actor(idx, target)?;
         let change = match id {
+            FAST_OPTION_ID if self.sessions[idx].drop_pending_fast(target) => {
+                ConfigChange::Patch(ConfigPatch {
+                    fast: Some(false),
+                    ..Default::default()
+                })
+            }
             FAST_OPTION_ID => ConfigChange::ToggleFast,
             WORKFLOW_OPTION_ID => ConfigChange::ToggleWorkflow,
             _ => return Err(format!("{UNSUPPORTED_AGENT_OPTION_PREFIX}: {id}")),
@@ -4855,12 +4885,17 @@ impl<'t> EventLoop<'t> {
     }
 
     fn dispatch_model_selection(
-        &self,
+        &mut self,
         idx: usize,
         target: Option<AgentRef>,
         selection: maki_commands::ModelSelection,
         reply: Option<flume::Sender<Result<HostResponse, CommandError>>>,
     ) {
+        if let Some(target) = &target
+            && (selection.spec.is_some() || selection.fast.is_some())
+        {
+            self.sessions[idx].drop_pending_fast(target);
+        }
         let (_, root) = self.sessions[idx].handles.manager_and_root();
         let root_spec = target
             .as_ref()
@@ -5659,6 +5694,7 @@ mod tests {
 
     const OBSERVATION: &str = "failed";
     const PENDING_FAST_MODEL: &str = "pending-fast-model";
+    const SWITCHED_FAST_MODEL: &str = "switched-fast-model";
     const DISCOVERY_PROVIDER: &str = "synthetic";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
@@ -5914,40 +5950,117 @@ mod tests {
         });
     }
 
-    #[test]
-    fn discovered_fast_support_commits_the_restored_fast_wish() {
+    fn fast_model(id: &str, support: FastSupport) -> Model {
+        let mut model = model_named(id);
+        model.supports_fast_override = Some(support);
+        model
+    }
+
+    fn model_change(model: Model) -> ConfigChange {
+        ConfigChange::Patch(ConfigPatch {
+            model: Some(maki_agent::actor::PreparedModel {
+                provider: Arc::new(StubProvider),
+                model,
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn pending_fast_runtime() -> SessionRuntime {
+        let mut runtime = test_runtime(fast_model(PENDING_FAST_MODEL, FastSupport::Pending));
+        runtime.app.state.fast_pending = true;
+        runtime
+    }
+
+    async fn discover_fast_support(
+        actor: &maki_agent::AgentActorHandle,
+    ) -> maki_agent::actor::ConfigCommit {
+        actor
+            .reserve_prepared_operation(None)
+            .unwrap()
+            .commit_when_ready(Some(model_change(fast_model(
+                PENDING_FAST_MODEL,
+                FastSupport::Supported,
+            ))))
+            .await
+            .unwrap()
+            .config
+    }
+
+    async fn settled_config(
+        actor: &maki_agent::AgentActorHandle,
+    ) -> Arc<maki_agent::EffectiveAgentConfig> {
+        actor
+            .reserve_prepared_operation(None)
+            .unwrap()
+            .wait_predecessor()
+            .await
+            .unwrap()
+    }
+
+    #[test_case(None, PENDING_FAST_MODEL, true ; "queued_change_restores_once")]
+    #[test_case(Some(SWITCHED_FAST_MODEL), SWITCHED_FAST_MODEL, false ; "queued_model_switch_skips_restore")]
+    fn restored_fast_lands_on_the_discovered_model_once(
+        switch: Option<&str>,
+        settled_model: &str,
+        restored: bool,
+    ) {
         smol::block_on(async {
-            let mut model = model_named(PENDING_FAST_MODEL);
-            model.supports_fast_override = Some(FastSupport::Pending);
-            let mut runtime = test_runtime(model.clone());
-            runtime.app.state.fast_pending = true;
+            let mut runtime = pending_fast_runtime();
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
             let commits = actor.subscribe_config_commits();
-            model.supports_fast_override = Some(FastSupport::Supported);
-            let discovered = actor
-                .reserve_prepared_operation(None)
-                .unwrap()
-                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
-                    model: Some(maki_agent::actor::PreparedModel {
-                        provider: Arc::new(StubProvider),
-                        model,
-                    }),
-                    ..Default::default()
-                })))
-                .await
-                .unwrap()
-                .config;
-            assert!(!discovered.config.fast);
+            let discovered = discover_fast_support(&actor).await;
+            let queued = actor.reserve_prepared_operation(None).unwrap();
             assert!(runtime.project_config(&discovered));
-            let observed = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
-            assert_eq!(observed.generation, discovered.generation);
-            let restored = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
-            assert!(restored.config.fast);
-            assert!(runtime.project_config(&restored));
+            let change = match switch {
+                Some(id) => model_change(fast_model(id, FastSupport::Supported)),
+                None => ConfigChange::Patch(ConfigPatch {
+                    workflow: Some(true),
+                    ..Default::default()
+                }),
+            };
+            let queued = queued.commit_when_ready(Some(change)).await.unwrap().config;
+            assert!(runtime.project_config(&queued));
+            let settled = settled_config(&actor).await;
+            assert_eq!(&*settled.model.id, settled_model);
+            assert_eq!(settled.fast, restored);
+            assert_eq!(commits.try_iter().count(), 2 + usize::from(restored));
             assert!(!runtime.app.state.fast_pending);
             release_runtime(runtime);
         });
+    }
+
+    fn toggle_root_fast(event_loop: &mut EventLoop<'_>) {
+        let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+        let target = manager.lookup(root).unwrap();
+        event_loop
+            .dispatch_target_toggle(0, &target, FAST_OPTION_ID, None)
+            .unwrap();
+    }
+
+    fn set_root_fast_off(event_loop: &mut EventLoop<'_>) {
+        event_loop.dispatch_model_set(None, None, false, Some(false), flume::unbounded().0);
+    }
+
+    #[test_case(toggle_root_fast ; "fast_toggle")]
+    #[test_case(set_root_fast_off ; "model_set_fast_off")]
+    fn explicit_fast_choice_replaces_the_restored_wish(choose: fn(&mut EventLoop<'_>)) {
+        with_event_loop_runtime(
+            |_| pending_fast_runtime(),
+            |event_loop| {
+                let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+                let actor = manager.actor(root).unwrap();
+                choose(event_loop);
+                assert!(!event_loop.sessions[0].app.state.fast_pending);
+                smol::block_on(async {
+                    assert!(!settled_config(&actor).await.fast);
+                    let discovered = discover_fast_support(&actor).await;
+                    assert!(event_loop.sessions[0].project_config(&discovered));
+                    assert!(!settled_config(&actor).await.fast);
+                });
+            },
+        );
     }
 
     #[test]
