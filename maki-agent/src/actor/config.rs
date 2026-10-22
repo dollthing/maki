@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_providers::provider::Provider;
-use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt};
+use maki_providers::{Model, RequestOptions, ThinkingConfig, ThinkingConfigExt, model_registry};
 
 use crate::{AgentMode, ModeDef};
 
@@ -137,7 +137,15 @@ impl ConfigChange {
                 config.context = current.context.change_directory(cwd);
                 return Ok(config);
             }
-            Self::Patch(patch) => patch,
+            Self::Patch(mut patch) => {
+                if let Some(model) = &mut patch.model
+                    && model_registry::discovered(&model.model.provider, &model.model.id).is_some()
+                    && let Some(refined) = rediscovered_model(&*model.provider, &model.model)
+                {
+                    model.model = refined;
+                }
+                patch
+            }
             Self::PatchAndMode {
                 patch,
                 mode,

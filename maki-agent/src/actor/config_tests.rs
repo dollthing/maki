@@ -15,6 +15,7 @@ use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
 const DISCOVERY_PROVIDER: &str = "synthetic";
 const DISCOVERED_MODEL_ID: &str = "rediscovered-config-known";
 const UNDISCOVERED_MODEL_ID: &str = "rediscovered-config-unknown";
+const COLD_PATCH_MODEL_ID: &str = "rediscovered-config-cold-patch";
 const DISCOVERED_WINDOW: u32 = 524_000;
 
 #[test]
@@ -1560,6 +1561,41 @@ fn cancelled_preparation_does_not_block_successors() {
             TurnOutcome::Cancelled { .. }
         ));
         assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 2);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn patched_model_takes_discovery_that_lands_before_commit() {
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        let config = EffectiveAgentConfig::new(policy(false), AgentMode::Build);
+        let provider = Arc::clone(&config.provider);
+        actor.initialize_config(config).unwrap();
+        let cold =
+            Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{COLD_PATCH_MODEL_ID}")).unwrap();
+        assert_ne!(cold.context_window, DISCOVERED_WINDOW);
+        let change = actor.reserve_prepared_operation(None).unwrap();
+        model_registry::set_known_models(
+            DISCOVERY_PROVIDER,
+            vec![ModelInfo {
+                context_window: Some(DISCOVERED_WINDOW),
+                ..ModelInfo::id_only(COLD_PATCH_MODEL_ID.into())
+            }],
+        );
+        let committed = change
+            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                model: Some(crate::PreparedModel {
+                    provider,
+                    model: cold,
+                }),
+                ..Default::default()
+            })))
+            .await
+            .unwrap()
+            .config;
+        assert_eq!(committed.config.model.context_window, DISCOVERED_WINDOW);
         actor.close();
         task.await;
     });
