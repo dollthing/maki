@@ -974,7 +974,6 @@ pub enum AgentEvent {
     Nudge,
     SubagentHistory {
         tool_use_id: String,
-        #[serde(default)]
         history_epoch: u64,
         messages: Vec<Message>,
     },
