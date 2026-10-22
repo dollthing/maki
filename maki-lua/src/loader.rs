@@ -1409,8 +1409,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options,
-            model: Arc::from("test/model"),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
             checkpoint,
             mailbox: SessionMailbox::new(id),

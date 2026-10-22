@@ -915,7 +915,7 @@ impl<'h> Agent<'h> {
                         crate::session_coordinator::SessionCoordinatorHandle::resolve(session.id())
                             .ok()
                     })
-                    .map(|coordinator| coordinator.read().cwd())
+                    .and_then(|coordinator| coordinator.read().cwd())
             })
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));

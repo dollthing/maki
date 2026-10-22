@@ -1247,8 +1247,6 @@ fn spawn_one_shot(
             params.input.thinking,
         ),
         persisted_options: Default::default(),
-        model: Arc::from(spec),
-        cwd: params.initial_wd.clone(),
         model_policy: Arc::clone(&params.model_policy),
         checkpoint: Arc::new(
             |request: maki_storage::checkpoint::CheckpointRequest<
@@ -1575,8 +1573,6 @@ mod tests {
                 Default::default(),
             ),
             persisted_options: Default::default(),
-            model: Arc::from(model),
-            cwd: PathBuf::from("/tmp"),
             model_policy: Arc::default(),
             checkpoint,
             mailbox: SessionMailbox::new(session_id),

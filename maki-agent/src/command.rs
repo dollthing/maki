@@ -121,13 +121,15 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     ),
                     HostContextRequest::ThemeNames => HostContextResponse::Unavailable,
                     HostContextRequest::WorkingDirectory => {
-                        HostContextResponse::WorkingDirectory(read.cwd())
+                        read.cwd().map_or(HostContextResponse::Unavailable, |cwd| {
+                            HostContextResponse::WorkingDirectory(cwd)
+                        })
                     }
                     HostContextRequest::FastModeSupported => {
-                        HostContextResponse::FastModeSupported(
-                            Model::from_spec(&read.model())
-                                .is_ok_and(|model| model.supports_fast() || model.fast_pending()),
-                        )
+                        HostContextResponse::FastModeSupported(read.model().is_some_and(|spec| {
+                            Model::from_spec(&spec)
+                                .is_ok_and(|model| model.supports_fast() || model.fast_pending())
+                        }))
                     }
                     HostContextRequest::SessionId => {
                         HostContextResponse::SessionId(Arc::from(read.session_id().to_string()))
@@ -866,8 +868,6 @@ mod tests {
                     ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                model: Arc::from(model),
-                cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),
                 checkpoint,
                 mailbox: crate::SessionMailbox::new(session_id),
@@ -1267,7 +1267,7 @@ mod tests {
                 maki_commands::FrontendFeedback::WorkingDirectory(path)
             )) if path == Path::new("/tmp")
         ));
-        assert_eq!(coordinator.read().cwd(), PathBuf::from("/tmp"));
+        assert_eq!(coordinator.read().cwd().unwrap(), PathBuf::from("/tmp"));
         let elsewhere = TempDir::new().unwrap();
         let elsewhere =
             smol::block_on(coordinator.change_directory(elsewhere.path().into())).unwrap();

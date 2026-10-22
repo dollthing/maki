@@ -693,8 +693,6 @@ fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
             maki_agent::ThinkingConfig::Off,
         ),
         persisted_options: Default::default(),
-        model: Arc::from("test/model"),
-        cwd: PathBuf::from("/tmp"),
         model_policy: Arc::default(),
         checkpoint,
         mailbox: SessionMailbox::new(id),

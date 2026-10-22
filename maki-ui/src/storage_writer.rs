@@ -25,14 +25,9 @@ use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
 use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::session_checkpoint::{apply_session_checkpoint, validate_checkpoint_history};
 use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
-use maki_agent::session_options::{
-    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
-    YOLO_OPTION_ID,
-};
 use maki_agent::tools::offload::OffloadStore;
-use maki_agent::{AgentMode, ThinkingConfig};
-use maki_storage::sessions::StoredMode;
 
 use crate::AppSession;
 use maki_providers::Message;
@@ -41,8 +36,6 @@ pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
 const CHECKPOINT_CANCELLED: &str = "session checkpoint cancelled";
-const HISTORY_MISSING_SNAPSHOT: &str = "history checkpoint requires an exact snapshot";
-const HISTORY_MISSING_REVISION: &str = "history checkpoint requires an exact revision";
 const SELECTED_CONFIG_DESTINATION: &str =
     "selected config requires its child checkpoint destination";
 const SELECTED_CONFIG_MISSING: &str = "selected child config requires existing stored metadata";
@@ -829,22 +822,6 @@ impl StorageWriter {
     }
 }
 
-fn validate_checkpoint_history(
-    checkpoint: &SessionCheckpoint,
-    has_history: bool,
-) -> Result<(), &'static str> {
-    if checkpoint.kind == SessionCheckpointKind::Options {
-        return Ok(());
-    }
-    if checkpoint.kind == SessionCheckpointKind::History && !has_history {
-        return Err(HISTORY_MISSING_SNAPSHOT);
-    }
-    if has_history && checkpoint.history_revision.is_none() {
-        return Err(HISTORY_MISSING_REVISION);
-    }
-    Ok(())
-}
-
 fn history_version(
     state: &PendingState,
     id: MakiId,
@@ -1324,64 +1301,11 @@ fn merge_checkpoint(
     live_ids: Option<&[String]>,
 ) -> AppSession {
     let mut session = base.clone();
-    if checkpoint.kind != SessionCheckpointKind::Options
-        && let Some(history) = &checkpoint.history
-    {
-        session.adopt_history(history);
+    apply_session_checkpoint(&mut session, checkpoint);
+    if checkpoint.kind != SessionCheckpointKind::Options && checkpoint.history.is_some() {
         prune_main_history(&mut session, live_ids);
     }
-    if checkpoint.kind == SessionCheckpointKind::History {
-        return session;
-    }
-    session.meta.yolo = Some(option_enabled(&checkpoint.options, YOLO_OPTION_ID));
-    if checkpoint.kind == SessionCheckpointKind::Config {
-        if let Some(projection) = &checkpoint.config {
-            session.meta.mode = Some(match &projection.config.mode {
-                AgentMode::Build => StoredMode::Build,
-                AgentMode::Plan(_) => StoredMode::Plan,
-                AgentMode::Custom(mode) => StoredMode::Custom(mode.to_string()),
-            });
-            session.meta.plan_path = match &projection.config.mode {
-                AgentMode::Plan(path) => Some(path.to_string_lossy().into_owned()),
-                _ => None,
-            };
-        }
-        session.set_model(checkpoint.model.to_string());
-        session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
-        session.meta.fast = option_enabled(&checkpoint.options, FAST_OPTION_ID);
-        session.meta.workflow = option_enabled(&checkpoint.options, WORKFLOW_OPTION_ID);
-        session.meta.thinking = checkpoint
-            .options
-            .options
-            .iter()
-            .find(|state| state.definition.id.as_ref() == THINKING_OPTION_ID)
-            .and_then(|state| state.current_value.parse::<ThinkingConfig>().ok())
-            .map(Into::into);
-    }
-    session.meta.session_options = checkpoint
-        .options
-        .options
-        .iter()
-        .filter(|state| {
-            state.definition.persistent
-                && matches!(state.definition.owner, SessionOptionOwner::Plugin { .. })
-        })
-        .map(|state| {
-            (
-                state.definition.id.to_string(),
-                state.current_value.to_string(),
-            )
-        })
-        .collect();
     session
-}
-
-fn option_enabled(options: &maki_agent::session_options::SessionOptionsSnapshot, id: &str) -> bool {
-    options
-        .options
-        .iter()
-        .find(|state| state.definition.id.as_ref() == id)
-        .is_some_and(|state| state.current_value.as_ref() == ENABLED_VALUE)
 }
 
 fn writer_gone() -> SessionError {
@@ -1840,9 +1764,12 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::actor::AgentContextSnapshot;
     use maki_agent::session_coordinator::CommittedConfigProjection;
     use maki_agent::session_coordinator::builtin_option_definitions;
     use maki_agent::session_options::SessionOptions;
+    use maki_agent::session_options::{ENABLED_VALUE, YOLO_OPTION_ID};
+    use maki_agent::{AgentMode, ThinkingConfig};
     use maki_agent::{RunSettings, ToolOutput};
     use maki_domain::{Post, PostLevel};
     use maki_providers::provider::{BoxFuture, Provider};
@@ -1853,13 +1780,17 @@ mod tests {
     use maki_storage::id::SessionRef;
     use maki_storage::session_lock;
     use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const DEFERRED_RETRY: Duration = Duration::from_secs(3600);
     const MODEL: &str = "test-model";
-    const FAILED_MODEL: &str = "failed-model";
+    const FAILED_MODEL_ID: &str = "failed-model";
+    const FAILED_MODEL: &str = "ollama/failed-model";
+    const NEXT_MODEL: &str = "ollama/next-model";
+    const NEXT_CWD: &str = "/tmp/next";
     const CWD: &str = "/tmp/writer";
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
@@ -1900,8 +1831,6 @@ mod tests {
             kind: SessionCheckpointKind::Config,
             history_revision: None,
             history: None,
-            model: Arc::from(FAILED_MODEL),
-            cwd: CWD.into(),
             options: SessionOptions::new(
                 builtin_option_definitions(
                     FAILED_MODEL,
@@ -1915,21 +1844,32 @@ mod tests {
             )
             .unwrap()
             .snapshot(),
-            config: Some(CommittedConfigProjection {
-                runtime: Arc::new(()),
-                runtime_epoch: epoch,
-                generation,
-                config: Arc::new(EffectiveAgentConfig::new(
-                    RunSettings {
-                        provider: Arc::new(ConfigTestProvider),
-                        model: crate::components::test_model(),
-                        fast: true,
-                        workflow: true,
-                        thinking: ThinkingConfig::Off,
-                    },
-                    AgentMode::Plan(CWD.into()),
-                )),
-            }),
+            config: Some(config_projection(FAILED_MODEL, CWD, epoch, generation)),
+        }
+    }
+
+    fn config_projection(
+        model: &str,
+        cwd: &str,
+        runtime_epoch: u64,
+        generation: u64,
+    ) -> CommittedConfigProjection {
+        let mut config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::new(ConfigTestProvider),
+                model: maki_providers::Model::from_spec(model).unwrap(),
+                fast: true,
+                workflow: true,
+                thinking: ThinkingConfig::Off,
+            },
+            AgentMode::Plan(CWD.into()),
+        );
+        config.context = AgentContextSnapshot::new(PathBuf::from(cwd));
+        CommittedConfigProjection {
+            runtime: Arc::new(()),
+            runtime_epoch,
+            generation,
+            config: Arc::new(config),
         }
     }
 
@@ -2091,9 +2031,7 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
         });
-        let mut config = config_checkpoint(1, 1);
-        let selected = Arc::make_mut(&mut config.config.as_mut().unwrap().config);
-        selected.settings.model.id = FAILED_MODEL.into();
+        let config = config_checkpoint(1, 1);
         let ack: CheckpointFuture =
             if child {
                 let response = enqueue_staged_checkpoint(
@@ -2163,6 +2101,7 @@ mod tests {
         }
         let stored = AppSession::load(id, &dir).unwrap();
         let expected_model = if reject { MODEL } else { FAILED_MODEL };
+        let expected_child_model = if reject { MODEL } else { FAILED_MODEL_ID };
         let assert_untouched = |saved: &AppSession| {
             let untouched = if child {
                 saved.messages()
@@ -2184,7 +2123,7 @@ mod tests {
                     .iter()
                     .find(|stored| stored.tool_use_id == TOOL_ID)
                     .unwrap();
-                assert_eq!(selected.model.as_deref(), Some(expected_model));
+                assert_eq!(selected.model.as_deref(), Some(expected_child_model));
                 assert_eq!(
                     selected.thinking,
                     Some(if reject {
@@ -2268,7 +2207,6 @@ mod tests {
         );
         let mut options = config_checkpoint(1, 0);
         options.kind = SessionCheckpointKind::Options;
-        options.model = MODEL.into();
         options.history = Some(HistorySnapshot::new(Vec::new()));
         Arc::make_mut(&mut options.options.options)
             .iter_mut()
@@ -2442,7 +2380,6 @@ mod tests {
         let checkpoint = writer.coordinator_checkpoint();
         let mut history = config_checkpoint(1, 1);
         history.config = None;
-        history.model = Arc::from(MODEL);
         history.kind = SessionCheckpointKind::History;
         history.history_revision = Some(1);
         history.history = Some(HistorySnapshot::new(vec![Message::user(
@@ -2627,7 +2564,6 @@ mod tests {
         });
         let mut provisional = config_checkpoint(1, 1);
         provisional.config = None;
-        provisional.model = Arc::from(MODEL);
         provisional.kind = SessionCheckpointKind::History;
         provisional.history_revision = Some(1);
         provisional.history = Some(HistorySnapshot::new(vec![Message::user(
@@ -2996,7 +2932,6 @@ mod tests {
         let ack = {
             let mut history = config_checkpoint(1, 1);
             history.config = None;
-            history.model = MODEL.into();
             history.kind = SessionCheckpointKind::History;
             history.history_revision = Some(1);
             history.history = Some(HistorySnapshot::new(vec![Message::user(
@@ -3066,7 +3001,6 @@ mod tests {
         let checkpoint = writer.coordinator_checkpoint();
         let mut history = config_checkpoint(1, 1);
         history.config = None;
-        history.model = MODEL.into();
         history.kind = SessionCheckpointKind::History;
         history.history_revision = Some(1);
         history.history = Some(HistorySnapshot::new(vec![Message::user(
@@ -3085,8 +3019,14 @@ mod tests {
         };
         let mut metadata = config_checkpoint(1, 1);
         if !versioned {
-            metadata.config = None;
+            metadata.kind = SessionCheckpointKind::Options;
         }
+        Arc::make_mut(&mut metadata.options.options)
+            .iter_mut()
+            .find(|state| state.definition.id.as_ref() == YOLO_OPTION_ID)
+            .unwrap()
+            .current_value = Arc::from(ENABLED_VALUE);
+        let expected_model = if versioned { FAILED_MODEL } else { MODEL };
         let metadata_ack = checkpoint.checkpoint(CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
@@ -3106,22 +3046,20 @@ mod tests {
         commit_save(&writer.pending, id, &in_flight);
         acknowledge_waiters(&writer.pending, &in_flight.session, in_flight.waiters);
         assert!(smol::block_on(history_ack).is_ok());
-        assert_eq!(
-            writer.latest_snapshot(id).unwrap().model,
-            if versioned { FAILED_MODEL } else { MODEL }
-        );
+        assert_eq!(writer.latest_snapshot(id).unwrap().model, expected_model);
         disk.flush(&writer.pending);
         assert!(smol::block_on(metadata_ack).is_ok());
-        assert_eq!(AppSession::load(id, &dir).unwrap().model, FAILED_MODEL);
-        assert_eq!(writer.latest_snapshot(id).unwrap().model, FAILED_MODEL);
+        assert_eq!(AppSession::load(id, &dir).unwrap().model, expected_model);
+        assert_eq!(writer.latest_snapshot(id).unwrap().model, expected_model);
         session.set_title(TITLE.into());
         writer.send(Arc::new(session));
         disk.flush(&writer.pending);
         let reopened = AppSession::load(id, &dir).unwrap();
-        assert_eq!(reopened.model, FAILED_MODEL);
+        assert_eq!(reopened.model, expected_model);
+        assert_eq!(reopened.meta.yolo, Some(true));
         assert_eq!(reopened.title, TITLE);
         assert_eq!(message_texts(&reopened), [COORDINATOR_MSG]);
-        assert_eq!(writer.latest_snapshot(id).unwrap().model, FAILED_MODEL);
+        assert_eq!(writer.latest_snapshot(id).unwrap().model, expected_model);
         if versioned {
             assert_eq!(reopened.meta.mode, Some(StoredMode::Plan));
         }
@@ -3141,7 +3079,6 @@ mod tests {
         let checkpoint = |text: &str| {
             let mut history = config_checkpoint(1, 1);
             history.config = None;
-            history.model = MODEL.into();
             history.kind = SessionCheckpointKind::History;
             history.history_revision = Some(1);
             history.history = Some(HistorySnapshot::new(vec![Message::user(text.into())]));
@@ -3390,8 +3327,6 @@ mod tests {
                         kind: SessionCheckpointKind::Config,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(Vec::new())),
-                        model: Arc::from("next/model"),
-                        cwd: std::path::PathBuf::from(CWD),
                         options,
                         config: None,
                     }),
@@ -3446,8 +3381,6 @@ mod tests {
                         kind: SessionCheckpointKind::Config,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(Vec::new())),
-                        model: Arc::from("next/model"),
-                        cwd: std::path::PathBuf::from(CWD),
                         options,
                         config: None,
                     }),
@@ -4143,10 +4076,8 @@ mod tests {
                         kind: SessionCheckpointKind::Config,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(history)),
-                        model: Arc::from("next/model"),
-                        cwd: "/tmp/next".into(),
                         options,
-                        config: None,
+                        config: Some(config_projection(NEXT_MODEL, NEXT_CWD, 1, 1)),
                     }),
                 })
                 .await
@@ -4171,8 +4102,8 @@ mod tests {
             assert_eq!(loaded.title, "later UI title");
             assert_eq!(loaded.meta.mode, Some(StoredMode::Plan));
             assert_eq!(loaded.meta.queued_messages, ["queued"]);
-            assert_eq!(loaded.model, "next/model");
-            assert_eq!(loaded.cwd, "/tmp/next");
+            assert_eq!(loaded.model, NEXT_MODEL);
+            assert_eq!(loaded.cwd, NEXT_CWD);
             assert_eq!(loaded.meta.yolo, Some(true));
             assert!(loaded.meta.fast);
             assert!(loaded.meta.workflow);
@@ -4223,8 +4154,6 @@ mod tests {
                         history: Some(HistorySnapshot::new(vec![Message::user(
                             "coordinator".into(),
                         )])),
-                        model: Arc::from(MODEL),
-                        cwd: CWD.into(),
                         options,
                         config: None,
                     }),
@@ -4290,8 +4219,6 @@ mod tests {
                     history: Some(HistorySnapshot::new(vec![Message::user(
                         COORDINATOR_MSG.into(),
                     )])),
-                    model: Arc::from(MODEL),
-                    cwd: CWD.into(),
                     options,
                     config: None,
                 }),
@@ -4373,8 +4300,6 @@ mod tests {
                         kind: SessionCheckpointKind::Config,
                         history_revision: None,
                         history: None,
-                        model: Arc::from(FAILED_MODEL),
-                        cwd: CWD.into(),
                         options,
                         config: None,
                     }),

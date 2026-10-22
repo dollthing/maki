@@ -1391,8 +1391,6 @@ fn prepare_coordinator(
         catalog: deps.catalog.clone(),
         definitions,
         persisted_options: session.meta.session_options.clone(),
-        model: Arc::from(model_spec.as_str()),
-        cwd: PathBuf::from(&session.cwd),
         model_policy: Arc::clone(&deps.model_policy),
         checkpoint: deps.checkpoint.clone(),
         mailbox,
@@ -6435,7 +6433,7 @@ mod tests {
                 target_model.spec()
             );
             assert_eq!(
-                runtime.coordinator.read().model().as_ref(),
+                runtime.coordinator.read().model().unwrap().as_ref(),
                 target_model.spec()
             );
             release_runtime(runtime);
@@ -6760,8 +6758,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            model: Arc::from("anthropic/test-model"),
-            cwd: PathBuf::from("/tmp"),
             model_policy: Arc::default(),
             checkpoint: Arc::new(TestCheckpoint),
             mailbox: maki_agent::SessionMailbox::new(session_id),
@@ -7586,7 +7582,10 @@ mod tests {
 
         let runtime_slot = runtime.model_slot.load();
         assert_eq!(runtime_slot.model.spec(), FOCUSED_MODEL);
-        assert_eq!(runtime.coordinator.read().model().as_ref(), FOCUSED_MODEL);
+        assert_eq!(
+            runtime.coordinator.read().model().unwrap().as_ref(),
+            FOCUSED_MODEL
+        );
         drop(runtime_slot);
         release_runtime(runtime);
     }
@@ -7814,7 +7813,12 @@ mod tests {
             );
             assert!(Arc::ptr_eq(&original, &first.effective_config().unwrap()));
             assert_eq!(
-                event_loop.sessions[1].coordinator.read().model().as_ref(),
+                event_loop.sessions[1]
+                    .coordinator
+                    .read()
+                    .model()
+                    .unwrap()
+                    .as_ref(),
                 FIRST
             );
             assert_eq!(event_loop.sessions[1].model_slot.load().model.spec(), FIRST);
@@ -7859,7 +7863,10 @@ mod tests {
             smol::block_on(runtime.model_slot.load().provider.list_models()).unwrap()[0].id,
             "focused"
         );
-        assert_eq!(runtime.coordinator.read().model().as_ref(), STORED_MODEL);
+        assert_eq!(
+            runtime.coordinator.read().model().unwrap().as_ref(),
+            STORED_MODEL
+        );
         let options = runtime.coordinator.read().options();
         assert_eq!(
             options
@@ -7971,12 +7978,12 @@ mod tests {
         let path = harness._temp_dir.path().join(FILE_NAME);
         std::fs::write(&path, []).unwrap();
         let runtime = harness.runtime(harness.session());
-        let expected_cwd = runtime.coordinator.read().cwd();
+        let expected_cwd = runtime.coordinator.read().cwd().unwrap();
 
         let error = smol::block_on(runtime.coordinator.change_directory(path)).unwrap_err();
 
         assert!(error.to_string().contains("not a directory"));
-        assert_eq!(runtime.coordinator.read().cwd(), expected_cwd);
+        assert_eq!(runtime.coordinator.read().cwd().unwrap(), expected_cwd);
         assert_eq!(*runtime.handles.cwd_slot().load_full(), expected_cwd);
         release_runtime(runtime);
     }
@@ -8752,7 +8759,10 @@ mod tests {
                 event_loop.handle_internal(event);
             }
             assert_eq!(actor.effective_config().unwrap().context.cwd(), child);
-            assert_eq!(event_loop.sessions[0].coordinator.read().cwd(), child);
+            assert_eq!(
+                event_loop.sessions[0].coordinator.read().cwd().unwrap(),
+                child
+            );
         });
     }
 

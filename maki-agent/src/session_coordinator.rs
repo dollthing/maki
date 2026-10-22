@@ -145,8 +145,6 @@ pub struct SessionCheckpoint {
     pub kind: SessionCheckpointKind,
     pub history_revision: Option<u64>,
     pub history: Option<HistorySnapshot<Message>>,
-    pub model: Arc<str>,
-    pub cwd: PathBuf,
     pub options: SessionOptionsSnapshot,
     pub config: Option<CommittedConfigProjection>,
 }
@@ -217,8 +215,6 @@ pub struct SessionReadHandle {
     binding: Arc<Mutex<Option<ActorBinding>>>,
     checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
     model_policy: Arc<ModelPolicy>,
-    initial_model: Arc<str>,
-    initial_cwd: PathBuf,
 }
 
 struct CoordinatorState {
@@ -231,8 +227,6 @@ pub struct SessionCoordinatorParams {
     pub catalog: SessionOptionCatalog,
     pub definitions: Vec<SessionOptionDefinition>,
     pub persisted_options: BTreeMap<String, String>,
-    pub model: Arc<str>,
-    pub cwd: PathBuf,
     pub model_policy: Arc<ModelPolicy>,
     pub checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
     pub mailbox: SessionMailbox,
@@ -706,8 +700,6 @@ impl SessionCoordinatorHandle {
                             kind: SessionCheckpointKind::Config,
                             history_revision,
                             history,
-                            model: Arc::from(snapshot.config.model.spec()),
-                            cwd: snapshot.config.context.cwd().to_path_buf(),
                             options,
                             config: Some(CommittedConfigProjection {
                                 runtime: snapshot.commit.identity,
@@ -750,8 +742,6 @@ impl SessionCoordinatorHandle {
                 kind: SessionCheckpointKind::History,
                 history_revision: Some(revision),
                 history: Some(history),
-                model: self.read.model(),
-                cwd: self.read.cwd(),
                 options,
                 config: None,
             }),
@@ -1079,8 +1069,6 @@ impl PreparedSessionCoordinator {
             catalog,
             mut definitions,
             persisted_options,
-            model,
-            cwd,
             model_policy,
             checkpoint,
             mailbox,
@@ -1102,8 +1090,6 @@ impl PreparedSessionCoordinator {
             binding: Arc::new(Mutex::new(None)),
             checkpoint,
             model_policy,
-            initial_model: model,
-            initial_cwd: cwd,
             state: Arc::new(Mutex::new(CoordinatorState {
                 checkpoint_revision: 0,
                 history_revision: 0,
@@ -1205,15 +1191,12 @@ impl SessionReadHandle {
         binding.agent.effective_config().ok().flatten()
     }
 
-    pub fn model(&self) -> Arc<str> {
-        self.config()
-            .map(|config| Arc::from(config.model.spec()))
-            .unwrap_or_else(|| Arc::clone(&self.initial_model))
+    pub fn model(&self) -> Option<Arc<str>> {
+        self.config().map(|config| Arc::from(config.model.spec()))
     }
-    pub fn cwd(&self) -> PathBuf {
+    pub fn cwd(&self) -> Option<PathBuf> {
         self.config()
             .map(|config| config.context.cwd().to_path_buf())
-            .unwrap_or_else(|| self.initial_cwd.clone())
     }
     pub fn subscribe(&self) -> SessionOptionsSubscription {
         self.options.subscribe()
@@ -1555,8 +1538,6 @@ async fn checkpoint_options(
             kind: SessionCheckpointKind::Options,
             history_revision: None,
             history: None,
-            model: read.model(),
-            cwd: read.cwd(),
             options,
             config: None,
         }),
@@ -1726,41 +1707,20 @@ mod tests {
     use super::*;
     use crate::actor::{ActorBackend, AgentContextSnapshot, BackendResult, ControlWork, WorkKind};
     use crate::manager::{AgentLimits, AgentManagerHandle};
+    use crate::tools::NullProvider;
     use crate::{AgentInput, AgentMode, History, RunSettings, TurnContext};
-    use maki_providers::provider::{BoxFuture, Provider};
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_providers::provider::BoxFuture;
     use maki_storage::checkpoint::CheckpointAck;
-    use maki_storage::id::SessionRef;
-    use serde_json::Value;
     use test_case::test_case;
 
     const OLD: &str = "ollama/old";
     const NEW: &str = "ollama/new";
     const FAILED: &str = "failed";
 
-    struct ProjectionProvider;
-    impl Provider for ProjectionProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async { unreachable!() })
-        }
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
-
     fn projection_config(workflow: bool) -> Arc<EffectiveAgentConfig> {
         let mut config = EffectiveAgentConfig::new(
             RunSettings {
-                provider: Arc::new(ProjectionProvider),
+                provider: Arc::new(NullProvider),
                 model: Model::from_spec(OLD).unwrap(),
                 thinking: ThinkingConfig::Off,
                 fast: false,
@@ -1927,8 +1887,6 @@ mod tests {
                 ThinkingConfig::Off,
             ),
             persisted_options: BTreeMap::new(),
-            model: Arc::from(OLD),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::new(ModelPolicy::default()),
             checkpoint,
             mailbox: SessionMailbox::new(id),
@@ -1954,7 +1912,7 @@ mod tests {
                 Arc::new(|model| {
                     Box::pin(async move {
                         Ok(PreparedModel {
-                            provider: Arc::new(ProjectionProvider),
+                            provider: Arc::new(NullProvider),
                             model,
                         })
                     })
@@ -2536,7 +2494,7 @@ mod tests {
                 assert!(lock(&saved).is_empty());
             } else {
                 let options = result.unwrap();
-                assert_eq!(coordinator.read().model().as_ref(), NEW);
+                assert_eq!(coordinator.read().model().unwrap().as_ref(), NEW);
                 assert_eq!(agent.effective_config().unwrap().unwrap().model.spec(), NEW);
                 assert_eq!(lock(&installed).as_slice(), &[NEW]);
                 let saved = lock(&saved);
@@ -2661,7 +2619,7 @@ mod tests {
                 if claimed { NEW } else { OLD }
             );
             assert_eq!(
-                coordinator.read().model().as_ref(),
+                coordinator.read().model().unwrap().as_ref(),
                 if claimed { NEW } else { OLD }
             );
             if claimed {
@@ -2670,7 +2628,7 @@ mod tests {
                 let saved = lock(&saved);
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved[0].options, options);
-                assert_eq!(saved[0].model.as_ref(), NEW);
+                assert_eq!(saved[0].config.as_ref().unwrap().config.model.spec(), NEW);
                 assert_eq!(lock(&installed).as_slice(), &[NEW]);
             } else {
                 assert_eq!(coordinator.read().options(), before);
@@ -2711,7 +2669,7 @@ mod tests {
                     started_tx.send_async(()).await.unwrap();
                     release_rx.recv_async().await.unwrap();
                     Ok(PreparedModel {
-                        provider: Arc::new(ProjectionProvider),
+                        provider: Arc::new(NullProvider),
                         model,
                     })
                 })
@@ -2769,14 +2727,14 @@ mod tests {
             let agent = bind(&coordinator, Arc::clone(&installed));
             let directory = tempfile::tempdir().unwrap();
             let canonical = smol::fs::canonicalize(directory.path()).await.unwrap();
-            let before = coordinator.read().cwd();
+            let before = coordinator.read().cwd().unwrap();
             let before_options = coordinator.read().options();
             let result = coordinator
                 .change_directory(directory.path().to_path_buf())
                 .await;
             if fail {
                 assert!(result.is_err());
-                assert_eq!(coordinator.read().cwd(), before);
+                assert_eq!(coordinator.read().cwd().unwrap(), before);
                 assert_eq!(
                     agent.effective_config().unwrap().unwrap().context.cwd(),
                     before
@@ -2786,18 +2744,27 @@ mod tests {
                 assert!(lock(&saved).is_empty());
             } else {
                 assert_eq!(result.unwrap(), canonical);
-                assert_eq!(coordinator.read().cwd(), canonical);
+                assert_eq!(coordinator.read().cwd().unwrap(), canonical);
                 assert_eq!(
                     agent.effective_config().unwrap().unwrap().context.cwd(),
                     canonical
                 );
-                assert_eq!(lock(&saved)[0].cwd, canonical);
+                assert_eq!(
+                    lock(&saved)[0]
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .config
+                        .context
+                        .cwd(),
+                    canonical
+                );
                 assert_eq!(lock(&installed).len(), 1);
                 coordinator
                     .change_directory(PathBuf::from("."))
                     .await
                     .unwrap();
-                assert_eq!(coordinator.read().cwd(), canonical);
+                assert_eq!(coordinator.read().cwd().unwrap(), canonical);
             }
             coordinator.close().await.unwrap();
         });
@@ -2905,7 +2872,7 @@ mod tests {
             let before = coordinator.read().options();
             assert!(coordinator.set_option(id, value).await.is_err());
             assert_eq!(coordinator.read().options(), before);
-            assert_eq!(coordinator.read().model().as_ref(), OLD);
+            assert_eq!(coordinator.read().model().unwrap().as_ref(), OLD);
             drop(
                 coordinator
                     .reserve_transaction(CheckpointPublication::default())

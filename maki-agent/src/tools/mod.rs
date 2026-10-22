@@ -821,7 +821,7 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
 
 use maki_providers::{Message, ProviderEvent, StreamResponse};
 
-struct NullProvider;
+pub(crate) struct NullProvider;
 
 impl Provider for NullProvider {
     fn stream_message<'a>(

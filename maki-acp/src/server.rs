@@ -994,8 +994,6 @@ async fn install_session_with_lock(
             catalog: params.lua_event_handle.session_option_catalog(),
             definitions,
             persisted_options: persisted_options.clone(),
-            model: Arc::from(current_model.as_str()),
-            cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
             checkpoint: checkpoint.clone(),
             mailbox: handle.mailbox.clone(),
@@ -2112,7 +2110,7 @@ fn start_event_pump(
                 AgentEvent::ThinkingBlockEnd => translate::thinking_block_end(),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    let update = translate::tool_start(&event, &session.cwd(), home.as_deref());
+                    let update = translate::tool_start(&event, &session.cwd().unwrap_or_default(), home.as_deref());
                     if let Some(raw_input) = &event.raw_input {
                         tool_inputs.insert(event.id.clone(), raw_input.clone());
                     }
@@ -2121,7 +2119,7 @@ fn start_event_pump(
                 AgentEvent::ToolExecutionStart { id } => translate::tool_execution_start(&id),
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => {
-                    translate::tool_done(&event, &session.cwd(), home.as_deref())
+                    translate::tool_done(&event, &session.cwd().unwrap_or_default(), home.as_deref())
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
@@ -2135,7 +2133,7 @@ fn start_event_pump(
                                 format!("{tool}: {}", scopes.join(", ")),
                                 &tool.to_string(),
                                 raw_input,
-                                &session.cwd(),
+                                &session.cwd().unwrap_or_default(),
                                 home.as_deref(),
                             ),
                             permissions::permission_options(project_trusted),
@@ -2600,7 +2598,6 @@ mod tests {
         let coordinator = test_coordinator_with(
             id.id(),
             FAST_SPEC,
-            PathBuf::from("/tmp"),
             host.event_handle().session_option_catalog(),
             checkpoint,
         );
@@ -2892,12 +2889,10 @@ mod tests {
     fn test_coordinator(
         session_id: MakiId,
         model: &str,
-        cwd: PathBuf,
     ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
         test_coordinator_with(
             session_id,
             model,
-            cwd,
             Default::default(),
             successful_checkpoint(),
         )
@@ -2906,7 +2901,6 @@ mod tests {
     fn test_coordinator_with(
         session_id: MakiId,
         model: &str,
-        cwd: PathBuf,
         catalog: maki_agent::session_coordinator::SessionOptionCatalog,
         checkpoint: Arc<
             dyn maki_storage::checkpoint::CheckpointWriter<
@@ -2934,8 +2928,6 @@ mod tests {
                     maki_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                model: Arc::from(model),
-                cwd,
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
                 checkpoint: Arc::new(GuardedTestCheckpoint(checkpoint)),
                 mailbox: maki_agent::SessionMailbox::new(session_id),
@@ -3049,7 +3041,6 @@ mod tests {
         let coordinator = test_coordinator_with(
             handle.session_id.id(),
             OFFLINE_SPEC,
-            PathBuf::from("/project"),
             Default::default(),
             checkpoint,
         );
@@ -3293,7 +3284,7 @@ mod tests {
                     .is_err()
             );
 
-            let retry = test_coordinator(session_id.id(), OFFLINE_SPEC, cwd.path().to_path_buf());
+            let retry = test_coordinator(session_id.id(), OFFLINE_SPEC);
             retry.close().await.unwrap();
         });
     }
@@ -3312,7 +3303,7 @@ mod tests {
                 .unwrap()
                 .clone();
             close_session(&mut srv).await;
-            let replacement = test_coordinator(id, OFFLINE_SPEC, PathBuf::from("/project"));
+            let replacement = test_coordinator(id, OFFLINE_SPEC);
             assert!(
                 coordinator
                     .set_option(
@@ -3615,7 +3606,6 @@ mod tests {
         let coordinator = test_coordinator_with(
             session_id,
             OFFLINE_SPEC,
-            PathBuf::from("/project"),
             lua.session_option_catalog(),
             checkpoint,
         );
@@ -4469,7 +4459,7 @@ mod tests {
             ..Default::default()
         }));
         let session_id = SessionRef::from(MakiId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
 
         start_event_pump(
             event_rx,
@@ -4520,7 +4510,7 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded::<String>();
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakiId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
 
         start_event_pump(
             event_rx,
@@ -4592,7 +4582,7 @@ mod tests {
                 ..Default::default()
             }));
             let session_id = SessionRef::from(MakiId::generate());
-            let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+            let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
             start_event_pump(
                 event_rx,
                 session_id,
@@ -4668,7 +4658,7 @@ mod tests {
         let (answer_tx, _answer_rx) = flume::unbounded::<String>();
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakiId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         let tool_id = "tool-1";
 
         start_event_pump(
@@ -4751,7 +4741,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded::<Value>();
         let (answer_tx, _) = flume::unbounded::<String>();
         let session_id = SessionRef::from(MakiId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         start_event_pump(
             event_rx,
             session_id,
@@ -4889,7 +4879,7 @@ mod tests {
         let (answer_tx, _answer_rx) = flume::unbounded::<String>();
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakiId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
 
         start_event_pump(
             event_rx,
@@ -4953,8 +4943,7 @@ mod tests {
     #[test]
     fn available_command_projection_tracks_registry_generation() {
         let registry = test_registry(&[]);
-        let coordinator =
-            test_coordinator(MakiId::generate(), OFFLINE_SPEC, PathBuf::from("/project"));
+        let coordinator = test_coordinator(MakiId::generate(), OFFLINE_SPEC);
         let target = test_target(&registry, flume::unbounded().0.into(), coordinator.clone());
         let initial = registry.snapshot_for(&target).unwrap();
         let commands = available_commands(&registry.presented_commands(&target).unwrap());
@@ -5055,9 +5044,9 @@ mod tests {
             let read = coordinator.read();
             let options = read.options();
             format!(
-                "model={},cwd={},options_version={}",
+                "model={:?},cwd={:?},options_version={}",
                 read.model(),
-                read.cwd().display(),
+                read.cwd(),
                 options.version
             )
         });
@@ -6480,7 +6469,7 @@ mod tests {
             session.replace_messages(vec![Message::user("not yet visible".into())]);
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             session.save(&storage).unwrap();
-            let coordinator = test_coordinator(session.id, OFFLINE_SPEC, tmp.path().to_path_buf());
+            let coordinator = test_coordinator(session.id, OFFLINE_SPEC);
             let params = test_params(
                 Model::from_spec(OFFLINE_SPEC).unwrap(),
                 tmp.path().to_path_buf(),

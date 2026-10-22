@@ -627,7 +627,6 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use maki_agent::session_coordinator::{
@@ -671,8 +670,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            model: Arc::from("test/model"),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
             checkpoint,
             mailbox: mailbox.clone(),

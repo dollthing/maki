@@ -219,8 +219,6 @@ fn gated_config_mutations(
                     config.thinking,
                 ),
                 persisted_options: Default::default(),
-                model: Arc::from(config.model.spec()),
-                cwd: config.context.cwd().to_path_buf(),
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
                 checkpoint: checkpoint.clone(),
                 mailbox: SessionMailbox::new(id),

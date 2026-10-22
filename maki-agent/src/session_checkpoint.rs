@@ -6,14 +6,14 @@ use maki_storage::checkpoint::{
     CheckpointRequest, CheckpointWriter,
 };
 use maki_storage::sessions::{
-    HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionLog, SessionMeta, StoredMode,
-    StoredSubagent,
+    HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionLog, StoredMode, StoredSubagent,
 };
 use maki_storage::{StateDir, StorageError, session_lock::SessionPublicationGuard};
 
 use crate::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
 use crate::session_options::{
-    ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+    YOLO_OPTION_ID,
 };
 use crate::{AgentMode, ToolOutput};
 
@@ -34,19 +34,14 @@ impl RetainedSession {
         &self,
         checkpoint: &SessionCheckpoint,
     ) -> Result<Option<(u64, u64)>, &'static str> {
-        if checkpoint.kind == SessionCheckpointKind::Options {
+        validate_checkpoint_history(checkpoint, checkpoint.history.is_some())?;
+        let (Some(history), Some(revision), false) = (
+            &checkpoint.history,
+            checkpoint.history_revision,
+            checkpoint.kind == SessionCheckpointKind::Options,
+        ) else {
             return Ok(self.history_version);
-        }
-        let Some(history) = &checkpoint.history else {
-            return if checkpoint.kind == SessionCheckpointKind::History {
-                Err(HISTORY_MISSING_SNAPSHOT)
-            } else {
-                Ok(self.history_version)
-            };
         };
-        let revision = checkpoint
-            .history_revision
-            .ok_or(HISTORY_MISSING_REVISION)?;
         let incoming = (history.epoch, revision);
         if self
             .history_version
@@ -318,7 +313,7 @@ impl SessionLogCheckpoint {
                 })?;
             (retained.session.clone(), revision)
         };
-        apply_checkpoint(&mut candidate, &request.snapshot);
+        apply_session_checkpoint(&mut candidate, &request.snapshot);
         let saved = match publication_guard {
             Some(guard) => guard
                 .publish(|| candidate.save(dir))
@@ -435,7 +430,7 @@ impl SessionLogCheckpoint {
                 .map_err(|message| failure(Arc::from(message)))?;
             (retained.session.clone(), revision)
         };
-        apply_checkpoint(&mut candidate, &request.snapshot);
+        apply_session_checkpoint(&mut candidate, &request.snapshot);
         Self::publish_candidate(dir, &candidate, guard, publication, claim)?;
         *lock(session) = RetainedSession {
             session: candidate,
@@ -547,64 +542,73 @@ fn upsert_child(candidate: &mut StoredSession, child: StoredSubagent) {
     candidate.set_subagents(children);
 }
 
-fn apply_checkpoint(candidate: &mut StoredSession, checkpoint: &SessionCheckpoint) {
-    if checkpoint.kind != SessionCheckpointKind::Options
-        && let Some(history) = &checkpoint.history
-    {
-        candidate.adopt_history(history);
-        candidate.update_title_if_default();
-    }
-    if checkpoint.kind == SessionCheckpointKind::Config {
-        candidate.set_model(checkpoint.model.to_string());
-        candidate.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
-        if let Some(projection) = &checkpoint.config {
-            candidate.meta.mode = Some(match &projection.config.mode {
-                AgentMode::Build => StoredMode::Build,
-                AgentMode::Plan(_) => StoredMode::Plan,
-                AgentMode::Custom(mode) => StoredMode::Custom(mode.to_string()),
-            });
-            candidate.meta.plan_path = match &projection.config.mode {
-                AgentMode::Plan(path) => Some(path.to_string_lossy().into_owned()),
-                _ => None,
-            };
-        }
-    }
-    if checkpoint.kind != SessionCheckpointKind::History {
-        candidate.meta = checkpoint_meta(&candidate.meta, checkpoint);
+/// Rejects a checkpoint whose history fields cannot be applied exactly.
+pub fn validate_checkpoint_history(
+    checkpoint: &SessionCheckpoint,
+    has_history: bool,
+) -> Result<(), &'static str> {
+    match checkpoint.kind {
+        SessionCheckpointKind::Options => Ok(()),
+        SessionCheckpointKind::History if !has_history => Err(HISTORY_MISSING_SNAPSHOT),
+        _ if has_history && checkpoint.history_revision.is_none() => Err(HISTORY_MISSING_REVISION),
+        _ => Ok(()),
     }
 }
 
-fn checkpoint_meta(current: &SessionMeta, checkpoint: &SessionCheckpoint) -> SessionMeta {
-    let mut meta = current.clone();
+/// Projects a coordinator checkpoint onto the stored session. Only options
+/// present in the snapshot are written; plugin options replace the stored map.
+pub fn apply_session_checkpoint(session: &mut StoredSession, checkpoint: &SessionCheckpoint) {
+    if checkpoint.kind != SessionCheckpointKind::Options
+        && let Some(history) = &checkpoint.history
+    {
+        session.adopt_history(history);
+        session.update_title_if_default();
+    }
+    if checkpoint.kind == SessionCheckpointKind::History {
+        return;
+    }
+    let config = checkpoint.kind == SessionCheckpointKind::Config;
+    if config && let Some(projection) = &checkpoint.config {
+        let config = &projection.config;
+        session.set_model(config.model.spec());
+        session.set_cwd(config.context.cwd().to_string_lossy().into_owned());
+        session.meta.mode = Some(match &config.mode {
+            AgentMode::Build => StoredMode::Build,
+            AgentMode::Plan(_) => StoredMode::Plan,
+            AgentMode::Custom(mode) => StoredMode::Custom(mode.to_string()),
+        });
+        session.meta.plan_path = match &config.mode {
+            AgentMode::Plan(path) => Some(path.to_string_lossy().into_owned()),
+            _ => None,
+        };
+    }
+    let meta = &mut session.meta;
     meta.session_options.clear();
     for option in checkpoint.options.options.iter() {
         let id = option.definition.id.as_ref();
         let enabled = option.current_value.as_ref() == ENABLED_VALUE;
         match id {
             YOLO_OPTION_ID => meta.yolo = Some(enabled),
-            FAST_OPTION_ID if checkpoint.kind == SessionCheckpointKind::Config => {
-                meta.fast = enabled
-            }
-            WORKFLOW_OPTION_ID if checkpoint.kind == SessionCheckpointKind::Config => {
-                meta.workflow = enabled
-            }
+            FAST_OPTION_ID if config => meta.fast = enabled,
+            WORKFLOW_OPTION_ID if config => meta.workflow = enabled,
             // Thinking predates session options and keeps its own field, so
             // the projection writes there rather than into the generic map.
-            THINKING_OPTION_ID if checkpoint.kind == SessionCheckpointKind::Config => {
+            THINKING_OPTION_ID if config => {
                 meta.thinking = option
                     .current_value
                     .parse::<ThinkingConfig>()
                     .ok()
                     .map(Into::into);
             }
-            _ if option.definition.persistent && id.contains('.') => {
+            _ if option.definition.persistent
+                && matches!(option.definition.owner, SessionOptionOwner::Plugin { .. }) =>
+            {
                 meta.session_options
                     .insert(id.to_string(), option.current_value.to_string());
             }
             _ => {}
         }
     }
-    meta
 }
 
 #[cfg(test)]
@@ -621,12 +625,16 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::session_coordinator::builtin_option_definitions;
+    use crate::RunSettings;
+    use crate::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+    use crate::session_coordinator::{CommittedConfigProjection, builtin_option_definitions};
     use crate::session_options::{DISABLED_VALUE, SessionOptions};
+    use crate::tools::NullProvider;
     use crate::{Post, PostLevel};
+    use maki_providers::Model;
 
-    const MODEL: &str = "test/model";
-    const COMMITTED_MODEL: &str = "test/committed";
+    const MODEL: &str = "ollama/model";
+    const COMMITTED_MODEL: &str = "ollama/committed";
     const CWD: &str = "/project";
     const COMMITTED_CWD: &str = "/committed-project";
     const ORIGINAL: &str = "original";
@@ -634,6 +642,7 @@ mod tests {
     const REJECTED: &str = "rejected";
     const CLAIM_ERROR: &str = "checkpoint authority revoked";
     const CATALOG_ID: &str = "test.selection";
+    const CATALOG_PLUGIN: &str = "test";
     const CATALOG_VALUE: &str = "updated";
     const CHILD_KEY: &str = "task/child";
     const SIBLING_KEY: &str = "task/sibling";
@@ -691,11 +700,29 @@ mod tests {
                 kind: SessionCheckpointKind::Config,
                 history_revision: None,
                 history: None,
-                model: Arc::from(model),
-                cwd: PathBuf::from("/project"),
                 options: options.snapshot(),
-                config: None,
+                config: Some(projection(model, CWD)),
             }),
+        }
+    }
+
+    fn projection(model: &str, cwd: &str) -> CommittedConfigProjection {
+        let mut config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::new(NullProvider),
+                model: Model::from_spec(model).unwrap(),
+                fast: false,
+                workflow: false,
+                thinking: ThinkingConfig::Off,
+            },
+            AgentMode::Build,
+        );
+        config.context = AgentContextSnapshot::new(PathBuf::from(cwd));
+        CommittedConfigProjection {
+            runtime: Arc::new(()),
+            generation: 1,
+            runtime_epoch: 1,
+            config: Arc::new(config),
         }
     }
 
@@ -722,7 +749,7 @@ mod tests {
             let session_guard = lock(&writer.session);
             let (checkpoint_tx, checkpoint_rx) = flume::bounded(1);
             let checkpoint_writer = Arc::clone(&writer);
-            let checkpoint_request = request(id, 1, "test/model", &options);
+            let checkpoint_request = request(id, 1, MODEL, &options);
             let call = std::thread::spawn(move || {
                 checkpoint_tx
                     .send(checkpoint_writer.checkpoint(checkpoint_request))
@@ -991,7 +1018,7 @@ mod tests {
             history.compacted = true;
             let mut config = request(id, u64::from(!config_first) + 1, COMMITTED_MODEL, &options);
             let candidate = Arc::make_mut(&mut config.snapshot);
-            candidate.cwd = COMMITTED_CWD.into();
+            candidate.config = Some(projection(COMMITTED_MODEL, COMMITTED_CWD));
             for option in Arc::make_mut(&mut candidate.options.options) {
                 if matches!(
                     option.definition.id.as_ref(),
@@ -1416,10 +1443,8 @@ mod tests {
                         kind: SessionCheckpointKind::Config,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(vec![Message::user("hello".into())])),
-                        model: Arc::from("test/model"),
-                        cwd: PathBuf::from("/project"),
                         options: options.snapshot(),
-                        config: None,
+                        config: Some(projection(MODEL, CWD)),
                     }),
                 })
                 .await
@@ -1443,7 +1468,7 @@ mod tests {
             let mut catalog = request(id, 2, COMMITTED_MODEL, &options);
             let candidate = Arc::make_mut(&mut catalog.snapshot);
             candidate.kind = SessionCheckpointKind::Options;
-            candidate.cwd = COMMITTED_CWD.into();
+            candidate.config = Some(projection(COMMITTED_MODEL, COMMITTED_CWD));
             candidate.history = Some(HistorySnapshot::new(vec![Message::user(REJECTED.into())]));
             for option in Arc::make_mut(&mut candidate.options.options) {
                 option.current_value = Arc::from(DISABLED_VALUE);
@@ -1451,6 +1476,10 @@ mod tests {
             let mut entries = candidate.options.options.to_vec();
             let mut persistent = entries[0].clone();
             persistent.definition.id = Arc::from(CATALOG_ID);
+            persistent.definition.owner = SessionOptionOwner::Plugin {
+                plugin: Arc::from(CATALOG_PLUGIN),
+                generation: 1,
+            };
             persistent.definition.persistent = true;
             persistent.current_value = Arc::from(CATALOG_VALUE);
             entries.push(persistent);
@@ -1464,12 +1493,9 @@ mod tests {
             assert_eq!(catalog.meta.thinking, loaded.meta.thinking);
             assert_eq!(catalog.meta.yolo, Some(false));
             assert_eq!(
-                catalog
-                    .meta
-                    .session_options
-                    .get(CATALOG_ID)
-                    .map(String::as_str),
-                Some(CATALOG_VALUE)
+                catalog.meta.session_options,
+                BTreeMap::from([(CATALOG_ID.to_owned(), CATALOG_VALUE.to_owned())]),
+                "only plugin-owned persistent options enter the stored map"
             );
             assert_eq!(
                 serde_json::to_value(catalog.messages()).unwrap(),

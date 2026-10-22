@@ -912,8 +912,6 @@ pub fn run(params: SdkParams) -> Result<()> {
             catalog: session_options.clone(),
             definitions,
             persisted_options,
-            model: Arc::from(startup_model.spec()),
-            cwd: cwd.clone(),
             model_policy: Arc::clone(&model_policy),
             checkpoint: checkpoint.clone(),
             mailbox: handle.mailbox.clone(),
@@ -2896,8 +2894,6 @@ mod tests {
                     thinking,
                 ),
                 persisted_options: Default::default(),
-                model: Arc::from(STARTUP_MODEL),
-                cwd: cwd.clone(),
                 model_policy: Arc::new(ModelPolicy::default()),
                 checkpoint: Arc::new(GuardedSdkCheckpoint(checkpoint)),
                 mailbox: handle.mailbox.clone(),
@@ -3007,13 +3003,13 @@ mod tests {
 
         let result = smol::block_on(route_model(&route_tx, "not-a-model".into()));
         assert!(matches!(result, Err(CommandError::Producer(_))));
-        assert_eq!(coordinator.read().model().as_ref(), STARTUP_MODEL);
+        assert_eq!(coordinator.read().model().unwrap().as_ref(), STARTUP_MODEL);
         assert_eq!(shared.lock().unwrap().model.spec(), STARTUP_MODEL);
         assert!(checkpointed.lock().unwrap().is_empty());
 
         let result = smol::block_on(route_model(&route_tx, TARGET_MODEL.into()));
         assert!(matches!(result, Ok(HostResponse::Completed)), "{result:?}");
-        assert_eq!(coordinator.read().model().as_ref(), TARGET_MODEL);
+        assert_eq!(coordinator.read().model().unwrap().as_ref(), TARGET_MODEL);
         assert_eq!(
             coordinator.read().options().options[0]
                 .current_value
@@ -3021,7 +3017,16 @@ mod tests {
             TARGET_MODEL
         );
         assert_eq!(shared.lock().unwrap().model.spec(), TARGET_MODEL);
-        assert_eq!(checkpointed.lock().unwrap()[0].model.as_ref(), TARGET_MODEL);
+        assert_eq!(
+            checkpointed.lock().unwrap()[0]
+                .config
+                .as_ref()
+                .unwrap()
+                .config
+                .model
+                .spec(),
+            TARGET_MODEL
+        );
         assert_eq!(
             agent
                 .effective_config()
@@ -3123,7 +3128,7 @@ mod tests {
             )
         );
         assert!(!persisted.subagent_messages().contains_key(&child_key));
-        assert_eq!(coordinator.read().model().as_ref(), TARGET_MODEL);
+        assert_eq!(coordinator.read().model().unwrap().as_ref(), TARGET_MODEL);
         assert_eq!(checkpointed.lock().unwrap().len(), 1);
         let child_ticket = child_ref.actor().unwrap().latest_ticket().unwrap();
         assert!(child_ticket.peek_result().is_none());
@@ -3290,8 +3295,6 @@ mod tests {
                     maki_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                model: Arc::from(STARTUP_MODEL),
-                cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),
                 checkpoint: Arc::new(
                     move |request: maki_storage::checkpoint::CheckpointRequest<

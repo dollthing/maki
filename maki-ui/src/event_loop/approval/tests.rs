@@ -1526,7 +1526,7 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
     with_event_loop(|event_loop| {
         let (index, original_path, requests, _host) = setup(event_loop);
         let coordinator = event_loop.sessions[index].coordinator.clone();
-        let cwd = coordinator.read().cwd().join(MOVED_CWD);
+        let cwd = coordinator.read().cwd().unwrap().join(MOVED_CWD);
         fs::create_dir(&cwd).unwrap();
         smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
         let relative = PathBuf::from(RELATIVE_PLAN_FILE);
@@ -1588,7 +1588,10 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
                 .filter_map(Message::user_text)
                 .any(|text| text.contains(&absolute.display().to_string()))
         );
-        assert_eq!(event_loop.sessions[index].coordinator.read().cwd(), cwd);
+        assert_eq!(
+            event_loop.sessions[index].coordinator.read().cwd().unwrap(),
+            cwd
+        );
         assert!(requests.is_empty());
     });
 }
@@ -1599,7 +1602,7 @@ fn stale_plan_path_rejects_approval() {
         let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let coordinator = event_loop.sessions[index].coordinator.clone();
-        let cwd = coordinator.read().cwd().join(MOVED_CWD);
+        let cwd = coordinator.read().cwd().unwrap().join(MOVED_CWD);
         fs::create_dir(&cwd).unwrap();
         smol::block_on(coordinator.change_directory(cwd)).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();

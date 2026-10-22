@@ -519,7 +519,6 @@ pub(crate) async fn unload(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use maki_agent::SessionMailbox;
     use maki_agent::session_coordinator::{
@@ -556,8 +555,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            model: Arc::from("test/model"),
-            cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),
             checkpoint,
             mailbox: SessionMailbox::new(id),
