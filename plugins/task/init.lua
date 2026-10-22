@@ -62,20 +62,11 @@ Report findings classified by severity (critical / high / medium / low), quoting
 ]] .. plan_spec
 
 local opts = maki.api.register_options({
-  max_concurrent = {
-    type = "integer",
-    min = 1,
-    desc = "Deprecated and ignored. Subagent capacity comes from agent.max_concurrent_agent_turns.",
-  },
   allow_model = {
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
   },
 })
-
-if opts.max_concurrent ~= nil then
-  maki.log.warn("plugins.task.max_concurrent is deprecated and ignored; use agent.max_concurrent_agent_turns")
-end
 
 local spawn_schema = {
   type = "object",

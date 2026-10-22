@@ -406,16 +406,6 @@ fn spawn_and_wait_stub(reg: &ToolRegistry, input: Value) -> Result<Value, String
 const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
 
 #[test]
-fn deprecated_max_concurrent_option_still_loads() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("max_concurrent".into(), json!(4));
-    let (reg, _host) = load_task_host_with_opts(opts);
-    let result = spawn_and_wait_stub(&reg, task_input(SCENARIO_PLAIN, None))
-        .expect("task with deprecated max_concurrent failed");
-    assert_eq!(result["text"], PLAIN_TEXT);
-}
-
-#[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
     let mut opts = serde_json::Map::new();
     opts.insert("allow_model".into(), json!(true));
