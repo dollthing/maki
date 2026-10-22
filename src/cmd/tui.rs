@@ -319,7 +319,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
 
     let (mut stack, mut startup_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
 
@@ -547,21 +546,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "reload: rebuilt plugins and config"
                 );
             }
-        }
-    }
-}
-
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(project_config.config_root().join(".makima/config.toml")),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://makima.ln4.net/docs/configuration/"
-            );
         }
     }
 }

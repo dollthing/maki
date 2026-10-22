@@ -2063,11 +2063,10 @@ mod tests {
         meta["usage_by_model"].clone()
     }
 
-    /// Session files predate `cost`, so an entry without the key loads unpriced
-    /// with its counters intact, and saving it back must not mint one: older
-    /// builds still read these files.
+    /// An entry without `cost` loads unpriced with its counters intact, and
+    /// saving it back must not mint one.
     #[test]
-    fn legacy_usage_entry_loads_unpriced_and_stays_that_way_on_disk() {
+    fn unpriced_usage_entry_stays_unpriced_on_disk() {
         let id: MakiId = FIXTURE_ID.parse().unwrap();
         let json = format!(
             r#"{{"t":"header","v":2,"id":"{FIXTURE_ID}","model":"m","cwd":"/","created_at":0}}
@@ -2116,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_by_model_absent_on_legacy_session() {
+    fn usage_by_model_absent_when_meta_omits_it() {
         let id: MakiId = FIXTURE_ID.parse().unwrap();
         let json = format!(
             r#"{{"t":"header","v":2,"id":"{FIXTURE_ID}","model":"m","cwd":"/","created_at":0}}
@@ -3393,7 +3392,7 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_backward_compat_defaults() {
+    fn session_meta_defaults_absent_fields() {
         let json = r#"{"mode":"build"}"#;
         let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
