@@ -739,12 +739,8 @@ fn thinking_change(input: &str) -> Result<ConfigChange, String> {
 /// The agent a session's commands and keymaps address: the selected chat's
 /// agent. A closed agent addresses nothing; there is no fallback to the root.
 fn selected_agent(runtime: &SessionRuntime) -> Option<AgentRef> {
-    let (manager, root) = runtime.handles.manager_and_root();
-    let selected = runtime
-        .app
-        .selected_agent_id()
-        .or_else(|| runtime.app.is_main_chat().then_some(root))?;
-    manager.lookup(selected).ok()
+    let (manager, _) = runtime.handles.manager_and_root();
+    manager.lookup(runtime.app.selected_agent_id()?).ok()
 }
 
 fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::Value {
@@ -1256,7 +1252,7 @@ impl SessionRuntime {
         let mut preamble = self.app.shell.results_for(Some(root)).to_vec();
         preamble.extend_from_slice(self.app.shell.results_for(None));
         let input = maki_agent::AgentInput {
-            message: text.clone(),
+            message: text,
             mode: config.mode.clone(),
             images: Vec::new(),
             preamble,
@@ -1271,8 +1267,7 @@ impl SessionRuntime {
         } else {
             self.handles.queue.current_run_id()
         };
-        if let Err(error) = self.handles.queue.try_push(QueueItem::Message {
-            text,
+        if let Err(error) = self.handles.queue.try_push(QueueItem {
             input,
             run_id,
             displayed: false,
@@ -4241,8 +4236,7 @@ impl<'t> EventLoop<'t> {
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Message {
-                    text: input.message.clone(),
+                rt.handles.queue.push(QueueItem {
                     input,
                     run_id,
                     displayed: true,
@@ -5829,8 +5823,7 @@ mod tests {
                 (runtime.id(), WORKFLOW_OPTION_ID),
                 &internal_tx,
             );
-            runtime.handles.queue.push(QueueItem::Message {
-                text: "after barrier".into(),
+            runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "after barrier".into(),
                     mode: Default::default(),
@@ -6552,8 +6545,7 @@ mod tests {
                 (runtime.id(), WORKFLOW_OPTION_ID),
                 &internal_tx,
             );
-            runtime.handles.queue.push(QueueItem::Message {
-                text: "queued root".into(),
+            runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "queued root".into(),
                     mode: Default::default(),
@@ -6765,6 +6757,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             SystemPromptOverride::default(),
         );
+        handles.apply_to_app(&mut app);
         let coordinator = test_coordinator(app.state.session.id);
         let (shell_tx, shell_rx) = flume::unbounded();
         let config_commits = observe_config_commits(

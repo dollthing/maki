@@ -63,15 +63,13 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
-use maki_agent::actor::{
-    EffectiveAgentConfig, TranscriptRequest, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
-};
+use maki_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType, ImageSource,
     McpConfigErrors, McpPromptRef, McpSnapshotReader, ModeId, Post, SharedBuf, SharedMessages,
-    SubagentInfo, TurnCompleteEvent, TurnId,
+    SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -2053,61 +2051,39 @@ impl App {
         }
     }
 
-    fn capture_cancel(&mut self) -> (Option<TurnId>, u64) {
-        let run_id = self.run_id;
-        let (turn_id, fence) = self.queue.capture_cancel(self.run_id);
-        self.run_id = fence;
-        self.queue.fence_cancelled_presentations(fence);
-        (turn_id, run_id)
-    }
-
     fn handle_cancel(&mut self) -> Vec<Action> {
-        if let Some(target) = self
+        let Some(target) = self
             .command_runtime
             .target_agent(&self.command_target)
             .filter(|target| Some(target.id()) == self.selected_agent_id())
-        {
-            let (_, fence) = match target.manager().local_cancel(target.id(), self.run_id) {
-                Ok(cut) => cut,
-                Err(error) => {
-                    self.flash(error.to_string());
-                    return Vec::new();
-                }
-            };
-            let id = self.selected_agent_id();
-            self.shell.cancel_for(id);
-            self.active_chat().flush();
-            self.active_chat().cancel_in_progress();
-            self.active_chat().retry_info = None;
-            self.queue.unfocus();
-            if self.is_main_chat() {
-                self.run_id = fence;
-                self.queue.fence_cancelled_presentations(fence);
-                self.status = Status::Idle;
-                self.recoverable_queue.clear();
-            }
-            return Vec::new();
-        }
-        if !self.is_main_chat() || self.selected_agent_id().is_some() {
+        else {
             self.flash(queue::NO_SUBAGENT_ERR.into());
             return Vec::new();
+        };
+        let run_id = self.run_id;
+        let (turn_id, fence) = match target.manager().local_cancel(target.id(), run_id) {
+            Ok(cut) => cut,
+            Err(error) => {
+                self.flash(error.to_string());
+                return Vec::new();
+            }
+        };
+        self.shell.cancel_for(Some(target.id()));
+        self.active_chat().flush();
+        self.active_chat().cancel_in_progress();
+        self.active_chat().retry_info = None;
+        self.queue.unfocus();
+        if !self.is_main_chat() {
+            return Vec::new();
         }
-        let (turn_id, run_id) = self.capture_cancel();
-        self.finish_cancel(turn_id, run_id)
-    }
-
-    fn finish_cancel(&mut self, turn_id: Option<TurnId>, run_id: u64) -> Vec<Action> {
-        self.chats[0].retry_info = None;
+        self.run_id = fence;
+        self.queue.fence_cancelled_presentations(fence);
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.input_queue.clear();
         self.active_input = None;
-        self.shell.cancel_for(self.chats[0].agent_id);
-        self.main_chat().flush();
-        self.main_chat().cancel_in_progress();
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.queue.unfocus();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent { turn_id, run_id }]
@@ -2968,17 +2944,6 @@ impl App {
             self.flash(CommandError::StaleTarget.to_string());
             return vec![];
         };
-        let actor = match admission
-            .target
-            .validate_live()
-            .and_then(|()| admission.target.actor())
-        {
-            Ok(actor) => actor,
-            Err(error) => {
-                self.flash(error.to_string());
-                return vec![];
-            }
-        };
         let images = turn
             .content
             .attachments
@@ -2988,14 +2953,14 @@ impl App {
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        let mut input = AgentInput {
+        let input = AgentInput {
             message: turn.content.text.to_string(),
             images,
             mode: admission.template.mode.clone(),
             thinking: admission.template.opts.thinking,
             fast: admission.template.opts.fast,
             workflow: admission.template.workflow,
-            preamble: self.shell.results_for(Some(admission.target.id())).to_vec(),
+            preamble: Vec::new(),
             prompt: turn.prompt.map(|prompt| {
                 Box::new(McpPromptRef {
                     qualified_name: prompt.qualified_name.to_string(),
@@ -3008,43 +2973,8 @@ impl App {
             }),
             cancel: None,
         };
-        let root = self.chats[0].agent_id == Some(admission.target.id());
-        let starting = root && self.status != Status::Streaming;
-        let correlation = if root {
-            input
-                .preamble
-                .extend_from_slice(self.shell.results_for(None));
-            let run_id = if starting {
-                actor.reserve_presentation(self.run_id)
-            } else {
-                actor.presentation_id()
-            };
-            crate::agent::shared_queue::correlation(run_id)
-        } else {
-            String::new()
-        };
-        match actor.admit_turn_with_options(
-            input,
-            None,
-            correlation,
-            TurnAdmissionOptions {
-                provenance: TurnProvenance {
-                    origin: TurnOrigin::User,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        ) {
-            Ok(_) => {
-                self.shell.drain_results_for(Some(admission.target.id()));
-                if root {
-                    self.shell.drain_results();
-                }
-                if starting {
-                    self.record_run_start(actor.presentation_id());
-                }
-            }
-            Err(error) => self.flash(error.to_string()),
+        if let Err(error) = self.admit_user_turn(&admission.target, input, None) {
+            self.flash(error);
         }
         vec![]
     }

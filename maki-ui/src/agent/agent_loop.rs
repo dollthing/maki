@@ -1015,10 +1015,7 @@ mod tests {
             // The prior UI turn already displayed RUN_ID - 1, so the explicit
             // turn after it is the one that allocates its own presentation.
             actor.observe_presentation(RUN_ID - 1);
-            let mut app = crate::app::tests::actor_presentation_app(
-                crate::agent::shared_queue::actor_queue(Arc::new(actor.clone())),
-                RUN_ID - 1,
-            );
+            let mut app = crate::app::tests::actor_presentation_app(root.clone(), RUN_ID - 1);
             let make_input = |text: &str| {
                 AgentInput::from_defaults(
                     text.into(),
@@ -1117,8 +1114,7 @@ mod tests {
                 let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
                 for text in ["earlier deferred", "final deferred"] {
                     let input = make_input(text);
-                    queue.push(crate::agent::shared_queue::QueueItem::Message {
-                        text: text.into(),
+                    queue.push(crate::agent::shared_queue::QueueItem {
                         input,
                         run_id: RUN_ID + 1,
                         displayed: false,
@@ -1397,7 +1393,7 @@ mod tests {
                 actor.observe_presentation(FIRST_RUN - 1);
                 let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
                 let mut app =
-                    crate::app::tests::actor_presentation_app(queue.clone(), FIRST_RUN - 1);
+                    crate::app::tests::actor_presentation_app(root.clone(), FIRST_RUN - 1);
                 let first = actor.admit_turn(make_input(), None, String::new()).unwrap();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
@@ -1410,8 +1406,7 @@ mod tests {
                 }
                 let (second, second_run) = if deferred {
                     let boundary = actor.reserve_prepared_operation(None).unwrap();
-                    queue.push(crate::agent::shared_queue::QueueItem::Message {
-                        text: "deferred root".into(),
+                    queue.push(crate::agent::shared_queue::QueueItem {
                         input: make_input(),
                         run_id: FIRST_RUN,
                         displayed: false,
@@ -1455,8 +1450,7 @@ mod tests {
                 // A displayed bubble pushes under the id the UI already shows,
                 // so admission keeps it and the counter does not move.
                 let displayed_presentation = queue.current_run_id();
-                queue.push(crate::agent::shared_queue::QueueItem::Message {
-                    text: "pending successor".into(),
+                queue.push(crate::agent::shared_queue::QueueItem {
                     input: make_input(),
                     run_id: displayed_presentation,
                     displayed: true,
@@ -1502,8 +1496,7 @@ mod tests {
                 assert_eq!(app.status, crate::components::Status::Idle);
 
                 let future = if deferred {
-                    queue.push(crate::agent::shared_queue::QueueItem::Message {
-                        text: "future deferred root".into(),
+                    queue.push(crate::agent::shared_queue::QueueItem {
                         input: make_input(),
                         run_id: FIRST_RUN,
                         displayed: false,
@@ -1617,27 +1610,24 @@ mod tests {
                 let actor = target.actor().unwrap();
                 let queue = actor_queue(Arc::new(actor.clone()));
                 let settlements = actor.subscribe_events();
-                let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
-                app.update(crate::app::Msg::Paste(INITIAL.into()));
-                let actions = app.update(crate::app::Msg::Key(crate::components::key(
-                    crossterm::event::KeyCode::Enter,
-                )));
-                let Some(crate::components::Action::SendMessage(mut input)) =
-                    actions.into_iter().next()
-                else {
-                    panic!("expected initial user submission");
+                let mut app = crate::app::tests::actor_presentation_app(target.clone(), 0);
+                let submission = |text: &str| {
+                    let mut input = AgentInput::from_defaults(
+                        text.into(),
+                        AgentMode::Build,
+                        vec![image.clone()],
+                        Default::default(),
+                    );
+                    input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {text}"))];
+                    QueueItem {
+                        input,
+                        run_id: 0,
+                        displayed: false,
+                    }
                 };
-                input.prompt = None;
-                input.images = vec![image.clone()];
-                input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {INITIAL}"))];
-                let submitted_run = app.run_id;
-                queue.push(QueueItem::Message {
-                    text: INITIAL.into(),
-                    input: *input,
-                    run_id: submitted_run,
-                    displayed: true,
-                });
+                queue.push(submission(INITIAL));
                 let first = requests.recv_async().await.unwrap();
+                let submitted_run = actor.presentation_id();
                 assert!(serde_json::to_string(&first).unwrap().contains(INITIAL));
                 let ticket = actor
                     .turn_ticket(actor.snapshot().active_turn.unwrap())
@@ -1647,21 +1637,9 @@ mod tests {
                     maki_agent::actor::TurnOrigin::User
                 );
                 for text in FOLLOWUPS {
-                    let mut input = AgentInput::from_defaults(
-                        text.into(),
-                        AgentMode::Build,
-                        vec![image.clone()],
-                        Default::default(),
-                    );
-                    input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {text}"))];
-                    queue.push(QueueItem::Message {
-                        text: text.into(),
-                        input,
-                        run_id: submitted_run,
-                        displayed: false,
-                    });
+                    queue.push(submission(text));
                 }
-                assert_eq!(queue.panel_len(), FOLLOWUPS.len());
+                assert_eq!(queue.text_messages(), FOLLOWUPS);
                 release.send(()).unwrap();
                 let next = requests.recv_async().await.unwrap();
                 let serialized = serde_json::to_string(&next).unwrap();
@@ -2061,9 +2039,8 @@ mod tests {
         }
     }
 
-    #[test_case(false; "production_immediate_admitted_turn")]
-    #[test_case(true; "displayed_root_current_presentation")]
-    fn ui_submission_fires_one_turn_start(root_work: bool) {
+    #[test]
+    fn ui_submission_fires_one_turn_start() {
         smol::block_on(async {
             const PROMPT: &str = "immediate UI prompt";
             const RESPONSE: &str = "visible explicit response";
@@ -2097,8 +2074,7 @@ mod tests {
                 .unwrap();
             let actor = root.actor().unwrap();
             let lifecycle = actor.subscribe_events();
-            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
-            let mut app = crate::app::tests::actor_presentation_app(queue.clone(), 0);
+            let mut app = crate::app::tests::actor_presentation_app(root, 0);
             let host = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
             host.load_source(
                 "turn_start_count",
@@ -2114,37 +2090,8 @@ mod tests {
             let actions = app.update(crate::app::Msg::Key(crate::components::key(
                 crossterm::event::KeyCode::Enter,
             )));
-            assert_eq!(actions.len(), 1);
-            let Some(crate::components::Action::SendMessage(mut input)) =
-                actions.into_iter().next()
-            else {
-                panic!("expected immediate submission");
-            };
-            input.prompt = None;
+            assert!(actions.is_empty());
             let submitted_run = app.run_id;
-            let text = input.message.clone();
-            if root_work {
-                // The app already reserved and displayed this presentation.
-                actor
-                    .submit(
-                        *input,
-                        None,
-                        crate::agent::shared_queue::correlation(submitted_run),
-                        TurnAdmissionOptions {
-                            already_displayed: true,
-                            displayed_presentation: Some(submitted_run),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap();
-            } else {
-                queue.push(crate::agent::shared_queue::QueueItem::Message {
-                    text,
-                    input: *input,
-                    run_id: submitted_run,
-                    displayed: true,
-                });
-            }
             loop {
                 let envelope = futures_lite::future::or(events.recv_async(), async {
                     smol::Timer::after(std::time::Duration::from_secs(10)).await;
@@ -2212,64 +2159,6 @@ mod tests {
                     .timed_out
                     .is_empty()
             );
-        });
-    }
-
-    #[test]
-    fn queue_facade_preserves_compaction_order_and_removes_selected_entry() {
-        smol::block_on(async {
-            const FIRST: &str = "before compact";
-            const LAST: &str = "after compact";
-            const RUN_ID: u64 = 9;
-            let (backend, _, _) = failing_backend();
-            let (actor, task) = maki_agent::actor::AgentActorHandle::spawn(
-                backend.agent_id,
-                Vec::new(),
-                None,
-                Box::new(backend),
-            );
-            let boundary = actor.reserve_prepared_operation(None).unwrap();
-            let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
-            let push = |text: &str| {
-                queue
-                    .try_push(crate::agent::shared_queue::QueueItem::Message {
-                        text: text.into(),
-                        input: AgentInput::from_defaults(
-                            text.into(),
-                            AgentMode::Build,
-                            Vec::new(),
-                            Default::default(),
-                        ),
-                        run_id: RUN_ID,
-                        displayed: false,
-                    })
-                    .unwrap();
-            };
-            push(FIRST);
-            queue
-                .try_push(crate::agent::shared_queue::QueueItem::Compact {
-                    run_id: RUN_ID,
-                    instructions: None,
-                })
-                .unwrap();
-            push(LAST);
-            assert_eq!(
-                queue
-                    .panel_entries()
-                    .iter()
-                    .map(|entry| entry.text.as_ref())
-                    .collect::<Vec<_>>(),
-                [FIRST, maki_commands::COMPACT_COMMAND_NAME, LAST]
-            );
-            assert!(queue.remove(1));
-            assert_eq!(queue.text_messages(), [FIRST, LAST]);
-            assert_eq!(queue.panel_len(), 2);
-            assert!(queue.remove(1));
-            assert_eq!(queue.text_messages(), [FIRST]);
-            assert!(!queue.remove(1));
-            actor.close();
-            drop(boundary);
-            task.await;
         });
     }
 
@@ -2607,10 +2496,8 @@ mod tests {
                 ).unwrap();
                 let actor = root.actor().unwrap();
                 actor.observe_presentation(RUN_ID - 1);
-                let mut app = crate::app::tests::actor_presentation_app(
-                    crate::agent::shared_queue::actor_queue(Arc::new(actor.clone())),
-                    RUN_ID - 1,
-                );
+                let mut app =
+                    crate::app::tests::actor_presentation_app(root.clone(), RUN_ID - 1);
                 let actor_events = actor.subscribe_events();
                 let parent = active.then(|| actor.admit_turn(input, None, String::new()).unwrap());
                 if active {

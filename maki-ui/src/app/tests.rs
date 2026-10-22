@@ -1,6 +1,5 @@
 use super::shell::ShellEvent;
 use super::*;
-use crate::agent::shared_queue;
 use crate::app::session_state::FastIntent;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::components::btw_modal::BtwEvent;
@@ -64,6 +63,7 @@ const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
 const REJECTED_COMMAND_SHELL_COMMAND: &str = "pwd";
 const REJECTED_COMMAND_SHELL_OUTPUT: &str = "command shell cwd";
+const RUNNING_TURN_TEXT: &str = "running turn";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -449,22 +449,170 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
         command_runtime,
     );
-    let shared_queue = shared_queue::queue();
-    app.queue.set_shared(shared_queue);
+    bind_root(&mut app, parked_root());
     app
 }
 
 pub(crate) fn test_app() -> App {
+    app_with_root(parked_root())
+}
+
+/// The root's runner never starts, so queued work stays put for assertions.
+fn parked_root() -> AgentRef {
+    let (start_tx, start_rx) = flume::bounded(1);
+    AgentManagerHandle::new(Default::default())
+        .unwrap()
+        .create_root_deferred_with_config(
+            Some(root_config()),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(ParkedBackend(start_tx)) as Box<dyn ActorBackend>),
+            start_rx,
+        )
+        .unwrap()
+}
+
+/// A root whose first turn is running and never finishes.
+fn running_root_app() -> (App, flume::Receiver<AgentInput>) {
+    let (tx, rx) = flume::unbounded();
+    let root = AgentManagerHandle::new(Default::default())
+        .unwrap()
+        .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let actor = root.actor().unwrap();
+    let mut app = app_with_root(root);
+    let run_id = actor.reserve_presentation(app.run_id);
+    actor
+        .submit(
+            AgentInput::from_defaults(
+                RUNNING_TURN_TEXT.into(),
+                AgentMode::Build,
+                Vec::new(),
+                Default::default(),
+            ),
+            None,
+            String::new(),
+            maki_agent::actor::TurnAdmissionOptions {
+                already_displayed: true,
+                displayed_presentation: Some(run_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.record_run_start(run_id);
+    rx.recv_timeout(SETTLE_TIMEOUT).unwrap();
+    (app, rx)
+}
+
+fn app_with_root(root: AgentRef) -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    let shared_queue = shared_queue::queue();
-    app.queue.set_shared(shared_queue);
+    bind_root(&mut app, root);
     app
 }
 
-pub(crate) fn actor_presentation_app(queue: shared_queue::QueueSender, run_id: u64) -> App {
-    let mut app = test_app();
-    app.queue.set_shared(queue);
+fn root_config() -> EffectiveAgentConfig {
+    EffectiveAgentConfig::new(
+        maki_agent::RunSettings {
+            provider: cli_tool_ctx().provider,
+            model: test_model(),
+            fast: false,
+            workflow: false,
+            thinking: Default::default(),
+        },
+        AgentMode::Build,
+    )
+    .with_mode_def(maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build))
+}
+
+fn root_actor(app: &App) -> maki_agent::actor::AgentActorHandle {
+    app.command_runtime
+        .target_agent(&app.command_target)
+        .unwrap()
+        .actor()
+        .unwrap()
+}
+
+fn root_submissions(app: &App) -> Vec<String> {
+    root_actor(app)
+        .pending_submissions()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect()
+}
+
+fn commit_root_config(app: &App, change: maki_agent::actor::ConfigChange) {
+    let actor = root_actor(app);
+    smol::block_on(
+        actor
+            .reserve_prepared_operation(None)
+            .unwrap()
+            .commit_when_ready(Some(change)),
+    )
+    .unwrap();
+}
+
+fn commit_root_model(app: &App, model: Model) {
+    commit_root_config(
+        app,
+        maki_agent::actor::ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+            model: Some(maki_agent::actor::PreparedModel {
+                provider: cli_tool_ctx().provider,
+                model,
+            }),
+            ..Default::default()
+        }),
+    );
+}
+
+pub(crate) fn bind_root(app: &mut App, root: AgentRef) {
+    app.queue
+        .set_shared(crate::agent::shared_queue::actor_queue(Arc::new(
+            root.actor().unwrap(),
+        )));
+    app.chats[0].agent_id = Some(root.id());
+    bind_actor_target(app, root);
+    app.sync_focused_queue();
+}
+
+/// Owns the runner's start sender so the deferred runner stays parked, and
+/// with it every queued submission, for as long as the actor lives.
+struct ParkedBackend(#[allow(dead_code)] flume::Sender<()>);
+
+impl ActorBackend for ParkedBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: AgentInput,
+        _: maki_agent::WorkKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a maki_agent::ControlWork,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+pub(crate) fn actor_presentation_app(target: AgentRef, run_id: u64) -> App {
+    let mut app = app_with_root(target);
     app.run_id = run_id;
     app
 }
@@ -490,9 +638,7 @@ pub(crate) fn assert_actor_presentation(app: &mut App, run_id: u64, response: &s
 /// A `test_app` past its idle splash, whose drifting starfield would mask
 /// every other cadence.
 fn app_without_splash() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(agent_msg(AgentEvent::TextDelta { text: "hi".into() }));
     app.update(done_event());
     app
@@ -529,7 +675,8 @@ fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let writer = Arc::new(test_writer(dir.clone()));
-    let app = build_app(dir.clone(), Arc::clone(&writer));
+    let mut app = build_app(dir.clone(), Arc::clone(&writer));
+    bind_root(&mut app, parked_root());
     (tmp, dir, writer, app)
 }
 
@@ -775,8 +922,8 @@ fn typing_and_submit() {
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
 
-    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::SendMessage(s) if s.message == "hi"));
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(root_submissions(&app), ["hi"]);
     assert_eq!(app.status, Status::Streaming);
     // Regression check: the bubble has to be on screen the same frame we
     // submit, otherwise it briefly sits one row too high before snapping down.
@@ -969,8 +1116,7 @@ fn paste_file_path_triggers_image_load() {
 fn submit_during_streaming_queues_message() {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('a'))));
-    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::SendMessage(_)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.status, Status::Streaming);
 
     app.update(Msg::Key(key(KeyCode::Char('b'))));
@@ -1253,27 +1399,12 @@ fn queue_item_consumed_marks_agent_streaming() {
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test_case(error_app as fn(&mut App) ; "error")]
-#[test_case(cancel_app as fn(&mut App) ; "cancel")]
-fn clears_queue(terminate: fn(&mut App)) {
-    let mut app = app_with_queued_message();
+#[test_case(idle_app_with_queued_message, error_app ; "error")]
+#[test_case(app_with_queued_message, cancel_app ; "cancel")]
+fn clears_queue(setup: fn() -> App, terminate: fn(&mut App)) {
+    let mut app = setup();
     terminate(&mut app);
     assert!(app.queue.is_empty());
-}
-
-#[test]
-fn cancel_cut_preserves_work_admitted_after_capture() {
-    const SUCCESSOR: &str = "successor after cancellation cut";
-    let mut app = app_with_queued_message();
-    let (turn_id, run_id) = app.capture_cancel();
-    assert!(app.queue.is_empty());
-    assert!(app.queue_and_notify(queued_msg(SUCCESSOR)));
-
-    app.finish_cancel(turn_id, run_id);
-
-    assert_eq!(app.queue.text_messages(), [SUCCESSOR]);
-    assert_eq!(app.status, Status::Idle);
-    assert!(app.queue.focus().is_none());
 }
 
 #[test_case("/compact" ; "slash_command")]
@@ -1281,18 +1412,19 @@ fn cancel_cut_preserves_work_admitted_after_capture() {
 #[test_case("!ls" ; "shell_prefix")]
 fn submit_prompt_never_interprets_text(text: &str) {
     let mut app = test_app();
-    match app.submit_prompt(queued_msg(text)) {
-        SubmitOutcome::Started(actions) => {
-            assert!(matches!(&actions[0], Action::SendMessage(_)))
-        }
-        _ => panic!("raw prompt must start the agent"),
-    }
+    assert!(
+        matches!(
+            app.submit_prompt(queued_msg(text)),
+            SubmitOutcome::Started(_)
+        ),
+        "raw prompt must start the agent"
+    );
+    assert_eq!(root_submissions(&app), [text]);
 }
 
 #[test]
 fn submit_prompt_queues_while_streaming() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
+    let mut app = streaming_app();
     assert!(matches!(
         app.submit_prompt(queued_msg("hi")),
         SubmitOutcome::Queued
@@ -1301,20 +1433,12 @@ fn submit_prompt_queues_while_streaming() {
 }
 
 #[test_case(test_app as fn() -> App, "   ", queue::EMPTY_PROMPT_ERR ; "blank_text")]
-#[test_case(streaming_app_without_queue, "hi", queue::NO_QUEUE_ERR ; "streaming_without_shared_queue")]
 fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
     let mut app = mk();
     match app.submit_prompt(queued_msg(text)) {
         SubmitOutcome::Rejected(e) => assert_eq!(e, expected),
         _ => panic!("expected rejection"),
     }
-}
-
-fn streaming_app_without_queue() -> App {
-    let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    app.status = Status::Streaming;
-    app
 }
 
 fn queued_msg(text: &str) -> QueuedMessage {
@@ -1325,10 +1449,22 @@ fn queued_msg(text: &str) -> QueuedMessage {
 }
 
 fn app_with_queued_message() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.queue_and_notify(queued_msg("queued"));
+    app
+}
+
+/// A root error ends the turn before the app sees it, so the root holds no
+/// active turn that could absorb the queued message.
+fn idle_app_with_queued_message() -> App {
+    let mut app = idle_busy_app();
+    app.queue_and_notify(queued_msg("queued"));
+    app
+}
+
+fn idle_busy_app() -> App {
+    let mut app = test_app();
+    app.record_run_start(app.queue.reserve_run_id(app.run_id));
     app
 }
 
@@ -2092,9 +2228,7 @@ fn tab_in_palette_completes_command() {
 
 #[test]
 fn chat_navigation_actions() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
         TASK_ID,
@@ -2118,9 +2252,7 @@ fn chat_navigation_actions() {
 
 #[test]
 fn subagents_get_descriptive_names() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "a".into() },
         TASK_ID,
@@ -2138,9 +2270,7 @@ fn subagents_get_descriptive_names() {
 
 #[test]
 fn subagent_prompt_shown_once_and_not_duplicated() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg_with_prompt(
         AgentEvent::TextDelta { text: "a".into() },
         TASK_ID,
@@ -2806,14 +2936,14 @@ fn restored_subagents_have_no_ago_and_are_finished() {
 }
 
 fn streaming_app() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app
+    running_root_app().0
 }
 
 fn app_with_subagent_id(id: &str) -> App {
-    let mut app = streaming_app();
+    with_subagent(streaming_app(), id)
+}
+
+fn with_subagent(mut app: App, id: &str) -> App {
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "x".into() },
         id,
@@ -3096,9 +3226,7 @@ const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
 
 #[test]
 fn cancel_clears_pending_input() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.pending_input = PendingInput::AuthRetry { agent_id: None };
     cancel_app(&mut app);
     assert_eq!(app.pending_input, PendingInput::None);
@@ -3224,9 +3352,7 @@ fn mouse_up_clears_edge_scroll() {
 
 #[test]
 fn double_esc_cancels_flushes_and_fails_tools() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(agent_msg(AgentEvent::TextDelta {
         text: "partial".into(),
     }));
@@ -3271,19 +3397,15 @@ fn double_esc_idle_no_user_turns_flashes_error() {
 
 #[test]
 fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
-    let mut app = test_app();
-    const RUN_ID: u64 = 1;
-    const QUEUED_RUN_ID: u64 = 9;
-    app.status = Status::Streaming;
-    app.run_id = RUN_ID;
-    app.queue.set_run_id(QUEUED_RUN_ID);
+    let mut app = streaming_app();
+    let cancelled_run = app.run_id;
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(matches!(
         &actions[0],
-        Action::CancelAgent { turn_id: None, run_id } if *run_id == RUN_ID
+        Action::CancelAgent { turn_id: Some(_), run_id } if *run_id == cancelled_run
     ));
-    assert_eq!(app.run_id, QUEUED_RUN_ID + 1);
+    assert!(app.run_id > cancelled_run);
     assert_eq!(app.status, Status::Idle);
     assert_ne!(app.exit_request, ExitRequest::Success);
 }
@@ -4503,10 +4625,10 @@ fn ctrl_q_pops_newest_visible_item() {
     );
 }
 
-#[test_case(cancel_app as fn(&mut App) ; "cancel")]
-#[test_case(error_app as fn(&mut App)  ; "error")]
-fn clears_queue_focus_on_terminate(terminate: fn(&mut App)) {
-    let mut app = app_with_queued_message();
+#[test_case(app_with_queued_message, cancel_app ; "cancel")]
+#[test_case(idle_app_with_queued_message, error_app ; "error")]
+fn clears_queue_focus_on_terminate(setup: fn() -> App, terminate: fn(&mut App)) {
+    let mut app = setup();
     app.queue.set_focus_at(0);
     terminate(&mut app);
     assert!(app.queue.focus().is_none());
@@ -4514,14 +4636,11 @@ fn clears_queue_focus_on_terminate(terminate: fn(&mut App)) {
 
 #[test]
 fn stale_events_ignored_after_run_id_increment() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
 
     cancel_app(&mut app);
     let current_run = app.run_id;
-    let actions = type_and_submit(&mut app, "new prompt");
-    assert!(matches!(&actions[0], Action::SendMessage(i) if i.message == "new prompt"));
+    type_and_submit(&mut app, "new prompt");
     let active_run = app.run_id;
 
     app.update(agent_msg_with_run_id(
@@ -4544,9 +4663,7 @@ fn stale_events_ignored_after_run_id_increment() {
 
 #[test]
 fn stale_done_does_not_drain_queue() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
 
     cancel_app(&mut app);
     app.queue_and_notify(queued_msg("next"));
@@ -4571,9 +4688,7 @@ fn mouse_down_in_input_creates_input_zone_selection() {
 
 #[test]
 fn resolve_or_create_chat_sets_model_id_and_annotation() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: TASK_ID.into(),
         tool: TASK_SPAWN_TOOL_NAME.into(),
@@ -4629,7 +4744,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "idle"
 )]
 #[test_case(
-    |app: &mut App| { app.status = Status::Streaming; },
+    |app: &mut App| { *app = streaming_app(); },
     &[KeybindContext::General, KeybindContext::Streaming, KeybindContext::Editing],
     &[]
     ; "streaming"
@@ -5004,7 +5119,6 @@ fn copy_tui_fixture() -> CopyTuiFixture {
         .set_cwd(root.path().to_string_lossy().into_owned());
     app.command_palette
         .set_cwd(Arc::from(root.path().to_string_lossy().as_ref()));
-    app.queue.set_shared(shared_queue::queue());
 
     let actions = host.host().ui_action_rx();
     CopyTuiFixture {
@@ -5406,12 +5520,8 @@ fn slash_noncommand_is_rejected_and_flashes() {
 #[test_case("///lmao", "//lmao" ; "triple slash strips one slash")]
 fn slash_escape_sends_literal_input(text: &str, expected: &str) {
     let mut app = test_app();
-    let actions = type_and_submit(&mut app, text);
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::SendMessage(input) if input.message.as_str() == expected
-    ));
+    assert!(type_and_submit(&mut app, text).is_empty());
+    assert_eq!(root_submissions(&app), [expected]);
 }
 
 fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
@@ -5687,7 +5797,7 @@ fn focused_queue_preserves_compact_and_stale_removal_identity() {
         .unwrap();
     type_and_submit(&mut app, "after compact");
     app.sync_focused_queue();
-    assert_eq!(app.queue.panel_len(), 3);
+    assert_eq!(app.queue.len(), 3);
     assert_eq!(app.queue.panel_entries()[1].text, COMPACT_WITH_GUIDANCE);
     app.queue.set_focus_at(0);
     let first = actor
@@ -5698,11 +5808,11 @@ fn focused_queue_preserves_compact_and_stale_removal_identity() {
     actor.remove_submission(first.id).unwrap();
     assert_eq!(app.queue.focus(), None);
     app.queue.remove_focused();
-    assert_eq!(app.queue.panel_len(), 2);
+    assert_eq!(app.queue.len(), 2);
     assert_eq!(app.queue.panel_entries()[0].text, COMPACT_WITH_GUIDANCE);
     app.queue.set_focus_at(0);
     app.queue.remove_focused();
-    assert_eq!(app.queue.panel_len(), 1);
+    assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.panel_entries()[0].text, "after compact");
 }
 
@@ -5912,9 +6022,7 @@ fn tick_error_expiry(age: Duration, expect_error: bool) {
 
 #[test]
 fn retry_clears_in_progress_tools() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(agent_msg(AgentEvent::ToolPending {
         id: "t1".into(),
         name: "bash".into(),
@@ -5932,9 +6040,7 @@ fn retry_clears_in_progress_tools() {
 
 #[test]
 fn retry_clears_subagent_in_progress_tools() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::ToolPending {
             id: "st1".into(),
@@ -5970,9 +6076,7 @@ fn auth_retry_type_then_enter(app: &mut App) -> Vec<Action> {
 #[test_case(auth_retry_enter          ; "bare_enter")]
 #[test_case(auth_retry_type_then_enter ; "typed_text_then_enter")]
 fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let (tx, rx) = flume::unbounded();
     app.answer_tx = Some(tx);
 
@@ -5991,9 +6095,7 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
 fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
     let (sub_tx, sub_rx) = flume::unbounded();
     let (main_tx, main_rx) = flume::unbounded();
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.answer_tx = Some(main_tx);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
@@ -6069,9 +6171,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
 #[test]
 fn send_to_agent_unknown_subagent_falls_back_to_main() {
     let (main_tx, main_rx) = flume::unbounded();
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.answer_tx = Some(main_tx);
 
     app.pending_input = PendingInput::AuthRetry {
@@ -6323,9 +6423,10 @@ fn overlay_zone_click_gating() {
 }
 
 fn streaming_app_with_history() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    with_history(streaming_app())
+}
+
+fn with_history(mut app: App) -> App {
     let history = vec![
         Message::user("hello".into()),
         Message {
@@ -6586,7 +6687,7 @@ fn parent_done_preserves_shell_and_same_id_child_tool() {
 
 #[test]
 fn error_event_matching_run_id_saves_session_and_queued_messages() {
-    let mut app = streaming_app_with_history();
+    let mut app = with_history(idle_busy_app());
     app.queue_and_notify(queued_msg("next"));
 
     app.update(agent_msg(AgentEvent::ControlError {
@@ -6607,7 +6708,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
 
 #[test]
 fn flush_restored_queue_drops_recovery_snapshot() {
-    let mut app = streaming_app_with_history();
+    let mut app = with_history(idle_busy_app());
     app.queue_and_notify(queued_msg("next"));
     app.update(agent_msg(AgentEvent::ControlError {
         message: "boom".into(),
@@ -6620,7 +6721,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
     assert_eq!(app.state.session.meta.queued_messages, ["next"]);
     assert!(app.recoverable_queue.is_empty());
 
-    app.queue.clear();
+    app.queue.clear_root_user_work();
     app.checkpoint();
     assert!(app.state.session.meta.queued_messages.is_empty());
 }
@@ -6628,9 +6729,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 // --- Plan form integration tests ---
 
 fn plan_app() -> App {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -6648,9 +6747,7 @@ fn plan_app() -> App {
 #[test_case(Mode::Plan,  true  ; "plan_mode_tooldone_opens_form")]
 #[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
 fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.state.mode = mode;
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -6669,9 +6766,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
 
 #[test]
 fn done_event_does_not_open_plan_form() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.update(done_event());
@@ -6754,6 +6849,13 @@ fn plan_submit_mode_disables_auto_open() {
         .unwrap();
 
     let mut app = test_app();
+    commit_root_config(
+        &app,
+        maki_agent::actor::ConfigChange::Mode {
+            mode: AgentMode::Plan("/tmp/plans/test.md".into()),
+            mode_def: registry.get(&maki_agent::ModeId::Plan),
+        },
+    );
     app.lua_event_handle =
         maki_lua::EventHandle::disconnected_for_test_with_modes(Arc::new(registry));
     app.status = Status::Streaming;
@@ -6876,7 +6978,10 @@ fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
         LATE_MODEL_SPEC.split_once('/').unwrap().1.into(),
     ));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == LATE_MODEL_SPEC));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ChangePinnedModel { spec, .. }] if spec == LATE_MODEL_SPEC
+    ));
     assert_eq!(app.plan_form.implementation_model(), None);
     assert!(app.plan_form.is_visible());
 }
@@ -7013,7 +7118,9 @@ fn normal_model_picker_still_requests_model_change() {
     models.store(Some(Arc::new(vec![MODEL.into()])));
     app.run_builtin(BuiltinAction::ModelPicker);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == MODEL));
+    assert!(
+        matches!(actions.as_slice(), [Action::ChangePinnedModel { spec, .. }] if spec == MODEL)
+    );
     assert_eq!(app.plan_form.implementation_model(), None);
 }
 
@@ -7064,26 +7171,20 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
     let mut app = plan_app();
     let initial_height = app
         .plan_form
-        .height(RENDER_AREA.width, &app.state.model.spec());
+        .height(RENDER_AREA.width, &app.focused_model_spec());
     const MODEL: &str = "zai/glm-5";
-    if !staged {
-        app.state.model = Model::from_spec(MODEL).unwrap();
-    }
     if staged {
         app.plan_form
-            .set_implementation_model(MODEL.into(), &app.state.model.spec());
+            .set_implementation_model(MODEL.into(), &app.focused_model_spec());
+    } else {
+        commit_root_model(&app, Model::from_spec(MODEL).unwrap());
     }
     let rows = rendered_area(&mut app).join("\n");
-    let spec = if staged {
-        MODEL.to_owned()
-    } else {
-        app.state.model.spec()
-    };
-    assert!(rows.contains(&format!("Implementation model: {spec}")));
+    assert!(rows.contains(&format!("Implementation model: {MODEL}")));
     assert_eq!(rows.contains("Use current model"), staged);
     let height = app
         .plan_form
-        .height(RENDER_AREA.width, &app.state.model.spec());
+        .height(RENDER_AREA.width, &app.focused_model_spec());
     assert_eq!(height, initial_height + u16::from(staged));
     let (_, bottom, _, _, _) = app.layout_geometry(RENDER_AREA);
     assert_eq!(bottom.height, height);
@@ -7093,8 +7194,8 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
 fn staged_model_matching_session_model_approves_without_override() {
     let mut app = plan_app();
     app.plan_form
-        .set_implementation_model(LATE_MODEL_SPEC.into(), &app.state.model.spec());
-    app.state.model = Model::from_spec(LATE_MODEL_SPEC).unwrap();
+        .set_implementation_model(LATE_MODEL_SPEC.into(), &app.focused_model_spec());
+    commit_root_model(&app, Model::from_spec(LATE_MODEL_SPEC).unwrap());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -7325,9 +7426,7 @@ fn plan_toggle_beats_override_when_open_and_after_dismiss() {
 
 #[test]
 fn streaming_cancel_wins_over_quit_override() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let _probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
@@ -7362,9 +7461,7 @@ fn dead_host_override_falls_back_to_builtin() {
 
 #[test]
 fn streaming_cancel_wins_over_esc_override() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
     let _probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -7498,19 +7595,6 @@ fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
 }
 
 #[test]
-fn streaming_status_uses_context_window_of_active_run() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_context_window = Some(123_456);
-    app.state.model.context_window = 987_654;
-
-    let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
-
-    assert!(status.contains(&maki_providers::format_tokens(123_456)));
-    assert!(!status.contains(&maki_providers::format_tokens(987_654)));
-}
-
-#[test]
 fn model_switch_updates_active_run_status() {
     const SWITCHED_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
     const INITIAL_CONTEXT_WINDOW: u32 = 123_456;
@@ -7569,9 +7653,7 @@ fn workflow_toggle_flows_into_agent_input() {
 /// SubagentHistory is what finishes their chat.
 #[test]
 fn subagent_history_finishes_workflow_chat() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
         "session-abc",
@@ -7594,9 +7676,7 @@ fn subagent_history_finishes_workflow_chat() {
 
 #[test]
 fn stamped_child_tool_done_does_not_finish_the_child_turn() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let info = subagent_info(TASK_ID, "worker");
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -7646,9 +7726,7 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
 
 #[test]
 fn outer_task_done_does_not_duplicate_stamped_child_completion() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let info = subagent_info(TASK_ID, "worker");
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
@@ -7685,9 +7763,7 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
 #[test]
 fn reusable_subagent_processes_distinct_turn_outcomes() {
     const FAILURE_MESSAGE: &str = "second turn failed";
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let info = subagent_info(TASK_ID, "worker");
     let envelope = |outcome| {
         Msg::Agent(Box::new(Envelope {
@@ -7767,9 +7843,7 @@ fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
 
 #[test]
 fn stamped_child_failure_wins_over_prior_history_snapshot() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.update(subagent_msg(
         AgentEvent::TextDelta { text: "sub".into() },
         TASK_ID,
@@ -7815,9 +7889,7 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
 fn failed_subagent_is_presented_without_ui_delivery(parent_is_root: bool, auto_deliver: bool) {
     const FAILURE_MESSAGE: &str = "provider unavailable";
 
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let (input_tx, _input_rx) = flume::unbounded();
     let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
     info.parent_is_root = parent_is_root;
@@ -7903,9 +7975,7 @@ fn update_model_to_ineligible_resets_fast() {
 
 #[test]
 fn agent_error_creates_synthetic_tool_done_with_message() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
 
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "t1".into(),
@@ -8228,6 +8298,7 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                         let (target, rx) =
                             spawn_input_child_with_mode(&mut app, TASK_ID, "matrix-agent", mode);
                         let config = target.effective_config().unwrap().unwrap();
+                        commit_root_model(&app, config.model.clone());
                         app.state.model = config.model.clone();
                         app.state.session_mut().model = config.model.spec();
                         if child {
@@ -8337,7 +8408,14 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
 #[test_case(true, true ; "both_busy")]
 fn focused_status_render_does_not_leak_root_state(root_busy: bool, child_busy: bool) {
     const ROOT_ERROR: &str = "root-only error";
-    let mut app = app_with_subagent();
+    let mut app = with_subagent(
+        if root_busy {
+            streaming_app()
+        } else {
+            test_app()
+        },
+        TASK_ID,
+    );
     app.status = if root_busy {
         Status::Streaming
     } else {
@@ -8832,9 +8910,7 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
 /// `retain_resolved_subagents` carries the survivors over.
 #[test]
 fn turn_end_keeps_running_and_finished_subagents() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     for (task_id, name) in [
         (FINISHED_TASK_ID, "finished child"),
         (UNFINISHED_TASK_ID, "open child"),
@@ -8881,8 +8957,6 @@ fn completion_app() -> (TempDir, App, Arc<maki_lua::TestCompletionBackend>) {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = maki_lua::test_support::event_handle_with_completion();
     let mut app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
-    let shared_queue = shared_queue::queue();
-    app.queue.set_shared(shared_queue);
     std::sync::Arc::get_mut(&mut app.state.session)
         .unwrap()
         .set_cwd(tmp.path().to_string_lossy().into_owned());
@@ -9992,25 +10066,14 @@ fn submit_expands_subagent_model_and_skill_in_place() {
 #[test]
 fn submit_standalone_model_expands_in_place_no_action() {
     let (_tmp, mut app, backend) = completion_app();
+    bind_root(&mut app, parked_root());
     seed_models(&backend, &["zai/glm-5"]);
-    let outcome = app.submit_prompt(queued_msg("@model:zai/glm-5 fix the bug"));
-    let actions = match outcome {
-        SubmitOutcome::Started(a) => a,
-        _ => panic!("expected Started"),
-    };
     // No ChangeModel: the `@model` path no longer switches the session model.
-    assert!(
-        !actions.iter().any(|a| matches!(a, Action::ChangeModel(_))),
-        "@model must not emit ChangeModel"
-    );
-    let message = actions
-        .into_iter()
-        .find_map(|a| match a {
-            Action::SendMessage(inp) => Some(inp.message),
-            _ => None,
-        })
-        .expect("SendMessage action");
-    assert_eq!(message, "<model:zai/glm-5> fix the bug");
+    assert!(matches!(
+        app.submit_prompt(queued_msg("@model:zai/glm-5 fix the bug")),
+        SubmitOutcome::Started(actions) if actions.is_empty()
+    ));
+    assert_eq!(root_submissions(&app), ["<model:zai/glm-5> fix the bug"]);
 }
 
 #[test]
@@ -10312,19 +10375,16 @@ fn shared_submission_preserves_images_and_preamble(child: bool) {
     let (mut app, input_rx) = if child {
         app_with_subagent_actor(TASK_ID)
     } else {
-        let mut app = test_app();
-        let manager = AgentManagerHandle::new(Default::default()).unwrap();
         let (tx, rx) = flume::unbounded();
-        let root = manager
+        let root = AgentManagerHandle::new(Default::default())
+            .unwrap()
             .create_root_with_config(None, Vec::new(), None, |_| {
                 Ok::<_, String>(
                     Box::new(FocusedInputBackend(tx)) as Box<dyn maki_agent::ActorBackend>
                 )
             })
             .unwrap();
-        app.chats[0].agent_id = Some(root.id());
-        bind_actor_target(&app, root);
-        (app, rx)
+        (app_with_root(root), rx)
     };
     let target = app.selected_agent_id().unwrap();
     let id = app.shell.reserve_for(Some(target));
@@ -10340,7 +10400,12 @@ fn shared_submission_preserves_images_and_preamble(child: bool) {
     let mut msg = queued_msg("hi");
     msg.images
         .push(ImageSource::new(ImageMediaType::Png, Arc::clone(&data)));
-    assert!(matches!(app.submit_prompt(msg), SubmitOutcome::Queued));
+    let outcome = app.submit_prompt(msg);
+    if child {
+        assert!(matches!(outcome, SubmitOutcome::Queued));
+    } else {
+        assert!(matches!(outcome, SubmitOutcome::Started(_)));
+    }
     let input = received_input(&input_rx);
     assert_eq!(input.images.len(), 1);
     assert_eq!(input.images[0].data, data);
@@ -10856,9 +10921,7 @@ fn subagent_history_updates_storage_without_queuing_parent_work() {
 
 #[test]
 fn grandchild_history_is_visible_but_not_promoted_to_root() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let parent_id = AgentId::generate();
     let grandchild_id = AgentId::generate();
     let (input_tx, _input_rx) = flume::unbounded();
@@ -10934,9 +10997,7 @@ fn permission_request_event() -> AgentEvent {
 
 #[test]
 fn turn_complete_emits_bell() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let actions = app.update(done_event());
     assert!(
         actions.iter().any(|a| matches!(a, Action::Bell)),
@@ -10959,9 +11020,7 @@ fn turn_complete_bell_disabled() {
 
 #[test]
 fn permission_request_emits_bell() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     let actions = app.update(agent_msg(permission_request_event()));
     assert!(
         actions.iter().all(|a| !matches!(a, Action::Bell)),
@@ -11624,9 +11683,7 @@ fn question_drawn_on_top_when_active() {
 
 #[test]
 fn bell_deferred_until_idle_promotion() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
+    let mut app = streaming_app();
     app.last_input = Some(Instant::now());
     let actions = app.update(agent_msg(permission_request_event()));
     assert!(

@@ -201,6 +201,7 @@ impl App {
     pub(super) fn reset_ui_chrome(&mut self) {
         let _ = self.cancel_middle_scroll();
         let splash_frame = self.chats.first().and_then(Chat::splash_frame).cloned();
+        let root = self.chats.first().and_then(|chat| chat.agent_id);
         self.chats.clear();
         let mut main = Chat::new(
             "Main".into(),
@@ -210,6 +211,7 @@ impl App {
         );
         main.set_restore_channel(self.restore_event_tx.clone());
         main.set_splash_frame(splash_frame);
+        main.agent_id = root;
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
@@ -217,7 +219,7 @@ impl App {
         self.terminal_subagents.clear();
         self.status = super::Status::Idle;
         self.clear_exit_request();
-        self.queue.clear();
+        self.queue.clear_root_user_work();
         self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;

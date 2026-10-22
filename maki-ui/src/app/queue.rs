@@ -5,19 +5,18 @@ use maki_agent::actor::{
     AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use maki_agent::{AgentId, AgentInput, TurnId};
+use maki_agent::{AgentId, AgentInput, AgentRef};
 use maki_commands::COMPACT_COMMAND_NAME;
 use std::borrow::Cow;
 
 use super::{Action, App, Status};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::agent::shared_queue::{QueueItem, QueueSender, visible_pending};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
-pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
 pub(crate) const NO_SUBAGENT_ERR: &str = "subagent is no longer accepting messages";
 
 pub(crate) enum SubmitOutcome {
@@ -32,8 +31,7 @@ pub(crate) struct MessageQueue {
     target: Option<AgentActorHandle>,
     target_id: Option<AgentId>,
     child_selected: bool,
-    focused_submission: Option<PendingIdentity>,
-    focus: Option<usize>,
+    focused: Option<PendingIdentity>,
     cancelled_through: u64,
 }
 
@@ -50,15 +48,22 @@ fn pending_identity(entry: &PendingQueueEntry) -> PendingIdentity {
     }
 }
 
-fn visible_pending(actor: &AgentActorHandle) -> Vec<PendingQueueEntry> {
-    actor
-        .pending_queue()
-        .into_iter()
-        .filter(|entry| match entry {
-            PendingQueueEntry::Message(entry) => !entry.already_displayed,
-            PendingQueueEntry::Compact { .. } => true,
-        })
-        .collect()
+fn panel_entry(entry: PendingQueueEntry) -> QueueEntry<'static> {
+    match entry {
+        PendingQueueEntry::Message(entry) => QueueEntry {
+            text: Cow::Owned(entry.text),
+            color: theme::current().foreground,
+        },
+        PendingQueueEntry::Compact { instructions, .. } => QueueEntry {
+            text: instructions.map_or(Cow::Borrowed(COMPACT_COMMAND_NAME), |extra| {
+                Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}"))
+            }),
+            color: theme::current()
+                .queue
+                .fg
+                .unwrap_or(theme::current().foreground),
+        },
+    }
 }
 
 impl MessageQueue {
@@ -75,6 +80,7 @@ impl MessageQueue {
         self.child_selected = child;
         self.target = actor;
     }
+
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
     }
@@ -96,14 +102,6 @@ impl MessageQueue {
         })
     }
 
-    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
-        self.shared
-            .as_ref()
-            .map_or((None, displayed_run_id + 1), |shared| {
-                shared.capture_cancel(displayed_run_id)
-            })
-    }
-
     pub(crate) fn current_run_id(&self) -> Option<u64> {
         self.shared.as_ref().map(QueueSender::current_run_id)
     }
@@ -114,56 +112,32 @@ impl MessageQueue {
         }
     }
 
+    fn entries(&self) -> Vec<PendingQueueEntry> {
+        self.target.as_ref().map_or(Vec::new(), visible_pending)
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     pub(crate) fn len(&self) -> usize {
-        if self.target.is_some() || self.child_selected {
-            return self
-                .target
-                .as_ref()
-                .map_or(0, |actor| visible_pending(actor).len());
-        }
-        self.shared.as_ref().map_or(0, |s| s.len())
+        self.entries().len()
     }
 
-    pub(crate) fn remove(&mut self, index: usize) {
-        if self.target.is_some() || self.child_selected {
-            if let Some(actor) = &self.target {
-                let id = if self.focus() == Some(index) {
-                    self.focused_submission
-                } else {
-                    visible_pending(actor).get(index).map(pending_identity)
-                };
-                match id {
-                    Some(PendingIdentity::Message(id)) => {
-                        actor.remove_submission(id);
-                    }
-                    Some(PendingIdentity::Compact(operation_id)) => {
-                        actor.remove_pending_compact(operation_id);
-                    }
-                    None => {}
-                }
-            }
-            self.unfocus();
+    fn remove(&self, index: usize) {
+        let Some(actor) = &self.target else {
             return;
+        };
+        match self.entries().get(index).map(pending_identity) {
+            Some(PendingIdentity::Message(id)) => {
+                actor.remove_submission(id);
+            }
+            Some(PendingIdentity::Compact(operation_id)) => {
+                actor.remove_pending_compact(operation_id);
+            }
+            None => {}
         }
-        // Removal success (or absence) only affects whether focus clamps;
-        // the panel must never point past the (possibly unchanged) list.
-        if let Some(ref shared) = self.shared {
-            shared.remove(index);
-        }
-        self.clamp_focus();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear(&mut self) {
-        if let Some(ref shared) = self.shared {
-            shared.clear();
-        }
-        self.focus = None;
     }
 
     pub(crate) fn clear_root_user_work(&mut self) {
@@ -182,13 +156,10 @@ impl MessageQueue {
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        if let Some(actor) = &self.target {
-            let identity = self.focused_submission?;
-            return visible_pending(actor)
-                .iter()
-                .position(|entry| pending_identity(entry) == identity);
-        }
-        self.focus.filter(|&index| index < self.len())
+        let identity = self.focused?;
+        self.entries()
+            .iter()
+            .position(|entry| pending_identity(entry) == identity)
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -196,8 +167,7 @@ impl MessageQueue {
     }
 
     pub(crate) fn unfocus(&mut self) {
-        self.focus = None;
-        self.focused_submission = None;
+        self.focused = None;
     }
 
     pub(crate) fn move_focus_up(&mut self) {
@@ -210,102 +180,42 @@ impl MessageQueue {
 
     pub(crate) fn move_focus_down(&mut self) {
         if let Some(sel) = self.focus() {
-            let len = self.len();
-            if sel + 1 < len {
-                self.set_focus_at(sel + 1);
-            }
+            self.set_focus_at(sel + 1);
         }
     }
 
+    /// Removes the focused entry and moves focus to whatever now sits in its
+    /// row, so repeated removals walk down the list.
     pub(crate) fn remove_focused(&mut self) {
-        if let Some(actor) = &self.target {
-            match self.focused_submission {
-                Some(PendingIdentity::Message(id)) => {
-                    actor.remove_submission(id);
-                }
-                Some(PendingIdentity::Compact(operation_id)) => {
-                    actor.remove_pending_compact(operation_id);
-                }
-                None => {}
-            }
-            self.unfocus();
-        } else if let Some(sel) = self.focus() {
-            self.remove(sel);
+        let Some(index) = self.focus() else {
+            return;
+        };
+        self.remove(index);
+        self.unfocus();
+        let len = self.len();
+        if len > 0 {
+            self.set_focus_at(index.min(len - 1));
         }
     }
 
     pub(crate) fn pop_newest(&mut self) {
-        if let Some(index) = self.panel_len().checked_sub(1) {
+        if let Some(index) = self.len().checked_sub(1) {
             self.remove(index);
         }
     }
 
-    pub(crate) fn panel_len(&self) -> usize {
-        if self.target.is_some() || self.child_selected {
-            return self.len();
-        }
-        self.shared.as_ref().map_or(0, |s| s.panel_len())
-    }
-
     pub(crate) fn panel_entries(&self) -> Vec<QueueEntry<'static>> {
-        if self.target.is_some() || self.child_selected {
-            return self.target.as_ref().map_or(Vec::new(), |actor| {
-                visible_pending(actor)
-                    .into_iter()
-                    .map(|entry| match entry {
-                        PendingQueueEntry::Message(entry) => QueueEntry {
-                            text: Cow::Owned(entry.text),
-                            color: theme::current().foreground,
-                        },
-                        PendingQueueEntry::Compact { instructions, .. } => QueueEntry {
-                            text: instructions
-                                .map_or(Cow::Borrowed(COMPACT_COMMAND_NAME), |extra| {
-                                    Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}"))
-                                }),
-                            color: theme::current()
-                                .queue
-                                .fg
-                                .unwrap_or(theme::current().foreground),
-                        },
-                    })
-                    .collect()
-            });
-        }
-        self.shared.as_ref().map_or(vec![], |s| s.panel_entries())
+        self.entries().into_iter().map(panel_entry).collect()
     }
 
     #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
-        if self.target.is_some() || self.child_selected {
-            return self.target.as_ref().map_or(Vec::new(), |actor| {
-                visible_pending(actor)
-                    .into_iter()
-                    .filter_map(|entry| match entry {
-                        PendingQueueEntry::Message(entry) => Some(entry.text),
-                        PendingQueueEntry::Compact { .. } => None,
-                    })
-                    .collect()
-            });
-        }
-        self.shared.as_ref().map_or(vec![], |s| s.text_messages())
-    }
-
-    fn clamp_focus(&mut self) {
-        let len = self.len();
-        self.focus = match self.focus {
-            Some(_) if len == 0 => None,
-            Some(sel) if sel >= len => Some(len - 1),
-            other => other,
-        };
+        crate::agent::shared_queue::pending_texts(self.entries())
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
-        if index < self.len() {
-            self.focus = Some(index);
-            self.focused_submission = self
-                .target
-                .as_ref()
-                .and_then(|actor| visible_pending(actor).get(index).map(pending_identity));
+        if let Some(identity) = self.entries().get(index).map(pending_identity) {
+            self.focused = Some(identity);
         }
     }
 }
@@ -327,18 +237,7 @@ impl App {
         };
         let mut msg = msg;
         msg.text = expanded;
-        if !self.is_main_chat() || self.selected_agent_id().is_some() {
-            return self.submit_to_focused_actor(msg);
-        }
-        if self.status == Status::Streaming {
-            if self.queue_and_notify(msg) {
-                SubmitOutcome::Queued
-            } else {
-                SubmitOutcome::Rejected(NO_QUEUE_ERR.into())
-            }
-        } else {
-            SubmitOutcome::Started(self.start_from_queue(&msg))
-        }
+        self.submit_to_focused_actor(msg)
     }
 
     /// Keyboard path: nobody is around to receive an `Err`, so
@@ -365,10 +264,6 @@ impl App {
         else {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
-        let actor = match target.validate_live().and_then(|()| target.actor()) {
-            Ok(actor) => actor,
-            Err(error) => return SubmitOutcome::Rejected(error.to_string()),
-        };
         let mut input = self.build_agent_input(&msg);
         if let Ok(Some(config)) = target.effective_config() {
             input.mode = config.mode.clone();
@@ -376,52 +271,65 @@ impl App {
             input.fast = config.settings.fast;
             input.workflow = config.settings.workflow;
         }
+        match self.admit_user_turn(&target, input, Some(msg.text)) {
+            Ok(true) => SubmitOutcome::Started(Vec::new()),
+            Ok(false) => SubmitOutcome::Queued,
+            Err(error) => SubmitOutcome::Rejected(error),
+        }
+    }
+
+    /// Admits a user turn to `target` and reports whether it started a root
+    /// run. Typed input (`display`) is submitted so it can fold into an active
+    /// turn, and a starting one is drawn at once; command turns are admitted
+    /// as their own turn and drawn on consumption. A starting root turn is
+    /// admitted under the presentation reserved here, so the app records the
+    /// id the actor stamps.
+    pub(super) fn admit_user_turn(
+        &mut self,
+        target: &AgentRef,
+        mut input: AgentInput,
+        display: Option<String>,
+    ) -> Result<bool, String> {
+        let actor = target
+            .validate_live()
+            .and_then(|()| target.actor())
+            .map_err(|error| error.to_string())?;
+        let root = self.chats[0].agent_id == Some(target.id());
         input.preamble = self.shell.results_for(Some(target.id())).to_vec();
-        if self.is_main_chat() {
+        if root {
             input
                 .preamble
                 .extend_from_slice(self.shell.results_for(None));
         }
-        let root = self.is_main_chat();
-        let starting = root && !self.focused_streaming();
-        let run_id = if starting {
-            actor.reserve_presentation(self.run_id)
-        } else if root {
-            actor.presentation_id()
-        } else {
-            0
-        };
-        let correlation = if root {
-            crate::agent::shared_queue::correlation(run_id)
-        } else {
-            String::new()
-        };
-        match actor.submit(
-            input,
-            None,
-            correlation,
-            TurnAdmissionOptions {
-                provenance: TurnProvenance {
-                    origin: TurnOrigin::User,
-                    ..Default::default()
-                },
-                // The app already chose the id it will draw and fence under.
-                displayed_presentation: Some(run_id),
+        let starting = root && self.status != Status::Streaming;
+        let reserved = starting.then(|| actor.reserve_presentation(self.run_id));
+        let images = input.images.clone();
+        let options = TurnAdmissionOptions {
+            provenance: TurnProvenance {
+                origin: TurnOrigin::User,
                 ..Default::default()
             },
-        ) {
-            Ok(_) => {
-                self.shell.drain_results_for(Some(target.id()));
-                if root {
-                    self.shell.drain_results();
-                }
-                if starting {
-                    self.record_run_start(run_id);
-                }
-                SubmitOutcome::Queued
-            }
-            Err(error) => SubmitOutcome::Rejected(error.to_string()),
+            already_displayed: starting && display.is_some(),
+            displayed_presentation: reserved,
+            ..Default::default()
+        };
+        let admitted = if display.is_some() {
+            actor.submit(input, None, String::new(), options)
+        } else {
+            actor.admit_turn_with_options(input, None, String::new(), options)
+        };
+        admitted.map_err(|error| error.to_string())?;
+        self.shell.drain_results_for(Some(target.id()));
+        if root {
+            self.shell.drain_results();
         }
+        if let Some(run_id) = reserved {
+            self.record_run_start(run_id);
+            if let Some(text) = display {
+                self.main_chat().show_user_message(text, images);
+            }
+        }
+        Ok(starting)
     }
 
     /// Deferred path: the agent is busy, so park the message and let
@@ -433,8 +341,7 @@ impl App {
         };
         let input = self.build_agent_input(&msg);
         shared
-            .try_push(QueueItem::Message {
-                text: msg.text,
+            .try_push(QueueItem {
                 input,
                 run_id: self.run_id,
                 displayed: false,
@@ -456,17 +363,6 @@ impl App {
                 images: Vec::new(),
             });
         }
-    }
-
-    /// Agent reached a deferred message: time to draw the bubble. Restored
-    /// queue items start runs without `start_run`, so this is where the app
-    /// learns the agent is busy. Immediate-dispatch items skip this event,
-    /// so no dedup needed.
-    /// Immediate path: kick off the agent and draw the bubble in the same
-    /// frame, so the user sees their message land where it will stay.
-    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
-        let input = self.build_agent_input(msg);
-        self.start_run(input, msg.text.clone())
     }
 
     pub(crate) fn start_mailbox_run(

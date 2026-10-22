@@ -767,12 +767,6 @@ fn materialize(
     }
 }
 
-/// Allocates the presentation id that follows `current`, never reusing one and
-/// never going below the floor `displayed` the frontend has already reached.
-pub fn next_presentation(current: u64, displayed: u64) -> u64 {
-    current.max(displayed) + 1
-}
-
 impl ActorState {
     fn check_instruction_capacity(&self, bytes: usize) -> Result<(), ActorError> {
         let (count, total) = self
@@ -789,7 +783,7 @@ impl ActorState {
     /// Allocates the next presentation id, never reusing or going below the
     /// given floor.
     fn reserve_presentation(&mut self, displayed: u64) -> u64 {
-        self.presentation = next_presentation(self.presentation, displayed);
+        self.presentation = self.presentation.max(displayed) + 1;
         self.presentation
     }
 

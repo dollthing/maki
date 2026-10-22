@@ -129,7 +129,7 @@ impl App {
                 .min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.queue.len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         };
@@ -148,7 +148,7 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else {
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.queue.len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
