@@ -7,14 +7,14 @@
 //! A session whose lock is fresh and held by another process is open
 //! elsewhere and cannot be continued from here.
 //!
-//! Only write paths (`heartbeat`) mutate lock state. Readers (`open_elsewhere`)
-//! never reclaim: a stale lock is cleaned up by the next claimant's heartbeat.
+//! Only write paths (`claim`, `heartbeat`) mutate lock state. Readers (`open_elsewhere`)
+//! never reclaim: a stale lock is cleaned up by the next claim.
 
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
@@ -437,32 +437,6 @@ pub fn claim(dir: &Path, id: &MakiId) -> io::Result<Option<ClaimedSessionLock>> 
     }))
 }
 
-fn deferred_leases() -> &'static Mutex<HashMap<PathBuf, ClaimedSessionLock>> {
-    static LEASES: OnceLock<Mutex<HashMap<PathBuf, ClaimedSessionLock>>> = OnceLock::new();
-    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Compatibility heartbeat for frontends that do not yet retain a lease.
-pub fn heartbeat(dir: &Path, id: &MakiId) -> io::Result<LockBeat> {
-    let path = lock_path(dir, id);
-    let mut leases = deferred_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if let Some(lease) = leases.get_mut(&path) {
-        let beat = lease.heartbeat()?;
-        if beat == LockBeat::Held {
-            return Ok(beat);
-        }
-        leases.remove(&path);
-        return Ok(LockBeat::Lost);
-    }
-    let Some(lease) = claim(dir, id)? else {
-        return Ok(LockBeat::Lost);
-    };
-    leases.insert(path, lease);
-    Ok(LockBeat::Claimed)
-}
-
 /// True when another process holds a fresh lock for the session. Read-only:
 /// stale or malformed locks are left for the next claimant's heartbeat to
 /// reclaim.
@@ -476,18 +450,6 @@ pub fn open_elsewhere(dir: &Path, id: &MakiId) -> bool {
     }
     meta.modified()
         .is_ok_and(|mtime| is_fresh(mtime, SystemTime::now()))
-}
-
-/// Compatibility release for frontends that do not yet retain a lease.
-pub fn release(dir: &Path, id: &MakiId) {
-    let path = lock_path(dir, id);
-    let lease = deferred_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&path);
-    if let Some(lease) = lease {
-        let _ = lease.release();
-    }
 }
 
 #[cfg(test)]
@@ -663,10 +625,10 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_claims_absent_lock() {
+    fn claim_takes_absent_lock() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
-        heartbeat(dir.path(), &id).unwrap();
+        let _lease = claim(dir.path(), &id).unwrap().unwrap();
         assert_eq!(
             holder_pid(&lock_path(dir.path(), &id)),
             Some(std::process::id())
@@ -674,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_claims_stale_foreign_lock() {
+    fn claim_takes_stale_foreign_lock() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
         fake_lock(dir.path(), &id);
@@ -682,7 +644,7 @@ mod tests {
             &lock_path(dir.path(), &id),
             STALE_AFTER + Duration::from_secs(5),
         );
-        heartbeat(dir.path(), &id).unwrap();
+        let _lease = claim(dir.path(), &id).unwrap().unwrap();
         assert_eq!(
             holder_pid(&lock_path(dir.path(), &id)),
             Some(std::process::id())
@@ -690,20 +652,20 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_never_clobbers_fresh_foreign_lock() {
+    fn claim_never_clobbers_fresh_foreign_lock() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
         fake_lock(dir.path(), &id);
-        heartbeat(dir.path(), &id).unwrap();
+        assert!(claim(dir.path(), &id).unwrap().is_none());
         assert_eq!(holder_pid(&lock_path(dir.path(), &id)), Some(FAKE_PID));
     }
 
     #[test]
-    fn heartbeat_claims_malformed_lock() {
+    fn claim_takes_malformed_lock() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
         fs::write(lock_path(dir.path(), &id), b"not a pid").unwrap();
-        heartbeat(dir.path(), &id).unwrap();
+        let _lease = claim(dir.path(), &id).unwrap().unwrap();
         assert_eq!(
             holder_pid(&lock_path(dir.path(), &id)),
             Some(std::process::id())
@@ -722,7 +684,7 @@ mod tests {
     fn open_elsewhere_is_false_for_own_lock() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
-        heartbeat(dir.path(), &id).unwrap();
+        let _lease = claim(dir.path(), &id).unwrap().unwrap();
         assert!(!open_elsewhere(dir.path(), &id));
     }
 
@@ -922,21 +884,11 @@ mod tests {
     fn release_marker_is_immediately_claimable() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
-        heartbeat(dir.path(), &id).unwrap();
-        release(dir.path(), &id);
+        claim(dir.path(), &id).unwrap().unwrap().release().unwrap();
 
         let path = lock_path(dir.path(), &id);
         assert_eq!(fs::read_to_string(&path).unwrap(), RELEASED_RECORD);
         assert!(!open_elsewhere(dir.path(), &id));
         claim(dir.path(), &id).unwrap().unwrap().release().unwrap();
-    }
-
-    #[test]
-    fn release_keeps_foreign_lock() {
-        let dir = tempdir().unwrap();
-        let id = MakiId::generate();
-        fake_lock(dir.path(), &id);
-        release(dir.path(), &id);
-        assert_eq!(holder_pid(&lock_path(dir.path(), &id)), Some(FAKE_PID));
     }
 }

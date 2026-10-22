@@ -1960,7 +1960,6 @@ where
             }
             Err(_) => {}
         }
-        session_lock::release(dir, &id);
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
@@ -3121,17 +3120,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_from_releases_the_session_lock() {
+    fn delete_from_is_not_blocked_by_own_session_lock() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
         s.save_to(dir).unwrap();
-        session_lock::heartbeat(dir, &s.id).unwrap();
-        assert!(session_lock::lock_path(dir, &s.id).exists());
+        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
 
         TestSession::delete_from(s.id, dir).unwrap();
-        assert!(!session_lock::open_elsewhere(dir, &s.id));
-        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
         lease.release().unwrap();
     }
 
