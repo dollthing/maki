@@ -2,24 +2,23 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use maki_commands::{
     AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
     CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
     CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
-    CompletionItem, HostContextRequest, HostContextResponse, HostRequest, HostResponse, Producer,
-    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
-    resolve_path,
+    CompletionItem, FrontendFeedback, HostContextRequest, HostContextResponse, HostRequest,
+    HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
+    TargetCapabilities, TargetCapability, resolve_path,
 };
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::Model;
 
 use crate::headless::{InteractiveControl, InteractiveControlSender};
+use crate::session_coordinator::SessionCoordinatorHandle;
+use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -44,104 +43,21 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
-struct ModelCommandState {
-    current: String,
-    fast: bool,
-}
-
-pub struct SessionCommandState {
-    model: Mutex<ModelCommandState>,
-    model_specs: Mutex<Arc<[Arc<str>]>>,
-    cwd: Mutex<PathBuf>,
-    workflow: AtomicBool,
-}
-
-impl SessionCommandState {
-    pub fn new(
-        current_model: String,
-        model_specs: Arc<[Arc<str>]>,
-        cwd: PathBuf,
-        fast: bool,
-        workflow: bool,
-    ) -> Self {
-        Self {
-            model: Mutex::new(ModelCommandState {
-                current: current_model,
-                fast,
-            }),
-            model_specs: Mutex::new(model_specs),
-            cwd: Mutex::new(cwd),
-            workflow: AtomicBool::new(workflow),
-        }
-    }
-
-    pub fn set_model(&self, model: &Model) {
-        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        state.current = model.spec();
-        state.fast &= model.supports_fast();
-    }
-
-    pub fn current_model(&self) -> String {
-        self.model
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .current
-            .clone()
-    }
-
-    pub fn set_model_specs(&self, specs: impl IntoIterator<Item = String>) {
-        *self
-            .model_specs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            specs.into_iter().map(Arc::from).collect::<Vec<_>>().into();
-    }
-
-    pub fn fast(&self) -> bool {
-        self.model
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .fast
-    }
-
-    pub fn set_fast(&self, enabled: bool) -> Result<(), &'static str> {
-        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        if enabled
-            && !Model::from_spec(&state.current)
-                .is_ok_and(|model| model.supports_fast() || model.fast_pending())
-        {
-            return Err(FAST_UNSUPPORTED);
-        }
-        state.fast = enabled;
-        Ok(())
-    }
-
-    pub fn workflow(&self) -> bool {
-        self.workflow.load(Ordering::Relaxed)
-    }
-
-    pub fn set_workflow(&self, enabled: bool) {
-        self.workflow.store(enabled, Ordering::Relaxed);
-    }
-}
-
 pub struct SessionCommandHost {
     control_tx: InteractiveControlSender,
-    state: Arc<SessionCommandState>,
+    coordinator: SessionCoordinatorHandle,
     reset_session_guidance: Option<Arc<str>>,
-    coordinator: Option<crate::session_coordinator::SessionCoordinatorHandle>,
 }
 
 impl SessionCommandHost {
     pub fn new(
         control_tx: impl Into<InteractiveControlSender>,
-        state: Arc<SessionCommandState>,
+        coordinator: SessionCoordinatorHandle,
     ) -> Self {
         Self {
             control_tx: control_tx.into(),
-            state,
+            coordinator,
             reset_session_guidance: None,
-            coordinator: None,
         }
     }
 
@@ -150,50 +66,13 @@ impl SessionCommandHost {
         self
     }
 
-    pub fn with_coordinator(
-        mut self,
-        coordinator: crate::session_coordinator::SessionCoordinatorHandle,
-    ) -> Self {
-        self.coordinator = Some(coordinator);
-        self
-    }
-
-    fn toggle_option(&self, id: &'static str) -> CommandFuture<Result<(), CommandError>> {
+    fn toggle_option(&self, id: &'static str) -> CommandFuture<Result<HostResponse, CommandError>> {
         let coordinator = self.coordinator.clone();
         Box::pin(async move {
-            let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-            let current = coordinator
-                .read()
-                .options()
-                .options
-                .iter()
-                .find(|option| option.definition.id.as_ref() == id)
-                .map(|option| {
-                    option.current_value.as_ref() == crate::session_options::ENABLED_VALUE
-                })
-                .ok_or_else(|| {
-                    CommandError::Producer(Arc::from(format!("unknown session option: {id}")))
-                })?;
-            let value = if current {
-                crate::session_options::DISABLED_VALUE
-            } else {
-                crate::session_options::ENABLED_VALUE
-            };
             coordinator
-                .set_option(id, value)
+                .toggle_boolean_option(id)
                 .await
-                .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-            Ok(())
-        })
-    }
-
-    fn toggle_option_response(
-        &self,
-        id: &'static str,
-    ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let future = self.toggle_option(id);
-        Box::pin(async move {
-            future.await?;
+                .map_err(producer_error)?;
             Ok(HostResponse::Completed)
         })
     }
@@ -221,126 +100,83 @@ impl SessionCommandHost {
 
 impl maki_commands::CommandHost for SessionCommandHost {
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let read = self.coordinator.read();
         let operation = match request {
-            HostRequest::Context(HostContextRequest::ModelSpecs) => {
-                let specs = self
-                    .state
-                    .model_specs
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(HostContextResponse::Values(specs)))
-                });
-            }
-            HostRequest::Context(HostContextRequest::ThemeNames) => {
-                return Box::pin(async {
-                    Ok(HostResponse::Context(HostContextResponse::Unavailable))
-                });
-            }
-            HostRequest::Context(HostContextRequest::WorkingDirectory) => {
-                let cwd = self
-                    .state
-                    .cwd
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(
-                        HostContextResponse::WorkingDirectory(cwd),
-                    ))
-                });
-            }
-            HostRequest::Context(HostContextRequest::FastModeSupported) => {
-                let model = self
-                    .coordinator
-                    .as_ref()
-                    .map(|coordinator| coordinator.read().model())
-                    .unwrap_or_else(|| Arc::from(self.state.current_model()));
-                let supported = Model::from_spec(&model)
-                    .is_ok_and(|model| model.supports_fast() || model.fast_pending());
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(
-                        HostContextResponse::FastModeSupported(supported),
-                    ))
-                });
-            }
-            HostRequest::Context(HostContextRequest::SessionId) => {
-                let Some(coordinator) = &self.coordinator else {
-                    return Box::pin(async {
-                        Ok(HostResponse::Context(HostContextResponse::Unavailable))
-                    });
+            HostRequest::Context(context) => {
+                let response = match context {
+                    HostContextRequest::ModelSpecs => HostContextResponse::Values(
+                        read.options()
+                            .options
+                            .iter()
+                            .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                            .map(|option| {
+                                option
+                                    .definition
+                                    .values
+                                    .iter()
+                                    .map(|value| Arc::clone(&value.value))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    HostContextRequest::ThemeNames => HostContextResponse::Unavailable,
+                    HostContextRequest::WorkingDirectory => {
+                        HostContextResponse::WorkingDirectory(read.cwd())
+                    }
+                    HostContextRequest::FastModeSupported => {
+                        HostContextResponse::FastModeSupported(
+                            Model::from_spec(&read.model())
+                                .is_ok_and(|model| model.supports_fast() || model.fast_pending()),
+                        )
+                    }
+                    HostContextRequest::SessionId => {
+                        HostContextResponse::SessionId(Arc::from(read.session_id().to_string()))
+                    }
                 };
-                let id = Arc::from(coordinator.read().session_id().to_string());
-                return Box::pin(async move {
-                    Ok(HostResponse::Context(HostContextResponse::SessionId(id)))
-                });
+                return Box::pin(async move { Ok(HostResponse::Context(response)) });
             }
             HostRequest::Builtin(operation) => operation,
         };
+        let coordinator = self.coordinator.clone();
         match operation {
-            maki_commands::BuiltinOperation::Compact(instructions) => {
+            BuiltinOperation::Compact(instructions) => {
                 Box::pin(async move { Ok(HostResponse::ManualCompaction(instructions)) })
             }
-            maki_commands::BuiltinOperation::ResetSession => {
-                if let Some(guidance) = self.reset_session_guidance.clone() {
-                    Box::pin(async move {
-                        Ok(HostResponse::FrontendFeedback(
-                            maki_commands::FrontendFeedback::Text(guidance),
-                        ))
-                    })
-                } else {
-                    self.control(InteractiveControl::Reset)
-                }
-            }
-            maki_commands::BuiltinOperation::ToggleYolo => {
-                self.toggle_option_response(crate::session_options::YOLO_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ToggleFast => {
-                self.toggle_option_response(crate::session_options::FAST_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ToggleWorkflow => {
-                self.toggle_option_response(crate::session_options::WORKFLOW_OPTION_ID)
-            }
-            maki_commands::BuiltinOperation::ChangeDirectory { path } => {
-                let coordinator = self.coordinator.clone();
-                let state = Arc::clone(&self.state);
-                Box::pin(async move {
-                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-                    let canonical = coordinator
-                        .change_directory(path)
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    *state.cwd.lock().unwrap_or_else(|error| error.into_inner()) =
-                        canonical.clone();
-                    Ok(HostResponse::FrontendFeedback(
-                        maki_commands::FrontendFeedback::WorkingDirectory(canonical),
-                    ))
-                })
-            }
-            maki_commands::BuiltinOperation::SelectModel(selection) => {
-                let coordinator = self.coordinator.clone();
-                Box::pin(async move {
-                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-                    coordinator
-                        .set_model(selection.spec, selection.fast, selection.thinking)
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    Ok(HostResponse::Completed)
-                })
-            }
-            maki_commands::BuiltinOperation::SetModel { spec } => {
-                let coordinator = self.coordinator.clone();
-                Box::pin(async move {
-                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
-                    coordinator
-                        .set_option(crate::session_options::MODEL_OPTION_ID, Arc::clone(&spec))
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    Ok(HostResponse::Completed)
-                })
-            }
-            maki_commands::BuiltinOperation::QuickQuestion {
+            BuiltinOperation::ResetSession => match self.reset_session_guidance.clone() {
+                Some(guidance) => Box::pin(async move {
+                    Ok(HostResponse::FrontendFeedback(FrontendFeedback::Text(
+                        guidance,
+                    )))
+                }),
+                None => self.control(InteractiveControl::Reset),
+            },
+            BuiltinOperation::ToggleYolo => self.toggle_option(YOLO_OPTION_ID),
+            BuiltinOperation::ToggleFast => self.toggle_option(FAST_OPTION_ID),
+            BuiltinOperation::ToggleWorkflow => self.toggle_option(WORKFLOW_OPTION_ID),
+            BuiltinOperation::ChangeDirectory { path } => Box::pin(async move {
+                let canonical = coordinator
+                    .change_directory(path)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::FrontendFeedback(
+                    FrontendFeedback::WorkingDirectory(canonical),
+                ))
+            }),
+            BuiltinOperation::SelectModel(selection) => Box::pin(async move {
+                coordinator
+                    .set_model(selection.spec, selection.fast, selection.thinking)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::Completed)
+            }),
+            BuiltinOperation::SetModel { spec } => Box::pin(async move {
+                coordinator
+                    .set_option(MODEL_OPTION_ID, spec)
+                    .await
+                    .map_err(producer_error)?;
+                Ok(HostResponse::Completed)
+            }),
+            BuiltinOperation::QuickQuestion {
                 question,
                 attachments,
             } => Box::pin(async move {
@@ -358,6 +194,10 @@ impl maki_commands::CommandHost for SessionCommandHost {
             }),
         }
     }
+}
+
+fn producer_error(error: impl std::fmt::Display) -> CommandError {
+    CommandError::Producer(Arc::from(error.to_string()))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1043,7 +883,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingCommandHost(Mutex<Vec<maki_commands::BuiltinOperation>>);
+    struct RecordingCommandHost(std::sync::Mutex<Vec<maki_commands::BuiltinOperation>>);
 
     impl maki_commands::CommandHost for RecordingCommandHost {
         fn request(
@@ -1363,19 +1203,11 @@ mod tests {
     #[test]
     fn session_host_dispatches_portable_state_operations() {
         let (control_tx, _control_rx) = flume::unbounded();
-        let state = Arc::new(SessionCommandState::new(
-            FAST_MODEL.into(),
-            Arc::from([]),
-            PathBuf::from("/project"),
-            false,
-            false,
-        ));
         let (coordinator, handle) = test_coordinator(
             FAST_MODEL,
             [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
         );
-        let host = SessionCommandHost::new(control_tx, Arc::clone(&state))
-            .with_coordinator(coordinator.clone());
+        let host = SessionCommandHost::new(control_tx, coordinator.clone());
         let request = |operation| HostRequest::Builtin(operation);
         assert!(matches!(
             smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleYolo))),
@@ -1436,6 +1268,13 @@ mod tests {
             )) if path == Path::new("/tmp")
         ));
         assert_eq!(coordinator.read().cwd(), PathBuf::from("/tmp"));
+        let elsewhere = TempDir::new().unwrap();
+        let elsewhere =
+            smol::block_on(coordinator.change_directory(elsewhere.path().into())).unwrap();
+        assert!(matches!(
+            smol::block_on(host.request(HostRequest::Context(HostContextRequest::WorkingDirectory))),
+            Ok(HostResponse::Context(HostContextResponse::WorkingDirectory(path))) if path == elsewhere
+        ));
 
         let model = Model::from_spec(OFFLINE_MODEL).unwrap();
         let result = smol::block_on(host.request(HostRequest::Builtin(
@@ -1471,16 +1310,10 @@ mod tests {
         let registry = maki_commands::CommandRegistry::new();
         let _commands =
             StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
-        let state = Arc::new(SessionCommandState::new(
-            OFFLINE_MODEL.into(),
-            Arc::from([]),
-            PathBuf::from("/project"),
-            false,
-            false,
-        ));
+        let (coordinator, handle) = test_coordinator(OFFLINE_MODEL, [Arc::from(OFFLINE_MODEL)]);
         let host = Arc::new(SessionCommandHost::new(
             flume::unbounded().0,
-            Arc::clone(&state),
+            coordinator.clone(),
         ));
         let target = registry.bind_target(portable_capabilities(), host);
 
@@ -1492,7 +1325,12 @@ mod tests {
                 CommandError::Producer(message)
             )) if message.as_ref() == FAST_UNSUPPORTED
         ));
-        assert!(!state.fast());
+        assert_eq!(
+            option_value(&coordinator, crate::session_options::FAST_OPTION_ID),
+            crate::session_options::DISABLED_VALUE.into()
+        );
+        smol::block_on(handle.task.cancel());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]

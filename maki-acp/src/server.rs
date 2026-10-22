@@ -135,7 +135,6 @@ struct OptionProjection {
     out_tx: Sender<Value>,
     session_id: SessionId,
     read: maki_agent::session_coordinator::SessionReadHandle,
-    command_state: Arc<maki_agent::command::SessionCommandState>,
     permissions: Arc<maki_agent::permissions::PermissionManager>,
     supports_boolean: bool,
     emitted_version: Mutex<u64>,
@@ -155,7 +154,17 @@ impl OptionProjection {
         if snapshot.version <= *emitted_version {
             return;
         }
-        self.apply_committed_options(snapshot);
+        self.permissions.set_yolo(
+            snapshot
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                })
+                .is_some_and(|option| {
+                    option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
+                }),
+        );
         if emit {
             emit_config_options(
                 &self.out_tx,
@@ -165,39 +174,6 @@ impl OptionProjection {
             );
         }
         *emitted_version = snapshot.version;
-    }
-
-    fn apply_committed_options(
-        &self,
-        snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
-    ) {
-        let value = |id: &str| {
-            snapshot
-                .options
-                .iter()
-                .find(|option| option.definition.id.as_ref() == id)
-                .map(|option| option.current_value.as_ref())
-        };
-        if let Some(spec) = value(maki_agent::session_options::MODEL_OPTION_ID) {
-            match Model::from_spec(spec) {
-                Ok(model) => self.command_state.set_model(&model),
-                Err(error) => warn!(%error, %spec, "committed model could not be parsed"),
-            }
-        }
-        self.permissions.set_yolo(
-            value(maki_agent::session_options::YOLO_OPTION_ID)
-                == Some(maki_agent::session_options::ENABLED_VALUE),
-        );
-        if let Err(error) = self.command_state.set_fast(
-            value(maki_agent::session_options::FAST_OPTION_ID)
-                == Some(maki_agent::session_options::ENABLED_VALUE),
-        ) {
-            warn!(%error, "committed Fast value could not be applied");
-        }
-        self.command_state.set_workflow(
-            value(maki_agent::session_options::WORKFLOW_OPTION_ID)
-                == Some(maki_agent::session_options::ENABLED_VALUE),
-        );
     }
 
     fn emit_current(&self) {
@@ -213,7 +189,6 @@ struct SessionState {
     checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
-    command_state: Arc<maki_agent::command::SessionCommandState>,
     pending: PendingState,
     command_registry: maki_commands::CommandRegistry,
     command_target: TargetHandle,
@@ -372,9 +347,6 @@ async fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         return;
     }
     let Some(session) = &srv.session else { return };
-    session
-        .command_state
-        .set_model_specs(srv.model_specs.clone());
     let Some(coordinator) = &session.coordinator else {
         return;
     };
@@ -1116,17 +1088,6 @@ async fn install_session_with_lock(
         initial_cost,
     );
     let command_registry = params.command_registry.clone();
-    let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
-        current_model,
-        srv.model_specs
-            .iter()
-            .map(|spec| Arc::from(spec.as_str()))
-            .collect::<Vec<_>>()
-            .into(),
-        cwd.clone(),
-        fast,
-        workflow,
-    ));
     let portable_capabilities = maki_agent::command::portable_capabilities();
     let command_target = command_registry.bind_target_with_presentation(
         portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
@@ -1136,10 +1097,9 @@ async fn install_session_with_lock(
         Arc::new(AcpCommandHost {
             host: maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
-                Arc::clone(&command_state),
+                coordinator.clone(),
             )
-            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
-            .with_coordinator(coordinator.clone()),
+            .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             root: trusted_root,
         }),
     );
@@ -1155,7 +1115,6 @@ async fn install_session_with_lock(
         out_tx: srv.out_tx.clone(),
         session_id,
         read: coordinator.read(),
-        command_state: Arc::clone(&command_state),
         permissions: Arc::clone(&handle.permissions),
         supports_boolean: srv.supports_boolean,
         emitted_version: Mutex::new(option_snapshot.version),
@@ -1171,7 +1130,6 @@ async fn install_session_with_lock(
         checkpoint: Some(checkpoint),
         mcp,
         current_mode: AgentMode::Build,
-        command_state,
         pending,
         command_registry,
         command_target,
@@ -2729,7 +2687,6 @@ mod tests {
             out_tx: srv.out_tx.clone(),
             session_id: SessionId::from(session.handle.session_id.to_string()),
             read: coordinator.read(),
-            command_state: Arc::clone(&session.command_state),
             permissions: Arc::clone(&session.handle.permissions),
             supports_boolean: false,
             emitted_version: Mutex::new(coordinator.read().options().version),
@@ -2857,7 +2814,7 @@ mod tests {
     fn test_target(
         registry: &maki_commands::CommandRegistry,
         control_tx: maki_agent::headless::InteractiveControlSender,
-        command_state: Arc<maki_agent::command::SessionCommandState>,
+        coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
     ) -> TargetHandle {
         {
             let portable_capabilities = maki_agent::command::portable_capabilities();
@@ -2867,7 +2824,7 @@ mod tests {
                 )),
                 portable_capabilities,
                 Arc::new(
-                    maki_agent::command::SessionCommandHost::new(control_tx, command_state)
+                    maki_agent::command::SessionCommandHost::new(control_tx, coordinator)
                         .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
                 ),
             )
@@ -3119,13 +3076,6 @@ mod tests {
             )
             .unwrap();
         let command_registry = test_registry(&[]);
-        let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
-            String::new(),
-            Arc::from([]),
-            PathBuf::from("/project"),
-            false,
-            false,
-        ));
         let portable_capabilities = maki_agent::command::portable_capabilities();
         let command_target = command_registry.bind_target_with_presentation(
             portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
@@ -3135,10 +3085,9 @@ mod tests {
             Arc::new(
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),
-                    Arc::clone(&command_state),
+                    coordinator.clone(),
                 )
-                .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
-                .with_coordinator(coordinator.clone()),
+                .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
             ),
         );
         let server = Server {
@@ -3150,7 +3099,6 @@ mod tests {
                     out_tx: out_tx.clone(),
                     session_id: SessionId::from(handle.session_id.to_string()),
                     read: coordinator.read(),
-                    command_state: Arc::clone(&command_state),
                     permissions: Arc::clone(&handle.permissions),
                     supports_boolean: false,
                     emitted_version: Mutex::new(coordinator.read().options().version),
@@ -3161,7 +3109,6 @@ mod tests {
                 checkpoint: None,
                 mcp: None,
                 current_mode: AgentMode::Build,
-                command_state,
                 pending: Arc::new(Mutex::new(Pending {
                     permissions: HashMap::from([(ANSWERED_ID, ("toolu_1".to_string(), answer_tx))]),
                     ..Default::default()
@@ -3525,14 +3472,10 @@ mod tests {
                 .set_option(maki_agent::session_options::MODEL_OPTION_ID, FAST_SPEC)
                 .await
                 .unwrap();
-            session
-                .command_state
-                .set_model(&Model::from_spec(FAST_SPEC).unwrap());
             session.option_projection = Some(Arc::new(OptionProjection {
                 out_tx: srv.out_tx.clone(),
                 session_id: SessionId::from(session.handle.session_id.to_string()),
                 read: coordinator.read(),
-                command_state: Arc::clone(&session.command_state),
                 permissions: Arc::clone(&session.handle.permissions),
                 supports_boolean: srv.supports_boolean,
                 emitted_version: Mutex::new(coordinator.read().options().version),
@@ -3683,7 +3626,6 @@ mod tests {
             out_tx: srv.out_tx.clone(),
             session_id: SessionId::from(session_id.to_string()),
             read: coordinator.read(),
-            command_state: Arc::clone(&session.command_state),
             permissions: Arc::clone(&session.handle.permissions),
             supports_boolean: false,
             emitted_version: Mutex::new(before.version),
@@ -3789,12 +3731,6 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let session = srv.session.as_mut().unwrap();
-        session
-            .command_state
-            .set_model(&Model::from_spec(FAST_SPEC).expect("fast-capable test model should parse"));
-        session.command_state.set_fast(true).unwrap();
-
         let active_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
         let result = smol::block_on(handle_set_config(
             &mut srv,
@@ -3818,9 +3754,6 @@ mod tests {
             snapshot.options[2].current_value.as_ref(),
             maki_agent::session_options::DISABLED_VALUE
         );
-        let state = &srv.session.as_ref().unwrap().command_state;
-        assert_eq!(state.current_model(), OFFLINE_SPEC);
-        assert!(!state.fast());
         smol::block_on(coordinator.close()).unwrap();
     }
 
@@ -5020,17 +4953,9 @@ mod tests {
     #[test]
     fn available_command_projection_tracks_registry_generation() {
         let registry = test_registry(&[]);
-        let target = test_target(
-            &registry,
-            flume::unbounded().0.into(),
-            Arc::new(maki_agent::command::SessionCommandState::new(
-                String::new(),
-                Arc::from([]),
-                PathBuf::from("/project"),
-                false,
-                false,
-            )),
-        );
+        let coordinator =
+            test_coordinator(MakiId::generate(), OFFLINE_SPEC, PathBuf::from("/project"));
+        let target = test_target(&registry, flume::unbounded().0.into(), coordinator.clone());
         let initial = registry.snapshot_for(&target).unwrap();
         let commands = available_commands(&registry.presented_commands(&target).unwrap());
         assert_eq!(
@@ -5070,6 +4995,7 @@ mod tests {
             review.input,
             Some(AvailableCommandInput::Unstructured(ref input)) if input.hint == "<path>"
         ));
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -5201,7 +5127,7 @@ mod tests {
         session.command_target = test_target(
             &registry,
             session.handle.control_tx.clone(),
-            Arc::clone(&session.command_state),
+            session.coordinator.clone().unwrap(),
         );
         session.command_registry = registry;
     }

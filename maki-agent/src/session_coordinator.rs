@@ -868,40 +868,35 @@ impl SessionCoordinatorHandle {
             .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))
     }
 
-    pub fn toggle_boolean_option(
+    pub async fn toggle_boolean_option(
         &self,
         id: impl Into<Arc<str>>,
-    ) -> impl Future<Output = Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError>> + Send
-    {
-        let coordinator = self.clone();
+    ) -> Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError> {
         let id = id.into();
-        async move {
-            if !matches!(
-                id.as_ref(),
-                YOLO_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID
-            ) {
-                return Err(SessionOptionError::InvalidValue {
-                    id,
-                    value: Arc::from("toggle"),
-                }
-                .into());
+        if !matches!(
+            id.as_ref(),
+            YOLO_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID
+        ) {
+            return Err(SessionOptionError::InvalidValue {
+                id,
+                value: Arc::from("toggle"),
             }
-            let snapshot = coordinator.read.options();
-            let enabled = snapshot
-                .options
-                .iter()
-                .find(|option| option.definition.id == id)
-                .is_some_and(|option| option.current_value.as_ref() == DISABLED_VALUE);
-            let value = if enabled {
-                ENABLED_VALUE
-            } else {
-                DISABLED_VALUE
-            };
-            coordinator
-                .set_option_if_version(id, value, Some(snapshot.version))
-                .await
-                .map(|snapshot| (enabled, snapshot))
+            .into());
         }
+        let snapshot = self.read.options();
+        let enabled = snapshot
+            .options
+            .iter()
+            .find(|option| option.definition.id == id)
+            .is_some_and(|option| option.current_value.as_ref() == DISABLED_VALUE);
+        let value = if enabled {
+            ENABLED_VALUE
+        } else {
+            DISABLED_VALUE
+        };
+        self.set_option_if_version(id, value, Some(snapshot.version))
+            .await
+            .map(|snapshot| (enabled, snapshot))
     }
 
     async fn prepare_model(
