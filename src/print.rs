@@ -18,14 +18,17 @@ use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
-use maki_agent::headless::{HeadlessHandle, HeadlessParams, RootBinding};
+use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
 use maki_agent::permissions::PluginRuleStore;
-use maki_agent::session_coordinator::SessionCoordinatorHandle;
-use maki_agent::tools::QUESTION_TOOL_NAME;
+use maki_agent::session_coordinator::{
+    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
+    builtin_option_definitions,
+};
 use maki_agent::tools::offload::OffloadCleanup;
+use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
-    PermissionsConfig, TurnOutcome,
+    AgentConfig, AgentEvent, AgentInput, DoneReason, Envelope, ImageSource, PermissionsConfig,
+    TurnOutcome,
 };
 use maki_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
@@ -34,10 +37,12 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_lua::orchestration::{self, AgentOrchestration, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
+use maki_providers::provider::available_model_specs;
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::checkpoint::ClaimingWriter;
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -357,40 +362,96 @@ fn run_and_settle<T>(
     }
 }
 
-fn print_initialization_input(literal: &AgentInput) -> AgentInput {
-    AgentInput::from_defaults(
-        String::new(),
-        Vec::new(),
-        SessionDefaults {
-            fast: literal.fast,
-            workflow: literal.workflow,
-            thinking: Some(literal.thinking.into()),
-        },
-    )
+/// A print run's root: an ordinary managed root whose session coordinator
+/// publishes into a writer that saves nothing.
+struct PrintSession {
+    handle: InteractiveHandle,
+    coordinator: SessionCoordinatorHandle,
+    root: TrustedTarget,
+    orchestration: Arc<AgentOrchestration>,
 }
 
-fn with_print_handle<T>(
-    handle: HeadlessHandle,
-    body: impl FnOnce(&HeadlessHandle) -> Result<T>,
+fn start_print_session(
+    params: InteractiveParams,
+    prepare: ProviderPreparation,
+    session_options: SessionOptionCatalog,
+    lua_handle: &EventHandle,
+) -> Result<PrintSession> {
+    let models = available_model_specs(&params.model_policy);
+    let definitions = builtin_option_definitions(
+        Arc::from(params.model.spec()),
+        models.iter().map(|spec| Arc::from(spec.as_str())),
+        params.permissions_config.yolo,
+        params.defaults.fast,
+        params.defaults.workflow,
+        params.defaults.thinking.into(),
+    );
+    let model_policy = Arc::clone(&params.model_policy);
+    let timeouts = params.timeouts;
+    let (binding, root_target) = orchestration::root_binding();
+    let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
+    smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
+    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: handle.session_id.id(),
+        catalog: session_options,
+        definitions,
+        persisted_options: Default::default(),
+        model_policy,
+        checkpoint: ClaimingWriter::accept_all(),
+        mailbox: handle.mailbox.clone(),
+    })
+    .map_err(|error| eyre!("register print session coordinator: {error}"))?;
+    let root = smol::block_on(orchestration::bind_frontend_root(
+        &handle,
+        &coordinator,
+        &root_target,
+        headless::default_model_preparer(timeouts),
+    ))
+    .map_err(|error| eyre!("bind print root: {error}"))?;
+    let orchestration = Arc::new(orchestration::frontend_root(
+        models,
+        root.clone(),
+        Arc::new(|_, publication| Ok(orchestration::nonpersistent_config_mutation(publication))),
+        coordinator.clone(),
+    ));
+    lua_handle.install_orchestration_services(orchestration.clone());
+    Ok(PrintSession {
+        handle,
+        coordinator,
+        root,
+        orchestration,
+    })
+}
+
+/// Runs {body}, then lets the session end once its input is gone, closing
+/// the coordinator either way.
+fn with_print_session<T>(
+    session: PrintSession,
+    body: impl FnOnce(&PrintSession) -> Result<T>,
 ) -> Result<T> {
-    let cleanup = handle.offload_cleanup.clone();
-    let manager = handle.manager.clone();
-    let coordinator = SessionCoordinatorHandle::resolve(handle.session_id.id()).ok();
-    let result = catch_unwind(AssertUnwindSafe(|| body(&handle)));
-    let task = {
-        let handle = handle;
-        handle.task
-    };
-    run_and_settle(
+    let result = catch_unwind(AssertUnwindSafe(|| body(&session)));
+    let PrintSession {
+        handle,
+        coordinator,
+        ..
+    } = session;
+    let InteractiveHandle {
+        manager,
         task,
-        cleanup,
+        offload_cleanup,
+        input_tx,
+        ..
+    } = handle;
+    drop(input_tx);
+    let closing = coordinator.clone();
+    let settled = run_and_settle(
+        task,
+        offload_cleanup,
         async move |deadline| {
             futures_lite::future::zip(
                 manager.shutdown(deadline.saturating_duration_since(Instant::now())),
                 async {
-                    if let Some(coordinator) = coordinator {
-                        let _ = coordinator.close().await;
-                    }
+                    let _ = closing.close().await;
                 },
             )
             .await;
@@ -399,30 +460,9 @@ fn with_print_handle<T>(
             Ok(result) => result,
             Err(panic) => resume_unwind(panic),
         },
-    )
-}
-
-type PrintRoot = (TrustedTarget, Arc<AgentOrchestration>);
-
-fn bind_print_root(lua_handle: EventHandle) -> (RootBinding, flume::Receiver<PrintRoot>) {
-    let (installed, services) = flume::bounded(1);
-    let binding: RootBinding = Box::new(move |_, root, template| {
-        Box::pin(async move {
-            let target = TrustedTarget {
-                target: root,
-                template,
-            };
-            let orchestration = Arc::new(
-                AgentOrchestration::bind_fixed_root(Arc::default(), target.clone())
-                    .with_completion(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
-            );
-            lua_handle.install_orchestration_services(orchestration.clone());
-            installed
-                .send((target, orchestration))
-                .map_err(|error| error.to_string())
-        })
-    });
-    (binding, services)
+    );
+    let _ = smol::block_on(coordinator.close());
+    settled
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,47 +519,47 @@ pub fn run(
 
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
+    let working_dir = cwd.to_string_lossy().into_owned();
     let outcome = (|| {
-        let (binding, installed) = bind_print_root(lua_handle.clone());
-        let handle = maki_agent::headless::spawn_with_binding(
-            HeadlessParams {
+        let session = start_print_session(
+            InteractiveParams {
                 model: model.clone(),
                 config,
                 permissions_config,
                 timeouts,
-                input: print_initialization_input(&literal),
-                prompt_slots,
+                prompt_slots: Arc::new(prompt_slots),
                 excluded_tools: vec![QUESTION_TOOL_NAME],
                 mcp_handle,
                 initial_wd: cwd,
-                model_policy: Arc::clone(&model_policy),
+                session_id: None,
+                initial_history: Vec::new(),
+                yolo: false,
                 system_prompt_override,
                 append_system_prompt,
+                defaults,
+                model_policy: Arc::clone(&model_policy),
+                modes: lua_handle.mode_registry(),
+                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
                 project_config,
-                modes: lua_handle.mode_registry(),
-                session_options: session_options.clone(),
-                state_dir: state_dir.clone(),
+                local_tools: Default::default(),
+                state_dir,
             },
-            maki_agent::headless::default_preparation(),
-            binding,
-        )
-        .map_err(|error| eyre!("register print session coordinator: {error}"))?;
+            headless::default_preparation(),
+            session_options,
+            &lua_handle,
+        )?;
 
-        with_print_handle(handle, |handle| {
-            smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-            let (trusted, orchestration) = installed.recv().map_err(|error| eyre!(error))?;
-            let root = trusted.target.clone();
+        with_print_session(session, |session| {
+            let handle = &session.handle;
+            let root = session.root.target.clone();
             let target = command_registry.bind_target(
                 print_capabilities(),
-                Arc::new(PrintCommandHost(Some(trusted))),
+                Arc::new(PrintCommandHost(Some(session.root.clone()))),
             );
-            orchestration.bind_commands(
+            session.orchestration.bind_commands(
                 &root,
-                maki_lua::orchestration::detached_command_runner(
-                    command_registry.clone(),
-                    target.clone(),
-                ),
+                orchestration::detached_command_runner(command_registry.clone(), target.clone()),
             );
             let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
             observer.install(root.clone());
@@ -529,11 +569,11 @@ pub fn run(
                 &CommandTurnMarker,
                 literal,
                 |input| {
-                    smol::block_on(handle.start_with_input(input)).map_err(|error| eyre!(error))?;
+                    smol::block_on(handle.input_tx.admit(input)).map_err(|error| eyre!(error))?;
                     let event_rx = &handle.event_rx;
                     let tool_names = &handle.tool_names;
                     let session_id = &handle.session_id;
-                    let cwd = &handle.cwd;
+                    let cwd = &working_dir;
                     let start = Instant::now();
                     let (mut result, verbose_out) = (|| -> Result<_> {
                         let mut verbose_out = match format {
@@ -731,7 +771,8 @@ mod tests {
     use super::*;
     use flume::{Receiver, Sender};
     use maki_agent::{
-        AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
+        AgentError, AgentId, AgentMode, SubagentInfo, ToolOutput, TurnCancellationReason,
+        TurnFailure, TurnId,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
@@ -746,10 +787,12 @@ mod tests {
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::borrow::Cow;
     use std::io::Write;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const PRINT_MODEL: &str = "anthropic/claude-opus-4-8";
     const OUTPUT_ERROR: &str = "print output failed";
     const ROOT_RESPONSE: &str = "root response";
     const PRINT_NESTED_TOOL: &str = "print_nested_task";
@@ -970,20 +1013,68 @@ mod tests {
         "session_id",
     ];
 
-    /// Spawns a print session on {provider} and admits {params}' input.
+    fn print_params(cwd: &Path, state_dir: Option<PathBuf>) -> InteractiveParams {
+        InteractiveParams {
+            model: Model::from_spec(PRINT_MODEL).unwrap(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Default::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: cwd.to_path_buf(),
+            session_id: None,
+            initial_history: Vec::new(),
+            yolo: false,
+            system_prompt_override: None,
+            append_system_prompt: None,
+            defaults: Default::default(),
+            model_policy: Arc::default(),
+            modes: EventHandle::disconnected_for_test().mode_registry(),
+            question_mode: QuestionMode::Headless,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(cwd),
+            local_tools: Default::default(),
+            state_dir,
+        }
+    }
+
+    fn provided(provider: Arc<dyn Provider>) -> ProviderPreparation {
+        Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) }))
+    }
+
+    /// Starts a print session on {provider} and admits {message}.
     fn spawn_started(
-        params: HeadlessParams,
-        provider: Arc<dyn maki_providers::provider::Provider>,
-    ) -> maki_agent::headless::HeadlessHandle {
-        let message = params.input.message.clone();
-        let handle = maki_agent::headless::spawn_with_binding(
+        params: InteractiveParams,
+        message: &str,
+        provider: Arc<dyn Provider>,
+    ) -> PrintSession {
+        let session = start_print_session(
             params,
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
-            Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+            provided(provider),
+            Default::default(),
+            &EventHandle::disconnected_for_test(),
         )
         .unwrap();
-        smol::block_on(handle.start_with_input(input(&message))).unwrap();
-        handle
+        smol::block_on(session.handle.input_tx.admit(input(message))).unwrap();
+        session
+    }
+
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .flat_map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    files_under(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
     }
 
     fn input(message: &str) -> AgentInput {
@@ -1218,27 +1309,9 @@ mod tests {
             .unwrap();
         let (polled, polling) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
-        let cwd = std::env::temp_dir();
-        let handle = spawn_started(
-            HeadlessParams {
-                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
-                config: AgentConfig::default(),
-                permissions_config: PermissionsConfig::default(),
-                timeouts: Default::default(),
-                input: input(name),
-                prompt_slots: Default::default(),
-                excluded_tools: Vec::new(),
-                mcp_handle: None,
-                initial_wd: cwd.clone(),
-                system_prompt_override: None,
-                append_system_prompt: None,
-                model_policy: Arc::default(),
-                plugin_rules: Arc::default(),
-                project_config: ProjectConfig::for_project(&cwd),
-                modes: EventHandle::disconnected_for_test().mode_registry(),
-                session_options: Default::default(),
-                state_dir: None,
-            },
+        let session = spawn_started(
+            print_params(&std::env::temp_dir(), None),
+            name,
             Arc::new(GatedToolProvider {
                 name,
                 polled,
@@ -1246,10 +1319,10 @@ mod tests {
             }),
         );
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
-        let manager = handle.manager.clone();
-        let session_id = handle.session_id.id();
+        let manager = session.handle.manager.clone();
+        let session_id = session.handle.session_id.id();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            with_print_handle(handle, |_| {
+            with_print_session(session, |_| {
                 if panic {
                     std::panic::panic_any(OUTPUT_ERROR);
                 }
@@ -1276,42 +1349,27 @@ mod tests {
     #[test]
     fn print_run_removes_offload_dir() {
         let state = tempfile::tempdir().unwrap();
-        let cwd = std::env::temp_dir();
         let (requests, received) = flume::bounded(0);
-        let handle = spawn_started(
-            HeadlessParams {
-                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
-                config: AgentConfig::default(),
-                permissions_config: PermissionsConfig::default(),
-                timeouts: Default::default(),
-                input: input("print request"),
-                prompt_slots: Default::default(),
-                excluded_tools: Vec::new(),
-                mcp_handle: None,
-                initial_wd: cwd.clone(),
-                system_prompt_override: None,
-                append_system_prompt: None,
-                model_policy: Arc::default(),
-                plugin_rules: Arc::default(),
-                project_config: ProjectConfig::for_project(&cwd),
-                modes: EventHandle::disconnected_for_test().mode_registry(),
-                session_options: Default::default(),
-                state_dir: Some(state.path().to_path_buf()),
-            },
+        let session = spawn_started(
+            print_params(&std::env::temp_dir(), Some(state.path().to_path_buf())),
+            PRINT_PROMPT,
             Arc::new(RecordingPrintProvider {
                 requests,
                 nested: None,
             }),
         );
-        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
+        let dir = offload_dir(
+            &state.path().join(SESSIONS_DIR),
+            session.handle.session_id.id(),
+        );
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), "output").unwrap();
 
-        received.recv_timeout(GATE_TIMEOUT).unwrap();
-        smol::block_on(futures_lite::future::or(handle.task, async {
-            smol::Timer::after(GATE_TIMEOUT).await;
-            panic!("{PRINT_SETTLEMENT_TIMEOUT}");
-        }));
+        with_print_session(session, |_| {
+            received.recv_timeout(GATE_TIMEOUT).unwrap();
+            Ok(())
+        })
+        .unwrap();
         assert!(!dir.exists(), "print mode must remove its offload dir");
     }
 
@@ -1320,7 +1378,6 @@ mod tests {
     #[test_case(false, "completed"; "completed_command")]
     #[test_case(false, "unknown"; "unknown_command")]
     fn print_turn_uses_initialized_config(nested: bool, outcome: &str) {
-        const SPEC: &str = "anthropic/claude-opus-4-8";
         const SYSTEM: &str = "print initialized system";
         const COMMAND: &str = "/print_initialized";
         const COMMAND_FINISHED: &str = "print command finished";
@@ -1376,12 +1433,10 @@ mod tests {
                         local selection = assert(agent:model(ctx))
                         local root_ref = assert(maki.agent.root(ctx))
                         if input.child then
-                            assert(selection.spec == "{SPEC}" and selection.fast)
+                            assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         else
                             local root = assert(maki.agent.get(ctx, root_ref))
                             assert(root:id() == agent:id())
-                            local value, err = root:set_model(ctx, {{ fast = false }})
-                            assert(value == nil and err == "{fixed_root}")
                         end
                         local prompt = input.child and "{GRANDCHILD_PROMPT}" or "{CHILD_PROMPT}"
                         local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
@@ -1401,7 +1456,7 @@ mod tests {
                         return result.result.text
                     end,
                 }})
-            "#, fixed_root = maki_lua::agent_errors::FIXED_ROOT_CONFIG_ERROR)).unwrap();
+            "#)).unwrap();
         }
         host.load_source(
             "print_initialized_command",
@@ -1412,14 +1467,16 @@ mod tests {
                         local root = assert(maki.agent.current(ctx))
                         assert(root:id() == assert(maki.agent.root(ctx)):id())
                         local selection = assert(root:model(ctx))
-                        assert(selection.spec == "{SPEC}" and selection.fast)
-                        local changed, err = root:set_model(ctx, {{ fast = false }})
-                        assert(changed == nil and err == "{fixed_root}")
+                        assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
+                        local slow = assert(root:set_model(ctx, {{ fast = false }}))
+                        assert(not slow.fast and not assert(root:model(ctx)).fast)
+                        assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                         local view, view_err = maki.fn.winsaveview()
                         assert(view == nil and view_err == "{no_ui}", view_err)
-                        local mode, mode_err = root:set_mode(ctx, "build")
-                        assert(mode == nil and mode_err == "{fixed_root}", mode_err)
-                        local set, set_err = maki.session.set_option("model", "{SPEC}")
+                        assert(root:set_mode(ctx, "plan"))
+                        assert(root:mode(ctx) == "plan", root:mode(ctx))
+                        assert(root:set_mode(ctx, "build"))
+                        local set, set_err = maki.session.set_option("model", "{PRINT_MODEL}")
                         assert(set == nil and set_err == "{session_required}", set_err)
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
@@ -1430,7 +1487,6 @@ mod tests {
                     end,
                 }})
             "#,
-                fixed_root = maki_lua::agent_errors::FIXED_ROOT_CONFIG_ERROR,
                 session_required = maki_lua::agent_errors::SESSION_REQUIRED_ERR,
                 no_ui = maki_lua::ui_sink::NO_UI_ERR,
             ),
@@ -1443,56 +1499,31 @@ mod tests {
         literal.fast = true;
         let cwd = std::env::temp_dir();
         let lua_handle = host.event_handle();
-        let (binding, installed) = bind_print_root(lua_handle.clone());
-        let handle = maki_agent::headless::spawn_with_binding(
-            HeadlessParams {
-                model: Model::from_spec(SPEC).unwrap(),
-                config: AgentConfig {
-                    max_concurrent_agent_turns: 1,
-                    ..Default::default()
-                },
-                permissions_config: PermissionsConfig {
-                    yolo: true,
-                    ..Default::default()
-                },
-                timeouts: Default::default(),
-                input: print_initialization_input(&literal),
-                prompt_slots: lua_handle.collect_prompt_slots(),
-                excluded_tools: Vec::new(),
-                mcp_handle: None,
-                initial_wd: cwd.clone(),
-                system_prompt_override: Some(SYSTEM.into()),
-                append_system_prompt: None,
-                model_policy: Arc::default(),
-                plugin_rules: Arc::default(),
-                project_config: ProjectConfig::for_project(&cwd),
-                modes: EventHandle::disconnected_for_test().mode_registry(),
-                session_options: lua_handle.session_option_catalog(),
-                state_dir: Some(state_dir.path().to_path_buf()),
-            },
-            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
-            binding,
+        let mut params = print_params(&cwd, Some(state_dir.path().to_path_buf()));
+        params.config.max_concurrent_agent_turns = 1;
+        params.permissions_config.yolo = true;
+        params.prompt_slots = Arc::new(lua_handle.collect_prompt_slots());
+        params.system_prompt_override = Some(SYSTEM.into());
+        params.defaults.fast = literal.fast;
+        let session = start_print_session(
+            params,
+            provided(provider),
+            lua_handle.session_option_catalog(),
+            &lua_handle,
         )
         .unwrap();
-        let manager = handle.manager.clone();
-        let session_id = handle.session_id.id();
+        let manager = session.handle.manager.clone();
+        let session_id = session.handle.session_id.id();
         let dir = offload_dir(&state_dir.path().join(SESSIONS_DIR), session_id);
         let mut ran = false;
-        let result = with_print_handle(handle, |handle| {
-            let root = smol::block_on(handle.initialized_root()).unwrap();
-            let (trusted, _) = installed.recv_timeout(GATE_TIMEOUT).unwrap();
-            assert_eq!(trusted.target.id(), root.id());
-            assert!(trusted.template.opts.fast);
-            let command_host = Arc::new(PrintCommandHost(Some(trusted)));
-            let target = registry.bind_target(print_capabilities(), command_host.clone());
-            assert!(matches!(
-                smol::block_on(command_host.request(HostRequest::Builtin(
-                    BuiltinOperation::ChangeDirectory {
-                        path: state_dir.path().to_path_buf(),
-                    },
-                ))),
-                Err(CommandError::Producer(_))
-            ));
+        let result = with_print_session(session, |session| {
+            let handle = &session.handle;
+            let root = session.root.target.clone();
+            assert!(session.root.template.opts.fast);
+            let target = registry.bind_target(
+                print_capabilities(),
+                Arc::new(PrintCommandHost(Some(session.root.clone()))),
+            );
             assert_eq!(root.effective_config().unwrap().unwrap().context.cwd(), cwd);
             host.wait_for_worker_barrier_for_test();
             assert_eq!(manager.snapshot()[0].parent_id, None);
@@ -1522,7 +1553,7 @@ mod tests {
                 |input: AgentInput| {
                     ran = true;
                     assert_eq!(input.message, PRINT_PROMPT);
-                    let ticket = smol::block_on(handle.start_with_input(input)).unwrap();
+                    let ticket = smol::block_on(handle.input_tx.admit(input)).unwrap();
                     let child_actor = if nested {
                         entering.recv_timeout(GATE_TIMEOUT).unwrap();
                         let graph = manager.snapshot();
@@ -1548,19 +1579,16 @@ mod tests {
                     let state = smol::block_on(futures_lite::future::or(
                         async {
                             let mut state = PrintTurnState::default();
-                            let mut outcomes = 0;
                             while let Ok(envelope) = events.recv_async().await {
-                                if matches!(envelope.event, AgentEvent::StreamClosed) {
-                                    break;
-                                }
                                 if let AgentEvent::TextDelta { text } = &envelope.event
                                     && envelope.subagent.is_none()
                                 {
                                     state.result_text.push_str(text);
                                 }
-                                outcomes += usize::from(state.accept_outcome(&envelope));
+                                if state.accept_outcome(&envelope) {
+                                    break;
+                                }
                             }
-                            assert_eq!(outcomes, 1);
                             Ok(state)
                         },
                         async {
@@ -1596,19 +1624,20 @@ mod tests {
         assert!(manager.snapshot().is_empty());
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         assert!(!dir.exists());
+        assert_eq!(files_under(state_dir.path()), Vec::<PathBuf>::new());
         let requests = received.try_iter().collect::<Vec<_>>();
         if outcome != "turn" {
             assert!(requests.is_empty());
             return;
         }
-        assert_eq!(requests[0], (SPEC.into(), String::new(), true));
-        assert_eq!(requests[1], (SPEC.into(), SYSTEM.into(), true));
+        assert_eq!(requests[0], (PRINT_MODEL.into(), String::new(), true));
+        assert_eq!(requests[1], (PRINT_MODEL.into(), SYSTEM.into(), true));
         if nested {
             assert_eq!(requests.len(), 6);
-            assert!(requests.iter().all(|(spec, _, _)| spec == SPEC));
+            assert!(requests.iter().all(|(spec, _, _)| spec == PRINT_MODEL));
             assert!(requests[2].2);
             assert!(requests[3].2);
-            assert_eq!(requests[5], (SPEC.into(), SYSTEM.into(), true));
+            assert_eq!(requests[5], (PRINT_MODEL.into(), SYSTEM.into(), true));
         } else {
             assert_eq!(requests.len(), 2);
         }

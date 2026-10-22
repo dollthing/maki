@@ -296,7 +296,7 @@ The bundled task plugin's ids are labels, not graph identity.
 
 ### Frontend roots
 
-TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `maki_lua::orchestration::bind_frontend_root`; print binds a fixed root that rejects model changes and never persists. SDK and ACP root configuration commits through the session coordinator's durable publication. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
+TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `maki_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
 
 ## Known implementation caveats
 

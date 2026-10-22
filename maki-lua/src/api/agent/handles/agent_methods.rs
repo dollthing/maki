@@ -397,7 +397,7 @@ async fn agent_set_model(
     let template = try_pair!(destination_template(&lua, &this));
     let target = try_pair!(this.manager.lookup(this.id));
     let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-    try_pair!(services.validate_config_mutation(&target));
+    try_pair!(services.validate_target(&target));
     let commit = orchestration::commit_config_change(
         &*services,
         &target,
@@ -467,7 +467,7 @@ async fn agent_set_mode(
     try_pair!(authorize(&lua, &ctx, &this));
     let target = try_pair!(this.manager.lookup(this.id));
     let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-    try_pair!(services.validate_config_mutation(&target));
+    try_pair!(services.validate_target(&target));
     let template = try_pair!(destination_template(&lua, &this));
     if ctx.trusted(&lua).is_err()
         && (mode_is_restricted(&template) || ctx.agent().is_some_and(mode_is_restricted))

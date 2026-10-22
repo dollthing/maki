@@ -174,7 +174,7 @@ UI agent actions keep the target selected when the action starts. `maki.session.
 
 ### Roots in other frontends
 
-Print, SDK and ACP roots are managed agents in the same graph as the TUI, so every `Agent` operation, including child spawn, works the same way there. Print runs a fixed root: `Agent:set_model` and `Agent:set_mode` on it return `configuration changes are unavailable for this fixed root` before anything changes. SDK and ACP root model changes go through the session coordinator and persist with the session. Concurrent ACP root prompts are rejected.
+Print, SDK and ACP roots are managed agents in the same graph as the TUI, so every `Agent` operation, including child spawn, works the same way there. Root model, mode and working-directory changes go through the session coordinator in all three. SDK and ACP persist them with the session; print applies them and saves nothing. Concurrent ACP root prompts are rejected.
 
 The [Lua API reference](/docs/lua-api/) defines the method signatures and returned fields. The Context concepts page describes model context windows, not Lua invocation authority.
 

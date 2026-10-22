@@ -16,8 +16,6 @@ use maki_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::warn;
 
-use crate::agent_errors::FIXED_ROOT_CONFIG_ERROR;
-
 use super::{
     CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
     TurnCompletionFuture, commit_config_change, default_config_mutation,
@@ -48,7 +46,6 @@ struct Targets {
 pub struct AgentOrchestration {
     targets: Mutex<Targets>,
     models: Arc<ArcSwapOption<Vec<String>>>,
-    fixed_root: Option<AgentRef>,
     completion: Option<TurnCompletion>,
 }
 
@@ -61,7 +58,6 @@ impl AgentOrchestration {
         Self {
             targets: Mutex::new(Targets::default()),
             models,
-            fixed_root: None,
             completion: None,
         }
     }
@@ -71,13 +67,6 @@ impl AgentOrchestration {
         let services = Self::new(models);
         services.register_root(root, None);
         services.select(Some(target));
-        services
-    }
-
-    pub fn bind_fixed_root(models: Arc<ArcSwapOption<Vec<String>>>, root: TrustedTarget) -> Self {
-        let fixed = root.target.clone();
-        let mut services = Self::bind_root(models, root);
-        services.fixed_root = Some(fixed);
         services
     }
 
@@ -280,18 +269,6 @@ impl OrchestrationServices for AgentOrchestration {
         } else {
             Err(FOREIGN_PLUGIN_HOST_AGENT.into())
         }
-    }
-
-    fn validate_config_mutation(&self, target: &AgentRef) -> Result<(), String> {
-        self.validate_target(target)?;
-        if self
-            .fixed_root
-            .as_ref()
-            .is_some_and(|root| same_agent(root, target))
-        {
-            return Err(FIXED_ROOT_CONFIG_ERROR.into());
-        }
-        Ok(())
     }
 
     fn reserve_config_mutation(

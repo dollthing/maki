@@ -483,10 +483,6 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         self.template(target).map(|_| ())
     }
 
-    fn validate_config_mutation(&self, target: &AgentRef) -> Result<(), String> {
-        self.validate_target(target)
-    }
-
     fn reserve_config_mutation(
         &self,
         target: &AgentRef,

@@ -336,7 +336,7 @@ impl ActorBackend for ParkedRoot {
     }
 }
 
-/// Installs a fixed root on {host} running {config}, parked inside one managed
+/// Installs a root on {host} running {config}, parked inside one managed
 /// turn until `ctx.cancel` fires, and points {ctx} at that turn.
 pub fn bind_parked_root(
     host: &PluginHost,
@@ -376,20 +376,19 @@ pub fn bind_parked_root(
         )
         .unwrap();
     ctx.managed_turn = Some(smol::block_on(bounded(turn_rx.recv_async())).unwrap());
-    install_fixed_root(host, root, with_request_tools(reg, ctx));
+    install_root(host, root, with_request_tools(reg, ctx));
 }
 
-/// Installs {root} as {host}'s fixed orchestration root.
-pub fn install_fixed_root(host: &PluginHost, root: AgentRef, template: ToolContext) {
-    host.event_handle().install_orchestration_services(Arc::new(
-        AgentOrchestration::bind_fixed_root(
+/// Installs {root} as {host}'s orchestration root.
+pub fn install_root(host: &PluginHost, root: AgentRef, template: ToolContext) {
+    host.event_handle()
+        .install_orchestration_services(Arc::new(AgentOrchestration::bind_root(
             Arc::default(),
             TrustedTarget {
                 target: root,
                 template,
             },
-        ),
-    ));
+        )));
     host.wait_for_worker_barrier_for_test();
 }
 

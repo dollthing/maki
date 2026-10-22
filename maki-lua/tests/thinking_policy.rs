@@ -54,7 +54,7 @@ fn load_thinking_host(ctx: &mut ToolContext) -> (Arc<ToolRegistry>, PluginHost) 
     ctx.execution_agent_id = Some(root.id());
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);
-    common::install_fixed_root(&host, root, template);
+    common::install_root(&host, root, template);
     (reg, host)
 }
 

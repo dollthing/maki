@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -13,7 +13,6 @@ use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, BoxFuture, Provider};
 use maki_providers::{RequestOptions, Timeouts};
-use maki_storage::checkpoint::accept_all;
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
@@ -23,10 +22,7 @@ use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
-use crate::session_coordinator::{
-    ModelPreparer, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
-    builtin_option_definitions,
-};
+use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{
@@ -47,29 +43,8 @@ const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 const OPERATION_CANCELLED: &str = "operation cancelled";
 #[cfg(any(test, feature = "test-util"))]
 const SESSION_ENDED: &str = "session ended";
-const PRINT_SESSION_ENDED: &str = "print session ended";
 const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
 const COMPACTION_CANCELLED: &str = "compaction cancelled";
-
-pub struct HeadlessParams {
-    pub model: Model,
-    pub config: AgentConfig,
-    pub permissions_config: PermissionsConfig,
-    pub timeouts: Timeouts,
-    pub input: AgentInput,
-    pub prompt_slots: ResolvedSlots,
-    pub excluded_tools: Vec<&'static str>,
-    pub mcp_handle: Option<McpHandle>,
-    pub initial_wd: PathBuf,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
-    pub model_policy: Arc<ModelPolicy>,
-    pub plugin_rules: Arc<PluginRuleStore>,
-    pub project_config: ProjectConfig,
-    pub modes: Arc<crate::ModeRegistry>,
-    pub session_options: SessionOptionCatalog,
-    pub state_dir: Option<PathBuf>,
-}
 
 #[derive(Clone, Default)]
 pub struct RootReadiness(Arc<RootInitialization>);
@@ -102,37 +77,6 @@ pub type RootBinding = Box<
     dyn FnOnce(AgentManagerHandle, AgentRef, ToolContext) -> BoxFuture<'static, Result<(), String>>
         + Send,
 >;
-
-pub struct HeadlessHandle {
-    pub manager: AgentManagerHandle,
-    pub root: RootReadiness,
-    pub event_rx: Receiver<Envelope>,
-    pub tool_names: Vec<String>,
-    pub session_id: SessionRef,
-    pub cwd: String,
-    pub task: smol::Task<()>,
-    pub offload_cleanup: Option<OffloadCleanup>,
-    started: AtomicBool,
-    input_tx: InteractiveInputSender,
-    admitted: flume::Sender<TurnTicket>,
-}
-
-impl HeadlessHandle {
-    pub async fn initialized_root(&self) -> Result<AgentRef, String> {
-        self.root.get().await
-    }
-
-    pub async fn start_with_input(&self, input: AgentInput) -> Result<TurnTicket, String> {
-        if self.started.swap(true, Ordering::AcqRel) {
-            return Err("print turn already started".to_owned());
-        }
-        let ticket = self.input_tx.admit(input).await?;
-        self.admitted
-            .send(ticket.clone())
-            .map_err(|_| PRINT_SESSION_ENDED.to_owned())?;
-        Ok(ticket)
-    }
-}
 
 pub struct InteractiveParams {
     pub model: Model,
@@ -406,15 +350,6 @@ pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
     })
 }
 
-pub fn spawn_interactive_with_binding(
-    params: InteractiveParams,
-    prepare: ProviderPreparation,
-    history: Option<crate::agent::HistorySnapshot>,
-    binding: Option<RootBinding>,
-) -> InteractiveHandle {
-    spawn_managed(params, prepare, history, binding, None)
-}
-
 struct HeadlessBackend {
     params: AgentParams,
     excluded_tools: Vec<&'static str>,
@@ -425,7 +360,6 @@ struct HeadlessBackend {
     answer_rx: Arc<Mutex<Receiver<String>>>,
     raw_tx: flume::Sender<Envelope>,
     root: RootReadiness,
-    persist: bool,
 }
 
 impl HeadlessBackend {
@@ -557,12 +491,8 @@ impl HeadlessBackend {
         .await
         .map_err(|error| error.to_string());
         let snapshot = history.snapshot().clone();
-        settle_manual_compaction(result, history, previous, cancel, |_| async move {
-            if self.persist {
-                persist_history(self.params.session_id.as_ref().unwrap().id(), snapshot).await
-            } else {
-                Ok(())
-            }
+        settle_manual_compaction(result, history, previous, cancel, |_| {
+            persist_history(self.params.session_id.as_ref().unwrap().id(), snapshot)
         })
         .await
     }
@@ -662,9 +592,6 @@ impl ActorBackend for HeadlessBackend {
             .with_mcp(self.mcp.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
-            if !self.persist {
-                return BackendResult::EnteredRun(outcome);
-            }
             let persisted = future::or(
                 persist_history(
                     self.params.session_id.as_ref().unwrap().id(),
@@ -729,15 +656,11 @@ impl ActorBackend for HeadlessBackend {
                 Some(InteractiveControl::Reset(reply)) => {
                     let previous = history.snapshot().clone();
                     history.replace(Vec::new());
-                    let result = if self.persist {
-                        persist_history(
-                            self.params.session_id.as_ref().unwrap().id(),
-                            history.snapshot().clone(),
-                        )
-                        .await
-                    } else {
-                        Ok(())
-                    };
+                    let result = persist_history(
+                        self.params.session_id.as_ref().unwrap().id(),
+                        history.snapshot().clone(),
+                    )
+                    .await;
                     if result.is_err() {
                         history.replace_snapshot(previous);
                     }
@@ -903,12 +826,11 @@ fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc
     state_dir.map(|root| Arc::new(OffloadStore::for_session(root, session)))
 }
 
-fn spawn_managed(
+pub fn spawn_interactive_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
-    one_shot: Option<(Receiver<TurnTicket>, SessionCoordinatorHandle)>,
 ) -> InteractiveHandle {
     let session_ref = params
         .session_id
@@ -1001,7 +923,6 @@ fn spawn_managed(
                 )
                 .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
                 .with_mode_def(Some(params.modes.current(&AgentMode::Build)));
-                let persist = one_shot.is_none();
                 let backend = HeadlessBackend {
                     params: AgentParams {
                         agent_id: crate::AgentId::generate(),
@@ -1033,7 +954,6 @@ fn spawn_managed(
                     answer_rx: Arc::new(Mutex::new(answer_rx)),
                     raw_tx: raw_tx.clone(),
                     root: root.clone(),
-                    persist,
                 };
                 let mut template = backend.template(&config);
                 let mirror =
@@ -1069,24 +989,18 @@ fn spawn_managed(
             .await;
             match initialized {
                 Ok(reference) => {
-                    if let Some((admitted, _)) = &one_shot {
-                        if let Ok(ticket) = admitted.recv_async().await {
-                            ticket.wait().await;
+                    let cancellation = async {
+                        while cancel_rx.recv_async().await.is_ok() {
+                            let _ = reference.cancel();
                         }
-                    } else {
-                        let cancellation = async {
-                            while cancel_rx.recv_async().await.is_ok() {
-                                let _ = reference.cancel();
-                            }
-                        };
-                        future::or(
-                            async {
-                                let _ = lifetime_rx.recv_async().await;
-                            },
-                            cancellation,
-                        )
-                        .await;
-                    }
+                    };
+                    future::or(
+                        async {
+                            let _ = lifetime_rx.recv_async().await;
+                        },
+                        cancellation,
+                    )
+                    .await;
                 }
                 Err(message) => {
                     root.finish(Err(message.clone()));
@@ -1096,9 +1010,6 @@ fn spawn_managed(
             manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
             if let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
-            }
-            if let Some((_, coordinator)) = one_shot {
-                let _ = coordinator.close().await;
             }
             drain_offload(cleanup.as_ref()).await;
             drop(guard);
@@ -1120,89 +1031,6 @@ fn spawn_managed(
         offload_cleanup,
         task,
     }
-}
-
-pub fn spawn_with_binding(
-    params: HeadlessParams,
-    prepare: ProviderPreparation,
-    binding: RootBinding,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_one_shot(params, MakiId::generate(), prepare, binding)
-}
-
-fn spawn_one_shot(
-    params: HeadlessParams,
-    session_id: MakiId,
-    prepare: ProviderPreparation,
-    binding: RootBinding,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    let spec = params.model.spec();
-    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-        session_id,
-        catalog: params.session_options,
-        definitions: builtin_option_definitions(
-            Arc::from(spec.as_str()),
-            [Arc::from(spec.as_str())],
-            params.permissions_config.yolo,
-            params.input.fast,
-            params.input.workflow,
-            params.input.thinking,
-        ),
-        persisted_options: Default::default(),
-        model_policy: Arc::clone(&params.model_policy),
-        checkpoint: accept_all(),
-        mailbox: SessionMailbox::new(session_id),
-    })?;
-    let session = SessionRef::from(session_id);
-    let cwd = params.initial_wd.to_string_lossy().into_owned();
-    let (admitted, admission) = flume::bounded(1);
-    let defaults = SessionDefaults {
-        fast: params.input.fast,
-        workflow: params.input.workflow,
-        thinking: Some(params.input.thinking.into()),
-    };
-    let interactive = spawn_managed(
-        InteractiveParams {
-            model: params.model,
-            config: params.config,
-            permissions_config: params.permissions_config,
-            timeouts: params.timeouts,
-            prompt_slots: Arc::new(params.prompt_slots),
-            excluded_tools: params.excluded_tools,
-            mcp_handle: params.mcp_handle,
-            initial_wd: params.initial_wd,
-            session_id: Some(session),
-            initial_history: Vec::new(),
-            yolo: false,
-            system_prompt_override: params.system_prompt_override,
-            append_system_prompt: params.append_system_prompt,
-            defaults,
-            model_policy: params.model_policy,
-            modes: params.modes,
-            question_mode: crate::tools::QuestionMode::Headless,
-            plugin_rules: params.plugin_rules,
-            project_config: params.project_config,
-            local_tools: Arc::default(),
-            state_dir: params.state_dir,
-        },
-        prepare,
-        None,
-        Some(binding),
-        Some((admission, coordinator)),
-    );
-    Ok(HeadlessHandle {
-        manager: interactive.manager,
-        root: interactive.root,
-        event_rx: interactive.event_rx,
-        tool_names: interactive.tool_names,
-        session_id: interactive.session_id,
-        cwd,
-        task: interactive.task,
-        offload_cleanup: interactive.offload_cleanup,
-        started: AtomicBool::new(false),
-        input_tx: interactive.input_tx,
-        admitted,
-    })
 }
 
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
@@ -1229,11 +1057,13 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
+    use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
     use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        accept_all,
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::io;
@@ -1245,6 +1075,8 @@ pub(crate) mod tests {
     const SAVE_ERROR: &str = "save failed";
     const FIRST: &str = "first provider";
     const SECOND: &str = "second provider";
+    const TEST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const TEST_CWD: &str = "/tmp";
     type Checkpoint = Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>>;
     type RecordedRequest = (&'static str, String, String, bool);
 
@@ -1335,68 +1167,44 @@ pub(crate) mod tests {
         AgentInput::from_defaults("hello".into(), Vec::new(), SessionDefaults::default())
     }
 
-    /// Spawns a print session on {provider} and admits its first turn.
+    /// Spawns a headless session on {provider} and admits its first turn.
     fn spawn_started(
-        params: HeadlessParams,
-        session_id: MakiId,
+        params: InteractiveParams,
         provider: Result<Arc<dyn Provider>, crate::AgentError>,
-    ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-        let handle = spawn_one_shot(
+    ) -> InteractiveHandle {
+        let handle = spawn_interactive_with_binding(
             params,
-            session_id,
             Box::new(move |model, _| {
                 Box::pin(async move { provider.map(|provider| (model, provider)) })
             }),
-            Box::new(|_, _, _| Box::pin(async { Ok(()) })),
-        )?;
-        let _ = smol::block_on(handle.start_with_input(first_input()));
-        Ok(handle)
-    }
-
-    fn test_params() -> HeadlessParams {
-        HeadlessParams {
-            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
-            config: AgentConfig::default(),
-            permissions_config: PermissionsConfig::default(),
-            timeouts: Timeouts::default(),
-            input: first_input(),
-            prompt_slots: ResolvedSlots::default(),
-            excluded_tools: Vec::new(),
-            mcp_handle: None,
-            initial_wd: PathBuf::from("/tmp"),
-            system_prompt_override: None,
-            append_system_prompt: None,
-            model_policy: Arc::default(),
-            plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(Path::new("/tmp")),
-            modes: Arc::new(ModeRegistry::builtin()),
-            session_options: Default::default(),
-            state_dir: None,
-        }
+            None,
+            None,
+        );
+        let _ = smol::block_on(handle.input_tx.admit(first_input()));
+        handle
     }
 
     fn interactive_params(session_id: MakiId, history: Vec<Message>) -> InteractiveParams {
-        let params = test_params();
         InteractiveParams {
-            model: params.model,
-            config: params.config,
-            permissions_config: params.permissions_config,
-            timeouts: params.timeouts,
-            prompt_slots: Arc::new(params.prompt_slots),
-            excluded_tools: params.excluded_tools,
+            model: Model::from_spec(TEST_MODEL).unwrap(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
             mcp_handle: None,
-            initial_wd: params.initial_wd,
+            initial_wd: PathBuf::from(TEST_CWD),
             session_id: Some(SessionRef::from(session_id)),
             initial_history: history,
             yolo: false,
             system_prompt_override: Some("admitted system".into()),
             append_system_prompt: None,
             defaults: Default::default(),
-            model_policy: params.model_policy,
-            modes: params.modes,
+            model_policy: Arc::default(),
+            modes: Arc::new(ModeRegistry::builtin()),
             question_mode: crate::tools::QuestionMode::Headless,
-            plugin_rules: params.plugin_rules,
-            project_config: params.project_config,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(Path::new(TEST_CWD)),
             local_tools: Arc::default(),
             state_dir: None,
         }
@@ -1443,13 +1251,12 @@ pub(crate) mod tests {
     }
 
     fn coordinator(session_id: MakiId, checkpoint: Checkpoint) -> SessionCoordinatorHandle {
-        let model = test_params().model.spec();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id,
             catalog: Default::default(),
             definitions: builtin_option_definitions(
-                Arc::from(model.as_str()),
-                [Arc::from(model.as_str())],
+                Arc::from(TEST_MODEL),
+                [Arc::from(TEST_MODEL)],
                 false,
                 false,
                 false,
@@ -1520,7 +1327,7 @@ pub(crate) mod tests {
             let (provider, _) = recording();
             let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
             let root = handle.initialized_root().await.unwrap();
-            let ticket = handle.input_tx.admit(test_params().input).await.unwrap();
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
             let saved = bounded(received.recv_async()).await.unwrap();
             assert!(saved.messages.len() >= 2);
             assert!(ticket.peek_result().is_none());
@@ -1580,7 +1387,7 @@ pub(crate) mod tests {
                 None,
                 Some(binding),
             );
-            let ticket = handle.input_tx.admit(test_params().input).await.unwrap();
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
             let settled = bounded(ticket.wait()).await;
             assert!(
                 matches!(&settled, TurnOutcome::Failed { failure, num_turns, .. }
@@ -1675,7 +1482,7 @@ pub(crate) mod tests {
             if fail {
                 assert_eq!(actor.committed_message_count(), original.len());
             }
-            let ticket = handle.input_tx.admit(test_params().input).await.unwrap();
+            let ticket = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
             release.send_async(()).await.unwrap();
             bounded(ticket.wait()).await;
@@ -1706,7 +1513,7 @@ pub(crate) mod tests {
             let (provider, _) = recording();
             let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
             let root = handle.initialized_root().await.unwrap();
-            let _turn = handle.input_tx.admit(test_params().input).await.unwrap();
+            let _turn = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
             let (reply, replies) = flume::bounded(1);
             handle.control_tx.send(control(reply)).await.unwrap();
@@ -1775,7 +1582,7 @@ pub(crate) mod tests {
             let (handle, coordinator) = fixture(Vec::new(), checkpoint(), first);
             let root = handle.initialized_root().await.unwrap();
             let actor = root.actor().unwrap();
-            let first = handle.input_tx.admit(test_params().input).await.unwrap();
+            let first = handle.input_tx.admit(first_input()).await.unwrap();
             let update = actor.reserve_prepared_operation(None).unwrap();
             update
                 .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
@@ -1792,7 +1599,7 @@ pub(crate) mod tests {
                 })))
                 .await
                 .unwrap();
-            let second = handle.input_tx.admit(test_params().input).await.unwrap();
+            let second = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(first.wait()).await;
             bounded(second.wait()).await;
             let before = bounded(received.recv_async()).await.unwrap();
@@ -1801,7 +1608,7 @@ pub(crate) mod tests {
                 before,
                 (
                     FIRST,
-                    test_params().model.spec(),
+                    TEST_MODEL.to_owned(),
                     "admitted system".into(),
                     false
                 )
@@ -1832,7 +1639,7 @@ pub(crate) mod tests {
                 exit: ProviderExit::Success,
             });
             let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
-            let primary = handle.input_tx.admit(test_params().input).await.unwrap();
+            let primary = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
             let (reply, response) = flume::bounded(1);
             handle
@@ -1862,7 +1669,7 @@ pub(crate) mod tests {
                 exit: ProviderExit::Pending,
             });
             let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
-            let primary = handle.input_tx.admit(test_params().input).await.unwrap();
+            let primary = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
             let (trigger, cancel) = CancelToken::new();
             let (output, events) = flume::unbounded();
@@ -1894,50 +1701,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn print_binding_precedes_first_admission() {
+    fn binding_precedes_first_admission() {
         const DISPATCHED_INPUT: &str = "expanded command prompt";
         smol::block_on(async {
             let (provider, received) = recording();
             let (bound, binding_seen) = flume::bounded(1);
-            let mut params = test_params();
+            let session_id = MakiId::generate();
+            let coordinator = coordinator(session_id, checkpoint());
+            let bind_actor = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let mut params = interactive_params(session_id, Vec::new());
             params.config.max_concurrent_agent_turns = 1;
-            let handle = spawn_with_binding(
+            let handle = spawn_interactive_with_binding(
                 params,
                 Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
-                Box::new(move |manager, root, template| {
+                None,
+                Some(Box::new(move |manager, root, template| {
                     Box::pin(async move {
                         assert_eq!(manager.root_id().unwrap(), root.id());
                         assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
                         assert_eq!(template.mode, AgentMode::Build);
                         assert_eq!(template.execution_agent_id, Some(root.id()));
-                        assert_eq!(template.cwd, PathBuf::from("/tmp"));
+                        assert_eq!(template.cwd, PathBuf::from(TEST_CWD));
                         assert!(template.managed_turn.is_none());
                         bound.send_async(root.id()).await.unwrap();
-                        Ok(())
+                        bind_actor(manager, root, template).await
                     })
-                }),
-            )
-            .unwrap();
+                })),
+            );
             let root = handle.initialized_root().await.unwrap();
             assert_eq!(binding_seen.recv_async().await.unwrap(), root.id());
             assert!(received.is_empty());
-            let ticket = handle
-                .start_with_input(AgentInput::from_defaults(
+            let InteractiveHandle {
+                input_tx,
+                event_rx,
+                manager,
+                task,
+                ..
+            } = handle;
+            let ticket = input_tx
+                .admit(AgentInput::from_defaults(
                     DISPATCHED_INPUT.into(),
                     Vec::new(),
                     SessionDefaults::default(),
                 ))
                 .await
                 .unwrap();
-            assert!(handle.start_with_input(first_input()).await.is_err());
             assert!(matches!(
                 bounded(ticket.wait()).await,
                 TurnOutcome::Completed { .. }
             ));
             assert_eq!(received.len(), 1);
-            bounded(handle.task).await;
-            let inputs = handle
-                .event_rx
+            drop(input_tx);
+            bounded(task).await;
+            let inputs = event_rx
                 .try_iter()
                 .filter_map(|envelope| match envelope.event {
                     AgentEvent::QueueItemConsumed { text, .. } => Some(text),
@@ -1946,12 +1762,12 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(inputs, [DISPATCHED_INPUT]);
             assert!(
-                !handle
-                    .manager
+                !manager
                     .snapshot()
                     .iter()
                     .any(|node| node.graph_lifecycle == crate::GraphLifecycle::Live)
             );
+            coordinator.close().await.unwrap();
         });
     }
 
@@ -1959,38 +1775,49 @@ pub(crate) mod tests {
     #[test_case(ProviderExit::Pending ; "cancelled_task")]
     fn headless_offload_cleanup_covers_task_exit(exit: ProviderExit) {
         let state = tempfile::tempdir().unwrap();
-        let mut params = test_params();
+        let session_id = MakiId::generate();
+        let mut params = interactive_params(session_id, Vec::new());
         params.state_dir = Some(state.path().to_path_buf());
         let (entered, received) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
         let handle = spawn_started(
             params,
-            MakiId::generate(),
             Ok(Arc::new(GatedHeadlessProvider {
                 entered,
                 release: released,
                 exit,
             })),
-        )
-        .unwrap();
+        );
+        let InteractiveHandle {
+            input_tx,
+            event_rx,
+            task,
+            offload_cleanup,
+            ..
+        } = handle;
         received.recv_timeout(GATE_TIMEOUT).unwrap();
-        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
-        let cleanup = handle.offload_cleanup.unwrap();
+        let cleanup = offload_cleanup.unwrap();
         match exit {
             ProviderExit::Pending => {
-                smol::block_on(handle.task.cancel());
+                smol::block_on(task.cancel());
             }
             ProviderExit::Success => {
                 release.send(()).unwrap();
-                while let Ok(event) = handle.event_rx.recv() {
-                    if matches!(event.event, AgentEvent::StreamClosed) {
-                        assert!(!dir.exists());
-                        break;
+                let mut input_tx = Some(input_tx);
+                while let Ok(event) = event_rx.recv() {
+                    match event.event {
+                        AgentEvent::TurnOutcome(_) => drop(input_tx.take()),
+                        AgentEvent::StreamClosed => {
+                            assert!(!dir.exists());
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                smol::block_on(handle.task);
+                smol::block_on(task);
             }
         }
         smol::block_on(cleanup.wait()).unwrap();
@@ -2049,16 +1876,14 @@ pub(crate) mod tests {
         let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
-        let mut params = test_params();
+        let mut params = interactive_params(session_id, Vec::new());
         params.state_dir = Some(state.path().to_path_buf());
         let handle = spawn_started(
             params,
-            session_id,
             Err(crate::AgentError::Config {
                 message: HEADLESS_PROVIDER_ERROR.into(),
             }),
-        )
-        .unwrap();
+        );
         let mut saw_error = false;
         let mut saw_close = false;
         while let Ok(event) = handle.event_rx.recv() {
@@ -2078,44 +1903,6 @@ pub(crate) mod tests {
         assert!(saw_error && saw_close);
         smol::block_on(handle.task);
         smol::block_on(handle.offload_cleanup.unwrap().wait()).unwrap();
-    }
-
-    #[test]
-    fn spawn_registers_a_resolvable_coordinator() {
-        let (entered, received) = flume::bounded(1);
-        let (_release, release) = flume::bounded(1);
-        let handle = spawn_started(
-            test_params(),
-            MakiId::generate(),
-            Ok(Arc::new(GatedHeadlessProvider {
-                entered,
-                release,
-                exit: ProviderExit::Pending,
-            })),
-        )
-        .unwrap();
-        received.recv_timeout(GATE_TIMEOUT).unwrap();
-        let session_id = handle.session_id.id();
-        let coordinator = SessionCoordinatorHandle::resolve(session_id).unwrap();
-        assert_eq!(coordinator.read().session_id(), session_id);
-        SessionMailbox::notify(session_id, "ping".into(), true).unwrap();
-        smol::block_on(coordinator.close()).unwrap();
-        smol::block_on(handle.task.cancel());
-    }
-
-    #[test]
-    fn spawn_stops_when_coordinator_registration_fails() {
-        let session_id = MakiId::generate();
-        let existing = coordinator(session_id, checkpoint());
-        let error = match spawn_started(test_params(), session_id, Ok(recording().0)) {
-            Ok(_) => panic!("duplicate registration succeeded"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            crate::session_coordinator::SessionCoordinatorError::DuplicateSession(session_id)
-        );
-        smol::block_on(existing.close()).unwrap();
     }
 
     #[test]

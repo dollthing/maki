@@ -148,17 +148,15 @@ pub fn accept_all<S: Send + Sync + 'static>() -> Arc<dyn CheckpointWriter<S>> {
 }
 
 /// Runs the publication claim, then delegates to an ordinary writer.
-#[cfg(any(test, feature = "test-util"))]
 pub struct ClaimingWriter<S>(pub Arc<dyn CheckpointWriter<S>>);
 
-#[cfg(any(test, feature = "test-util"))]
 impl<S: Send + Sync + 'static> ClaimingWriter<S> {
+    /// Publishes everything, guarded or not, and saves nothing.
     pub fn accept_all() -> Arc<dyn CheckpointWriter<S>> {
         Arc::new(Self(accept_all()))
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
 impl<S: Send + Sync + 'static> CheckpointWriter<S> for ClaimingWriter<S> {
     fn checkpoint(&self, request: CheckpointRequest<S>) -> CheckpointFuture {
         self.0.checkpoint(request)

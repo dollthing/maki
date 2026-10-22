@@ -6,8 +6,6 @@ pub const NO_TASK_AUTHORITY: &str = "no active task authority";
 pub const MANAGED_AUTHORITY_INACTIVE: &str =
     "managed agent authority is not active in this invocation";
 pub const SESSION_REQUIRED_ERR: &str = "session is required";
-pub const FIXED_ROOT_CONFIG_ERROR: &str =
-    "configuration changes are unavailable for this fixed root";
 pub const AGENT_CONFIG_UNAVAILABLE: &str = "agent configuration is unavailable";
 pub const OTHER_RUNTIME: &str = "agent belongs to another runtime";
 pub const NO_ORCHESTRATION_SERVICES: &str = "no host orchestration services";
