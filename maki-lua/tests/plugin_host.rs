@@ -36,6 +36,8 @@ use maki_storage::id::{MakiId, SessionRef};
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
+mod common;
+
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
@@ -3820,15 +3822,24 @@ fn invalid_typed_copy_input_does_not_execute(input: &str) {
     ));
 }
 
-const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
+const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the frontend runner";
 
-/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. A
-/// handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
-/// counting toward the cap.
+/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair the frontend's
+/// runner gives back. A handler reached at depth 0 asks for depth 1 so a
+/// chain of aliases keeps counting toward the cap.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
-fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
+fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
+    let (runs_tx, runs) = flume::unbounded();
+    let _root = common::install_command_root(
+        &host,
+        Arc::new(move |cmdline, depth, _| {
+            runs_tx.send((cmdline, depth)).unwrap();
+            let reply = reply.clone();
+            Box::pin(async move { reply })
+        }),
+    );
     host.load_source(
         "p",
         r#"
@@ -3847,20 +3858,10 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
 
-    let maki_lua::UiAction::RunCommand {
-        cmdline,
-        depth,
-        reply_tx,
-        ..
-    } = rx
+    let (cmdline, depth) = runs
         .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION)
-    else {
-        panic!("{RUN_COMMAND_NO_ACTION}");
-    };
+        .expect(RUN_COMMAND_NO_ACTION);
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
-    reply_tx.send(reply).unwrap();
-
     let action = rx
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION);
@@ -6113,16 +6114,6 @@ fn host_roundtrip_bounded(
 #[test]
 fn session_picker_requested_autocmd_does_not_wedge_host() {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    // Answer the deferred `RunCommand` so the wrapper task completes: a bare
-    // host leaves it parked, and load barriers hold up every later request.
-    let ui_rx = guard.host().ui_action_rx();
-    std::thread::spawn(move || {
-        while let Ok(action) = ui_rx.recv() {
-            if let maki_lua::UiAction::RunCommand { reply_tx, .. } = action {
-                let _ = reply_tx.send(Ok(()));
-            }
-        }
-    });
     // Firing the event must return promptly instead of suspending the dispatch.
     let guard = host_roundtrip_bounded(guard, |host| {
         host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
@@ -6134,35 +6125,38 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
 }
 
 /// The picker must open through the `/sessions` command, which the host runs
-/// as a deadline-free coroutine. A silent no-op autocmd would never emit the
-/// `RunCommand`, and a direct `open()` call would never route through it.
+/// as a deadline-free coroutine. A silent no-op autocmd would never reach the
+/// frontend's runner, and a direct `open()` call would never route through it.
 #[test]
 fn session_picker_requested_routes_through_sessions_command() {
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    let actions = guard.host().ui_action_rx();
-    handle.fire_autocmd("SessionPickerRequested", json!({}));
-    let UiAction::RunCommand {
-        cmdline,
-        depth,
-        reply_tx,
-        ..
-    } = next_picker_action(&actions)
-    else {
-        panic!("SessionPickerRequested did not route through RunCommand");
-    };
-    assert_eq!(cmdline, PICKER_COMMAND);
     let registry = guard.host().command_registry();
     let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
-    let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
-    let outcome = smol::block_on(registry.dispatch_command_with_depth(
-        &target,
-        resolved.command,
-        resolved.arguments,
-        cmdline.as_str().into(),
-        usize::from(depth),
-    ));
-    reply_tx.send(Ok(())).unwrap();
-    assert!(matches!(outcome, CommandOutcome::Completed));
+    let (runs_tx, runs) = flume::unbounded();
+    let _root = common::install_command_root(
+        guard.host(),
+        Arc::new(move |cmdline, depth, _| {
+            let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
+            let dispatch = registry.dispatch_command_with_depth(
+                &target,
+                resolved.command,
+                resolved.arguments,
+                cmdline.as_str().into(),
+                usize::from(depth),
+            );
+            runs_tx.send(cmdline).unwrap();
+            Box::pin(async move {
+                assert!(matches!(dispatch.await, CommandOutcome::Completed));
+                Ok(())
+            })
+        }),
+    );
+    let actions = guard.host().ui_action_rx();
+    handle.fire_autocmd("SessionPickerRequested", json!({}));
+    assert_eq!(
+        runs.recv_timeout(HOST_REPLY_TIMEOUT).unwrap(),
+        PICKER_COMMAND
+    );
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close("esc");

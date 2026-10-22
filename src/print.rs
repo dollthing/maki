@@ -402,7 +402,9 @@ fn with_print_handle<T>(
     )
 }
 
-fn bind_print_root(lua_handle: EventHandle) -> (RootBinding, flume::Receiver<TrustedTarget>) {
+type PrintRoot = (TrustedTarget, Arc<AgentOrchestration>);
+
+fn bind_print_root(lua_handle: EventHandle) -> (RootBinding, flume::Receiver<PrintRoot>) {
     let (installed, services) = flume::bounded(1);
     let binding: RootBinding = Box::new(move |_, root, template| {
         Box::pin(async move {
@@ -410,11 +412,14 @@ fn bind_print_root(lua_handle: EventHandle) -> (RootBinding, flume::Receiver<Tru
                 target: root,
                 template,
             };
-            lua_handle.install_orchestration_services(Arc::new(
+            let orchestration = Arc::new(
                 AgentOrchestration::bind_fixed_root(Arc::default(), target.clone())
                     .with_completion(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
-            ));
-            installed.send(target).map_err(|error| error.to_string())
+            );
+            lua_handle.install_orchestration_services(orchestration.clone());
+            installed
+                .send((target, orchestration))
+                .map_err(|error| error.to_string())
         })
     });
     (binding, services)
@@ -503,12 +508,20 @@ pub fn run(
 
         with_print_handle(handle, |handle| {
             smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-            let trusted = installed.recv().map_err(|error| eyre!(error))?;
+            let (trusted, orchestration) = installed.recv().map_err(|error| eyre!(error))?;
             let selection =
                 CompleteModelSelection::from_model(&trusted.template.model, trusted.template.opts);
+            let root = trusted.target.clone();
             let target = command_registry.bind_target(
                 print_capabilities(),
                 Arc::new(PrintCommandHost(Some(trusted))),
+            );
+            orchestration.bind_commands(
+                &root,
+                maki_lua::orchestration::detached_command_runner(
+                    command_registry.clone(),
+                    target.clone(),
+                ),
             );
             let snapshot = HeadlessSnapshot::default();
             snapshot.install(
@@ -1480,7 +1493,7 @@ mod tests {
         let mut ran = false;
         let result = with_print_handle(handle, |handle| {
             let root = smol::block_on(handle.initialized_root()).unwrap();
-            let trusted = installed.recv_timeout(GATE_TIMEOUT).unwrap();
+            let (trusted, _) = installed.recv_timeout(GATE_TIMEOUT).unwrap();
             assert_eq!(trusted.target.id(), root.id());
             assert!(trusted.template.opts.fast);
             let command_host = Arc::new(PrintCommandHost(Some(trusted)));

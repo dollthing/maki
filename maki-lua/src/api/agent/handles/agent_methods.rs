@@ -8,7 +8,6 @@ use maki_agent::{
     TurnProvenance,
 };
 use maki_lua_macro::{lua_class, lua_fn};
-use maki_storage::StateDir;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, observe, retire_closed};
@@ -27,7 +26,7 @@ use crate::agent_errors::{
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
 };
-use crate::api::env::StateDirOverride;
+use crate::api::env::host_state_dir;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -454,13 +453,6 @@ fn agent_mode(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Res
     Ok((Some(config.mode.id().key().to_string()), None))
 }
 
-fn state_dir(lua: &Lua) -> Result<StateDir, String> {
-    match lua.app_data_ref::<StateDirOverride>() {
-        Some(dir) => Ok(StateDir::from_path(dir.0.clone())),
-        None => StateDir::resolve().map_err(|error| error.to_string()),
-    }
-}
-
 /// Switch mode through the actor configuration FIFO.
 /// @param ctx LuaCtx Invocation context.
 /// @param name string Registered mode name.
@@ -486,7 +478,7 @@ async fn agent_set_mode(
         .state
         .as_ref()
         .is_some_and(|state| state.structured.is_some());
-    let state_dir = try_pair!(state_dir(&lua));
+    let state_dir = try_pair!(host_state_dir(&lua));
     let ticket = try_pair!(orchestration::reserve_config_change(&*services, &target));
     let commit = ticket
         .commit_mode(

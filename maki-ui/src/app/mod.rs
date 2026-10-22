@@ -2579,6 +2579,7 @@ impl App {
     /// waits on resolution; the command's effects are applied by the event
     /// loop on a later iteration, so state inspected immediately after this
     /// call may predate them.
+    #[cfg(test)]
     pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
         let trimmed = cmdline.trim();
         let input = format!("/{}", trimmed.trim_start_matches('/'));

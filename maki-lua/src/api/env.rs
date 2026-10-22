@@ -1,11 +1,21 @@
 use std::path::PathBuf;
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::StateDir;
 use mlua::Lua;
 
 use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) struct StateDirOverride(pub(crate) PathBuf);
+
+/// The state directory this host writes to: the override a test or embedder
+/// installed, or the user's.
+pub(crate) fn host_state_dir(lua: &Lua) -> Result<StateDir, String> {
+    match lua.app_data_ref::<StateDirOverride>() {
+        Some(dir) => Ok(StateDir::from_path(dir.0.clone())),
+        None => StateDir::resolve().map_err(|error| error.to_string()),
+    }
+}
 
 fn utf8(p: PathBuf) -> Option<String> {
     p.into_os_string().into_string().ok()

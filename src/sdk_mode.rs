@@ -859,6 +859,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         coordinator.clone(),
         Arc::clone(&checkpoint),
     );
+    orchestration.bind_commands(
+        &root,
+        maki_lua::orchestration::detached_command_runner(
+            sdk_commands.registry.clone(),
+            sdk_commands.target.clone(),
+        ),
+    );
     lua_handle.install_orchestration_services(orchestration.clone());
     let modes = lua_handle.mode_registry();
     let set_mode = |key: &str| {

@@ -9,8 +9,11 @@ use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgS
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
     CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
-    HostRequest, HostResponse, PreparedTarget, ResolvedCommand, TargetCapabilities, TargetHandle,
+    HostRequest, HostResponse, PreparedTarget, ResolutionError, ResolvedCommand,
+    TargetCapabilities, TargetHandle,
 };
+
+pub(crate) const CLOSED_TARGET_ERR: &str = "the selected agent has closed; switch to a live chat";
 
 pub(crate) enum CommandEvent {
     Host {
@@ -225,24 +228,37 @@ impl CommandRuntime {
         self.send_outcome(target.id(), admission, future);
     }
 
-    /// Dispatches with an admission pinned before the request arrived.
-    pub(crate) fn dispatch_command_pinned(
+    /// Runs {cmdline} on {target} with an admission pinned before the request
+    /// arrived; the outcome reaches the event loop like a typed command's.
+    /// Answers once the name resolves, not when the command finishes.
+    pub(crate) fn run_pinned(
         &self,
         target: &TargetHandle,
-        command: ResolvedCommand,
-        arguments: Arc<str>,
-        depth: usize,
+        cmdline: &str,
+        depth: u8,
         admission: TrustedTarget,
-    ) {
+    ) -> Result<(), String> {
+        admission
+            .target
+            .validate_live()
+            .map_err(|_| CLOSED_TARGET_ERR.to_owned())?;
+        let resolved =
+            self.registry
+                .resolve_input_for(target, cmdline)
+                .map_err(|error| match error {
+                    ResolutionError::UnknownCommand(name) => format!("unknown command '{name}'"),
+                    ResolutionError::StaleTarget => error.to_string(),
+                })?;
         let future = self.registry.dispatch_command_with_admission(
             target,
-            command,
-            arguments,
+            resolved.command,
+            resolved.arguments,
             CommandContent::default(),
-            depth,
+            depth.into(),
             Arc::new(admission.clone()),
         );
         self.send_outcome(target.id(), Some(admission), future);
+        Ok(())
     }
 
     pub(crate) fn dispatch_input(&self, target: &TargetHandle, content: CommandContent) {

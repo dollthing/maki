@@ -8,17 +8,21 @@ use maki_agent::session_options::{
     SessionOptionCategory, SessionOptionOwner, SessionOptionsSnapshot,
 };
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::parse_thinking;
 use maki_storage::id::MakiId;
+use maki_storage::sessions::{Prefs, write_prefs};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::{
     DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION,
-    DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
+    DELEGATED_SESSION_LIFECYCLE, NO_FOCUSED_AGENT, SESSION_REQUIRED_ERR,
 };
+use crate::api::env::host_state_dir;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::orchestration::resolve_target;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// session id from Lua and returns a serialized
@@ -29,6 +33,7 @@ pub type SessionSnapshotFn =
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
+const NO_FOCUSED_SESSION: &str = "the focused agent has no session";
 
 async fn roundtrip(
     lua: Lua,
@@ -145,17 +150,20 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
-/// Returns the id of the currently focused session.
+/// Returns the id of the focused agent's session; a headless frontend's
+/// focus is its one session.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    if crate::runtime::in_delegated_tool(&lua) {
+fn current(lua: &Lua) -> LuaResult<Pair<String>> {
+    if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_FOCUS));
     }
-    roundtrip(lua, tx, SessionRequest::Current).await
+    let target = try_pair!(try_pair!(resolve_target(lua, None)).ok_or(NO_FOCUSED_AGENT));
+    let session = try_pair!(target.template.session_id.ok_or(NO_FOCUSED_SESSION));
+    Ok((Some(session.to_string()), None))
 }
 
 /// Returns a session's token usage without making a network request.
@@ -440,20 +448,22 @@ async fn set_title(
 /// @example
 /// maki.session.set_default_thinking("medium")
 #[lua_fn]
-async fn set_default_thinking(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    mode: String,
-) -> LuaResult<Pair<Value>> {
-    if crate::runtime::in_delegated_tool(&lua) {
+fn set_default_thinking(lua: &Lua, mode: String) -> LuaResult<Pair<Table>> {
+    if crate::runtime::in_delegated_tool(lua) {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
-    roundtrip(
-        lua,
-        tx,
-        SessionRequest::SetDefaultThinking { thinking: mode },
-    )
-    .await
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let thinking = try_pair!(parse_thinking(mode.trim()));
+    let state_dir = try_pair!(host_state_dir(lua));
+    try_pair!(write_prefs(
+        &state_dir,
+        &Prefs {
+            default_thinking: Some(thinking.into()),
+        },
+    ));
+    let reply = lua.create_table()?;
+    reply.set("mode", thinking.to_string())?;
+    Ok((Some(reply), None))
 }
 
 /// Delegated tools may change only the session their turn belongs to.
@@ -475,7 +485,7 @@ lua_table! {
     /// invocation's session, and `current` names the focused one. Tool
     /// handlers cannot read UI focus, so `current` refuses them.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options, set_option, set_title(tx), set_default_thinking(tx)]
+    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options, set_option, set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]

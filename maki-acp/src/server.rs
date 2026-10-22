@@ -943,8 +943,15 @@ async fn install_session_with_lock(
                 coordinator.clone(),
             )
             .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
-            root: trusted_root,
+            root: trusted_root.clone(),
         }),
+    );
+    orchestration.bind_commands(
+        &trusted_root.target,
+        maki_lua::orchestration::detached_command_runner(
+            command_registry.clone(),
+            command_target.clone(),
+        ),
     );
     let session_id = SessionId::from(handle.session_id.to_string());
     let command_projection_task = watch_available_commands(

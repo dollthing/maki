@@ -12,7 +12,10 @@ use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::{AgentRef, ModeRegistry, tools::ToolContext};
-use maki_commands::CommandInvocation;
+use maki_commands::{
+    CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
+    InputDispatch, TargetHandle,
+};
 use maki_providers::Message;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
@@ -202,6 +205,42 @@ pub type ConfigMutationReserver = Arc<
 >;
 
 pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// Runs a slash command a plugin asked for outside a command invocation,
+/// pinned to the given target, at the given hop depth. Resolves once the
+/// frontend has taken the command; a long one such as `/compact` may still be
+/// running.
+pub type CommandRunner =
+    Arc<dyn Fn(String, u8, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
+
+pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
+
+/// A runner for a frontend that hands no outcome back to a frontend loop:
+/// commands run on {target} and only `Completed` counts as done.
+pub fn detached_command_runner(registry: CommandRegistry, target: TargetHandle) -> CommandRunner {
+    Arc::new(move |cmdline, _, _| {
+        let dispatch = registry.dispatch_input(&target, CommandContent::from(cmdline.as_str()));
+        Box::pin(async move { detached_outcome(&cmdline, dispatch.await) })
+    })
+}
+
+/// Only `Completed` is finished by the time a detached dispatch returns, so
+/// every outcome that still needs a frontend loop to run it is an error
+/// rather than a `true` the caller would read as "it ran".
+pub(crate) fn detached_outcome(cmdline: &str, result: InputDispatch) -> Result<(), String> {
+    match result {
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_)))
+        | InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
+        InputDispatch::Dispatched(CommandOutcome::Completed) => Ok(()),
+        InputDispatch::Dispatched(
+            CommandOutcome::AgentTurn(_)
+            | CommandOutcome::IsolatedTurn(_)
+            | CommandOutcome::ManualCompaction(_)
+            | CommandOutcome::FrontendFeedback(_),
+        ) => Err(format!("{cmdline} {NEEDS_FRONTEND}")),
+    }
+}
 
 pub type TurnCompletion =
     Arc<dyn Fn(&AgentRef, HistorySnapshot<Message>) -> TurnCompletionFuture + Send + Sync>;
@@ -482,6 +521,10 @@ pub trait OrchestrationServices: Send + Sync + 'static {
     fn available_models(&self, _target: &AgentRef) -> Result<Vec<String>, String> {
         Err("host model catalog is unavailable".into())
     }
+
+    fn command_runner(&self, _target: &AgentRef) -> Result<CommandRunner, String> {
+        Err("host command runner is unavailable".into())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -666,8 +709,9 @@ pub(crate) fn validate_pinned_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScopeAuthority, WRONG_TASK, close_event_callback, event_callback, install_plugin_authority,
-        plugin_authority, register_event_callback, revoke_plugin,
+        CommandContent, CommandError, CommandOutcome, InputDispatch, NEEDS_FRONTEND,
+        ScopeAuthority, WRONG_TASK, close_event_callback, detached_outcome, event_callback,
+        install_plugin_authority, plugin_authority, register_event_callback, revoke_plugin,
     };
     use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
@@ -749,5 +793,53 @@ mod tests {
         close_event_callback(&lua, id);
         assert!(first.is_cancelled() && second.is_cancelled());
         assert!(event_callback(&lua, id).is_none());
+    }
+
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+            Arc::from("/bogus")
+        ))),
+        Err("unknown command".to_owned()) ;
+        "unknown command is rejected"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Completed),
+        Ok(()) ;
+        "dispatched command succeeds"
+    )]
+    #[test_case::test_case(
+        InputDispatch::LiteralInput(CommandContent::from("prose")),
+        Err("unknown command".to_owned()) ;
+        "literal input is not a command"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+            content: CommandContent::from("review this"),
+            prompt: None,
+        })),
+        Err(format!("/nested {NEEDS_FRONTEND}")) ;
+        "an agent turn has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(maki_commands::IsolatedTurn {
+            content: CommandContent::from("why?"),
+        })),
+        Err(format!("/nested {NEEDS_FRONTEND}")) ;
+        "an isolated turn has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(None)),
+        Err(format!("/nested {NEEDS_FRONTEND}")) ;
+        "manual compaction has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(
+            maki_commands::FrontendFeedback::Text(Arc::from("use session/new")),
+        )),
+        Err(format!("/nested {NEEDS_FRONTEND}")) ;
+        "frontend feedback has no frontend to show it"
+    )]
+    fn detached_outcome_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
+        assert_eq!(detached_outcome("/nested", result), expected);
     }
 }

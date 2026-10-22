@@ -449,7 +449,6 @@ pub enum SessionRequest {
     List,
     ListAll,
     Live,
-    Current,
     Usage { id: MakiId },
     Read { id: MakiId },
     New { prompt: Option<String>, focus: bool },
@@ -457,7 +456,6 @@ pub enum SessionRequest {
     Focus { id: String },
     Delete { id: String },
     SetTitle { id: String, title: String },
-    SetDefaultThinking { thinking: String },
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -579,17 +577,6 @@ pub enum UiAction {
         scroll_top: u16,
     },
     Builtin(BuiltinAction),
-    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
-    /// how the command itself went: `/compact` streams for a minute, and the
-    /// Lua caller must not park for that long.
-    RunCommand {
-        cmdline: String,
-        depth: u8,
-        /// The agent a keymap or event callback was pinned to; `None` runs
-        /// against the focused session.
-        target: Option<Box<crate::orchestration::TrustedTarget>>,
-        reply_tx: flume::Sender<Result<(), String>>,
-    },
 }
 
 /// Hand an action to the UI event loop. A full or closed channel means the

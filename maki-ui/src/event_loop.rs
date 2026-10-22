@@ -71,9 +71,7 @@ use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock::{self, ClaimedSessionLock};
-use maki_storage::sessions::{
-    Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
-};
+use maki_storage::sessions::{SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -93,7 +91,7 @@ use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
 };
 use crate::color_compat;
-use crate::command_runtime::{CommandEvent, CommandRuntime};
+use crate::command_runtime::{CLOSED_TARGET_ERR, CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
 use crate::components::{
@@ -134,7 +132,6 @@ const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage"
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
-const CLOSED_TARGET_ERR: &str = "the selected agent has closed; switch to a live chat";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
@@ -1975,6 +1972,15 @@ impl<'t> EventLoop<'t> {
                     Arc::clone(&self.orchestration),
                 )),
             );
+            let commands = Arc::clone(&self.ctx.command_runtime);
+            let command_target = runtime.app.command_target.clone();
+            self.orchestration.bind_commands(
+                &root,
+                Arc::new(move |cmdline, depth, admission| {
+                    let ran = commands.run_pinned(&command_target, &cmdline, depth, admission);
+                    Box::pin(async move { ran })
+                }),
+            );
             if let Some(target) = selected_agent(runtime) {
                 if let Ok(template) = OrchestrationServices::template(&*self.orchestration, &target)
                 {
@@ -2718,33 +2724,6 @@ impl<'t> EventLoop<'t> {
                 let actions = self.focused_app().run_builtin(action);
                 self.dispatch(self.focused, actions);
             }
-            UiAction::RunCommand {
-                cmdline,
-                depth,
-                target: Some(target),
-                reply_tx,
-            } => {
-                let _ = reply_tx.send(self.run_pinned_cmdline(&cmdline, depth, *target));
-            }
-            UiAction::RunCommand {
-                cmdline,
-                depth,
-                target: None,
-                reply_tx,
-            } => {
-                // Answer before dispatching: the caller only waits on the name
-                // resolving, and dispatch may take a while (or exit the app).
-                self.sync_orchestration();
-                match self.focused_app().run_cmdline(&cmdline, depth) {
-                    Ok(actions) => {
-                        let _ = reply_tx.send(Ok(()));
-                        self.dispatch(self.focused, actions);
-                    }
-                    Err(e) => {
-                        let _ = reply_tx.send(Err(e));
-                    }
-                }
-            }
         }
     }
 
@@ -3174,9 +3153,6 @@ impl<'t> EventLoop<'t> {
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
-            SessionRequest::Current => {
-                let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
-            }
             SessionRequest::Read { id } => {
                 let reply = match self.resolve_session_index(id) {
                     Ok(idx) => Ok(self.session_snapshot_json(idx)),
@@ -3247,21 +3223,6 @@ impl<'t> EventLoop<'t> {
                     }
                     Ok(json!(true))
                 })();
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::SetDefaultThinking { thinking } => {
-                let reply = maki_domain::parse_thinking(thinking.trim())
-                    .map_err(|error| error.to_string())
-                    .and_then(|thinking| {
-                        write_prefs(
-                            &self.ctx.storage,
-                            &Prefs {
-                                default_thinking: Some(thinking.into()),
-                            },
-                        )
-                        .map_err(|error| error.to_string())?;
-                        Ok(json!({ "mode": thinking.to_string() }))
-                    });
                 let _ = reply_tx.send(reply);
             }
         }
@@ -4029,46 +3990,6 @@ impl<'t> EventLoop<'t> {
 
     /// Runs a command for a keymap or event callback against the agent that
     /// callback was pinned to, in the session that owns it.
-    fn run_pinned_cmdline(
-        &self,
-        cmdline: &str,
-        depth: u8,
-        target: TrustedTarget,
-    ) -> Result<(), String> {
-        target
-            .target
-            .validate_live()
-            .map_err(|_| CLOSED_TARGET_ERR.to_owned())?;
-        let runtime = self
-            .sessions
-            .iter()
-            .find(|runtime| {
-                let (manager, _) = runtime.handles.manager_and_root();
-                target.target.manager().same_manager(&manager)
-            })
-            .ok_or_else(|| NOT_LIVE_ERR.to_owned())?;
-        let input = format!("/{}", cmdline.trim().trim_start_matches('/'));
-        let resolved = self
-            .ctx
-            .command_runtime
-            .registry
-            .resolve_input_for(&runtime.app.command_target, &input)
-            .map_err(|error| match error {
-                maki_commands::ResolutionError::UnknownCommand(name) => {
-                    format!("unknown command '{name}'")
-                }
-                maki_commands::ResolutionError::StaleTarget => error.to_string(),
-            })?;
-        self.ctx.command_runtime.dispatch_command_pinned(
-            &runtime.app.command_target,
-            resolved.command,
-            resolved.arguments,
-            depth.into(),
-            target,
-        );
-        Ok(())
-    }
-
     /// Pins the keymap callback to the agent selected when the key was
     /// pressed, so later focus changes do not retarget it.
     fn run_keybind(&mut self, idx: usize, id: u64) {
@@ -8549,15 +8470,6 @@ mod tests {
             event_loop.run_keybind(0, keymap);
             event_loop.sessions[0].app.active_chat = 0;
             event_loop.sync_orchestration();
-            let action = actions.recv_timeout(ACTION_TIMEOUT).unwrap();
-            assert!(matches!(
-                &action,
-                UiAction::RunCommand {
-                    target: Some(_),
-                    ..
-                }
-            ));
-            event_loop.handle_ui_action(action);
             assert!(matches!(
                 actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
                 UiAction::Flash(text) if text == INNER_DONE

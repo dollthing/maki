@@ -28,7 +28,7 @@ use maki_agent::{
     TurnCancellationReason, TurnContext, TurnOutcome, WorkKind,
 };
 use maki_lua::PluginHost;
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_lua::orchestration::{AgentOrchestration, CommandRunner, TrustedTarget};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -391,4 +391,28 @@ pub fn install_fixed_root(host: &PluginHost, root: AgentRef, template: ToolConte
         ),
     ));
     host.wait_for_worker_barrier_for_test();
+}
+
+/// Installs an idle root as {host}'s orchestration root whose plugin-requested
+/// commands go to {runner}, and returns its manager.
+pub fn install_command_root(host: &PluginHost, runner: CommandRunner) -> AgentManagerHandle {
+    let (template, _events, _cancel) = ctx_with_canned_provider();
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root_with_config(Some(effective_config(&template)), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(IdleRoot) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let services = AgentOrchestration::bind_root(
+        Arc::default(),
+        TrustedTarget {
+            target: root.clone(),
+            template,
+        },
+    );
+    services.bind_commands(&root, runner);
+    host.event_handle()
+        .install_orchestration_services(Arc::new(services));
+    host.wait_for_worker_barrier_for_test();
+    manager
 }

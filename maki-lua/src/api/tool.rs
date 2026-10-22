@@ -26,8 +26,7 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use maki_commands::{
-    ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
-    InputDispatch, PositionalArgument,
+    ArgumentKind, CommandArguments, CommandContent, CompletionPolicy, PositionalArgument,
 };
 use maki_config::{AgentConfig, Effect, Permission, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -38,7 +37,10 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
-use crate::agent_errors::{DELEGATED_REGISTRATION, TRUSTED_RUN_COMMAND_REQUIRED};
+use crate::agent_errors::{
+    DELEGATED_REGISTRATION, NO_FOCUSED_AGENT, NO_ORCHESTRATION_SERVICES,
+    TRUSTED_RUN_COMMAND_REQUIRED,
+};
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -46,11 +48,12 @@ use crate::api::session_option::add_session_option_fn;
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     ArgumentCompletion, ArgumentCompletionNavigation, CommandEntry, CommandHandlerMap,
-    PendingCommandMap, UiAction, ui_roundtrip,
+    PendingCommandMap,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::orchestration::{detached_outcome, resolve_target, services};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
@@ -1128,11 +1131,13 @@ fn register_command(
 /// Delegated tool handlers cannot call this trusted command executor. Nested
 /// trusted command calls retain the invoking command's pinned agent target.
 ///
-/// Called from inside another command's handler there is no frontend waiting
-/// on the result, so a command that needs one to run it -- a model turn, a
-/// custom Markdown command, `/compact`, `/btw`, `/cd` -- reports an error
-/// instead of pretending it ran. Call it from a keybinding or an autocmd if
-/// you need those.
+/// Outside a command handler the command runs on the frontend's own command
+/// target for the keymap's pinned agent, or the focused agent. Inside another
+/// command's handler, and on frontends that run commands only from their
+/// input, there is no frontend loop waiting on the result, so a command that
+/// needs one to run it -- a model turn, a custom Markdown command,
+/// `/compact`, `/btw` -- reports an error instead of pretending it ran. Call
+/// it from a TUI keybinding or an autocmd if you need those.
 ///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
 /// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.
@@ -1150,11 +1155,7 @@ fn register_command(
 ///   end,
 /// })
 #[lua_fn]
-async fn run_command(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    cmdline: String,
-) -> LuaResult<Pair<bool>> {
+async fn run_command(lua: Lua, cmdline: String) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
     }
@@ -1166,44 +1167,17 @@ async fn run_command(
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(nested_dispatch_result(&cmdline, result));
+        try_pair!(detached_outcome(&cmdline, result));
     } else {
-        let reply = try_pair!(
-            ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
-                cmdline,
-                depth,
-                target: crate::runtime::pinned_target(&lua).map(Box::new),
-                reply_tx,
-            })
-            .await
-        );
-        try_pair!(reply);
+        let target = match crate::runtime::pinned_target(&lua) {
+            Some(target) => target,
+            None => try_pair!(try_pair!(resolve_target(&lua, None)).ok_or(NO_FOCUSED_AGENT)),
+        };
+        let services = try_pair!(services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
+        let run = try_pair!(services.command_runner(&target.target));
+        try_pair!(run(cmdline, depth, target).await);
     }
     Ok((Some(true), None))
-}
-
-const NESTED_NEEDS_FRONTEND: &str =
-    "needs a frontend to run it and cannot be nested inside another command";
-
-/// A nested dispatch has no frontend behind it: the outcome comes back here
-/// and stops. Only `Completed` is actually finished by the time it arrives, so
-/// every outcome that still needs a frontend to run it is an error rather than
-/// a `true` the caller would read as "it ran".
-fn nested_dispatch_result(cmdline: &str, result: InputDispatch) -> Result<(), String> {
-    match result {
-        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
-            Err("unknown command".to_owned())
-        }
-        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
-        InputDispatch::Dispatched(CommandOutcome::Completed) => Ok(()),
-        InputDispatch::Dispatched(
-            CommandOutcome::AgentTurn(_)
-            | CommandOutcome::IsolatedTurn(_)
-            | CommandOutcome::ManualCompaction(_)
-            | CommandOutcome::FrontendFeedback(_),
-        ) => Err(format!("{cmdline} {NESTED_NEEDS_FRONTEND}")),
-        InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
-    }
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -1408,7 +1382,6 @@ pub(crate) fn create_api_table(
     context: PluginLoadContext,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_tool_fns(
@@ -1430,7 +1403,7 @@ pub(crate) fn create_api_table(
         context.pending_expanders.clone(),
     )?;
     add_session_option_fn(&t, lua, context.pending_session_options.clone())?;
-    run_command__register(&t, lua, ui_action_tx)?;
+    run_command__register(&t, lua)?;
     Ok(t)
 }
 
@@ -3288,53 +3261,5 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
-    }
-
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
-            Arc::from("/bogus")
-        ))),
-        Err("unknown command".to_owned()) ;
-        "unknown command is rejected"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::Completed),
-        Ok(()) ;
-        "dispatched command succeeds"
-    )]
-    #[test_case::test_case(
-        InputDispatch::LiteralInput(CommandContent::from("prose")),
-        Err("unknown command".to_owned()) ;
-        "literal input is not a command"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
-            content: CommandContent::from("review this"),
-            prompt: None,
-        })),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "an agent turn has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(maki_commands::IsolatedTurn {
-            content: CommandContent::from("why?"),
-        })),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "an isolated turn has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(None)),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "manual compaction has no frontend to run it"
-    )]
-    #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(
-            maki_commands::FrontendFeedback::Text(Arc::from("use session/new")),
-        )),
-        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
-        "frontend feedback has no frontend to show it"
-    )]
-    fn nested_dispatch_result_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
-        assert_eq!(nested_dispatch_result("/nested", result), expected);
     }
 }

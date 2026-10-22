@@ -18,7 +18,7 @@ use maki_agent::{
 };
 use maki_commands::CommandInvocation;
 use maki_lua::{
-    PluginHost, SessionRequest, UiAction,
+    PluginHost, UiAction,
     agent_errors::{
         AGENT_BUSY, DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, DELEGATED_REGISTRATION,
         FOREIGN_AGENT_REFERENCE, INVOCATION_EXPIRED, NO_FOCUSED_AGENT, NOT_DESCENDANT_OF_CALLER,
@@ -38,13 +38,14 @@ use maki_providers::{
     RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
+use maki_storage::StateDir;
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
     CheckpointRequest, CheckpointWriter,
 };
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::plans::PLANS_DIR;
-use maki_storage::sessions::HistorySnapshot;
+use maki_storage::sessions::{HistorySnapshot, read_prefs};
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -2879,26 +2880,7 @@ fn bundled_thinking_command_updates_only_its_target_agent() {
             ._host
             .load_source(PLUGIN, include_str!("../../plugins/thinking/init.lua"))
             .unwrap();
-        let ui = target._host.ui_action_rx();
-        let (flash_tx, flashes) = flume::unbounded();
-        let (default_tx, defaults) = flume::unbounded();
-        std::thread::spawn(move || {
-            while let Ok(action) = ui.recv() {
-                match action {
-                    UiAction::Flash(message) => {
-                        let _ = flash_tx.send(message);
-                    }
-                    UiAction::Session {
-                        req: SessionRequest::SetDefaultThinking { thinking },
-                        reply_tx,
-                    } => {
-                        let _ = reply_tx.send(Ok(json!({ "mode": thinking.clone() })));
-                        let _ = default_tx.send(thinking);
-                    }
-                    _ => {}
-                }
-            }
-        });
+        let flashes = target._host.ui_action_rx();
         assert_eq!(
             handle
                 .run_command_for_test(Arc::from(PLUGIN), Arc::from("/thinking"), "low".into(), 0)
@@ -2906,11 +2888,15 @@ fn bundled_thinking_command_updates_only_its_target_agent() {
                 .unwrap(),
             Ok(())
         );
-        assert_eq!(defaults.recv_timeout(TEST_TIMEOUT).unwrap(), "low");
+        let prefs = read_prefs(&StateDir::from_path(target._state_dir.path().to_path_buf()));
         assert_eq!(
-            flashes.recv_timeout(TEST_TIMEOUT).unwrap(),
-            "Thinking: low (default for new sessions)"
+            prefs.default_thinking.map(ThinkingConfig::from),
+            Some(ThinkingConfig::Effort(Effort::Low))
         );
+        assert!(matches!(
+            flashes.recv_timeout(TEST_TIMEOUT).unwrap(),
+            UiAction::Flash(message) if message == "Thinking: low (default for new sessions)"
+        ));
         let thinking = |fixture: &Fixture| {
             fixture
                 .manager

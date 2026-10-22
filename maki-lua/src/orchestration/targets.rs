@@ -19,16 +19,18 @@ use tracing::warn;
 use crate::agent_errors::FIXED_ROOT_CONFIG_ERROR;
 
 use super::{
-    ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
+    CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
     TurnCompletionFuture, commit_config_change, default_config_mutation,
 };
 
 const CHILD_HISTORY_KEY_UNAVAILABLE: &str = "child agent history key is unavailable";
 const FOREIGN_PLUGIN_HOST_AGENT: &str = "agent does not belong to this plugin host";
+const NO_COMMAND_RUNNER: &str = "this frontend runs no commands for the agent";
 
 struct RootTarget {
     target: TrustedTarget,
     config_mutations: Option<ConfigMutationReserver>,
+    commands: Option<CommandRunner>,
 }
 
 struct ChildTarget {
@@ -103,7 +105,21 @@ impl AgentOrchestration {
         targets.roots.push(RootTarget {
             target,
             config_mutations,
+            commands: None,
         });
+    }
+
+    /// Runs plugin-requested commands for {root}'s graph through {runner},
+    /// the frontend's own command target.
+    pub fn bind_commands(&self, root: &AgentRef, runner: CommandRunner) {
+        if let Some(entry) = self
+            .lock()
+            .roots
+            .iter_mut()
+            .find(|entry| same_agent(&entry.target.target, root))
+        {
+            entry.commands = Some(runner);
+        }
     }
 
     pub fn history_key(&self, target: &AgentRef) -> Result<String, String> {
@@ -308,6 +324,16 @@ impl OrchestrationServices for AgentOrchestration {
             return completion(target, history);
         }
         Box::pin(async { Ok(()) })
+    }
+
+    fn command_runner(&self, target: &AgentRef) -> Result<CommandRunner, String> {
+        self.validate_target(target)?;
+        self.lock()
+            .roots
+            .iter()
+            .find(|root| root.target.target.same_manager(target))
+            .and_then(|root| root.commands.clone())
+            .ok_or_else(|| NO_COMMAND_RUNNER.into())
     }
 
     fn available_models(&self, target: &AgentRef) -> Result<Vec<String>, String> {

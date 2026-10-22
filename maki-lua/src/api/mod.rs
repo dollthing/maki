@@ -76,13 +76,7 @@ pub(crate) fn create_maki_global(
     lua.set_app_data(context.pending_prompts.clone());
     lua.set_app_data(context.pending_hint.clone());
 
-    let api = tool::create_api_table(
-        lua,
-        context.clone(),
-        Arc::clone(&plugin),
-        opts,
-        ui_action_tx.clone(),
-    )?;
+    let api = tool::create_api_table(lua, context.clone(), Arc::clone(&plugin), opts)?;
     autocmd::add_autocmd_methods(
         &api,
         lua,

@@ -823,11 +823,13 @@ block your handler.
 Delegated tool handlers cannot call this trusted command executor. Nested
 trusted command calls retain the invoking command's pinned agent target.
 
-Called from inside another command's handler there is no frontend waiting
-on the result, so a command that needs one to run it -- a model turn, a
-custom Markdown command, `/compact`, `/btw`, `/cd` -- reports an error
-instead of pretending it ran. Call it from a keybinding or an autocmd if
-you need those.
+Outside a command handler the command runs on the frontend's own command
+target for the keymap's pinned agent, or the focused agent. Inside another
+command's handler, and on frontends that run commands only from their
+input, there is no frontend loop waiting on the result, so a command that
+needs one to run it -- a model turn, a custom Markdown command,
+`/compact`, `/btw` -- reports an error instead of pretending it ran. Call
+it from a TUI keybinding or an autocmd if you need those.
 
 **Parameters:**
 
@@ -4119,7 +4121,8 @@ local live, err = maki.session.live()
 maki.session.current()
 ```
 
-Returns the id of the currently focused session.
+Returns the id of the focused agent's session; a headless frontend's
+focus is its one session.
 
 **Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
 
