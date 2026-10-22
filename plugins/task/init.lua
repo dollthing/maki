@@ -209,7 +209,7 @@ local function project_result(result)
   }
 end
 
-local function create_session(ctx, options)
+local function spawn_agent(ctx, options)
   local agent, err = maki.agent.spawn(ctx, options)
   if not agent then
     return nil, err
@@ -217,16 +217,7 @@ local function create_session(ctx, options)
   local latest
   local tickets = {}
   local order = {}
-  local adapter = {}
-  function adapter:session_id()
-    return agent:_maki_session_id()
-  end
-  function adapter:_maki_task_owner()
-    return agent:_maki_task_owner(ctx)
-  end
-  function adapter:close(call_ctx)
-    return agent:close(call_ctx)
-  end
+  local turns = {}
   local function make_ticket_room(call_ctx)
     for index, id in ipairs(order) do
       if #order < MAX_RETAINED_TURNS then
@@ -251,7 +242,7 @@ local function create_session(ctx, options)
     end
     return ticket
   end
-  function adapter:send(message, call_ctx)
+  function turns:send(message, call_ctx)
     local authorized, auth_err = agent:status(call_ctx)
     if not authorized then
       return nil, auth_err, true
@@ -267,7 +258,7 @@ local function create_session(ctx, options)
     latest = ticket:id()
     return latest
   end
-  function adapter:wait(call_ctx, turn_id, timeout)
+  function turns:wait(call_ctx, turn_id, timeout)
     -- Without an id, wait on the child's latest turn, which may be one the
     -- runtime admitted to hand it a result from its own subagents.
     local ticket
@@ -288,11 +279,11 @@ local function create_session(ctx, options)
     end
     return project_result(result)
   end
-  function adapter:idle(call_ctx)
+  function turns:idle(call_ctx)
     local status = agent:status(call_ctx)
     return status ~= nil and status.status ~= "running" and status.queued == 0
   end
-  return adapter
+  return agent, turns
 end
 local function fail_task(task, err, ctx)
   if task.closed then
@@ -300,7 +291,7 @@ local function fail_task(task, err, ctx)
   end
   task.closed = true
   task.error = err
-  task.sess:close(ctx)
+  task.agent:close(ctx)
 end
 
 local function enqueue(task, message, ctx)
@@ -308,7 +299,7 @@ local function enqueue(task, message, ctx)
     return nil, task.error or TASK_CLOSED_ERR
   end
   local ok, admitted, admission_err, nonfatal = pcall(function()
-    return task.sess:send(message, ctx)
+    return task.turns:send(message, ctx)
   end)
   if not ok then
     fail_task(task, admitted or TASK_CLOSED_ERR, ctx)
@@ -332,8 +323,8 @@ local function spawn(spec, input, ctx)
       tasks[id] = nil
       table.remove(task_order, i)
     elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_maki_can_control() then
-      if task.closed or task.sess:idle(ctx) then
-        task.sess:close(ctx)
+      if task.closed or task.turns:idle(ctx) then
+        task.agent:close(ctx)
         tasks[id] = nil
         table.remove(task_order, i)
       else
@@ -346,23 +337,24 @@ local function spawn(spec, input, ctx)
   if #task_order >= MAX_RETAINED_TASKS then
     return nil, TASK_LIMIT_ERR
   end
-  local ok, sess, sess_err = pcall(function()
-    return create_session(ctx, spawn_options(spec, input))
+  local ok, agent, turns = pcall(function()
+    return spawn_agent(ctx, spawn_options(spec, input))
   end)
   if not ok then
-    return nil, tostring(sess)
+    return nil, tostring(agent)
   end
-  if sess_err then
-    return nil, sess_err
+  if not agent then
+    return nil, turns
   end
-  local task_id = sess:session_id()
+  local task_id = agent:_maki_session_id()
   if tasks[task_id] then
-    sess:close(ctx)
+    agent:close(ctx)
     return nil, "duplicate task_id"
   end
   local task = {
-    sess = sess,
-    owner = sess:_maki_task_owner(),
+    agent = agent,
+    turns = turns,
+    owner = agent:_maki_task_owner(ctx),
     closed = false,
     writes = spec.subagent_type == "general",
   }
@@ -486,7 +478,7 @@ local function wait_handler(input, ctx)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  local result, wait_err = task.sess:wait(ctx, input.turn_id, input.timeout)
+  local result, wait_err = task.turns:wait(ctx, input.turn_id, input.timeout)
   if wait_err == TURN_WAIT_TIMEOUT then
     return { llm_output = maki.json.encode({ status = "running" }) }
   end

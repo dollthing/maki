@@ -91,28 +91,28 @@ end
 
 local behaviors = {}
 
-behaviors.plain = function(sess, msg)
+behaviors.plain = function(agent, msg)
   return { text = "@PLAIN_TEXT@" }
 end
 behaviors.happy = behaviors.plain
 
 
-behaviors.prompt_error = function(sess, msg)
+behaviors.prompt_error = function(agent, msg)
   return nil, "@PROMPT_ERR@"
 end
 
-behaviors.nested_failed = function(sess, msg)
+behaviors.nested_failed = function(agent, msg)
   if #recorder.prompts == 1 then
     return { text = "started" }
   end
   return nil, "@PROMPT_ERR@"
 end
 
-behaviors.partial_error = function(sess, msg)
+behaviors.partial_error = function(agent, msg)
   return { text = "@PARTIAL_TEXT@" }, "@CANCELLED_ERR@"
 end
 
-behaviors.raise = function(sess, msg)
+behaviors.raise = function(agent, msg)
   error("@RAISE_MSG@")
 end
 
@@ -120,8 +120,8 @@ maki.agent.spawn = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
-  local sess = { opts = opts }
-  function sess:submit(call_ctx, msg, submit_opts)
+  local agent = { opts = opts }
+  function agent:submit(call_ctx, msg, submit_opts)
     if opts.name == "unresolved" then
       assert(submit_opts.existing_only == (#recorder.prompts >= @TURN_LIMIT@))
       local turn_id = tostring(#recorder.prompts)
@@ -152,16 +152,16 @@ maki.agent.spawn = function(ctx, opts)
       wait = function(_, ticket_ctx, wait_opts) return res end,
     }
   end
-  function sess:status(call_ctx)
+  function agent:status(call_ctx)
     return { status = "idle", queued = 0, input_tokens = 0, output_tokens = 0 }
   end
-  function sess:latest_turn(call_ctx)
+  function agent:latest_turn(call_ctx)
     return nil
   end
-  function sess:_maki_session_id()
+  function agent:_maki_session_id()
     return opts.name
   end
-  function sess:_maki_task_owner()
+  function agent:_maki_task_owner()
     return {
       _maki_can_control = function()
         return recorder.can_control ~= false
@@ -171,10 +171,7 @@ maki.agent.spawn = function(ctx, opts)
       end,
     }
   end
-  function sess:defer_close(call_ctx)
-    return true
-  end
-  function sess:close()
+  function agent:close()
     recorder.closed = recorder.closed + 1
   end
   if opts.name == "runtime" then
@@ -205,11 +202,11 @@ maki.agent.spawn = function(ctx, opts)
       }
       return latest
     end
-    function sess:submit(call_ctx, msg, submit_opts)
+    function agent:submit(call_ctx, msg, submit_opts)
       assert(not submit_opts.existing_only)
       return admit(false)
     end
-    function sess:latest_turn()
+    function agent:latest_turn()
       return latest
     end
     recorder.advance = function(input)
@@ -219,7 +216,7 @@ maki.agent.spawn = function(ctx, opts)
       return latest:id()
     end
   end
-  return sess
+  return agent
 end
 
 maki.api.register_tool({
