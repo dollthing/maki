@@ -605,91 +605,6 @@ impl StorageWriter {
         wake_checkpoint(&self.pending, &self.wake, id);
     }
 
-    pub fn checkpoint_child_history(
-        &self,
-        session_id: MakiId,
-        child_key: String,
-        history: HistorySnapshot<Message>,
-    ) -> CheckpointFuture {
-        let mut state = lock(&self.pending);
-        if state.closed {
-            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
-        }
-        let Some(base) = state
-            .coordinator_pending
-            .get(&session_id)
-            .map(|pending| Arc::clone(&pending.session))
-            .or_else(|| state.latest.get(&session_id).cloned())
-        else {
-            return Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id,
-                    message: Arc::from("session snapshot is unavailable"),
-                })
-            });
-        };
-        let mut candidate = base.as_ref().clone();
-        if !candidate.adopt_subagent_history(child_key.clone(), &history) {
-            return Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id,
-                    message: Arc::from(CHECKPOINT_REPLACED),
-                })
-            });
-        }
-        candidate.prune_posts(Some(&child_key), history.messages.len());
-        let candidate = Arc::new(candidate);
-        let generation = next_generation(&mut state);
-        let history_base = state
-            .coordinator_pending
-            .get(&session_id)
-            .and_then(|pending| pending.history_base);
-        state.coordinator_pending.insert(
-            session_id,
-            CoordinatorPending {
-                generation,
-                session: Arc::clone(&candidate),
-                history_base,
-            },
-        );
-        state.latest_generations.insert(session_id, generation);
-        let version = CheckpointVersion {
-            revision: generation,
-            epoch: candidate.history_snapshot().epoch,
-        };
-        let config_version = state.config_versions.get(&session_id).copied();
-        let (reply, response) = flume::bounded(1);
-        enqueue_locked(
-            &mut state.entries,
-            PendingSave {
-                session: candidate,
-                waiters: vec![CheckpointWaiter {
-                    version,
-                    config_version: None,
-                    histories: vec![RequiredHistory::Child {
-                        key: child_key,
-                        history,
-                    }],
-                    reply,
-                }],
-                generation,
-                coordinator_generation: Some(generation),
-                config_version,
-                coordinator_history_base: history_base,
-                retry_attempt: 0,
-                retry_at: None,
-            },
-        );
-        drop(state);
-        wake_checkpoint(&self.pending, &self.wake, session_id);
-        Box::pin(async move {
-            response
-                .recv_async()
-                .await
-                .map_err(|_| CheckpointError::Closed(session_id))?
-        })
-    }
-
     pub async fn checkpoint_staged(&self, request: StagedSessionCheckpoint) -> Result<(), String> {
         enqueue_staged_checkpoint(&self.pending, &self.wake, request)?
             .recv_async()
@@ -3069,9 +2984,8 @@ mod tests {
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
     }
 
-    #[test_case(false; "root")]
-    #[test_case(true; "child")]
-    fn acknowledged_in_flight_history_survives_newer_metadata_failure(child: bool) {
+    #[test]
+    fn acknowledged_in_flight_history_survives_newer_metadata_failure() {
         let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
@@ -3079,13 +2993,7 @@ mod tests {
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
-        let ack = if child {
-            writer.checkpoint_child_history(
-                id,
-                TOOL_ID.into(),
-                HistorySnapshot::new(vec![Message::user(COORDINATOR_MSG.into())]),
-            )
-        } else {
+        let ack = {
             let mut history = config_checkpoint(1, 1);
             history.config = None;
             history.model = MODEL.into();
@@ -3132,11 +3040,7 @@ mod tests {
         std::fs::remove_file(&sessions_path).unwrap();
         std::fs::rename(&saved_path, &sessions_path).unwrap();
         let latest = writer.latest_snapshot(id).unwrap();
-        let messages = if child {
-            &latest.subagent_messages()[TOOL_ID]
-        } else {
-            latest.messages()
-        };
+        let messages = latest.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
         assert_eq!(latest.title, TITLE);
         writer.send(Arc::new(session));
@@ -3145,11 +3049,7 @@ mod tests {
         }
         disk.flush(&writer.pending);
         let recovered = AppSession::load(id, &dir).unwrap();
-        let messages = if child {
-            &recovered.subagent_messages()[TOOL_ID]
-        } else {
-            recovered.messages()
-        };
+        let messages = recovered.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
         assert_eq!(recovered.title, TITLE);
     }
@@ -3228,11 +3128,9 @@ mod tests {
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
     }
 
-    #[test_case(false, false; "root_rollback")]
-    #[test_case(true, false; "child_rollback")]
-    #[test_case(false, true; "root_metadata_before_success")]
-    #[test_case(true, true; "child_metadata_before_success")]
-    fn in_flight_success_rebases_newer_history_rollback(child: bool, succeed: bool) {
+    #[test_case(false; "rollback")]
+    #[test_case(true; "metadata_before_success")]
+    fn in_flight_success_rebases_newer_history_rollback(succeed: bool) {
         let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
@@ -3241,30 +3139,22 @@ mod tests {
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
         let checkpoint = |text: &str| {
-            if child {
-                writer.checkpoint_child_history(
-                    id,
-                    TOOL_ID.into(),
-                    HistorySnapshot::new(vec![Message::user(text.into())]),
-                )
-            } else {
-                let mut history = config_checkpoint(1, 1);
-                history.config = None;
-                history.model = MODEL.into();
-                history.kind = SessionCheckpointKind::History;
-                history.history_revision = Some(1);
-                history.history = Some(HistorySnapshot::new(vec![Message::user(text.into())]));
-                writer
-                    .coordinator_checkpoint()
-                    .checkpoint(CheckpointRequest {
-                        session_id: id,
-                        version: CheckpointVersion {
-                            revision: 1,
-                            epoch: 1,
-                        },
-                        snapshot: Arc::new(history),
-                    })
-            }
+            let mut history = config_checkpoint(1, 1);
+            history.config = None;
+            history.model = MODEL.into();
+            history.kind = SessionCheckpointKind::History;
+            history.history_revision = Some(1);
+            history.history = Some(HistorySnapshot::new(vec![Message::user(text.into())]));
+            writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(history),
+                })
         };
         let first_ack = checkpoint(COORDINATOR_MSG);
         let Entry::Save(first) = lock(&writer.pending).entries.remove(&id).unwrap() else {
@@ -3282,21 +3172,14 @@ mod tests {
         commit_save(&writer.pending, id, &first);
         acknowledge_waiters(&writer.pending, &first.session, first.waiters);
         let first_result = smol::block_on(first_ack);
-        if child {
-            first_result.unwrap();
-        } else {
-            assert!(
-                matches!(first_result, Err(CheckpointError::Save { session_id, .. }) if session_id == id)
-            );
-        }
+        assert!(
+            matches!(first_result, Err(CheckpointError::Save { session_id, .. }) if session_id == id)
+        );
+
         {
             let state = lock(&writer.pending);
             let candidate = &state.coordinator_pending[&id].session;
-            let messages = if child {
-                &candidate.subagent_messages()[TOOL_ID]
-            } else {
-                candidate.messages()
-            };
+            let messages = candidate.messages();
             assert_eq!(messages[0].first_text_content(), Some(REWOUND_MSG));
         }
         if succeed {
@@ -3307,11 +3190,7 @@ mod tests {
             let latest = writer.latest_snapshot(id).unwrap();
             let reopened = AppSession::load(id, &dir).unwrap();
             for saved in [&*latest, &reopened] {
-                let messages = if child {
-                    &saved.subagent_messages()[TOOL_ID]
-                } else {
-                    saved.messages()
-                };
+                let messages = saved.messages();
                 assert_eq!(messages[0].first_text_content(), Some(REWOUND_MSG));
                 assert_eq!(saved.title, TITLE);
             }
@@ -3330,18 +3209,10 @@ mod tests {
         std::fs::remove_file(&sessions_path).unwrap();
         std::fs::rename(&saved_path, &sessions_path).unwrap();
         let latest = writer.latest_snapshot(id).unwrap();
-        let messages = if child {
-            &latest.subagent_messages()[TOOL_ID]
-        } else {
-            latest.messages()
-        };
+        let messages = latest.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
         let recovered = AppSession::load(id, &dir).unwrap();
-        let messages = if child {
-            &recovered.subagent_messages()[TOOL_ID]
-        } else {
-            recovered.messages()
-        };
+        let messages = recovered.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
     }
 
@@ -3705,12 +3576,27 @@ mod tests {
             session.push_post(stored_post(Some(SIBLING_AGENT_ID), 2));
             let id = session.id;
             writer.send(Arc::new(session.clone()));
+            let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+                .unwrap()
+                .unwrap();
             writer
-                .checkpoint_child_history(
-                    id,
-                    TOOL_ID.into(),
-                    HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
-                )
+                .checkpoint_staged(StagedSessionCheckpoint {
+                    session_id: id,
+                    checkpoint: None,
+                    selected_config: None,
+                    history: Some((
+                        HistoryDestination::Child(TOOL_ID.into()),
+                        HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]),
+                    )),
+                    publication: CheckpointPublication::default(),
+                    claim: Arc::new(|publication| {
+                        publication
+                            .try_publish()
+                            .then_some(())
+                            .ok_or_else(|| Arc::from(CHECKPOINT_CANCELLED))
+                    }),
+                    guard: lease.publication_guard(),
+                })
                 .await
                 .unwrap();
             let expected_posts = [
@@ -4034,11 +3920,9 @@ mod tests {
         });
     }
 
-    #[test_case(false, false; "main_without_interleaved_save")]
-    #[test_case(true, false; "child_without_interleaved_save")]
-    #[test_case(false, true; "main_with_interleaved_save")]
-    #[test_case(true, true; "child_with_interleaved_save")]
-    fn failed_replacement_keeps_committed_history(child: bool, interleaved: bool) {
+    #[test_case(false; "without_interleaved_save")]
+    #[test_case(true; "with_interleaved_save")]
+    fn failed_replacement_keeps_committed_history(interleaved: bool) {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, _wake_rx) = manual_writer();
@@ -4048,9 +3932,7 @@ mod tests {
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
         let history = HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]);
-        let checkpoint = if child {
-            writer.checkpoint_child_history(id, TOOL_ID.into(), history)
-        } else {
+        let checkpoint = {
             let mut snapshot = config_checkpoint(1, 1);
             snapshot.config = None;
             snapshot.kind = SessionCheckpointKind::History;

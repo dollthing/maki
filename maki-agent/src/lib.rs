@@ -21,10 +21,9 @@ pub use actor::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
     AgentActorHandle, AgentContextSnapshot, BackendResult, CompletionPolicy, ConfigChange,
     ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryBoundary, HistoryChange,
-    HistoryEditCheckpoint, InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel,
-    QueueProjection, SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission,
-    TurnAdmissionOptions, TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult,
-    TurnTicket, WorkKind,
+    InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel, QueueProjection,
+    SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission, TurnAdmissionOptions,
+    TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket, WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,

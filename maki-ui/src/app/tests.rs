@@ -5420,10 +5420,24 @@ fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
     let shared = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         messages.clone(),
     )));
+    let template = cli_tool_ctx();
+    let config = EffectiveAgentConfig::new(
+        maki_agent::RunSettings {
+            provider: template.provider,
+            model: (*template.model).clone(),
+            fast: false,
+            workflow: false,
+            thinking: Default::default(),
+        },
+        AgentMode::Build,
+    );
     let target = manager
-        .create_root_with_config(None, messages.clone(), Some(Arc::clone(&shared)), |_| {
-            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
-        })
+        .create_root_with_config(
+            Some(config),
+            messages.clone(),
+            Some(Arc::clone(&shared)),
+            |_| Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>),
+        )
         .unwrap();
     app.chats[0].agent_id = Some(target.id());
     app.shared_history = Some(shared);
@@ -5699,12 +5713,30 @@ fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
     };
     assert!(actions.next().is_none());
     let actor = target.actor().unwrap();
-    let checkpoint: maki_agent::actor::HistoryEditCheckpoint =
-        Arc::new(|_| Box::pin(async { Ok(()) }));
-    let change =
-        smol::block_on(actor.prepare_idle().unwrap().rewind(boundary, checkpoint)).unwrap();
+    let guard = actor.prepare_idle().unwrap();
+    let (draft, replacement) = actor.rewind_snapshot(&boundary).unwrap();
+    let operation = guard.reserve_prepared_operation(None).unwrap();
+    let transaction = maki_agent::actor::PreparedTransaction {
+        publication: Default::default(),
+        publish: Box::new(|_, publication| {
+            Box::pin(async move {
+                assert!(publication.try_publish());
+                Ok(())
+            })
+        }),
+        finalize: Box::new(|_| {}),
+    };
+    let (_, _, change) = smol::block_on(async {
+        operation.resolve(None).unwrap();
+        operation.wait_ready().await.unwrap();
+        guard
+            .commit_prepared_transaction_held(operation, Some(replacement), transaction)
+            .await
+    })
+    .unwrap();
+    let change = change.unwrap();
     assert_eq!(change.agent_id, target.id());
-    app.apply_history_change(change);
+    app.apply_history_change(maki_agent::HistoryChange { draft, ..change });
 }
 
 fn build_rewind_app() -> App {

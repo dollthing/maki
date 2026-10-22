@@ -173,8 +173,8 @@ impl Runner {
             state.finish_close(&self.inner);
             state.publish_idle(&self.inner);
             drop(state);
-            if let Some(completion) = completion {
-                completion.send();
+            if let Some((sender, result)) = completion {
+                let _ = sender.send(result);
             }
         }
         #[cfg(any(test, feature = "test-util"))]

@@ -1,10 +1,5 @@
 use std::collections::HashSet;
-use std::future::Future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
 use std::sync::Arc;
-
-use futures_lite::FutureExt;
 
 use maki_providers::{ContentBlock, Message, MessageKind, Role};
 use maki_storage::sessions::HistorySnapshot;
@@ -31,12 +26,6 @@ pub struct HistoryChange {
     pub draft: Message,
 }
 
-pub type HistoryEditCheckpoint = Arc<
-    dyn Fn(HistorySnapshot<Message>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
-        + Send
-        + Sync,
->;
-
 pub struct HistoryEditWork {
     owner: Arc<()>,
     action: HistoryEditAction,
@@ -45,42 +34,13 @@ pub struct HistoryEditWork {
 type PreparedEditResult =
     Result<(ActorIdleGuard, PreparedCommit, Option<HistoryChange>), ActorError>;
 
-enum HistoryEditAction {
-    Rewind {
-        boundary: HistoryBoundary,
-        checkpoint: HistoryEditCheckpoint,
-        completion: flume::Sender<Result<HistoryChange, ActorError>>,
-    },
-    Prepared {
-        operation: Box<PreparedOperation>,
-        replacement: Option<HistorySnapshot<Message>>,
-        transaction: PreparedTransaction,
-        completion: flume::Sender<PreparedEditResult>,
-    },
-}
+pub(super) type HistoryEditCompletion = (flume::Sender<PreparedEditResult>, PreparedEditResult);
 
-pub(super) enum HistoryEditCompletion {
-    Rewind {
-        sender: flume::Sender<Result<HistoryChange, ActorError>>,
-        result: Result<HistoryChange, ActorError>,
-    },
-    Prepared {
-        sender: flume::Sender<PreparedEditResult>,
-        result: PreparedEditResult,
-    },
-}
-
-impl HistoryEditCompletion {
-    pub(super) fn send(self) {
-        match self {
-            Self::Rewind { sender, result } => {
-                let _ = sender.send(result);
-            }
-            Self::Prepared { sender, result } => {
-                let _ = sender.send(result);
-            }
-        }
-    }
+struct HistoryEditAction {
+    operation: Box<PreparedOperation>,
+    replacement: Option<HistorySnapshot<Message>>,
+    transaction: PreparedTransaction,
+    completion: flume::Sender<PreparedEditResult>,
 }
 
 impl AgentActorHandle {
@@ -96,6 +56,19 @@ impl AgentActorHandle {
             return Err(ActorError::StaleHistoryBoundary);
         }
         Ok(history.messages[boundary.offset].clone())
+    }
+
+    /// The boundary's message, to restore as the draft, and the history
+    /// before it, to replace the current history with.
+    pub fn rewind_snapshot(
+        &self,
+        boundary: &HistoryBoundary,
+    ) -> Result<(Message, HistorySnapshot<Message>), ActorError> {
+        let draft = self.history_boundary_message(boundary)?;
+        let history = self.inner.history.load_full();
+        let mut replacement = HistorySnapshot::new(history.messages[..boundary.offset].to_vec());
+        replacement.compacted = history.compacted;
+        Ok((draft, replacement))
     }
 
     pub fn history_boundaries(&self) -> Result<Vec<HistoryBoundary>, ActorError> {
@@ -164,7 +137,7 @@ impl ActorIdleGuard {
             state.owned_idle(&self.owner).unwrap().committing = true;
             state.owned_idle(&self.owner).unwrap().edit = Some(HistoryEditWork {
                 owner: Arc::clone(&self.owner),
-                action: HistoryEditAction::Prepared {
+                action: HistoryEditAction {
                     operation: Box::new(pending),
                     replacement,
                     transaction,
@@ -206,65 +179,21 @@ impl ActorIdleGuard {
             .await
             .map_err(|_| ActorError::Closed)?
     }
-
-    pub async fn rewind(
-        mut self,
-        boundary: HistoryBoundary,
-        checkpoint: HistoryEditCheckpoint,
-    ) -> Result<HistoryChange, ActorError> {
-        let (completion, response) = flume::bounded(1);
-        let actor = self.actor.clone();
-        {
-            let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(super::lifecycle_error(state.lifecycle));
-            }
-            let reservation = state
-                .owned_idle(&self.owner)
-                .filter(|reservation| {
-                    reservation.permission.is_none() && reservation.edit.is_none()
-                })
-                .ok_or(ActorError::Busy)?;
-            self.release = false;
-            reservation.edit = Some(HistoryEditWork {
-                owner: Arc::clone(&self.owner),
-                action: HistoryEditAction::Rewind {
-                    boundary,
-                    checkpoint,
-                    completion,
-                },
-            });
-            actor.inner.queue.notify();
-        }
-        response
-            .recv_async()
-            .await
-            .map_err(|_| ActorError::Closed)?
-    }
 }
 
 impl HistoryEditWork {
-    pub(super) fn prepared_id(&self) -> Option<u64> {
-        match &self.action {
-            HistoryEditAction::Prepared { operation, .. } => Some(operation.id),
-            HistoryEditAction::Rewind { .. } => None,
-        }
+    pub(super) fn prepared_id(&self) -> u64 {
+        self.action.operation.id
     }
 
     pub(super) fn fail(self, error: ActorError) {
-        match self.action {
-            HistoryEditAction::Rewind { completion, .. } => {
-                let _ = completion.send(Err(error));
-            }
-            HistoryEditAction::Prepared {
-                operation,
-                completion,
-                ..
-            } => {
-                (*operation).fail(error.clone());
-                let _ = completion.send(Err(error));
-            }
-        }
+        let HistoryEditAction {
+            operation,
+            completion,
+            ..
+        } = self.action;
+        (*operation).fail(error.clone());
+        let _ = completion.send(Err(error));
     }
 
     pub(super) async fn execute(
@@ -277,161 +206,89 @@ impl HistoryEditWork {
             owner: Arc::clone(&self.owner),
             release: true,
         };
-        match self.action {
-            HistoryEditAction::Rewind {
-                boundary,
-                checkpoint,
-                completion,
-            } => {
-                let result = Self::apply(&self.owner, &boundary, &checkpoint, actor, history).await;
-                drop(guard);
-                HistoryEditCompletion::Rewind {
-                    sender: completion,
-                    result,
-                }
+        let HistoryEditAction {
+            operation,
+            replacement,
+            transaction,
+            completion,
+        } = self.action;
+        let snapshot = replacement
+            .clone()
+            .unwrap_or_else(|| (*actor.inner.history.load_full()).clone());
+        let snapshot = {
+            let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            operation.transaction_snapshot(&actor.inner, &state, snapshot)
+        };
+        let result = transaction.publish(snapshot).await;
+        let id = operation.id;
+        let result = match result {
+            Err(error) => {
+                (*operation).fail(error.clone());
+                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.end_prepared_publication(id);
+                super::drive_operations(&actor.inner, &mut state);
+                Err(error)
             }
-            HistoryEditAction::Prepared {
-                operation,
-                replacement,
-                transaction,
-                completion,
-            } => {
-                let snapshot = replacement
-                    .clone()
-                    .unwrap_or_else(|| (*actor.inner.history.load_full()).clone());
-                let snapshot = {
-                    let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                    operation.transaction_snapshot(&actor.inner, &state, snapshot)
-                };
-                let result = transaction.publish(snapshot).await;
-                let id = operation.id;
-                let result = match result {
-                    Err(error) => {
-                        (*operation).fail(error.clone());
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        state.end_prepared_publication(id);
-                        super::drive_operations(&actor.inner, &mut state);
-                        Err(error)
+            Ok(finalize) => {
+                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let change = replacement.map(|snapshot| {
+                    history.replace_snapshot(snapshot.clone());
+                    HistoryChange {
+                        agent_id: actor.agent_id(),
+                        epoch: snapshot.epoch,
+                        messages: snapshot.messages,
+                        draft: Message::user(String::new()),
                     }
-                    Ok(finalize) => {
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        let change = replacement.map(|snapshot| {
-                            history.replace_snapshot(snapshot.clone());
-                            HistoryChange {
-                                agent_id: actor.agent_id(),
-                                epoch: snapshot.epoch,
-                                messages: snapshot.messages,
-                                draft: Message::user(String::new()),
-                            }
-                        });
-                        let committed =
-                            (*operation).commit_locked(&actor.inner, &mut state, finalize);
-                        state.end_prepared_publication(id);
-                        if let Some(reservation) = state.owned_idle(&self.owner) {
-                            reservation.committing = false;
-                            guard.release = false;
-                        }
-                        super::drive_operations(&actor.inner, &mut state);
-                        Ok((committed, change))
-                    }
-                };
-                if let Ok((committed, _)) = &result
-                    && let Some(ticket) = &committed.ticket
-                {
-                    let cancelled = {
-                        let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        let reason = match state.lifecycle {
-                            ActorLifecycle::Open => None,
-                            ActorLifecycle::Closed => Some(crate::TurnCancellationReason::Closed),
-                            ActorLifecycle::Shutdown => {
-                                Some(crate::TurnCancellationReason::Shutdown)
-                            }
-                        };
-                        if let Some(reason) = reason {
-                            actor
-                                .inner
-                                .queue
-                                .remove_turn(ticket.turn_id())
-                                .zip(Some(reason))
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some((admission, reason)) = cancelled {
-                        super::terminalize_work(
-                            &actor.inner,
-                            vec![super::ActorWork::Turn(Box::new(admission))],
-                            reason,
-                        );
-                    }
-                }
-                let result = result.map(|(commit, history)| {
-                    let idle = ActorIdleGuard {
-                        actor: actor.clone(),
-                        owner: Arc::clone(&self.owner),
-                        release: true,
-                    };
-                    (idle, commit, history)
                 });
-                drop(guard);
-                HistoryEditCompletion::Prepared {
-                    sender: completion,
-                    result,
+                let committed = (*operation).commit_locked(&actor.inner, &mut state, finalize);
+                state.end_prepared_publication(id);
+                if let Some(reservation) = state.owned_idle(&self.owner) {
+                    reservation.committing = false;
+                    guard.release = false;
                 }
+                super::drive_operations(&actor.inner, &mut state);
+                Ok((committed, change))
+            }
+        };
+        if let Ok((committed, _)) = &result
+            && let Some(ticket) = &committed.ticket
+        {
+            let cancelled = {
+                let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let reason = match state.lifecycle {
+                    ActorLifecycle::Open => None,
+                    ActorLifecycle::Closed => Some(crate::TurnCancellationReason::Closed),
+                    ActorLifecycle::Shutdown => Some(crate::TurnCancellationReason::Shutdown),
+                };
+                if let Some(reason) = reason {
+                    actor
+                        .inner
+                        .queue
+                        .remove_turn(ticket.turn_id())
+                        .zip(Some(reason))
+                } else {
+                    None
+                }
+            };
+            if let Some((admission, reason)) = cancelled {
+                super::terminalize_work(
+                    &actor.inner,
+                    vec![super::ActorWork::Turn(Box::new(admission))],
+                    reason,
+                );
             }
         }
+        let result = result.map(|(commit, history)| {
+            let idle = ActorIdleGuard {
+                actor: actor.clone(),
+                owner: Arc::clone(&self.owner),
+                release: true,
+            };
+            (idle, commit, history)
+        });
+        drop(guard);
+        (completion, result)
     }
-
-    async fn apply(
-        owner: &Arc<()>,
-        boundary: &HistoryBoundary,
-        checkpoint_fn: &HistoryEditCheckpoint,
-        actor: &AgentActorHandle,
-        history: &mut History,
-    ) -> Result<HistoryChange, ActorError> {
-        let (draft, snapshot) = {
-            let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(super::lifecycle_error(state.lifecycle));
-            }
-            if state.owned_idle(owner).is_none() {
-                return Err(ActorError::PolicyCancelled);
-            }
-            let snapshot = actor.inner.history.load_full();
-            if boundary.agent_id != actor.agent_id()
-                || boundary.epoch != snapshot.epoch
-                || !valid_boundary(history.as_slice(), boundary.offset)
-            {
-                return Err(ActorError::StaleHistoryBoundary);
-            }
-            let mut replacement =
-                HistorySnapshot::new(history.as_slice()[..boundary.offset].to_vec());
-            replacement.compacted = snapshot.compacted;
-            (history.as_slice()[boundary.offset].clone(), replacement)
-        };
-        checkpoint(checkpoint_fn, snapshot.clone()).await?;
-        let _state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        history.replace_snapshot(snapshot.clone());
-        Ok(HistoryChange {
-            agent_id: actor.agent_id(),
-            epoch: snapshot.epoch,
-            messages: snapshot.messages,
-            draft,
-        })
-    }
-}
-
-async fn checkpoint(
-    checkpoint: &HistoryEditCheckpoint,
-    snapshot: HistorySnapshot<Message>,
-) -> Result<(), ActorError> {
-    let future = catch_unwind(AssertUnwindSafe(|| checkpoint(snapshot)))
-        .map_err(|_| ActorError::HistoryCheckpoint("checkpoint callback panicked".into()))?;
-    AssertUnwindSafe(future)
-        .catch_unwind()
-        .await
-        .map_err(|_| ActorError::HistoryCheckpoint("checkpoint future panicked".into()))?
-        .map_err(ActorError::HistoryCheckpoint)
 }
 
 fn valid_boundary(messages: &[Message], offset: usize) -> bool {
@@ -485,12 +342,12 @@ mod tests {
     use maki_storage::sessions::HistorySnapshot;
     use test_case::test_case;
 
-    use super::{HistoryEditCheckpoint, valid_boundary};
+    use super::{HistoryBoundary, HistoryChange, valid_boundary};
     use crate::actor::tests::{ScriptedBackend, input, policy};
     use crate::actor::{
         ActorBackend, ActorError, AgentActorHandle, BackendResult, ChildDelivery, ConfigChange,
-        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedTransaction, PreparedTurn,
-        TurnContext, TurnResult, WorkKind,
+        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedPublication, PreparedTransaction,
+        PreparedTurn, TurnContext, TurnResult, WorkKind,
     };
     use crate::{
         AgentId, AgentInput, AgentMode, DoneReason, History, TurnCancellationReason, TurnId,
@@ -499,11 +356,48 @@ mod tests {
 
     const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
 
-    #[test_case(false, false; "rewind_close")]
-    #[test_case(true, false; "prepared_close")]
-    #[test_case(false, true; "rewind_shutdown")]
-    #[test_case(true, true; "prepared_shutdown")]
-    fn queued_history_edit_resolves_when_actor_closes(prepared: bool, shutdown: bool) {
+    fn idle_actor(messages: Vec<Message>) -> (AgentActorHandle, smol::Task<()>) {
+        let (actor, runner) =
+            AgentActorHandle::spawn(AgentId::generate(), messages, None, Box::new(IdleBackend));
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        (actor, runner)
+    }
+
+    fn published() -> PreparedPublication {
+        Box::new(|_, publication| {
+            Box::pin(async move {
+                assert!(publication.try_publish());
+                Ok(())
+            })
+        })
+    }
+
+    async fn rewind(
+        actor: &AgentActorHandle,
+        boundary: &HistoryBoundary,
+        publish: PreparedPublication,
+    ) -> Result<HistoryChange, ActorError> {
+        let guard = actor.prepare_idle()?;
+        let (_, replacement) = actor.rewind_snapshot(boundary)?;
+        let operation = guard.reserve_prepared_operation(None)?;
+        operation.resolve(None)?;
+        operation.wait_ready().await?;
+        let transaction = PreparedTransaction {
+            publication: CheckpointPublication::default(),
+            publish,
+            finalize: Box::new(|_| {}),
+        };
+        let (_, _, change) = guard
+            .commit_prepared_transaction_held(operation, Some(replacement), transaction)
+            .await?;
+        Ok(change.expect("rewind replaces history"))
+    }
+
+    #[test_case(false; "close")]
+    #[test_case(true; "shutdown")]
+    fn queued_history_edit_resolves_when_actor_closes(shutdown: bool) {
         smol::block_on(async {
             const TEXT: &str = "draft";
             let (_start, rx) = flume::bounded(1);
@@ -520,31 +414,23 @@ mod tests {
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let guard = actor.prepare_idle().unwrap();
-            let checkpoint: HistoryEditCheckpoint =
-                Arc::new(|_| panic!("closed edit must not checkpoint"));
-            let boundary = actor.history_boundaries().unwrap().remove(0);
             let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(|_, _| panic!("closed edit must not publish")),
+                finalize: Box::new(|_| panic!("closed edit must not finalize")),
+            };
             let edit = async move {
-                if prepared {
-                    let transaction = PreparedTransaction {
-                        publication: CheckpointPublication::default(),
-                        publish: Box::new(|_, _| panic!("closed edit must not publish")),
-                        finalize: Box::new(|_| panic!("closed edit must not finalize")),
-                    };
-                    guard
-                        .commit_prepared_transaction_held(
-                            operation,
-                            Some(HistorySnapshot::new(Vec::new())),
-                            transaction,
-                        )
-                        .await
-                        .map(|(held, _, _)| drop(held))
-                } else {
-                    drop(operation);
-                    guard.rewind(boundary, checkpoint).await.map(|_| ())
-                }
+                guard
+                    .commit_prepared_transaction_held(
+                        operation,
+                        Some(HistorySnapshot::new(Vec::new())),
+                        transaction,
+                    )
+                    .await
+                    .map(|(held, _, _)| drop(held))
             };
             let mut edit = Box::pin(edit);
             assert!(future::poll_once(&mut edit).await.is_none());
@@ -564,9 +450,8 @@ mod tests {
         });
     }
 
-    #[test_case(false; "rewind")]
-    #[test_case(true; "prepared_config_only")]
-    fn edit_response_waits_for_runner_cleanup(prepared: bool) {
+    #[test]
+    fn edit_response_waits_for_runner_cleanup() {
         smol::block_on(async {
             const DRAFT: &str = "draft";
             let (actor, runner) = AgentActorHandle::spawn(
@@ -582,32 +467,25 @@ mod tests {
             let (release, released) = flume::bounded(1);
             *actor.inner.after_work_execution.lock().unwrap() = Some((executed, released));
             let guard = actor.prepare_idle().unwrap();
-            let checkpoint: HistoryEditCheckpoint = Arc::new(|_| Box::pin(async { Ok(()) }));
-            let boundary = actor.history_boundaries().unwrap().remove(0);
             let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
+            let transaction = PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                publish: Box::new(|snapshot, publication| {
+                    Box::pin(async move {
+                        assert_eq!(snapshot.history.messages.len(), 1);
+                        assert!(publication.try_publish());
+                        Ok(())
+                    })
+                }),
+                finalize: Box::new(|_| {}),
+            };
             let mut edit = Box::pin(async move {
-                if prepared {
-                    let transaction = PreparedTransaction {
-                        publication: CheckpointPublication::default(),
-                        publish: Box::new(|snapshot, publication| {
-                            Box::pin(async move {
-                                assert_eq!(snapshot.history.messages.len(), 1);
-                                assert!(publication.try_publish());
-                                Ok(())
-                            })
-                        }),
-                        finalize: Box::new(|_| {}),
-                    };
-                    guard
-                        .commit_prepared_transaction_held(operation, None, transaction)
-                        .await
-                        .map(|(held, _, _)| drop(held))
-                } else {
-                    drop(operation);
-                    guard.rewind(boundary, checkpoint).await.map(|_| ())
-                }
+                guard
+                    .commit_prepared_transaction_held(operation, None, transaction)
+                    .await
+                    .map(|(held, _, _)| drop(held))
             });
             assert!(future::poll_once(&mut edit).await.is_none());
             execution.recv_async().await.unwrap();
@@ -1336,72 +1214,22 @@ mod tests {
     }
 
     #[test]
-    fn rewind_checkpoint_is_unpublished_until_ack_and_survives_close() {
-        smol::block_on(async {
-            let (actor, runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user("first".into()), Message::user("draft".into())],
-                None,
-                Box::new(IdleBackend),
-            );
-            let boundary = actor.history_boundaries().unwrap().remove(1);
-            let epoch = boundary.epoch;
-            let (entered, entry) = flume::bounded(1);
-            let (release, released) = flume::bounded(1);
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |messages| {
-                let entered = entered.clone();
-                let released = released.clone();
-                Box::pin(async move {
-                    entered.send(messages).unwrap();
-                    released.recv_async().await.unwrap();
-                    Ok(())
-                })
-            });
-            let guard = actor.prepare_idle().unwrap();
-            let edit = smol::spawn(guard.rewind(boundary, checkpoint));
-            let checkpointed = entry.recv_async().await.unwrap();
-            assert_eq!(checkpointed.messages.len(), 1);
-            assert_eq!(actor.inner.history.load().epoch, epoch);
-            assert_eq!(actor.inner.history.load().messages.len(), 2);
-            assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
-            actor.close();
-            release.send(()).unwrap();
-            let change = edit.await.unwrap();
-            assert_eq!(change.epoch, checkpointed.epoch);
-            assert!(Arc::ptr_eq(&change.messages, &checkpointed.messages));
-            let published = actor.inner.history.load();
-            assert_eq!(published.epoch, checkpointed.epoch);
-            assert_eq!(published.compacted, checkpointed.compacted);
-            assert!(Arc::ptr_eq(&published.messages, &checkpointed.messages));
-            assert_eq!(change.messages.len(), 1);
-            assert_ne!(change.epoch, epoch);
-            runner.await;
-        });
-    }
-
-    #[test]
     fn rewind_serializes_concurrent_child_report() {
         smol::block_on(async {
-            let (actor, runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user("draft".into())],
-                None,
-                Box::new(IdleBackend),
-            );
+            let (actor, runner) = idle_actor(vec![Message::user("draft".into())]);
             let boundary = actor.history_boundaries().unwrap().remove(0);
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let checkpoint: HistoryEditCheckpoint = Arc::new(move |_| {
-                let entered = entered.clone();
-                let released = released.clone();
+            let publish: PreparedPublication = Box::new(move |_, publication| {
                 Box::pin(async move {
                     entered.send(()).unwrap();
                     released.recv_async().await.unwrap();
+                    assert!(publication.try_publish());
                     Ok(())
                 })
             });
-            let guard = actor.prepare_idle().unwrap();
-            let edit = smol::spawn(guard.rewind(boundary, checkpoint));
+            let rewound = actor.clone();
+            let edit = smol::spawn(async move { rewind(&rewound, &boundary, publish).await });
             entry.recv_async().await.unwrap();
             let turn_id = TurnId::generate();
             let report = ChildDelivery {
@@ -1447,23 +1275,14 @@ mod tests {
     #[test]
     fn rewind_callback_panic_releases_reservation_without_publication() {
         smol::block_on(async {
-            let (actor, runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user("draft".into())],
-                None,
-                Box::new(IdleBackend),
-            );
+            let (actor, runner) = idle_actor(vec![Message::user("draft".into())]);
             let boundary = actor.history_boundaries().unwrap().remove(0);
             let epoch = boundary.epoch;
-            let checkpoint: HistoryEditCheckpoint = Arc::new(|_| panic!("callback panic"));
-            let result = actor
-                .prepare_idle()
-                .unwrap()
-                .rewind(boundary, checkpoint)
-                .await;
+            let result = rewind(&actor, &boundary, Box::new(|_, _| panic!("callback panic"))).await;
             assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
+            assert!(actor.prepare_idle().is_ok());
             actor.close();
             runner.await;
         });
@@ -1472,36 +1291,25 @@ mod tests {
     #[test]
     fn rewind_checkpoint_failure_restores_history() {
         smol::block_on(async {
-            let (actor, runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user("first".into()), Message::user("draft".into())],
-                None,
-                Box::new(IdleBackend),
-            );
+            let (actor, runner) = idle_actor(vec![
+                Message::user("first".into()),
+                Message::user("draft".into()),
+            ]);
             let boundary = actor.history_boundaries().unwrap().remove(1);
             let original = actor.inner.history.load_full();
-            let checkpoint: HistoryEditCheckpoint = Arc::new(|_: HistorySnapshot<Message>| {
-                Box::pin(async { Err(CHECKPOINT_ERROR.to_owned()) }) as _
-            });
-            let result = actor
-                .prepare_idle()
-                .unwrap()
-                .rewind(boundary.clone(), checkpoint)
-                .await;
+            let result = rewind(
+                &actor,
+                &boundary,
+                Box::new(|_, _| Box::pin(async { Err(CHECKPOINT_ERROR.to_owned()) })),
+            )
+            .await;
             assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, original.epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 2);
-            let checkpoint: HistoryEditCheckpoint =
-                Arc::new(|_: HistorySnapshot<Message>| Box::pin(async { Ok(()) }) as _);
-            let guard = actor.prepare_idle().unwrap();
-            let changed = guard
-                .rewind(boundary.clone(), checkpoint.clone())
-                .await
-                .unwrap();
+            let changed = rewind(&actor, &boundary, published()).await.unwrap();
             assert_eq!(changed.messages.len(), 1);
             assert_ne!(changed.epoch, original.epoch);
-            let guard = actor.prepare_idle().unwrap();
-            let stale = guard.rewind(boundary, checkpoint).await;
+            let stale = rewind(&actor, &boundary, published()).await;
             assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
             actor.close();
             runner.await;
@@ -1537,18 +1345,10 @@ mod tests {
                 assert!(actor.inner.history.load().compacted);
                 assert_ne!(boundary.epoch, actor.inner.history.load().epoch);
             }
-            let epoch = actor.inner.history.load().epoch;
-            let result = actor
-                .prepare_idle()
-                .unwrap()
-                .rewind(
-                    boundary,
-                    Arc::new(|_| panic!("stale boundary must not checkpoint")),
-                )
-                .await;
-            assert!(matches!(result, Err(ActorError::StaleHistoryBoundary)));
-            assert_eq!(actor.inner.history.load().epoch, epoch);
-            assert_eq!(actor.committed_message_count(), 1);
+            assert!(matches!(
+                actor.rewind_snapshot(&boundary),
+                Err(ActorError::StaleHistoryBoundary)
+            ));
             actor.close();
             other.close();
             runner.await;
@@ -1572,8 +1372,7 @@ mod tests {
                 },
                 Message::user(NEXT.into()),
             ];
-            let (actor, runner) =
-                AgentActorHandle::spawn(AgentId::generate(), messages, None, Box::new(IdleBackend));
+            let (actor, runner) = idle_actor(messages);
             let boundaries = actor.history_boundary_messages().unwrap();
             assert_eq!(
                 boundaries
@@ -1592,12 +1391,7 @@ mod tests {
                         && boundary.epoch == boundaries[0].0.epoch)
             );
             let boundary = boundaries[1].0.clone();
-            actor
-                .prepare_idle()
-                .unwrap()
-                .rewind(boundary.clone(), Arc::new(|_| Box::pin(async { Ok(()) })))
-                .await
-                .unwrap();
+            rewind(&actor, &boundary, published()).await.unwrap();
             assert!(actor.prepare_idle().is_ok());
             assert_eq!(boundaries[1].1.first_text_content(), Some(NEXT));
             assert!(matches!(

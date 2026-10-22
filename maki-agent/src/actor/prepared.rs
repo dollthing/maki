@@ -329,12 +329,7 @@ impl PreparedOperationTicket {
             && publication.publication.cancel()
         {
             let edit = state.idle.as_mut().and_then(|idle| {
-                if idle
-                    .edit
-                    .as_ref()
-                    .and_then(super::HistoryEditWork::prepared_id)
-                    == Some(self.id)
-                {
+                if idle.edit.as_ref().map(super::HistoryEditWork::prepared_id) == Some(self.id) {
                     idle.edit.take()
                 } else {
                     None

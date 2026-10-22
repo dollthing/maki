@@ -39,7 +39,7 @@ mod context;
 mod types;
 pub use context::AgentContextSnapshot;
 mod history_edit;
-pub use history_edit::{HistoryBoundary, HistoryChange, HistoryEditCheckpoint, HistoryEditWork};
+pub use history_edit::{HistoryBoundary, HistoryChange, HistoryEditWork};
 
 #[cfg(test)]
 mod tests;
@@ -2861,7 +2861,7 @@ impl AgentActorHandle {
             }
             state.cancelled_correlations.clear();
             let edit = state.idle.take().and_then(|idle| idle.edit);
-            if let Some(id) = edit.as_ref().and_then(HistoryEditWork::prepared_id) {
+            if let Some(id) = edit.as_ref().map(HistoryEditWork::prepared_id) {
                 state.end_prepared_publication(id);
             }
             if let Some(active) = state.active.take() {

@@ -30,7 +30,7 @@ const APPROVAL_CHECKPOINT_TIMEOUT: &str =
     "Plan approval timed out before its checkpoint was published";
 const IMPLEMENTATION_CORRELATION: &str = "plan-implementation";
 
-pub(super) type PlanApprovalTransaction =
+pub(super) type HistoryTransaction =
     Box<dyn FnOnce(Arc<EffectiveAgentConfig>, bool) -> Result<PreparedTransaction, String> + Send>;
 
 pub(super) struct PendingPlanApproval {
@@ -477,7 +477,7 @@ impl EventLoop<'_> {
                 .register_publication(&publication)
                 .map_err(|error| error.to_string())?;
             let transaction =
-                self.reserve_plan_approval_transaction(idx, &target, publication.clone())?;
+                self.reserve_history_transaction(idx, &target, publication.clone())?;
             Ok((
                 target,
                 request,

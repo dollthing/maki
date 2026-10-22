@@ -5048,33 +5048,6 @@ impl<'t> EventLoop<'t> {
         selected_agent(&self.sessions[idx])
     }
 
-    fn child_history_checkpoint(
-        &self,
-        idx: usize,
-        target: &AgentRef,
-    ) -> Result<maki_agent::actor::HistoryEditCheckpoint, String> {
-        let key = self.sessions[idx]
-            .app
-            .chats
-            .iter()
-            .find(|chat| chat.agent_id == Some(target.id()))
-            .and_then(|chat| chat.subagent_id.clone())
-            .ok_or_else(|| CHILD_HISTORY_IDENTITY_ERR.to_owned())?;
-        let writer = Arc::clone(&self.ctx.storage_writer);
-        let session = self.sessions[idx].id();
-        Ok(Arc::new(move |messages| {
-            let writer = Arc::clone(&writer);
-            let key = key.clone();
-            Box::pin(async move {
-                writer
-                    .checkpoint_child_history(session, key, messages)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-        }))
-    }
-
     fn dispatch_rewind(
         &self,
         idx: usize,
@@ -5083,34 +5056,44 @@ impl<'t> EventLoop<'t> {
     ) -> Result<(), String> {
         let actor = self.target_actor(idx, &target)?;
         let guard = actor.prepare_idle().map_err(|error| error.to_string())?;
-        let root = self.sessions[idx].handles.manager_and_root().1;
-        let checkpoint: maki_agent::actor::HistoryEditCheckpoint = if target.id() == root {
+        let (draft, replacement) = actor
+            .rewind_snapshot(&boundary)
+            .map_err(|error| error.to_string())?;
+        if target.id() == self.sessions[idx].handles.manager_and_root().1 {
             self.sessions[idx].app.sync_live_children();
-            let coordinator = self.sessions[idx].coordinator.clone();
-            Arc::new(move |messages| {
-                let coordinator = coordinator.clone();
-                Box::pin(async move {
-                    coordinator
-                        .persist_history(messages)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-            })
-        } else {
-            self.child_history_checkpoint(idx, &target)?
-        };
+        }
+        let operation = guard
+            .reserve_prepared_operation(None)
+            .map_err(|error| error.to_string())?;
+        let publication = CheckpointPublication::default();
+        operation
+            .register_publication(&publication)
+            .map_err(|error| error.to_string())?;
+        let transaction = self.reserve_history_transaction(idx, &target, publication)?;
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let change = Arc::new(Mutex::new(None));
-            let result = guard
-                .rewind(boundary, checkpoint)
-                .await
-                .map(|updated| {
-                    *change.lock().unwrap_or_else(|error| error.into_inner()) = Some(updated);
-                })
-                .map_err(|error| error.to_string());
+            let result = async {
+                operation.resolve(None)?;
+                operation.wait_ready().await?;
+                let config = operation.ready_config()?;
+                Ok::<_, maki_agent::ActorError>(config)
+            }
+            .await
+            .map_err(|error| error.to_string());
+            let result = match result.and_then(|config| transaction(config, true)) {
+                Ok(transaction) => guard
+                    .commit_prepared_transaction_held(operation, Some(replacement), transaction)
+                    .await
+                    .map(|(_, _, updated)| {
+                        *change.lock().unwrap_or_else(|error| error.into_inner()) =
+                            updated.map(|updated| HistoryChange { draft, ..updated });
+                    })
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -5219,12 +5202,12 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
-    fn reserve_plan_approval_transaction(
+    fn reserve_history_transaction(
         &self,
         idx: usize,
         target: &AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<approval::PlanApprovalTransaction, String> {
+    ) -> Result<approval::HistoryTransaction, String> {
         let root = self.sessions[idx].handles.manager_and_root().1;
         if target.id() == root {
             let reservation = self.sessions[idx]
