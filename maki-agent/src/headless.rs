@@ -47,6 +47,12 @@ const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_CLOSED: &str = "session ended before initialization";
 const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 const OPERATION_CANCELLED: &str = "operation cancelled";
+#[cfg(any(test, feature = "test-util"))]
+const SESSION_ENDED: &str = "session ended";
+const PRINT_SESSION_ENDED: &str = "print session ended";
+const ADMISSION_WITHOUT_TICKET: &str = "turn admission produced no ticket";
+const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
+const COMPACTION_CANCELLED: &str = "compaction cancelled";
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -126,7 +132,7 @@ impl HeadlessHandle {
         let ticket = self.input_tx.admit(input).await?;
         self.admitted
             .send(ticket.clone())
-            .map_err(|_| "print session ended".to_owned())?;
+            .map_err(|_| PRINT_SESSION_ENDED.to_owned())?;
         Ok(ticket)
     }
 }
@@ -236,7 +242,7 @@ impl InteractiveControlSender {
             return channel
                 .send_async(control)
                 .await
-                .map_err(|_| "session ended".to_owned());
+                .map_err(|_| SESSION_ENDED.to_owned());
         }
         let actor = self
             .root
@@ -312,7 +318,7 @@ impl InteractiveInputSender {
             return mirror
                 .send_async(input)
                 .await
-                .map_err(|_| "session ended".to_owned());
+                .map_err(|_| SESSION_ENDED.to_owned());
         }
         self.admit(input).await.map(|_| ())
     }
@@ -374,7 +380,7 @@ async fn admit_input(
         .await
         .map_err(|error| error.to_string())?
         .ticket
-        .ok_or_else(|| "turn admission produced no ticket".to_owned())
+        .ok_or_else(|| ADMISSION_WITHOUT_TICKET.to_owned())
 }
 
 pub struct InteractiveHandle {
@@ -468,7 +474,7 @@ impl HeadlessBackend {
             .await?
             .effective_config()
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "managed headless configuration unavailable".to_owned())
+            .ok_or_else(|| HEADLESS_CONFIG_UNAVAILABLE.to_owned())
     }
 
     fn system(&self, config: &EffectiveAgentConfig, instructions: &agent::Instructions) -> String {
@@ -842,7 +848,7 @@ fn compaction_result(event: ManualCompactionEvent) -> Result<(), String> {
     match event {
         ManualCompactionEvent::Completed => Ok(()),
         ManualCompactionEvent::Failed(error) => Err(error),
-        ManualCompactionEvent::Cancelled => Err("compaction cancelled".into()),
+        ManualCompactionEvent::Cancelled => Err(COMPACTION_CANCELLED.into()),
         ManualCompactionEvent::Started => unreachable!(),
     }
 }

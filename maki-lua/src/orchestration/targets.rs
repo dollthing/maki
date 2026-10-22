@@ -22,6 +22,9 @@ use super::{
     TurnCompletionFuture, commit_config_change, default_config_mutation,
 };
 
+const CHILD_HISTORY_KEY_UNAVAILABLE: &str = "child agent history key is unavailable";
+const FOREIGN_PLUGIN_HOST_AGENT: &str = "agent does not belong to this plugin host";
+
 struct RootTarget {
     target: TrustedTarget,
     config_mutations: Option<ConfigMutationReserver>,
@@ -109,7 +112,7 @@ impl AgentOrchestration {
             .iter()
             .find(|entry| same_agent(&entry.target.target, target))
             .map(|entry| entry.history_key.clone())
-            .ok_or_else(|| "child agent history key is unavailable".into())
+            .ok_or_else(|| CHILD_HISTORY_KEY_UNAVAILABLE.into())
     }
 
     /// Commits a metadata refresh for every live agent whose model resolves
@@ -222,7 +225,7 @@ impl OrchestrationServices for AgentOrchestration {
                 entry.target.target.same_manager(target)
                     && entry.target.target.validate_live().is_ok()
             })
-            .ok_or("agent does not belong to this plugin host")?;
+            .ok_or(FOREIGN_PLUGIN_HOST_AGENT)?;
         let source = if root.target.target.id() == target.id() {
             &root.target
         } else {
@@ -258,7 +261,7 @@ impl OrchestrationServices for AgentOrchestration {
         }) {
             Ok(())
         } else {
-            Err("agent does not belong to this plugin host".into())
+            Err(FOREIGN_PLUGIN_HOST_AGENT.into())
         }
     }
 

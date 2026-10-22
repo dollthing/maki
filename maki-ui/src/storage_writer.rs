@@ -39,6 +39,7 @@ const CHECKPOINT_CANCELLED: &str = "session checkpoint cancelled";
 pub(crate) const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const CONFIG_REQUIRES_CLAIM: &str = "configuration checkpoints require a publication claim";
 const SNAPSHOT_UNAVAILABLE: &str = "session snapshot is unavailable";
+const STAGED_HISTORY_INCOMPLETE: &str = "staged history requires a destination and exact snapshot";
 const SELECTED_CONFIG_DESTINATION: &str =
     "selected config requires its child checkpoint destination";
 const SELECTED_CONFIG_MISSING: &str = "selected child config requires existing stored metadata";
@@ -817,7 +818,7 @@ fn enqueue_staged_checkpoint(
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.history.is_some())
         {
-            return Err("staged history requires a destination and exact snapshot".into());
+            return Err(STAGED_HISTORY_INCOMPLETE.into());
         }
         if let Some(checkpoint) = &request.checkpoint {
             validate_checkpoint_history(checkpoint, request.history.is_some())

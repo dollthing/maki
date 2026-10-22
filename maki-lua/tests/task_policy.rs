@@ -761,7 +761,7 @@ fn task_ticket_limit_atomically_rejects_successors_but_joins_pending_work() {
 }
 
 #[test]
-fn unmanaged_nested_task_lifecycle_remains_compatible() {
+fn general_subagent_nested_task_lifecycle() {
     let (reg, _host) = load_task_host();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.audience = ToolAudience::GENERAL_SUB;

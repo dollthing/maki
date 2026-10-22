@@ -30,6 +30,7 @@ mod targets;
 pub use targets::AgentOrchestration;
 
 const WRONG_TASK: &str = "orchestration context belongs to another task";
+pub const DURABLE_CONFIG_UNAVAILABLE: &str = "durable configuration adapter is unavailable";
 static NEXT_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -377,7 +378,7 @@ fn default_config_mutation(
         .parent_id
         .is_none()
     {
-        return Err("durable root configuration adapter is unavailable".into());
+        return Err(DURABLE_CONFIG_UNAVAILABLE.into());
     }
     Ok(nonpersistent_config_mutation(publication))
 }

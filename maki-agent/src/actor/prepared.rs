@@ -19,6 +19,9 @@ use super::{
     lifecycle_error, materialize, preparation_input,
 };
 
+const PUBLICATION_CALLBACK_PANICKED: &str = "publication callback panicked";
+const PUBLICATION_FUTURE_PANICKED: &str = "publication future panicked";
+
 pub struct PreparedTurn {
     pub input: AgentInput,
     pub event_sender: Option<EventSender>,
@@ -80,11 +83,11 @@ impl PreparedTransaction {
         let future = catch_unwind(AssertUnwindSafe(|| {
             (self.publish)(snapshot, self.publication.clone())
         }))
-        .map_err(|_| ActorError::HistoryCheckpoint("publication callback panicked".into()))?;
+        .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_CALLBACK_PANICKED.into()))?;
         AssertUnwindSafe(future)
             .catch_unwind()
             .await
-            .map_err(|_| ActorError::HistoryCheckpoint("publication future panicked".into()))?
+            .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_FUTURE_PANICKED.into()))?
             .map_err(ActorError::HistoryCheckpoint)?;
         if self.publication.is_cancelled() {
             return Err(ActorError::PolicyCancelled);

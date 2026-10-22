@@ -52,6 +52,7 @@ const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
     "session cancellation is still in progress; retry the prompt";
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
+const SESSION_ENDED_MESSAGE: &str = "session ended";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
@@ -1222,7 +1223,7 @@ async fn send_manual_compaction(
             operation_id,
             OperationKind::ManualCompaction,
         );
-        return Err(AcpError::new(-32603, "session ended"));
+        return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
     }
     let pending = Arc::clone(&session.pending);
     let out_tx = out_tx.clone();
@@ -1362,7 +1363,7 @@ async fn send_isolated_turn(
         .is_err()
     {
         release_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
-        return Err(AcpError::new(-32603, "session ended"));
+        return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
     }
     let pending = Arc::clone(&session.pending);
     let out_tx = out_tx.clone();
@@ -1500,7 +1501,7 @@ async fn send_command_turn(
     }
     if session.handle.input_tx.send(input).await.is_err() {
         release_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
-        return Err(AcpError::new(-32603, "session ended"));
+        return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
     }
     Ok(())
 }

@@ -21,7 +21,10 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use maki_agent::actor::{ConfigChange, ConfigPatch, HistoryChange};
+use maki_agent::actor::{
+    ActorEvent, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange, PreparedModel,
+    PreparedTransaction,
+};
 use maki_agent::command::CustomCommand;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -44,7 +47,10 @@ use maki_commands::{BuiltinOperation, CommandError, HostResponse};
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
-use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, OrchestrationServices};
+use maki_lua::orchestration::{
+    AgentOrchestration, ConfigMutationReserver, DURABLE_CONFIG_UNAVAILABLE, OrchestrationServices,
+    TrustedTarget,
+};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -726,7 +732,7 @@ fn dispatch_thinking_change(
     .detach();
 }
 
-fn thinking_reply(commit: &maki_agent::actor::ConfigCommit) -> serde_json::Value {
+fn thinking_reply(commit: &ConfigCommit) -> serde_json::Value {
     json!({ "mode": commit.config.thinking.to_string() })
 }
 
@@ -767,7 +773,7 @@ fn observe_config_commits(
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
     prepare: PrepareProvider,
-) -> Result<flume::Receiver<maki_agent::actor::ConfigCommit>, SessionCoordinatorError> {
+) -> Result<flume::Receiver<ConfigCommit>, SessionCoordinatorError> {
     let (manager, root) = handles.manager_and_root();
     let (ui_tx, ui_rx) = flume::unbounded();
     let actor = manager
@@ -870,10 +876,10 @@ impl Drop for CoordinatorRetirement {
 
 struct SessionRuntime {
     generation: u64,
-    config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
+    config_commits: flume::Receiver<ConfigCommit>,
     /// The last root commit the app followed, so the next one can tell what
     /// changed.
-    projected_config: Option<maki_agent::actor::ConfigCommit>,
+    projected_config: Option<ConfigCommit>,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -1177,7 +1183,7 @@ fn replace_session_runtime(
 }
 
 impl SessionRuntime {
-    fn project_config(&mut self, commit: &maki_agent::actor::ConfigCommit) -> bool {
+    fn project_config(&mut self, commit: &ConfigCommit) -> bool {
         let (manager, root) = self.handles.manager_and_root();
         let Ok(actor) = manager.actor(root) else {
             return false;
@@ -1693,13 +1699,13 @@ enum SessionOpKind {
     },
     /// `maki.session.set_thinking` from Lua, which owes its caller a reply.
     ThinkingSet {
-        commit: Option<maki_agent::actor::ConfigCommit>,
+        commit: Option<ConfigCommit>,
         set_default: bool,
         reply_tx: flume::Sender<UiReply>,
     },
     /// `maki.model.set` from Lua, which owes its caller a reply.
     ModelSet {
-        commit: Option<maki_agent::actor::ConfigCommit>,
+        commit: Option<ConfigCommit>,
         spec: Option<String>,
         reply_tx: flume::Sender<UiReply>,
     },
@@ -1797,7 +1803,7 @@ enum Wake {
     InputGone,
     Ui(UiAction),
     Agent(usize, Box<maki_agent::Envelope>),
-    Actor(usize, maki_agent::actor::ActorEvent),
+    Actor(usize, ActorEvent),
     Shell(usize, ShellEvent),
     Warn(String),
     Command(CommandEvent),
@@ -2094,7 +2100,7 @@ impl<'t> EventLoop<'t> {
                 template.cwd = config.context.cwd().to_path_buf();
             }
             self.orchestration.register_root(
-                maki_lua::orchestration::TrustedTarget {
+                TrustedTarget {
                     target: root.clone(),
                     template,
                 },
@@ -2105,13 +2111,11 @@ impl<'t> EventLoop<'t> {
                 )),
             );
             if let Some(target) = selected_agent(runtime) {
-                if let Ok(template) = maki_lua::orchestration::OrchestrationServices::template(
-                    &*self.orchestration,
-                    &target,
-                ) {
+                if let Ok(template) = OrchestrationServices::template(&*self.orchestration, &target)
+                {
                     admissions.insert(
                         runtime.app.command_target.id(),
-                        maki_lua::orchestration::TrustedTarget {
+                        TrustedTarget {
                             target: target.clone(),
                             template,
                         },
@@ -2140,11 +2144,7 @@ impl<'t> EventLoop<'t> {
             };
             let specs = target
                 .and_then(|target| {
-                    maki_lua::orchestration::OrchestrationServices::available_models(
-                        &*self.orchestration,
-                        &target,
-                    )
-                    .ok()
+                    OrchestrationServices::available_models(&*self.orchestration, &target).ok()
                 })
                 .unwrap_or_default();
             runtime.app.project_model_discovery(specs);
@@ -2685,8 +2685,8 @@ impl<'t> EventLoop<'t> {
     /// notification on the same guaranteed agent channel every other frontend
     /// event uses. The actor already checked emptiness and ticket drain under
     /// its own lock, so this never races a concurrent push.
-    fn handle_actor_settlement(&mut self, idx: usize, event: &maki_agent::actor::ActorEvent) {
-        let maki_agent::actor::ActorEvent::Idle {
+    fn handle_actor_settlement(&mut self, idx: usize, event: &ActorEvent) {
+        let ActorEvent::Idle {
             settled: Some(identity),
             ..
         } = event
@@ -4535,7 +4535,7 @@ impl<'t> EventLoop<'t> {
         &self,
         cmdline: &str,
         depth: u8,
-        target: maki_lua::orchestration::TrustedTarget,
+        target: TrustedTarget,
     ) -> Result<(), String> {
         target
             .target
@@ -4576,9 +4576,9 @@ impl<'t> EventLoop<'t> {
     fn run_keybind(&mut self, idx: usize, id: u64) {
         self.sync_orchestration();
         let target = self.selected_target(idx).and_then(|target| {
-            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, &target)
+            OrchestrationServices::template(&*self.orchestration, &target)
                 .ok()
-                .map(|template| maki_lua::orchestration::TrustedTarget { target, template })
+                .map(|template| TrustedTarget { target, template })
         });
         if !self.sessions[idx]
             .app
@@ -4592,10 +4592,9 @@ impl<'t> EventLoop<'t> {
     /// The model catalog filtered by {target}'s model policy, so `/model`
     /// fragments resolve only to models the pinned agent may use.
     fn target_model_specs(&self, target: &AgentRef) -> Result<HostResponse, CommandError> {
-        let policy =
-            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, target)
-                .map_err(|_| CommandError::StaleTarget)?
-                .model_policy;
+        let policy = OrchestrationServices::template(&*self.orchestration, target)
+            .map_err(|_| CommandError::StaleTarget)?
+            .model_policy;
         let specs = self
             .ctx
             .available_models
@@ -4807,7 +4806,7 @@ impl<'t> EventLoop<'t> {
             .register_publication(&publication)
             .map_err(|error| error.to_string())?;
         Ok(Box::new(move |_, history_changed| {
-            Ok(maki_agent::actor::PreparedTransaction {
+            Ok(PreparedTransaction {
                 publication,
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -4871,7 +4870,7 @@ impl<'t> EventLoop<'t> {
             .filter(|target| target.id() == root)
             .and_then(|_| selection.spec.clone());
         let target_policy = target.as_ref().and_then(|target| {
-            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, target)
+            OrchestrationServices::template(&*self.orchestration, target)
                 .ok()
                 .map(|template| template.model_policy)
         });
@@ -4979,7 +4978,7 @@ impl<'t> EventLoop<'t> {
                             })
                             .await?;
                             Ok(ConfigChange::Refresh {
-                                expected: maki_agent::actor::PreparedModel {
+                                expected: PreparedModel {
                                     provider: Arc::clone(&expected.provider),
                                     model: expected.model.clone(),
                                 },
@@ -5278,7 +5277,7 @@ fn runtime_config_mutations(
             .register_publication(&publication)
             .map_err(|error| error.to_string())?;
         Ok(Box::new(move |_, claim| {
-            Ok(maki_agent::actor::PreparedTransaction {
+            Ok(PreparedTransaction {
                 publication,
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -5330,7 +5329,7 @@ fn reserve_config_change(
             .into_config_mutation()
     } else {
         services
-            .ok_or_else(|| "durable agent configuration adapter is unavailable".to_owned())?
+            .ok_or_else(|| DURABLE_CONFIG_UNAVAILABLE.to_owned())?
             .reserve_config_mutation(target, publication.clone())?
     };
     let operation = target
@@ -5396,7 +5395,7 @@ async fn commit_mode_change(
 async fn commit_config_change(
     reservation: ConfigChangeReservation,
     change: ConfigChange,
-) -> Result<maki_agent::actor::ConfigCommit, String> {
+) -> Result<ConfigCommit, String> {
     let ConfigChangeReservation {
         operation,
         transaction,
@@ -5430,7 +5429,7 @@ async fn prepare_config_change<F, E>(
     ticket: ConfigChangeReservation,
     prepare: F,
     expiry: E,
-) -> Result<maki_agent::actor::ConfigCommit, String>
+) -> Result<ConfigCommit, String>
 where
     F: std::future::Future<Output = Result<ConfigChange, String>>,
     E: std::future::Future<Output = ()>,
@@ -5458,13 +5457,10 @@ where
     }
 }
 
-fn prepare_provider(
-    mut model: Model,
-    timeouts: Timeouts,
-) -> Result<maki_agent::actor::PreparedModel, Arc<str>> {
+fn prepare_provider(mut model: Model, timeouts: Timeouts) -> Result<PreparedModel, Arc<str>> {
     let provider =
         from_model(&mut model, timeouts).map_err(|error| Arc::from(error.to_string()))?;
-    Ok(maki_agent::actor::PreparedModel {
+    Ok(PreparedModel {
         provider: Arc::from(provider),
         model,
     })
@@ -5826,7 +5822,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_mode_change_waits_for_lease_before_committing() {
+    fn reserved_mode_change_waits_for_predecessor_before_committing() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();
@@ -5870,12 +5866,12 @@ mod tests {
     }
 
     #[test]
-    fn yolo_toggle_commits_while_turn_holds_lease() {
+    fn yolo_toggle_commits_while_actor_operation_is_pending() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             let id = runtime.id();
             let (manager, root) = runtime.handles.manager_and_root();
-            let lease = manager
+            let pending = manager
                 .actor(root)
                 .unwrap()
                 .reserve_prepared_operation(None)
@@ -5913,7 +5909,7 @@ mod tests {
                     .as_ref(),
                 ENABLED_VALUE
             );
-            drop(lease);
+            drop(pending);
             release_runtime(runtime);
         });
     }

@@ -52,6 +52,8 @@ pub use queue::{ActorQueue, InterruptQueue, QueueProjection};
 pub use tickets::{TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket};
 
 pub const MAX_RETAINED_TURN_RESULTS: usize = 128;
+#[cfg(any(test, feature = "test-util"))]
+const QUIESCENCE_BARRIER_ROUNDS: usize = 128;
 
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub async fn graph_quiescence_barrier(
     actors: &[AgentActorHandle],
 ) -> Result<Vec<ActorRuntimeProbe>, ActorError> {
     let mut previous = None;
-    for _ in 0..MAX_RETAINED_TURN_RESULTS {
+    for _ in 0..QUIESCENCE_BARRIER_ROUNDS {
         let mut probes = Vec::with_capacity(actors.len());
         for actor in actors {
             probes.push(actor.runtime_barrier().await?);
