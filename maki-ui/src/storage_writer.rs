@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use maki_storage::checkpoint::{
@@ -36,6 +36,7 @@ pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
 const CHECKPOINT_CANCELLED: &str = "session checkpoint cancelled";
+pub(crate) const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const CONFIG_REQUIRES_CLAIM: &str = "configuration checkpoints require a publication claim";
 const SNAPSHOT_UNAVAILABLE: &str = "session snapshot is unavailable";
 const SELECTED_CONFIG_DESTINATION: &str =
@@ -191,11 +192,22 @@ pub struct StorageWriter {
     stop: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
-struct CoordinatorCheckpointWriter {
+/// The coordinator's writer. Guarded publication needs the session lock's
+/// guard, which the runtime rebinds whenever its lock state changes.
+pub(crate) struct CoordinatorCheckpointWriter {
     pending: Pending,
     wake: flume::Sender<()>,
-    publication: Option<(SessionPublicationGuard, HistoryDestination)>,
+    publication: Mutex<Option<(SessionPublicationGuard, HistoryDestination)>>,
+}
+
+impl CoordinatorCheckpointWriter {
+    pub(crate) fn bind(&self, guard: Option<SessionPublicationGuard>) {
+        *self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            guard.map(|guard| (guard, HistoryDestination::Main));
+    }
 }
 
 impl CheckpointWriter<AppSession> for StorageWriter {
@@ -213,11 +225,16 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
     ) -> CheckpointFuture {
         let session_id = request.session_id;
         let version = request.version;
-        let Some((guard, destination)) = &self.publication else {
+        let Some((guard, destination)) = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
             return Box::pin(async move {
                 Err(CheckpointError::Save {
                     session_id,
-                    message: Arc::from("checkpoint writer has no session publication guard"),
+                    message: Arc::from(LOCK_LOST_REPLACEMENT_ERR),
                 })
             });
         };
@@ -226,7 +243,7 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
             .history
             .take()
             .filter(|_| checkpoint.kind != SessionCheckpointKind::Options)
-            .map(|history| (destination.clone(), history));
+            .map(|history| (destination, history));
         let response = enqueue_staged_checkpoint(
             &self.pending,
             &self.wake,
@@ -237,7 +254,7 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                 history,
                 publication,
                 claim,
-                guard: guard.clone(),
+                guard,
             },
         );
         Box::pin(async move {
@@ -548,24 +565,26 @@ impl StorageWriter {
             .map_err(|error| error.to_string())?
     }
 
-    pub fn coordinator_checkpoint(&self) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
+    pub(crate) fn coordinator_checkpoint(&self) -> Arc<CoordinatorCheckpointWriter> {
         Arc::new(CoordinatorCheckpointWriter {
             pending: Arc::clone(&self.pending),
             wake: self.wake.clone(),
-            publication: None,
+            publication: Mutex::default(),
         })
     }
 
-    pub fn coordinator_checkpoint_guarded(
+    #[cfg(test)]
+    fn coordinator_checkpoint_guarded(
         &self,
         guard: SessionPublicationGuard,
         destination: HistoryDestination,
     ) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
-        Arc::new(CoordinatorCheckpointWriter {
-            pending: Arc::clone(&self.pending),
-            wake: self.wake.clone(),
-            publication: Some((guard, destination)),
-        })
+        let writer = self.coordinator_checkpoint();
+        *writer
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((guard, destination));
+        writer
     }
 
     #[cfg(test)]

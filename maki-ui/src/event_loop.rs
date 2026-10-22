@@ -27,9 +27,9 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    PreparedSessionCoordinator, SessionCheckpoint, SessionCoordinatorError,
-    SessionCoordinatorHandle, SessionCoordinatorParams, SessionTransactionReservation,
-    builtin_option_definitions, canonical_directory, publication_claim,
+    PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
+    SessionCoordinatorParams, SessionTransactionReservation, builtin_option_definitions,
+    canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
@@ -61,10 +61,7 @@ use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
-use maki_storage::checkpoint::{
-    CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
-    CheckpointWriter,
-};
+use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock::{self, ClaimedSessionLock};
 use maki_storage::sessions::{
@@ -104,7 +101,9 @@ use crate::provider_usage::{
 };
 use crate::repaint::{Dirty, IDLE_POLL};
 
-use crate::storage_writer::StorageWriter;
+use crate::storage_writer::{
+    CoordinatorCheckpointWriter, LOCK_LOST_REPLACEMENT_ERR, StorageWriter,
+};
 use crate::terminal;
 use crate::theme::ThemesProvider;
 
@@ -129,7 +128,6 @@ const NOT_LIVE_ERR: &str = "session not live";
 const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
 const CLOSED_TARGET_ERR: &str = "the selected agent has closed; switch to a live chat";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
-const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
 
@@ -909,7 +907,7 @@ struct PreparedSessionRuntime {
     handles: PreparedAgentHandles,
     model_slot: Arc<ProviderSlot>,
     coordinator: PreparedSessionCoordinator,
-    checkpoint: Arc<RuntimeCheckpointBinding>,
+    checkpoint: Arc<CoordinatorCheckpointWriter>,
     prepare_provider: PrepareProvider,
     provider: Option<PreparedProvider>,
     shell_tx: flume::Sender<ShellEvent>,
@@ -962,7 +960,10 @@ impl PreparedSessionRuntime {
             checkpoint,
             prepare_provider,
         } = self;
-        checkpoint.bind(&storage_writer, session_lock.as_ref());
+        checkpoint.bind(match &session_lock {
+            Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
+            _ => None,
+        });
         let coordinator = match coordinator.activate() {
             Ok(coordinator) => coordinator,
             Err(error) => {
@@ -1039,7 +1040,10 @@ impl PreparedSessionRuntime {
             checkpoint,
             prepare_provider,
         } = self;
-        checkpoint.bind(&storage_writer, session_lock.as_ref());
+        checkpoint.bind(match &session_lock {
+            Some(SessionLockState::Held(lock)) => Some(lock.publication_guard()),
+            _ => None,
+        });
         let session_id = app.session_id();
         let activated = if session_id == current.read().session_id() {
             coordinator.activate_replacing(current)
@@ -1303,66 +1307,10 @@ struct SpawnCtx {
     trust_question: Option<TrustQuestion>,
 }
 
-struct RuntimeCheckpointBinding {
-    ordinary: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
-    guarded: Mutex<Option<Arc<dyn CheckpointWriter<SessionCheckpoint>>>>,
-}
-
-impl RuntimeCheckpointBinding {
-    fn new(writer: &StorageWriter) -> Self {
-        Self {
-            ordinary: writer.coordinator_checkpoint(),
-            guarded: Mutex::new(None),
-        }
-    }
-
-    fn bind(&self, writer: &StorageWriter, state: Option<&SessionLockState>) {
-        let guarded = match state {
-            Some(SessionLockState::Held(lock)) => Some(writer.coordinator_checkpoint_guarded(
-                lock.publication_guard(),
-                maki_storage::sessions::HistoryDestination::Main,
-            )),
-            _ => None,
-        };
-        *self
-            .guarded
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = guarded;
-    }
-}
-
-impl CheckpointWriter<SessionCheckpoint> for RuntimeCheckpointBinding {
-    fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
-        self.ordinary.checkpoint(request)
-    }
-
-    fn checkpoint_guarded(
-        &self,
-        request: CheckpointRequest<SessionCheckpoint>,
-        publication: CheckpointPublication,
-        claim: CheckpointClaim,
-    ) -> CheckpointFuture {
-        let writer = self
-            .guarded
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        match writer {
-            Some(writer) => writer.checkpoint_guarded(request, publication, claim),
-            None => Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id: request.session_id,
-                    message: Arc::from(LOCK_LOST_REPLACEMENT_ERR),
-                })
-            }),
-        }
-    }
-}
-
 struct CoordinatorDeps {
     catalog: maki_agent::session_coordinator::SessionOptionCatalog,
     model_policy: Arc<ModelPolicy>,
-    checkpoint: Arc<RuntimeCheckpointBinding>,
+    checkpoint: Arc<CoordinatorCheckpointWriter>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1403,7 +1351,7 @@ impl SpawnCtx {
         CoordinatorDeps {
             catalog: self.lua_event_handle.session_option_catalog(),
             model_policy: Arc::clone(&self.model_policy),
-            checkpoint: Arc::new(RuntimeCheckpointBinding::new(&self.storage_writer)),
+            checkpoint: self.storage_writer.coordinator_checkpoint(),
         }
     }
 
