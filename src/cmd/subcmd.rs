@@ -560,18 +560,14 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
         }
     }
 
-    smol::block_on(fetch_all_models(
-        &config.provider.model_policy,
-        |batch| {
-            for model in batch.models {
-                println!("{model}");
-            }
-            for warning in batch.warnings {
-                eprintln!("warning: {warning}");
-            }
-        },
-        None,
-    ));
+    smol::block_on(fetch_all_models(&config.provider.model_policy, |batch| {
+        for model in batch.models {
+            println!("{model}");
+        }
+        for warning in batch.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }));
 
     if let Some(e) = refresh_failure {
         bail!("catalog refresh failed, keeping existing cache: {e}");

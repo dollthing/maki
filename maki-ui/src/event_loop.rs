@@ -818,31 +818,6 @@ fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
     }
 }
 
-fn reserve_refined_model_updates(
-    sessions: &[SessionRuntime],
-    requested_spec: &str,
-    expected_provider: ProviderIdentity,
-) -> Vec<(MakiId, Result<ConfigChangeReservation, String>)> {
-    sessions
-        .iter()
-        .filter_map(|runtime| {
-            let current = runtime.model_slot.load();
-            let matches = current.model.spec() == requested_spec
-                && current.provider.identity() == expected_provider;
-            drop(current);
-            if !matches {
-                return None;
-            }
-            let (manager, root) = runtime.handles.manager_and_root();
-            let reservation = manager
-                .lookup(root)
-                .map_err(|error| error.to_string())
-                .and_then(|target| reserve_config_change(&target, &runtime.coordinator, None));
-            Some((runtime.id(), reservation))
-        })
-        .collect()
-}
-
 fn observe_config_commits(
     handles: &AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -1851,17 +1826,7 @@ impl SpawnCtx {
 }
 
 enum InternalEvent {
-    ModelCandidate {
-        requested_spec: String,
-        expected_provider: ProviderIdentity,
-        model: Model,
-        provider: Arc<dyn Provider>,
-    },
-    ModelCandidateReconciled {
-        session: MakiId,
-        runtime: Arc<()>,
-        result: Result<(), String>,
-    },
+    ModelsDiscovered,
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -2077,6 +2042,7 @@ fn merge_batch(
     available: &Arc<ArcSwapOption<Vec<String>>>,
     batch: maki_providers::provider::ModelBatch,
     warn_tx: &flume::Sender<String>,
+    internal_tx: &flume::Sender<InternalEvent>,
 ) {
     for w in batch.warnings {
         let _ = warn_tx.try_send(w);
@@ -2091,13 +2057,11 @@ fn merge_batch(
         }
     }
     available.store(Some(Arc::new(merged)));
+    let _ = internal_tx.send(InternalEvent::ModelsDiscovered);
 }
 
 fn spawn_model_fetch(
-    requested_spec: String,
-    expected_provider: ProviderIdentity,
     internal_tx: flume::Sender<InternalEvent>,
-    timeouts: Timeouts,
     policy: Arc<ModelPolicy>,
 ) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
@@ -2105,34 +2069,9 @@ fn spawn_model_fetch(
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let warn_tx_bg = warn_tx.clone();
     let task = smol::spawn(async move {
-        let warn_tx = warn_tx_bg;
-        let done = Box::new(move || {
-            let mut resolved = match Model::from_spec(&requested_spec) {
-                Ok(model) => model,
-                Err(error) => {
-                    warn!(spec = %requested_spec, %error, "failed to resolve model after discovery");
-                    return;
-                }
-            };
-            let provider = match from_model(&mut resolved, timeouts) {
-                Ok(provider) => Arc::from(provider),
-                Err(error) => {
-                    warn!(spec = %requested_spec, %error, "failed to create provider after discovery");
-                    return;
-                }
-            };
-            let _ = internal_tx.send(InternalEvent::ModelCandidate {
-                requested_spec,
-                expected_provider,
-                model: resolved,
-                provider,
-            });
-        });
-        fetch_all_models(
-            &policy,
-            |batch| merge_batch(&bg, batch, &warn_tx),
-            Some(done),
-        )
+        fetch_all_models(&policy, |batch| {
+            merge_batch(&bg, batch, &warn_tx_bg, &internal_tx)
+        })
         .await;
     });
     BackgroundModels {
@@ -2217,13 +2156,7 @@ impl<'t> EventLoop<'t> {
         let (model_slot, provider_change_rx) = ProviderSlot::new(model.clone(), provider);
         let initial_provider = model_slot.load().provider.identity();
         let (internal_tx, internal_rx) = flume::unbounded();
-        let bg = spawn_model_fetch(
-            model.spec(),
-            initial_provider,
-            internal_tx.clone(),
-            timeouts,
-            Arc::clone(&model_policy),
-        );
+        let bg = spawn_model_fetch(internal_tx.clone(), Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
@@ -2584,96 +2517,7 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
-            InternalEvent::ModelCandidate {
-                requested_spec,
-                expected_provider,
-                model,
-                provider,
-            } => {
-                let current = self.ctx.model_slot.load();
-                let still_current = current.model.spec() == requested_spec
-                    && current.provider.identity() == expected_provider;
-                drop(current);
-                if still_current {
-                    // Reserve first: otherwise an actor can admit a turn with
-                    // the old policy after its provider slot has been refined.
-                    let updates = reserve_refined_model_updates(
-                        &self.sessions,
-                        &requested_spec,
-                        expected_provider,
-                    );
-                    self.ctx
-                        .model_slot
-                        .install(model.clone(), Arc::clone(&provider));
-                    for (session, reservation) in updates {
-                        let Some(idx) = self.position(session) else {
-                            continue;
-                        };
-                        match reservation {
-                            Ok(reservation) => {
-                                let rt = &self.sessions[idx];
-                                let identity = rt.handles.identity();
-                                let (manager, root) = rt.handles.manager_and_root();
-                                let Some(expected) = manager
-                                    .actor(root)
-                                    .ok()
-                                    .and_then(|actor| actor.effective_config())
-                                else {
-                                    drop(reservation);
-                                    continue;
-                                };
-                                let change = ConfigChange::Refresh {
-                                    expected: maki_agent::actor::PreparedModel {
-                                        provider: Arc::clone(&expected.provider),
-                                        model: expected.model.clone(),
-                                    },
-                                    replacement: maki_agent::actor::PreparedModel {
-                                        provider: Arc::clone(&provider),
-                                        model: model.clone(),
-                                    },
-                                };
-                                let internal_tx = self.internal_tx.clone();
-                                smol::spawn(async move {
-                                    let result =
-                                        commit_config_change(reservation, change).await.map(|_| ());
-                                    let _ =
-                                        internal_tx.send(InternalEvent::ModelCandidateReconciled {
-                                            session,
-                                            runtime: identity,
-                                            result,
-                                        });
-                                })
-                                .detach();
-                            }
-                            Err(error) => {
-                                let _ = self.internal_tx.send(
-                                    InternalEvent::ModelCandidateReconciled {
-                                        session,
-                                        runtime: self.sessions[idx].handles.identity(),
-                                        result: Err(error),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            InternalEvent::ModelCandidateReconciled {
-                session,
-                runtime,
-                result,
-            } => {
-                if let Err(error) = result {
-                    if let Some(idx) = self.position(session).filter(|idx| {
-                        Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity())
-                    }) {
-                        self.sessions[idx]
-                            .app
-                            .flash(format!("failed to reconcile refined model policy: {error}"));
-                    }
-                    warn!(%session, %error, "failed to reconcile refined model policy");
-                }
-            }
+            InternalEvent::ModelsDiscovered => self.refresh_discovered_models(),
             InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -5438,16 +5282,32 @@ impl<'t> EventLoop<'t> {
     fn refresh_models(&self) {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
+        let internal_tx = self.internal_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
         smol::spawn(async move {
-            fetch_all_models(
-                &policy,
-                |batch| merge_batch(&available, batch, &warn_tx),
-                None,
-            )
+            fetch_all_models(&policy, |batch| {
+                merge_batch(&available, batch, &warn_tx, &internal_tx)
+            })
             .await;
         })
         .detach();
+    }
+
+    /// The UI slot only seeds new tabs, so it is written directly; live agents
+    /// go through their durable config path.
+    fn refresh_discovered_models(&mut self) {
+        let current = self.ctx.model_slot.load();
+        if let Some(model) =
+            maki_agent::actor::rediscovered_model(&*current.provider, &current.model)
+        {
+            let provider = Arc::clone(&current.provider) as Arc<dyn Provider>;
+            drop(current);
+            self.ctx.model_slot.project(model, provider);
+        }
+        self.sync_orchestration();
+        if let Some(refresh) = self.orchestration.refresh_discovered_models() {
+            smol::spawn(refresh).detach();
+        }
     }
 
     fn refresh_provider(&mut self, slug: String) {
@@ -6091,6 +5951,11 @@ mod tests {
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+    const DISCOVERY_PROVIDER: &str = "synthetic";
+    const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
+    const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
+    const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
+    const DISCOVERED_WINDOW: u32 = 524_000;
 
     #[test]
     fn ui_queue_and_mode_model_projection() {
@@ -6950,73 +6815,65 @@ mod tests {
         });
     }
 
-    #[test]
-    fn refined_model_reservations_precede_provider_slot_installation() {
-        smol::block_on(async {
-            let runtime = test_runtime(model_named("test-model"));
-            let current = runtime.model_slot.load();
-            let original_provider = current.provider.identity();
-            let requested_spec = current.model.spec();
-            drop(current);
-            let updates = reserve_refined_model_updates(
-                std::slice::from_ref(&runtime),
-                &requested_spec,
-                original_provider,
-            );
-            assert_eq!(updates.len(), 1);
-            let (_, reservation) = updates.into_iter().next().unwrap();
-            let reservation = reservation.unwrap();
-            let refined = model_named("test-model");
-            runtime
-                .model_slot
-                .install(refined.clone(), Arc::new(FocusedProvider));
-            assert_eq!(runtime.model_slot.load().model.spec(), refined.spec());
-            let policy = runtime
-                .handles
-                .manager_and_root()
-                .0
-                .effective_config(runtime.handles.manager_and_root().1)
-                .unwrap()
-                .unwrap();
-            assert_eq!(policy.model.spec(), requested_spec);
-            commit_config_change(
-                reservation,
-                ConfigChange::Patch(maki_agent::actor::ConfigPatch {
-                    model: Some(maki_agent::actor::PreparedModel {
-                        provider: Arc::clone(&runtime.model_slot.load().provider)
-                            as Arc<dyn Provider>,
-                        model: runtime.model_slot.load().model.clone(),
-                    }),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            release_runtime(runtime);
-        });
-    }
+    #[test_case(STARTUP_MODEL_ID, STARTUP_MODEL_ID, true ; "startup_spec")]
+    #[test_case(RESUMED_MODEL_ID, RESUMED_MODEL_ID, true ; "resumed_spec")]
+    #[test_case(STARTUP_MODEL_ID, UNRELATED_MODEL_ID, false ; "unrelated_spec_is_unchanged")]
+    fn models_discovered_refreshes_live_context_window(
+        session_model: &str,
+        discovered: &str,
+        refreshed: bool,
+    ) {
+        let spec = |id: &str| format!("{DISCOVERY_PROVIDER}/{id}");
+        with_event_loop_runtime(
+            |harness| {
+                let startup = Model::from_spec(&spec(STARTUP_MODEL_ID)).unwrap();
+                harness.ctx.as_mut().unwrap().model_slot =
+                    ProviderSlot::new(startup, Arc::new(StubProvider)).0;
+                let resumed = (session_model != STARTUP_MODEL_ID).then(|| PreparedProvider {
+                    model: Model::from_spec(&spec(session_model)).unwrap(),
+                    provider: Arc::new(StubProvider),
+                });
+                harness
+                    .ctx()
+                    .spawn_runtime_with_provider(harness.session(), resumed)
+                    .unwrap()
+            },
+            |event_loop| {
+                let runtime = &event_loop.sessions[0];
+                let before = runtime.config().unwrap();
+                assert_eq!(before.model.spec(), spec(session_model));
+                assert_ne!(before.model.context_window, DISCOVERED_WINDOW);
+                let identity = runtime.model_slot.load().provider.identity();
+                maki_providers::model_registry::set_known_models(
+                    DISCOVERY_PROVIDER,
+                    vec![maki_providers::ModelInfo {
+                        context_window: Some(DISCOVERED_WINDOW),
+                        ..maki_providers::ModelInfo::id_only(discovered.into())
+                    }],
+                );
 
-    #[test]
-    fn refined_model_reservation_skips_distinct_provider_identity() {
-        let runtime = test_runtime(model_named("test-model"));
-        let (other_slot, _) =
-            ProviderSlot::new(model_named("test-model"), Arc::new(FocusedProvider));
-        let mut other = test_runtime(model_named("test-model"));
-        other.model_slot = other_slot;
-        let current = runtime.model_slot.load();
-        let expected_provider = current.provider.identity();
-        let requested_spec = current.model.spec();
-        drop(current);
-        assert_ne!(
-            other.model_slot.load().provider.identity(),
-            expected_provider
+                event_loop.handle_internal(InternalEvent::ModelsDiscovered);
+
+                let runtime = &event_loop.sessions[0];
+                if refreshed {
+                    let commit = smol::block_on(runtime.config_commits.recv_async()).unwrap();
+                    assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
+                } else {
+                    assert!(
+                        event_loop
+                            .orchestration
+                            .refresh_discovered_models()
+                            .is_none()
+                    );
+                }
+                let window = |model: &Model| model.context_window == DISCOVERED_WINDOW;
+                assert_eq!(window(&runtime.config().unwrap().model), refreshed);
+                let slot = runtime.model_slot.load();
+                assert_eq!(window(&slot.model), refreshed);
+                assert_eq!(slot.provider.identity(), identity);
+                assert_eq!(window(&event_loop.ctx.model_slot.load().model), refreshed);
+            },
         );
-
-        let updates =
-            reserve_refined_model_updates(&[runtime, other], &requested_spec, expected_provider);
-
-        assert_eq!(updates.len(), 1);
-        assert!(updates[0].1.is_ok());
     }
 
     fn model_named(id: &str) -> Model {
@@ -7335,8 +7192,15 @@ mod tests {
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
     pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
+        with_event_loop_runtime(|harness| harness.runtime(harness.session()), test);
+    }
+
+    fn with_event_loop_runtime(
+        runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
+        test: impl FnOnce(&mut EventLoop<'_>),
+    ) {
         let mut harness = RuntimeHarness::new();
-        let runtime = harness.runtime(harness.session());
+        let runtime = runtime(&mut harness);
         let ctx = harness.ctx.take().unwrap();
         let initial_provider = ctx.model_slot.load().provider.identity();
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
@@ -9847,10 +9711,14 @@ mod tests {
                 if target.id() == child && spec == NEXT_MODEL)
             );
             event_loop.dispatch(0, actions);
-            let completion = event_loop
-                .internal_rx
-                .recv_timeout(SESSION_OP_TIMEOUT)
-                .unwrap();
+            let completion = std::iter::repeat_with(|| {
+                event_loop
+                    .internal_rx
+                    .recv_timeout(SESSION_OP_TIMEOUT)
+                    .unwrap()
+            })
+            .find(|event| !matches!(event, InternalEvent::ModelsDiscovered))
+            .unwrap();
             assert!(
                 matches!(&completion, InternalEvent::SessionOp { result, .. } if result.is_err() == close_child),
                 "{:?}",

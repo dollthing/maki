@@ -1,15 +1,18 @@
 use arc_swap::ArcSwapOption;
 use maki_agent::{
     AgentRef,
+    actor::{ConfigChange, ConfigCommit},
     agent::LoadedInstructions,
     cancel::CancelToken,
-    tools::{Deadline, ToolContext, TurnToolBindings},
+    session_coordinator::publication_claim,
+    tools::{Deadline, ToolContext, TurnToolBindings, registry::BoxFuture},
 };
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 use crate::agent_errors::FIXED_MODEL_ERROR;
 
@@ -158,6 +161,75 @@ impl AgentOrchestration {
             history_key,
         });
         Ok(())
+    }
+
+    /// Commits a metadata refresh for every live agent whose model resolves
+    /// differently now that discovery has run. `None` when none does.
+    pub fn refresh_discovered_models(self: &Arc<Self>) -> Option<BoxFuture<'static, ()>> {
+        let roots = self
+            .targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .roots
+            .iter()
+            .map(|entry| entry.target.target.clone())
+            .collect::<Vec<_>>();
+        let refreshes = roots
+            .iter()
+            .flat_map(|root| root.manager().list())
+            .filter_map(|target| {
+                let config = target.effective_config().ok()??;
+                Some((target, ConfigChange::rediscovered(&config)?))
+            })
+            .collect::<Vec<_>>();
+        if refreshes.is_empty() {
+            return None;
+        }
+        let services = Arc::clone(self);
+        Some(Box::pin(async move {
+            for (target, change) in refreshes {
+                if let Err(error) = services.commit_config_change(&target, change).await {
+                    warn!(agent = %target.id(), %error, "failed to refresh discovered model");
+                }
+            }
+        }))
+    }
+
+    pub async fn commit_config_change(
+        &self,
+        target: &AgentRef,
+        change: ConfigChange,
+    ) -> Result<ConfigCommit, String> {
+        let operation = target
+            .actor()
+            .map_err(|error| error.to_string())?
+            .reserve_prepared_operation(None)
+            .map_err(|error| error.to_string())?;
+        let publication = CheckpointPublication::default();
+        operation
+            .register_publication(&publication)
+            .map_err(|error| error.to_string())?;
+        operation
+            .wait_predecessor()
+            .await
+            .map_err(|error| error.to_string())?;
+        let reserve = self.reserve_config_mutation(target, publication)?;
+        operation
+            .resolve(Some(change))
+            .map_err(|error| error.to_string())?;
+        operation
+            .wait_ready()
+            .await
+            .map_err(|error| error.to_string())?;
+        let config = operation
+            .ready_config()
+            .map_err(|error| error.to_string())?;
+        let transaction = reserve(config, publication_claim())?;
+        operation
+            .commit_durable(transaction)
+            .await
+            .map(|commit| commit.config)
+            .map_err(|error| error.to_string())
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {

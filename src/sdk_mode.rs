@@ -946,7 +946,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model_specs,
         Some(trusted_root.clone()),
     )?;
-    lua_handle.install_orchestration_services(Arc::new_cyclic(|weak| {
+    let orchestration = Arc::new_cyclic(|weak| {
         let persistence = maki_lua::orchestration::child_persistence(
             "SDK",
             weak.clone(),
@@ -954,7 +954,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         );
         sdk_orchestration(models, trusted_root, coordinator.clone(), persistence.0)
             .with_completion(persistence.1)
-    }));
+    });
+    lua_handle.install_orchestration_services(orchestration.clone());
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -1078,6 +1079,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let model_discovery = watch_model_discovery(
         Arc::clone(&model_policy),
         coordinator.clone(),
+        orchestration,
         Arc::clone(&sdk_commands.model_specs),
     );
 
@@ -1330,33 +1332,33 @@ async fn stop_sdk_tasks(
 fn watch_model_discovery(
     policy: Arc<ModelPolicy>,
     coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+    orchestration: Arc<AgentOrchestration>,
     model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                let mut specs = model_specs
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                specs.extend(batch.models.into_iter().map(Arc::from));
-                specs.sort_unstable();
-                specs.dedup();
-                let specs: Arc<[Arc<str>]> = specs.into();
-                *model_specs.write().unwrap() = Arc::clone(&specs);
-                let coordinator = coordinator.clone();
-                smol::spawn(async move {
-                    if let Err(error) = coordinator.update_model_values(specs.to_vec()).await {
-                        warn!(%error, "failed to publish discovered SDK models");
-                    }
-                })
-                .detach();
-            },
-            None,
-        )
+        fetch_all_models(&policy, |batch| {
+            if let Some(refresh) = orchestration.refresh_discovered_models() {
+                smol::spawn(refresh).detach();
+            }
+            let mut specs = model_specs
+                .read()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            specs.extend(batch.models.into_iter().map(Arc::from));
+            specs.sort_unstable();
+            specs.dedup();
+            let specs: Arc<[Arc<str>]> = specs.into();
+            *model_specs.write().unwrap() = Arc::clone(&specs);
+            let coordinator = coordinator.clone();
+            smol::spawn(async move {
+                if let Err(error) = coordinator.update_model_values(specs.to_vec()).await {
+                    warn!(%error, "failed to publish discovered SDK models");
+                }
+            })
+            .detach();
+        })
         .await;
     })
 }
@@ -2173,7 +2175,6 @@ mod tests {
     use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
     use maki_agent::tools::ToolRegistry;
     use maki_agent::{AgentError, AgentRef, ModelSource, PreparedModel};
-    use maki_lua::orchestration::OrchestrationServices;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
@@ -2711,33 +2712,11 @@ mod tests {
     }
 
     fn commit_patch(
-        services: &dyn OrchestrationServices,
+        services: &AgentOrchestration,
         target: &AgentRef,
         patch: ConfigPatch,
     ) -> maki_agent::actor::ConfigCommit {
-        smol::block_on(async {
-            let operation = target
-                .actor()
-                .unwrap()
-                .reserve_prepared_operation(None)
-                .unwrap();
-            let publication = CheckpointPublication::default();
-            operation.register_publication(&publication).unwrap();
-            operation.wait_predecessor().await.unwrap();
-            let reserve = services
-                .reserve_config_mutation(target, publication)
-                .unwrap();
-            operation.resolve(Some(ConfigChange::Patch(patch))).unwrap();
-            operation.wait_ready().await.unwrap();
-            let claim: CheckpointClaim = Arc::new(|publication| {
-                publication
-                    .try_publish()
-                    .then_some(())
-                    .ok_or_else(|| Arc::from(SDK_SETTLEMENT_TIMEOUT))
-            });
-            let transaction = reserve(operation.ready_config().unwrap(), claim).unwrap();
-            operation.commit_durable(transaction).await.unwrap().config
-        })
+        smol::block_on(services.commit_config_change(target, ConfigChange::Patch(patch))).unwrap()
     }
 
     #[test]

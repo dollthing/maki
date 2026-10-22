@@ -209,6 +209,7 @@ impl OptionProjection {
 struct SessionState {
     handle: InteractiveHandle,
     coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
+    orchestration: Option<Arc<AgentOrchestration>>,
     checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
@@ -343,21 +344,25 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
     smol::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-            },
-            None,
-        )
+        fetch_all_models(&policy, |batch| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Incoming::Models(batch.models));
+            }
+        })
         .await;
     })
     .detach();
 }
 
 async fn refresh_models(srv: &mut Server, batch: Vec<String>) {
+    if let Some(refresh) = srv
+        .session
+        .as_ref()
+        .and_then(|session| session.orchestration.as_ref())
+        .and_then(|orchestration| orchestration.refresh_discovered_models())
+    {
+        smol::spawn(refresh).detach();
+    }
     let old_len = srv.model_specs.len();
     for spec in batch {
         if !srv.model_specs.contains(&spec) {
@@ -1082,24 +1087,25 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
+    let orchestration = Arc::new_cyclic(|weak| {
+        let persistence = maki_lua::orchestration::child_persistence(
+            "ACP",
+            weak.clone(),
+            Arc::clone(&checkpoint),
+        );
+        acp_orchestration(
+            Arc::new(ArcSwapOption::from_pointee(available_model_specs(
+                &params.model_policy,
+            ))),
+            trusted_root.clone(),
+            handle.session_id.id(),
+            persistence.0,
+        )
+        .with_completion(persistence.1)
+    });
     params
         .lua_event_handle
-        .install_orchestration_services(Arc::new_cyclic(|weak| {
-            let persistence = maki_lua::orchestration::child_persistence(
-                "ACP",
-                weak.clone(),
-                Arc::clone(&checkpoint),
-            );
-            acp_orchestration(
-                Arc::new(ArcSwapOption::from_pointee(available_model_specs(
-                    &params.model_policy,
-                ))),
-                trusted_root.clone(),
-                handle.session_id.id(),
-                persistence.0,
-            )
-            .with_completion(persistence.1)
-        }));
+        .install_orchestration_services(orchestration.clone());
     let pending = PendingState::default();
     let project_trusted = handle.permissions.project_is_trusted();
     start_event_pump(
@@ -1167,6 +1173,7 @@ async fn install_session_with_lock(
     srv.session = Some(SessionState {
         handle,
         coordinator: Some(coordinator),
+        orchestration: Some(orchestration),
         checkpoint: Some(checkpoint),
         mcp,
         current_mode: AgentMode::Build,
@@ -2410,6 +2417,10 @@ mod tests {
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
     const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
+    const DISCOVERY_PROVIDER: &str = "ollama";
+    const DISCOVERY_MODEL_ID: &str = "acp-discovery-refresh-test";
+    const DISCOVERED_WINDOW: u32 = 524_000;
+    const NEW_SESSION_REQUEST: i64 = 91;
     static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
 
     struct RecordingAcpProvider {
@@ -3153,6 +3164,7 @@ mod tests {
                 })),
                 handle,
                 coordinator: Some(coordinator),
+                orchestration: None,
                 checkpoint: None,
                 mcp: None,
                 current_mode: AgentMode::Build,
@@ -5835,6 +5847,65 @@ mod tests {
             assert!(
                 out_rx.try_iter().all(|message| message["id"] != 83),
                 "queued prompt must not return a terminal response"
+            );
+            close_session(&mut srv).await;
+            match previous_host {
+                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
+                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+            }
+        });
+    }
+
+    #[test]
+    fn discovery_refreshes_managed_root_context_window() {
+        smol::block_on(async {
+            let previous_host = std::env::var_os("OLLAMA_HOST");
+            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let temp = TempDir::new().unwrap();
+            let cwd = temp.path().to_path_buf();
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let model =
+                Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}")).unwrap();
+            assert_ne!(model.context_window, DISCOVERED_WINDOW);
+            let params = test_params(model, cwd.clone());
+            handle_request(
+                &mut srv,
+                "session/new",
+                RequestId::Number(NEW_SESSION_REQUEST),
+                &serde_json::json!({ "params": { "cwd": cwd, "mcpServers": [] } }),
+                &params,
+            )
+            .await;
+            assert_eq!(
+                out_rx.recv_async().await.unwrap()["id"],
+                NEW_SESSION_REQUEST
+            );
+            let actor = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .handle
+                .manager
+                .root()
+                .unwrap()
+                .actor()
+                .unwrap();
+            let commits = actor.subscribe_config_commits();
+            maki_providers::model_registry::set_known_models(
+                DISCOVERY_PROVIDER,
+                vec![maki_providers::ModelInfo {
+                    context_window: Some(DISCOVERED_WINDOW),
+                    ..maki_providers::ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+                }],
+            );
+
+            refresh_models(&mut srv, Vec::new()).await;
+
+            let commit = commits.recv_async().await.unwrap();
+            assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
+            assert_eq!(
+                actor.effective_config().unwrap().model.context_window,
+                DISCOVERED_WINDOW
             );
             close_session(&mut srv).await;
             match previous_host {

@@ -97,7 +97,31 @@ pub struct ConfigCommit {
     pub config: Arc<EffectiveAgentConfig>,
 }
 
+/// Re-resolves `model` against what discovery knows now. `None` when that
+/// changes nothing, so an already-correct agent is left alone.
+pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Model> {
+    let mut refined = Model::from_spec(&model.spec()).ok()?;
+    provider.adjust_model(&mut refined);
+    (!same_model(&refined, model)).then_some(refined)
+}
+
 impl ConfigChange {
+    /// A metadata-only refresh: the provider stays, so a concurrent model
+    /// switch makes the compare-and-swap a no-op.
+    pub fn rediscovered(config: &EffectiveAgentConfig) -> Option<Self> {
+        let model = rediscovered_model(&*config.provider, &config.model)?;
+        Some(Self::Refresh {
+            expected: PreparedModel {
+                provider: Arc::clone(&config.provider),
+                model: config.model.clone(),
+            },
+            replacement: PreparedModel {
+                provider: Arc::clone(&config.provider),
+                model,
+            },
+        })
+    }
+
     pub(super) fn apply(
         self,
         current: &EffectiveAgentConfig,

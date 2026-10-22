@@ -479,11 +479,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     specs
 }
 
-pub async fn fetch_all_models(
-    policy: &ModelPolicy,
-    mut on_ready: impl FnMut(ModelBatch),
-    on_done: Option<Box<dyn FnOnce() + Send>>,
-) {
+pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(ModelBatch)) {
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
@@ -620,9 +616,6 @@ pub async fn fetch_all_models(
     while let Ok(mut batch) = rx.recv_async().await {
         batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
-    }
-    if let Some(done) = on_done {
-        done();
     }
 }
 

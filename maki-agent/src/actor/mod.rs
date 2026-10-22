@@ -13,7 +13,9 @@
 
 mod actor_error;
 mod config;
-pub use config::{ConfigChange, ConfigCommit, ConfigPatch, ModeCeiling, PreparedModel};
+pub use config::{
+    ConfigChange, ConfigCommit, ConfigPatch, ModeCeiling, PreparedModel, rediscovered_model,
+};
 pub(crate) mod delivery;
 pub use delivery::{
     ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus, MAX_DELIVERY_BATCH,

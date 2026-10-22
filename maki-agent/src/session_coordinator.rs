@@ -290,7 +290,7 @@ fn actor_error(error: impl std::fmt::Display) -> SessionCoordinatorError {
     SessionCoordinatorError::Actor(Arc::from(error.to_string()))
 }
 
-fn publication_claim() -> CheckpointClaim {
+pub fn publication_claim() -> CheckpointClaim {
     Arc::new(|publication| {
         if publication.try_publish() {
             Ok(())

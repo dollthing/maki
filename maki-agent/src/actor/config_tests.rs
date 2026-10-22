@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use maki_providers::{Model, ModelInfo, model_registry};
 use maki_storage::checkpoint::CheckpointPublication;
+use test_case::test_case;
 
 use super::{ScriptedBackend, input, policy, spawn, until};
 use crate::actor::{
@@ -9,6 +11,11 @@ use crate::actor::{
 };
 use crate::types::TurnCancellationReason;
 use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
+
+const DISCOVERY_PROVIDER: &str = "synthetic";
+const DISCOVERED_MODEL_ID: &str = "rediscovered-config-known";
+const UNDISCOVERED_MODEL_ID: &str = "rediscovered-config-unknown";
+const DISCOVERED_WINDOW: u32 = 524_000;
 
 #[test]
 fn admitted_prompt_dependencies_remain_pinned() {
@@ -1558,4 +1565,37 @@ fn cancelled_preparation_does_not_block_successors() {
         actor.close();
         task.await;
     });
+}
+
+#[test_case(DISCOVERED_MODEL_ID, Some(DISCOVERED_WINDOW) ; "discovered_window_refines_fallback")]
+#[test_case(UNDISCOVERED_MODEL_ID, None ; "undiscovered_model_is_unchanged")]
+fn rediscovered_refreshes_only_changed_models(model_id: &str, expected: Option<u32>) {
+    let mut settings = policy(false);
+    settings.model = Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{model_id}")).unwrap();
+    assert_ne!(settings.model.context_window, DISCOVERED_WINDOW);
+    model_registry::set_known_models(
+        DISCOVERY_PROVIDER,
+        vec![ModelInfo {
+            context_window: Some(DISCOVERED_WINDOW),
+            ..ModelInfo::id_only(DISCOVERED_MODEL_ID.into())
+        }],
+    );
+    let config = EffectiveAgentConfig::new(settings, AgentMode::Build);
+
+    let change = ConfigChange::rediscovered(&config);
+
+    let window = change.map(|change| {
+        let ConfigChange::Refresh {
+            expected,
+            replacement,
+        } = change
+        else {
+            panic!("rediscovery must be a metadata refresh");
+        };
+        assert!(Arc::ptr_eq(&expected.provider, &config.provider));
+        assert!(Arc::ptr_eq(&replacement.provider, &config.provider));
+        assert_eq!(expected.model.spec(), replacement.model.spec());
+        replacement.model.context_window
+    });
+    assert_eq!(window, expected);
 }
