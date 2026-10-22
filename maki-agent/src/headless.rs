@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -179,125 +178,111 @@ pub enum InteractiveControl {
     },
 }
 
-type Controls = Arc<StdMutex<HashMap<String, InteractiveControl>>>;
-
 #[derive(Clone)]
 pub struct InteractiveControlSender {
-    target: ControlTarget,
+    root: RootReadiness,
+    next: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-util"))]
+    channel: Option<flume::Sender<InteractiveControl>>,
 }
 
-#[derive(Clone)]
-enum ControlTarget {
-    Actor {
-        root: RootReadiness,
-        controls: Controls,
-        next: Arc<AtomicU64>,
-    },
-    Channel(flume::Sender<InteractiveControl>),
-}
-
+#[cfg(any(test, feature = "test-util"))]
 impl From<flume::Sender<InteractiveControl>> for InteractiveControlSender {
     fn from(sender: flume::Sender<InteractiveControl>) -> Self {
         Self {
-            target: ControlTarget::Channel(sender),
+            root: RootReadiness::default(),
+            next: Arc::default(),
+            channel: Some(sender),
         }
+    }
+}
+
+/// A control the actor owns until it runs. Dropping it unrun, because it was
+/// cancelled or the actor closed, reports the cancellation to its caller; once
+/// the actor drops its work, the task forwarding the caller's cancel ends.
+struct PendingControl {
+    control: Option<InteractiveControl>,
+    _done: flume::Sender<()>,
+}
+
+impl PendingControl {
+    fn cancel(&mut self) {
+        match self.control.take() {
+            Some(InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply)) => {
+                let _ = reply.send(Err("operation cancelled".into()));
+            }
+            Some(InteractiveControl::ManualCompaction { output, .. }) => {
+                let _ = output.send(ManualCompactionEvent::Cancelled);
+            }
+            Some(InteractiveControl::IsolatedTurn { output, .. }) => {
+                let _ = output.send(agent::isolated_turn::IsolatedTurnEvent::Cancelled);
+            }
+            None => {}
+        }
+    }
+}
+
+impl Drop for PendingControl {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
 impl InteractiveControlSender {
     pub async fn send(&self, control: InteractiveControl) -> Result<(), String> {
-        let ControlTarget::Actor {
-            root,
-            controls,
-            next,
-        } = &self.target
-        else {
-            let ControlTarget::Channel(sender) = &self.target else {
-                unreachable!()
-            };
-            return sender
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(channel) = &self.channel {
+            return channel
                 .send_async(control)
                 .await
                 .map_err(|_| "session ended".to_owned());
-        };
-        let actor = root
+        }
+        let actor = self
+            .root
             .get()
             .await?
             .actor()
             .map_err(|error| error.to_string())?;
-        let key = format!("headless-control:{}", next.fetch_add(1, Ordering::Relaxed));
+        let key = format!(
+            "headless-control:{}",
+            self.next.fetch_add(1, Ordering::Relaxed)
+        );
         let cancel = match &control {
             InteractiveControl::ManualCompaction { cancel, .. }
             | InteractiveControl::IsolatedTurn { cancel, .. } => Some(cancel.clone()),
             _ => None,
         };
-        let events = actor.subscribe_events();
-        {
-            let mut pending = controls.lock().unwrap_or_else(|error| error.into_inner());
-            pending.insert(key.clone(), control);
-            if let Err(error) = actor.push_control(key.clone(), key.clone()) {
-                pending.remove(&key);
-                return Err(error.to_string());
-            }
+        let (done, finished) = flume::bounded(0);
+        let pending = Arc::new(StdMutex::new(PendingControl {
+            control: Some(control),
+            _done: done,
+        }));
+        let queued = Arc::downgrade(&pending);
+        actor
+            .push_control(key.clone(), key.clone(), Some(pending))
+            .map_err(|error| error.to_string())?;
+        if let Some(cancel) = cancel {
+            smol::spawn(async move {
+                future::or(
+                    async {
+                        cancel.cancelled().await;
+                        actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
+                        if let Some(pending) = queued.upgrade() {
+                            pending
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .cancel();
+                        }
+                    },
+                    async {
+                        let _ = finished.recv_async().await;
+                    },
+                )
+                .await;
+            })
+            .detach();
         }
-        let controls = Arc::clone(controls);
-        smol::spawn(async move {
-            let completion = async {
-                while let Ok(event) = events.recv_async().await {
-                    let mut pending = controls.lock().unwrap_or_else(|error| error.into_inner());
-                    if !pending.contains_key(&key) {
-                        return;
-                    }
-                    if matches!(event, crate::actor::ActorEvent::Close { .. }) {
-                        pending.remove(&key);
-                        return;
-                    }
-                    if matches!(event, crate::actor::ActorEvent::Idle { .. }) {
-                        let snapshot = actor.snapshot();
-                        pending.retain(|key, _| {
-                            snapshot.queue.iter().any(|work| {
-                                matches!(
-                                    work,
-                                    crate::actor::QueueProjection::Control(name) if name == key
-                                )
-                            })
-                        });
-                    }
-                }
-            };
-            let cancellation = async {
-                if let Some(cancel) = cancel {
-                    cancel.cancelled().await;
-                    actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
-                    if let Some(control) = controls
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .remove(&key)
-                    {
-                        cancel_control(control);
-                    }
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            future::or(completion, cancellation).await;
-        })
-        .detach();
         Ok(())
-    }
-}
-
-fn cancel_control(control: InteractiveControl) {
-    match control {
-        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => {
-            let _ = reply.send(Err("operation cancelled".into()));
-        }
-        InteractiveControl::ManualCompaction { output, .. } => {
-            let _ = output.send(ManualCompactionEvent::Cancelled);
-        }
-        InteractiveControl::IsolatedTurn { output, .. } => {
-            let _ = output.send(agent::isolated_turn::IsolatedTurnEvent::Cancelled);
-        }
     }
 }
 
@@ -308,16 +293,20 @@ pub struct InteractiveInputSender {
     next: Arc<AtomicU64>,
     _lifetime: flume::Sender<()>,
     modes: Arc<crate::ModeRegistry>,
+    #[cfg(any(test, feature = "test-util"))]
     mirror: Option<flume::Sender<AgentInput>>,
 }
 
 impl InteractiveInputSender {
+    /// Diverts sent input to {mirror} instead of admitting it.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn with_input_mirror(mut self, mirror: flume::Sender<AgentInput>) -> Self {
         self.mirror = Some(mirror);
         self
     }
 
     pub async fn send(&self, input: AgentInput) -> Result<(), String> {
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(mirror) = &self.mirror {
             return mirror
                 .send_async(input)
@@ -461,7 +450,6 @@ struct HeadlessBackend {
     answer_rx: Arc<Mutex<Receiver<String>>>,
     raw_tx: flume::Sender<Envelope>,
     root: RootReadiness,
-    controls: Controls,
     persist: bool,
 }
 
@@ -730,11 +718,17 @@ impl ActorBackend for HeadlessBackend {
         control: &'a ControlWork,
     ) -> BoxFuture<'a, BackendResult> {
         Box::pin(async move {
-            let control = self
-                .controls
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&control.correlation);
+            let pending = control
+                .payload
+                .clone()
+                .and_then(|payload| payload.downcast::<StdMutex<PendingControl>>().ok());
+            let control = pending.as_ref().and_then(|pending| {
+                pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .control
+                    .take()
+            });
             match control {
                 Some(InteractiveControl::Compact(reply)) => {
                     let result = self.compact(history, &context, None, &context.cancel).await;
@@ -956,7 +950,6 @@ fn spawn_managed(
     })
     .expect("headless agent limits are valid");
     let root = RootReadiness::default();
-    let controls = Arc::new(StdMutex::new(HashMap::new()));
     let model = crate::SharedModel::default();
     let (guard, events) = crate::types::event_stream();
     let raw_tx = guard.tx().clone();
@@ -967,14 +960,14 @@ fn spawn_managed(
         next: Arc::new(AtomicU64::new(0)),
         _lifetime: lifetime_tx,
         modes: Arc::clone(&params.modes),
+        #[cfg(any(test, feature = "test-util"))]
         mirror: None,
     };
     let control_tx = InteractiveControlSender {
-        target: ControlTarget::Actor {
-            root: root.clone(),
-            controls: Arc::clone(&controls),
-            next: Arc::new(AtomicU64::new(0)),
-        },
+        root: root.clone(),
+        next: Arc::new(AtomicU64::new(0)),
+        #[cfg(any(test, feature = "test-util"))]
+        channel: None,
     };
     let (answer_tx, answer_rx) = flume::unbounded();
     let (cancel_tx, cancel_rx) = flume::bounded(1);
@@ -1070,7 +1063,6 @@ fn spawn_managed(
                     answer_rx: Arc::new(Mutex::new(answer_rx)),
                     raw_tx: raw_tx.clone(),
                     root: root.clone(),
-                    controls,
                     persist,
                 };
                 let mut template = backend.template(&config);

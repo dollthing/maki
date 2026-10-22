@@ -338,6 +338,7 @@ mod tests {
                 ActorWorkKind::Control { operation_id: 0 },
                 0,
             ),
+            payload: None,
         }));
         queue.push(compact(1));
         assert!(queue.pop_interrupt(1).is_none());

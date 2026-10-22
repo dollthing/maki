@@ -1958,7 +1958,7 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         let (handle, task) = spawn(backend);
         let (popped, release) = handle.pause_after_next_pop();
         handle
-            .push_control("cancelled".into(), "cancelled".into())
+            .push_control("cancelled".into(), "cancelled".into(), None)
             .unwrap();
 
         popped.recv_async().await.unwrap();
@@ -1968,7 +1968,7 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         assert!(state.controls.lock().unwrap().is_empty());
 
         handle
-            .push_control("surviving".into(), "surviving".into())
+            .push_control("surviving".into(), "surviving".into(), None)
             .unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
@@ -1995,7 +1995,9 @@ fn compact_keeps_admitted_policy() {
             .commit_when_ready(Some(fast_change(true)))
             .await
             .unwrap();
-        handle.push_control("fence".into(), "fence".into()).unwrap();
+        handle
+            .push_control("fence".into(), "fence".into(), None)
+            .unwrap();
         until(|| state.controls.lock().unwrap().len() == 1).await;
         assert_eq!(
             state.compact_policies.lock().unwrap().as_slice(),
@@ -2022,7 +2024,9 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
 
         handle.push_compact(2, None).unwrap();
-        handle.push_control("fence".into(), "fence".into()).unwrap();
+        handle
+            .push_control("fence".into(), "fence".into(), None)
+            .unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
         handle.close();
@@ -2538,7 +2542,9 @@ fn snapshot_queued_excludes_controls_from_pending_work_count() {
             .admit_turn(input("running"), None, "running".into())
             .unwrap();
         until(|| handle.snapshot().status != ActorStatus::Idle).await;
-        handle.push_control("pin".into(), "control".into()).unwrap();
+        handle
+            .push_control("pin".into(), "control".into(), None)
+            .unwrap();
         handle
             .submit(
                 input("queued"),
@@ -2566,7 +2572,9 @@ fn control_produces_no_outcome() {
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let events = handle.subscribe_events();
-        handle.push_control("pin".into(), "c1".into()).unwrap();
+        handle
+            .push_control("pin".into(), "c1".into(), None)
+            .unwrap();
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["pin"]);
         let snapshot = handle.snapshot();
@@ -2603,7 +2611,9 @@ fn control_settles_after_a_turn_cancelled_while_it_ran() {
         let (handle, task) = spawn(ScriptedBackend::new());
         let events = handle.subscribe_events();
         let (popped, release) = handle.pause_after_next_pop();
-        handle.push_control("pin".into(), "c1".into()).unwrap();
+        handle
+            .push_control("pin".into(), "c1".into(), None)
+            .unwrap();
         popped.recv_async().await.unwrap();
         let queued = handle
             .admit_turn(input("queued"), None, "q".into())
@@ -4660,7 +4670,7 @@ fn queued_submissions_do_not_cross_control_boundary() {
         let first = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
-        actor.push_control(TEXT.into(), TEXT.into()).unwrap();
+        actor.push_control(TEXT.into(), TEXT.into(), None).unwrap();
         let next = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();

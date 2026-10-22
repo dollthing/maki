@@ -1131,7 +1131,9 @@ fn control_waits_for_earlier_preparation(root: bool) {
             actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
         }
         entered_rx.recv_async().await.unwrap();
-        actor.push_control(CONTROL.into(), CONTROL.into()).unwrap();
+        actor
+            .push_control(CONTROL.into(), CONTROL.into(), None)
+            .unwrap();
         assert!(actor.inner.queue.is_empty());
         let snapshot = actor.snapshot();
         assert_eq!(snapshot.queue.len(), 2);
@@ -1178,7 +1180,7 @@ fn deferred_control_queue_operations(action: &str) {
         let ticket = actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
         entered_rx.recv_async().await.unwrap();
         let control = || (CONTROL.to_string(), WORK.to_string());
-        actor.push_control(control().0, control().1).unwrap();
+        actor.push_control(control().0, control().1, None).unwrap();
         assert!(actor.inner.queue.is_empty());
         assert!(
             matches!(&actor.pending_queue()[..], [PendingQueueEntry::Message(pending)] if pending.turn_id == ticket.turn_id())
@@ -1191,14 +1193,14 @@ fn deferred_control_queue_operations(action: &str) {
             "close" => {
                 actor.close();
                 assert_eq!(
-                    actor.push_control(control().0, control().1),
+                    actor.push_control(control().0, control().1, None),
                     Err(ActorError::Closed)
                 );
             }
             "shutdown" => {
                 actor.shutdown();
                 assert_eq!(
-                    actor.push_control(control().0, control().1),
+                    actor.push_control(control().0, control().1, None),
                     Err(ActorError::Shutdown)
                 );
             }

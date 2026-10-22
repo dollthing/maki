@@ -176,6 +176,7 @@ pub use types::{
     TurnContext, WorkKind,
 };
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
@@ -2338,7 +2339,12 @@ impl AgentActorHandle {
         Ok(generation)
     }
 
-    pub fn push_control(&self, name: String, correlation: String) -> Result<(), ActorError> {
+    pub fn push_control(
+        &self,
+        name: String,
+        correlation: String,
+        payload: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -2356,6 +2362,7 @@ impl AgentActorHandle {
                     ActorWorkKind::Control { operation_id: id },
                     presentation_id,
                 ),
+                payload,
             },
         });
         drive_operations(&self.inner, &mut state);

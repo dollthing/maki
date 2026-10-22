@@ -1,5 +1,6 @@
 //! Backend trait and the dependency-neutral work shapes the scheduler moves.
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -148,6 +149,8 @@ pub struct ControlWork {
     pub name: String,
     pub correlation: String,
     pub work: ActorWorkIdentity,
+    /// Host data for the backend; dropped with the work if it never runs.
+    pub payload: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// A turn admitted by the host. Holds the agent input plus the admission's
