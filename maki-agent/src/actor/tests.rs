@@ -3516,7 +3516,7 @@ fn cancelled_running_turn_does_not_fold_next_generation() {
         let running = handle
             .admit_turn(input("running"), None, "running".into())
             .unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
         handle.cancel_existing();
         handle
             .submit(
