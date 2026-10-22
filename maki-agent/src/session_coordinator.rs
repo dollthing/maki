@@ -1765,6 +1765,7 @@ mod tests {
     use crate::manager::{AgentLimits, AgentManagerHandle};
     use crate::tools::NullProvider;
     use crate::{AgentInput, AgentMode, History, RunSettings, TurnContext};
+    use maki_providers::Effort;
     use maki_providers::provider::BoxFuture;
     use maki_storage::checkpoint::CheckpointAck;
     use test_case::test_case;
@@ -1772,6 +1773,12 @@ mod tests {
     const OLD: &str = "ollama/old";
     const NEW: &str = "ollama/new";
     const FAILED: &str = "failed";
+    const CAPABLE_MODEL: &str = "anthropic/claude-opus-4-8";
+    const FAST_TIER_TARGET: &str = "openai/gpt-5";
+    const NO_THINKING_TARGET: &str = "ollama/llama3";
+    const CURRENT_MODEL: &str = "current/model";
+    const DISCOVERED_MODEL: &str = "other/model";
+    const THINKING_OFF: &str = "off";
 
     impl SessionCoordinatorHandle {
         async fn barrier(&self) {
@@ -1942,15 +1949,19 @@ mod tests {
         coordinator: &SessionCoordinatorHandle,
         installed: Arc<Mutex<Vec<String>>>,
     ) -> AgentRef {
+        bind_config(coordinator, (*projection_config(false)).clone(), installed)
+    }
+
+    fn bind_config(
+        coordinator: &SessionCoordinatorHandle,
+        config: EffectiveAgentConfig,
+        installed: Arc<Mutex<Vec<String>>>,
+    ) -> AgentRef {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let agent = manager
             .create_root(Vec::new(), None, Box::new(TestBackend))
             .unwrap();
-        agent
-            .actor()
-            .unwrap()
-            .initialize_config((*projection_config(false)).clone())
-            .unwrap();
+        agent.actor().unwrap().initialize_config(config).unwrap();
         coordinator
             .bind_actor(
                 agent.clone(),
@@ -2849,6 +2860,71 @@ mod tests {
             first.close().await.unwrap();
             second.close().await.unwrap();
         });
+    }
+
+    #[test_case(FAST_TIER_TARGET, FAST_OPTION_ID, DISABLED_VALUE; "model_change_disables_fast")]
+    #[test_case(NO_THINKING_TARGET, THINKING_OPTION_ID, THINKING_OFF; "model_change_disables_thinking")]
+    fn model_change_clamps_unsupported_settings(target: &str, id: &str, expected: &str) {
+        smol::block_on(async {
+            let mut params = params(MakiId::generate(), writer(false));
+            params.definitions = builtin_option_definitions(
+                CAPABLE_MODEL,
+                [Arc::from(CAPABLE_MODEL)],
+                false,
+                true,
+                false,
+                ThinkingConfig::Effort(Effort::High),
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let mut config = (*projection_config(false)).clone();
+            config.settings.model = Model::from_spec(CAPABLE_MODEL).unwrap();
+            config.settings.fast = true;
+            config.settings.thinking = ThinkingConfig::Effort(Effort::High);
+            let agent = bind_config(&coordinator, config, Arc::default());
+            let before = coordinator.read().options();
+            let after = coordinator
+                .set_option(MODEL_OPTION_ID, target)
+                .await
+                .unwrap();
+            assert_eq!(after.version, before.version + 1);
+            let value = |id: &str| {
+                after
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                    .unwrap()
+            };
+            assert_eq!(value(MODEL_OPTION_ID).current_value.as_ref(), target);
+            assert!(value(MODEL_OPTION_ID).definition.accepts(target));
+            assert_eq!(value(id).current_value.as_ref(), expected);
+            let settings = agent.effective_config().unwrap().unwrap();
+            if id == FAST_OPTION_ID {
+                assert!(!settings.fast);
+            } else {
+                assert_eq!(settings.thinking, ThinkingConfig::Off);
+            }
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(THINKING_OPTION_ID, "high", true; "listed_thinking_effort")]
+    #[test_case(THINKING_OPTION_ID, "8192", true; "thinking_budget_outside_value_list")]
+    #[test_case(THINKING_OPTION_ID, "deeply", false; "unknown_thinking_value")]
+    #[test_case(MODEL_OPTION_ID, CURRENT_MODEL, true; "current_model_missing_from_discovery")]
+    fn builtin_definitions_accept_values(id: &str, value: &str, accepted: bool) {
+        let definitions = builtin_option_definitions(
+            CURRENT_MODEL,
+            [Arc::from(DISCOVERED_MODEL)],
+            false,
+            false,
+            false,
+            ThinkingConfig::Off,
+        );
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.id.as_ref() == id)
+            .unwrap();
+        assert_eq!(definition.accepts(value), accepted);
     }
 
     #[test_case(FAST_OPTION_ID, ENABLED_VALUE; "unsupported_fast")]
