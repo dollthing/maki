@@ -5,7 +5,6 @@ mod tui;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_config::project::TrustMode;
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, TrustAction};
@@ -26,13 +25,9 @@ pub fn seed_automode(config: &mut maki_config::Config, automode: bool) {
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
-    // `--trust` is a grant for this process, so every entry point under it
-    // reads the same shared project config the TUI would.
-    let trust_mode = if cli.trust {
-        TrustMode::Session
-    } else {
-        TrustMode::Consult
-    };
+    // `--trust` and `--no-project` hold for this process, so every entry
+    // point under them reads the same shared project config the TUI would.
+    let trust_mode = cli.trust_mode();
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;

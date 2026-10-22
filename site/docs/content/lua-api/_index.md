@@ -99,7 +99,7 @@ The rules:
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs). |
+| [`maki.env`](#maki-env) | Paths to makima's own directories (config, state, logs), and whether |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
@@ -2472,7 +2472,8 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 
 ## maki.env {#maki-env}
 
-Paths to makima's own directories (config, state, logs).
+Paths to makima's own directories (config, state, logs), and whether
+the project's `.makima` directory is off limits.
 
 Use these to locate config files or persistent state without hard-coding paths.
 
@@ -2541,6 +2542,29 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local dir = maki.env.logs_dir()
+```
+
+---
+
+### `maki.env.no_project()` {#maki-env-no_project}
+
+```lua
+maki.env.no_project()
+```
+
+Whether maki was started with `--no-project`. A plugin that reads files
+from the project's `.makima` directory should skip them when this is true.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`boolean`) `true` under `--no-project`.
+
+**Example:**
+
+```lua
+if not maki.env.no_project() then
+  scan(".makima/skills")
+end
 ```
 
 

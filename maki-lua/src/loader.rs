@@ -419,6 +419,9 @@ impl PluginHost {
         project_config: &ProjectConfig,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        if project_config.is_ignored() {
+            let _ = self.inner.tx.send(Request::IgnoreProject);
+        }
         self.load_init_files(InitFiles::resolve(project_config, no_plugins), warnings)
     }
 

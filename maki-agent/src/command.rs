@@ -14,6 +14,7 @@ use maki_commands::{
     HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
     TargetCapabilities, TargetCapability, resolve_path,
 };
+use maki_config::ProjectConfig;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::Model;
 
@@ -25,6 +26,7 @@ use tracing::{debug, warn};
 
 const COMMANDS_DIR: &str = "commands";
 const PROJECT_COMMAND_DIRS: &[&str] = &[".makima/commands", ".claude/commands"];
+const MAKIMA_COMMAND_DIR: &str = ".makima/commands";
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
@@ -692,11 +694,14 @@ impl CustomCommand {
     }
 }
 
-pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
+/// Commands from the user's dirs and the project's, leaving out
+/// `.makima/commands` when {project} is ignored.
+pub fn discover_commands(cwd: &Path, project: &ProjectConfig) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
         maki_storage::paths::config_dir().ok().as_deref(),
+        project.is_ignored(),
     )
 }
 
@@ -704,6 +709,7 @@ fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
     global_config: Option<&Path>,
+    ignore_project: bool,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
@@ -717,7 +723,10 @@ fn discover_commands_inner(
     }
 
     for dir in find_project_ancestor_dirs(cwd) {
-        for cmd_dir in PROJECT_COMMAND_DIRS {
+        for cmd_dir in PROJECT_COMMAND_DIRS
+            .iter()
+            .filter(|cmd_dir| !(ignore_project && **cmd_dir == MAKIMA_COMMAND_DIR))
+        {
             scan_command_dir(&dir.join(cmd_dir), CommandScope::Project, &mut commands);
         }
     }
@@ -1404,15 +1413,16 @@ mod tests {
         )
         .unwrap();
 
-        let commands = discover_commands_inner(project.path(), None, Some(global.path()));
+        let commands = discover_commands_inner(project.path(), None, Some(global.path()), false);
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");
         assert_eq!(overlap[0].scope, CommandScope::Project);
     }
 
-    #[test]
-    fn discover_supports_both_dir_sources() {
+    #[test_case(false ; "both_sources")]
+    #[test_case(true ; "no_project_skips_makima")]
+    fn discover_supports_both_dir_sources(ignore_project: bool) {
         let dir = TempDir::new().unwrap();
 
         for (cmd_dir, filename) in [
@@ -1424,9 +1434,9 @@ mod tests {
             fs::write(path.join(filename), "Content").unwrap();
         }
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands = discover_commands_inner(dir.path(), None, None, ignore_project);
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"a-cmd"));
+        assert_eq!(names.contains(&"a-cmd"), !ignore_project);
         assert!(names.contains(&"b-cmd"));
     }
 
@@ -1438,7 +1448,7 @@ mod tests {
         fs::write(cmd_dir.join("valid.md"), "Content").unwrap();
         fs::write(cmd_dir.join("invalid.txt"), "Content").unwrap();
 
-        let commands = discover_commands_inner(dir.path(), None, None);
+        let commands = discover_commands_inner(dir.path(), None, None, false);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "valid");
     }

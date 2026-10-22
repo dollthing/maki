@@ -8,6 +8,9 @@ use crate::plugin_permissions::PluginPermissions;
 
 pub(crate) struct StateDirOverride(pub(crate) PathBuf);
 
+/// Present when maki was started with `--no-project`.
+pub(crate) struct NoProject;
+
 /// The state directory this host writes to: the override a test or embedder
 /// installed, or the user's.
 pub(crate) fn host_state_dir(lua: &Lua) -> Result<StateDir, String> {
@@ -57,8 +60,22 @@ fn logs_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
     Ok(maki_storage::paths::logs_dir().ok().and_then(utf8))
 }
 
+/// Whether maki was started with `--no-project`. A plugin that reads files
+/// from the project's `.makima` directory should skip them when this is true.
+///
+/// @return (boolean) `true` under `--no-project`.
+/// @example
+/// if not maki.env.no_project() then
+///   scan(".makima/skills")
+/// end
+#[lua_fn(guard = Env)]
+fn no_project(lua: &Lua) -> mlua::Result<bool> {
+    Ok(lua.app_data_ref::<NoProject>().is_some())
+}
+
 lua_table! {
-    /// Paths to makima's own directories (config, state, logs).
+    /// Paths to makima's own directories (config, state, logs), and whether
+    /// the project's `.makima` directory is off limits.
     ///
     /// Use these to locate config files or persistent state without hard-coding paths.
     ///
@@ -66,6 +83,6 @@ lua_table! {
     /// local cfg = maki.env.config_dir()
     /// ```
     "maki.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
-        state_dir(perms), config_dir(perms), logs_dir(perms),
+        state_dir(perms), config_dir(perms), logs_dir(perms), no_project(perms),
     ]
 }

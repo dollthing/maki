@@ -85,6 +85,9 @@ impl std::fmt::Display for GatedFile {
 pub struct ProjectConfig {
     config_root: PathBuf,
     trusted: bool,
+    /// `--no-project`: nothing under the project's `.makima` directory loads,
+    /// whatever the folder's trust.
+    ignored: bool,
     /// The store the trust answer came from, so a gated file Maki writes later
     /// can be added to that same answer. A config nobody resolved against a
     /// store has no answer to widen, so it records nothing, which also keeps
@@ -104,6 +107,7 @@ impl ProjectConfig {
         Self {
             config_root: git_checkout_boundary(&cwd, home).unwrap_or(cwd),
             trusted: false,
+            ignored: false,
             trust_store: None,
         }
     }
@@ -122,6 +126,10 @@ impl ProjectConfig {
 
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        self.ignored
     }
 
     /// The only route to a gated project file. `None` unless the folder is
@@ -300,21 +308,34 @@ pub enum TrustMode {
     Consult,
     /// Trust for this process only. `--trust`.
     Session,
+    /// Load nothing from the project, trusted or not. `--no-project`.
+    Ignore,
 }
 
 pub fn resolve(storage: &StateDir, cwd: &Path, mode: TrustMode) -> ProjectDecision {
     match mode {
         TrustMode::Session => session_grant(ProjectConfig::discover(cwd)),
         TrustMode::Consult => resolve_recorded(storage, ProjectConfig::discover(cwd)),
+        TrustMode::Ignore => ignored(cwd),
     }
+}
+
+/// Nothing is read or recorded, so a folder that was never asked about stays
+/// unasked.
+fn ignored(cwd: &Path) -> ProjectDecision {
+    let mut project_config = ProjectConfig::discover(cwd);
+    project_config.ignored = true;
+    ProjectDecision::new(project_config, TrustState::Inert, None)
 }
 
 /// For commands that never open the state directory for anything else: a state
 /// directory they cannot resolve costs them the shared project config, not the
 /// whole command.
 pub fn resolve_noninteractive(cwd: &Path, mode: TrustMode) -> ProjectDecision {
-    if mode == TrustMode::Session {
-        return session_grant(ProjectConfig::discover(cwd));
+    match mode {
+        TrustMode::Session => return session_grant(ProjectConfig::discover(cwd)),
+        TrustMode::Ignore => return ignored(cwd),
+        TrustMode::Consult => {}
     }
     match StateDir::resolve() {
         Ok(storage) => resolve(&storage, cwd, mode),

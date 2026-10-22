@@ -24,6 +24,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `-m` / `--model` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-rtk` / `--no-jit` | yes | yes | yes |
+| `--trust` / `--no-project` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `-c` / `--continue [ID]` | yes (ID, or picker with no ID) | no (ID ignored; bare flag errors) | yes (ID only) |
 | `-l` / `--last` | yes | no (always new session) | yes |
@@ -52,6 +53,8 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--no-rtk` | Disable [rtk](https://github.com/rtk-ai/rtk) command rewriting |
 | `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
+| `--trust` | Load the project's `.makima` files for this run without asking or recording an answer. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
+| `--no-project` | Load nothing from the project's `.makima` directory (`init.lua`, `permissions.toml`, `mcp.toml`, `.env`, commands, skills), whatever the folder's trust. For a repository whose `.makima` files are broken. See [Folder Trust](/docs/folder-trust/#loading-nothing-from-the-project) |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |

@@ -139,6 +139,25 @@ maki.setup({
 })
 ```
 
+## Loading Nothing From the Project
+
+Trust decides what an untrusted project may load. `--no-project` loads nothing
+from the project's `.makima` directory, whatever its trust: no gated file, no
+`permissions.toml`, and no commands or skills under `.makima`. It records no
+decision, and the TUI, `--print`, the SDK, ACP and the utility subcommands all
+honour it.
+
+Use it to work in a repository whose `.makima` files are broken, such as a
+`permissions.toml` that stops Makima from starting, or that you would rather not
+run at all:
+
+```bash
+makima --no-project
+```
+
+Instruction files such as `AGENTS.md`, and other tools' directories such as
+`.claude/commands`, still load. `--no-project` cannot be combined with `--trust`.
+
 ## What a Yes Covers
 
 Your yes covers the kinds of gated file the folder had that day. A project that

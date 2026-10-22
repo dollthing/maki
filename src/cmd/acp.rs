@@ -34,7 +34,7 @@ pub fn run(
     let command_registry = maki_commands::CommandRegistry::new();
     let standard_commands = command::StandardCommands::register(
         &command_registry,
-        &command::discover_commands(&cwd),
+        &command::discover_commands(&cwd, &trust.project_config),
         command::StandardCompletions::default(),
     )
     .context("register standard commands")?;

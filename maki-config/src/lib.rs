@@ -15,6 +15,7 @@ use thiserror::Error;
 pub const PROJECT_DIR: &str = ".makima";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
+pub const NO_PROJECT_HINT: &str = "pass --no-project to start without the project's .makima files";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .makima/permissions.toml";
 
@@ -343,6 +344,8 @@ pub enum ConfigError {
     },
     #[error("cannot load permissions from {}: {reason}", path.display())]
     PermissionsFile { path: PathBuf, reason: String },
+    #[error("{0}; {NO_PROJECT_HINT}")]
+    ProjectPermissions(Box<ConfigError>),
     #[error(
         "invalid permissions in {}: {}: {reason}",
         path.display(),
@@ -2119,8 +2122,15 @@ fn load_permissions_inner(
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
     // scopes when nobody vouched for the folder.
+    if project_config.is_ignored() {
+        return Ok(build_permissions(
+            global_perms,
+            PermissionsFileConfig::default(),
+        ));
+    }
     let mut project_perms =
-        read_permissions_file(&project_config.project_file(GatedFile::Permissions))?;
+        read_permissions_file(&project_config.project_file(GatedFile::Permissions))
+            .map_err(|error| ConfigError::ProjectPermissions(Box::new(error)))?;
     if !project_config.is_trusted() {
         project_perms.restrict_to_deny_scopes();
     }
@@ -3576,10 +3586,30 @@ mod tests {
         } else {
             ProjectConfig::discover(dir.path())
         };
-        assert!(matches!(
-            load_permissions_inner(None, &project),
-            Err(ConfigError::PermissionRule { .. })
-        ));
+        let error = load_permissions_inner(None, &project).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ProjectPermissions(inner)
+                if matches!(**inner, ConfigError::PermissionRule { .. })),
+            "{error}"
+        );
+        assert!(error.to_string().ends_with(NO_PROJECT_HINT), "{error}");
+    }
+
+    #[test_case(project::TrustMode::Consult, false ; "malformed_file_fails")]
+    #[test_case(project::TrustMode::Session, false ; "trusted_malformed_file_fails")]
+    #[test_case(project::TrustMode::Ignore, true ; "no_project_ignores_it")]
+    fn no_project_ignores_malformed_project_permissions(mode: project::TrustMode, loads: bool) {
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(maki_dir.join(PERMISSIONS_FILE), "[bash\n").unwrap();
+        let state = TempDir::new().unwrap();
+        let storage = maki_storage::StateDir::from_path(state.path().to_path_buf());
+        let decision = project::resolve(&storage, dir.path(), mode);
+        assert_eq!(
+            load_permissions_inner(None, &decision.project_config).is_ok(),
+            loads
+        );
     }
 
     #[test]

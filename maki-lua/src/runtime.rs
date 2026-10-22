@@ -199,6 +199,8 @@ pub enum Request {
         provider: crate::api::session::SessionSnapshotFn,
     },
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
+    /// `--no-project`: plugins leave the project's `.makima` directory alone.
+    IgnoreProject,
     SetClockFormat(maki_config::ClockFormat),
     LoadSource {
         name: Arc<str>,
@@ -5001,6 +5003,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::WarmJit => codegen_armed = true,
                         Request::InstallOrchestrationServices(services) => {
                             rt.lua.set_app_data(services);
+                        }
+                        Request::IgnoreProject => {
+                            rt.lua.set_app_data(crate::api::env::NoProject);
                         }
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua

@@ -11,7 +11,7 @@ use crossterm::style::Stylize;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
+use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_lua::ui_sink::{HeadlessUi, HostUi};
@@ -83,11 +83,11 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path, project: &ProjectConfig) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    command::discover_commands(cwd)
+    command::discover_commands(cwd, project)
 }
 
 fn load_config(
@@ -187,7 +187,7 @@ fn build_stack(
         }
     }
 
-    let commands = discover_commands(cli.no_commands, cwd);
+    let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -318,11 +318,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    let mode = if cli.trust {
-        TrustMode::Session
-    } else {
-        TrustMode::Consult
-    };
+    let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
 
