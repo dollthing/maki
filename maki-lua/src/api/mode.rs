@@ -1,42 +1,17 @@
-//! `maki.api.mode`: define/override agent modes and switch between them.
-//! Definitions land in the shared `ModeRegistry` (built-ins `build`/`plan`
-//! included), so the agent, UI, and SDK all see the same modes.
+//! `maki.api.mode`: define and override agent modes. Definitions land in the
+//! shared `ModeRegistry` (built-ins `build`/`plan` included), so every
+//! frontend sees the same modes. `Agent:set_mode` switches an agent's mode.
 
 use std::sync::Arc;
 
-use maki_agent::{AgentRef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
+use maki_agent::{ModeDefSpec, ModeId, ModeRegistry};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::agent_errors::{DELEGATED_FOCUS, DELEGATED_HOST_MUTATION, NO_FOCUSED_AGENT};
-use crate::api::util::command::{SessionRequest, UiAction, ui_send};
+use crate::agent_errors::DELEGATED_HOST_MUTATION;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const NO_REGISTRY_ERR: &str = "mode registry not available";
-const MODE_CONFIG_UNAVAILABLE: &str = "agent mode configuration is unavailable";
-
-fn target(lua: &Lua) -> Result<Option<AgentRef>, String> {
-    if let Some(target) = crate::runtime::pinned_target(lua) {
-        target.target.actor().map_err(|error| error.to_string())?;
-        return Ok(Some(target.target));
-    }
-    let invocation = crate::runtime::command_invocation(lua);
-    if invocation.is_none()
-        && crate::runtime::current_plugin(lua).is_some()
-        && crate::orchestration::services(lua).is_some()
-    {
-        return Err(NO_FOCUSED_AGENT.into());
-    }
-    let target = crate::orchestration::resolve_target(
-        lua,
-        invocation.as_ref().map(|current| &current.invocation),
-    )?
-    .map(|target| target.target);
-    if target.is_none() && crate::orchestration::services(lua).is_some() {
-        return Err(NO_FOCUSED_AGENT.into());
-    }
-    Ok(target)
-}
 
 fn registry(lua: &Lua) -> Result<Arc<ModeRegistry>, mlua::Error> {
     lua.app_data_ref::<Arc<ModeRegistry>>()
@@ -110,103 +85,6 @@ fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
     }
 }
 
-/// Returns the mode id ("build", "plan", or a custom name) of the invocation's
-/// agent, or the focused agent when called outside an invocation.
-///
-/// @return (string|nil, string|nil) Mode id, or nil and an error.
-/// @example
-/// local mode = maki.api.mode.get()
-#[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
-    if crate::runtime::in_delegated_tool(&lua) {
-        return Ok(err_pair(DELEGATED_FOCUS));
-    }
-    try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    if let Some(target) = try_pair!(target(&lua)) {
-        let config = try_pair!(target.effective_config().map_err(|error| error.to_string()));
-        let config = try_pair!(config.ok_or(MODE_CONFIG_UNAVAILABLE));
-        return Ok((Some(config.mode.id().key().to_owned()), None));
-    }
-    let (reply_tx, reply_rx) = flume::bounded(1);
-    match ui_send(tx.as_ref(), UiAction::GetMode { reply_tx }) {
-        Ok(()) => match reply_rx.recv_async().await {
-            Ok(id) => Ok((Some(id), None)),
-            Err(_) => Ok(err_pair("ui dropped the mode query")),
-        },
-        Err(e) => Ok(err_pair(e)),
-    }
-}
-
-/// Enters a mode by name on the invocation's agent, or the focused agent when
-/// called outside an invocation. Fails when the mode is not defined. Success
-/// means the actor committed the mode for subsequent admissions.
-/// See [Configuration changes](/docs/modes/#configuration-changes).
-///
-/// @param name string Mode id ("build", "plan", or a custom name).
-/// @return (boolean, string|nil) `true` on success, or nil and an error.
-/// @example
-/// maki.api.mode.set("plan")
-#[lua_fn]
-async fn set(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    name: String,
-) -> LuaResult<Pair<bool>> {
-    if crate::runtime::in_delegated_tool(&lua) {
-        return Ok(err_pair(DELEGATED_HOST_MUTATION));
-    }
-    try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    set_inner(&lua, tx, name).await
-}
-
-async fn set_inner(
-    lua: &Lua,
-    tx: Option<flume::Sender<UiAction>>,
-    name: String,
-) -> LuaResult<Pair<bool>> {
-    let id = ModeId::parse(&name);
-    let reg = registry(lua)?;
-    if reg.get(&id).is_none() {
-        return Ok(err_pair(ModeError::Unknown(name).to_string()));
-    }
-    if let Some(target) = try_pair!(target(lua)) {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        try_pair!(ui_send(
-            tx.as_ref(),
-            UiAction::SetAgentMode {
-                target,
-                id: id.key().to_owned(),
-                reply_tx,
-            },
-        ));
-        try_pair!(try_pair!(
-            reply_rx
-                .recv_async()
-                .await
-                .map_err(|_| "ui dropped the mode update")
-        ));
-        return Ok((Some(true), None));
-    }
-    let (reply_tx, reply_rx) = flume::bounded(1);
-    match ui_send(
-        tx.as_ref(),
-        UiAction::Session {
-            req: SessionRequest::SetMode {
-                session: None,
-                id: id.key().to_owned(),
-            },
-            reply_tx,
-        },
-    ) {
-        Ok(()) => match reply_rx.recv_async().await {
-            Ok(Ok(_)) => Ok((Some(true), None)),
-            Ok(Err(error)) => Ok(err_pair(error)),
-            Err(_) => Ok(err_pair("ui dropped the mode update")),
-        },
-        Err(error) => Ok(err_pair(error)),
-    }
-}
-
 /// Lists all known modes as `{ name, label }` pairs (built-ins first).
 ///
 /// @return (table|nil, string|nil) Array of `{name, label}`, or nil and an error.
@@ -250,24 +128,23 @@ fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
 }
 
 lua_table! {
-    /// `maki.api.mode`: define, override, list, and switch agent modes.
-    /// Built-in `build` and `plan` are pre-registered, so overrides use the
-    /// same call as defining a custom mode.
-    "maki.api.mode" => pub(crate) fn create_mode_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [define, get(tx), set(tx), list, reset]
+    /// `maki.api.mode`: define, override and list agent modes. Built-in
+    /// `build` and `plan` are pre-registered, so overrides use the same call
+    /// as defining a custom mode. Switch an agent with `Agent:set_mode`.
+    "maki.api.mode" => pub(crate) fn create_mode_table(),
+    DOCS [define, list, reset]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::util::command::NO_UI_ERR;
     use serde_json::json;
 
     fn prep(reg: Option<Arc<ModeRegistry>>) -> Lua {
         let lua = Lua::new();
         let reg = reg.unwrap_or_else(|| Arc::new(ModeRegistry::builtin()));
         lua.set_app_data(reg);
-        let t = create_mode_table(&lua, None).unwrap();
+        let t = create_mode_table(&lua).unwrap();
         lua.globals().set("mode", t).unwrap();
         lua
     }
@@ -328,24 +205,6 @@ mod tests {
             .exec_async(),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn set_unknown_mode_errors() {
-        let lua = prep(None);
-        let (val, err): (Option<bool>, Option<String>) =
-            smol::block_on(lua.load("return mode.set('ghost')").eval_async()).unwrap();
-        assert!(val.is_none());
-        assert_eq!(err.as_deref(), Some("unknown mode 'ghost'"));
-    }
-
-    #[test]
-    fn get_without_ui_returns_error_pair() {
-        let lua = prep(None);
-        let (val, err): (Option<String>, Option<String>) =
-            smol::block_on(lua.load("return mode.get()").eval_async()).unwrap();
-        assert!(val.is_none());
-        assert_eq!(err.as_deref(), Some(NO_UI_ERR));
     }
 
     #[test]

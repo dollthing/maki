@@ -5,7 +5,6 @@ pub const NO_PLUGIN_AUTHORITY: &str = "no active plugin authority";
 pub const NO_TASK_AUTHORITY: &str = "no active task authority";
 pub const MANAGED_AUTHORITY_INACTIVE: &str =
     "managed agent authority is not active in this invocation";
-pub const OTHER_PLUGIN_GENERATION: &str = "agent belongs to another plugin generation";
 pub const SESSION_REQUIRED_ERR: &str = "session is required";
 pub const FIXED_ROOT_CONFIG_ERROR: &str =
     "configuration changes are unavailable for this fixed root";
@@ -26,10 +25,6 @@ pub const DELEGATED_FOCUS: &str = "delegated tool handlers cannot read UI focus"
 pub const SELF_TURN_WAIT: &str = "cannot wait for a turn on the calling agent";
 pub const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
-pub const EXPLICIT_MODEL_TARGET_REQUIRED: &str =
-    "no interactive UI attached; pass ctx or use the Agent API";
-pub const TRUSTED_MODEL_MUTATION_REQUIRED: &str =
-    "host model mutation requires trusted handler authority";
 pub const UNKNOWN_SPAWN_OPTION: &str = "unknown spawn option";
 pub const AGENT_BUSY: &str = "agent has pending work";
 pub const STALE_TURN: &str = "after_turn is not the agent's latest settled turn";

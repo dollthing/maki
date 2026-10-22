@@ -91,8 +91,7 @@ pub(crate) fn create_maki_global(
     )?;
     lua.set_app_data(context.pending_slots.clone());
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
-    let mode_table = mode::create_mode_table(lua, ui_action_tx.clone())?;
-    api.set("mode", mode_table)?;
+    api.set("mode", mode::create_mode_table(lua)?)?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
     maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
@@ -114,10 +113,7 @@ pub(crate) fn create_maki_global(
         "session",
         session::create_session_table(lua, ui_action_tx.clone())?,
     )?;
-    maki.set(
-        "model",
-        model::create_model_table(lua, ui_action_tx.clone())?,
-    )?;
+    maki.set("model", model::create_model_table(lua)?)?;
     maki.set(
         "usage",
         usage::create_usage_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,

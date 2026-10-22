@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use maki_agent::{AgentRef, SharedBuf};
 use maki_commands::{CommandArguments, PositionalArgument};
+use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -449,60 +450,14 @@ pub enum SessionRequest {
     ListAll,
     Live,
     Current,
-    Usage,
-    Read {
-        id: Option<String>,
-    },
-    New {
-        prompt: Option<String>,
-        focus: bool,
-    },
-    Prompt {
-        id: Option<String>,
-        text: String,
-    },
-    Focus {
-        id: String,
-    },
-    Delete {
-        id: String,
-    },
-    SetTitle {
-        id: String,
-        title: String,
-    },
-    GetThinking,
-    SetThinking {
-        set_default: bool,
-        thinking: String,
-    },
-    SetDefaultThinking {
-        thinking: String,
-    },
-    Options {
-        session: String,
-    },
-    SetOption {
-        session: String,
-        id: String,
-        value: String,
-        version: u64,
-    },
-    SetMode {
-        session: Option<String>,
-        id: String,
-    },
-}
-
-pub enum ModelRequest {
-    Get,
-    Available,
-    Set {
-        spec: Option<String>,
-        thinking: Option<maki_providers::ThinkingConfig>,
-        toggle_thinking: bool,
-        fast: Option<bool>,
-    },
+    Usage { id: MakiId },
+    Read { id: MakiId },
+    New { prompt: Option<String>, focus: bool },
+    Prompt { id: MakiId, text: String },
+    Focus { id: String },
+    Delete { id: String },
+    SetTitle { id: String, title: String },
+    SetDefaultThinking { thinking: String },
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -585,14 +540,6 @@ pub enum BuiltinAction {
 }
 
 pub enum UiAction {
-    SetAgentMode {
-        target: AgentRef,
-        id: String,
-        reply_tx: flume::Sender<Result<(), String>>,
-    },
-    GetMode {
-        reply_tx: flume::Sender<String>,
-    },
     OpenWin {
         buf: Arc<SharedBuf>,
         config: FloatConfig,
@@ -618,10 +565,6 @@ pub enum UiAction {
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<UiReply>,
-    },
-    Model {
-        req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     UsageFetch {

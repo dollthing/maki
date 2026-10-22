@@ -96,10 +96,14 @@ if not ok then
   maki.log.warn("mode_plan_override: define failed: " .. err)
 end
 
-local function set_mode(name)
-  local switched, e = maki.api.mode.set(name)
+local function set_mode(ctx, name)
+  local agent, err = ctx and maki.agent.current(ctx)
+  local switched
+  if agent then
+    switched, err = agent:set_mode(ctx, name)
+  end
   if not switched then
-    maki.log.warn("mode_plan_override: set(" .. name .. ") failed: " .. e)
+    maki.log.warn("mode_plan_override: set(" .. name .. ") failed: " .. tostring(err or "no agent target"))
   end
 end
 
@@ -107,8 +111,8 @@ maki.api.register_command({
   name = "/plan",
   description = "Switch to plan mode (analyse and write only the plan file)",
   tui_only = false,
-  handler = function(_args)
-    set_mode("plan")
+  handler = function(_, ctx)
+    set_mode(ctx, "plan")
   end,
 })
 
@@ -116,7 +120,7 @@ maki.api.register_command({
   name = "/build",
   description = "Switch to build mode (full tool access)",
   tui_only = false,
-  handler = function(_args)
-    set_mode("build")
+  handler = function(_, ctx)
+    set_mode(ctx, "build")
   end,
 })

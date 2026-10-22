@@ -1429,12 +1429,7 @@ pub(crate) fn create_api_table(
         context.pending_sources.clone(),
         context.pending_expanders.clone(),
     )?;
-    add_session_option_fn(
-        &t,
-        lua,
-        context.pending_session_options.clone(),
-        ui_action_tx.clone(),
-    )?;
+    add_session_option_fn(&t, lua, context.pending_session_options.clone())?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }

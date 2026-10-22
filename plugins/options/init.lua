@@ -1,15 +1,21 @@
 local helpers = require("options_helpers")
 
-local function read_options()
-  local snapshot, err = maki.session.options()
+local function read_options(target)
+  local snapshot, err = maki.session.options(target)
   if not snapshot then
     maki.ui.flash("Options unavailable: " .. tostring(err))
   end
   return snapshot
 end
 
-local function command()
-  local snapshot = read_options()
+local function command(_, ctx)
+  local session_id, session_err = ctx and ctx:session_id()
+  if not session_id then
+    maki.ui.flash("Options unavailable: " .. tostring(session_err or "no session"))
+    return
+  end
+  local target = { session = session_id }
+  local snapshot = read_options(target)
   if not snapshot then
     return
   end
@@ -27,7 +33,7 @@ local function command()
     return
   end
 
-  snapshot = read_options()
+  snapshot = read_options(target)
   if not snapshot then
     return
   end
@@ -49,7 +55,7 @@ local function command()
     return
   end
 
-  snapshot = read_options()
+  snapshot = read_options(target)
   if not snapshot then
     return
   end
@@ -69,7 +75,7 @@ local function command()
     maki.ui.flash("Option values changed: " .. selected_item.id)
     return
   end
-  local ok, err = maki.session.set_option(selected_item.id, value_item.value)
+  local ok, err = maki.session.set_option(selected_item.id, value_item.value, target)
   if not ok then
     maki.ui.flash("Option update failed: " .. tostring(err))
   end

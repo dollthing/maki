@@ -59,9 +59,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
-    ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
-    ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
+    EventHandle, HintReader, KeymapReader, ProviderUsageAck, ProviderUsageInvalidation,
+    ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot, ProviderUsageWindow,
+    SessionRequest, StatusContentReader, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -614,17 +614,7 @@ fn project_committed_options(runtime: &mut SessionRuntime) {
     project_committed_options_for_app(&mut runtime.app, &snapshot);
 }
 
-/// Who hears how a mode change ended: a pinned command as soon as the actor
-/// commits, Lua once the runtime that owns the change has handled it.
-enum ModeReply {
-    None,
-    Committed(flume::Sender<Result<(), String>>),
-    Handled(flume::Sender<UiReply>),
-}
-
-/// Commits mode `id` on `target` and reports it as one session op, so a mode
-/// change from a key, a pinned command or Lua projects and replies alike.
-#[allow(clippy::too_many_arguments)]
+/// Commits mode `id` on `target` and reports it as one session op.
 fn dispatch_mode_commit(
     runtime: &SessionRuntime,
     target: Result<AgentRef, String>,
@@ -633,7 +623,6 @@ fn dispatch_mode_commit(
     services: Option<Arc<AgentOrchestration>>,
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
-    reply: ModeReply,
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
@@ -653,81 +642,14 @@ fn dispatch_mode_commit(
             Err(error) => Err(error),
         }
         .map_err(|error| error.to_string());
-        let reply = match reply {
-            ModeReply::Committed(reply) => {
-                let _ = reply.send(result.clone());
-                None
-            }
-            ModeReply::None => Some(None),
-            ModeReply::Handled(reply_tx) => Some(Some(reply_tx)),
-        };
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
-            kind: SessionOpKind::ModeChanged { reply },
+            kind: SessionOpKind::ModeChanged,
             result,
         });
     })
     .detach();
-}
-
-fn dispatch_thinking_change(
-    runtime: &SessionRuntime,
-    set_default: bool,
-    thinking: &str,
-    reply_tx: flume::Sender<UiReply>,
-    internal_tx: flume::Sender<InternalEvent>,
-) {
-    let change = match thinking_change(thinking) {
-        Ok(change) => change,
-        Err(error) => {
-            let _ = reply_tx.send(Err(error));
-            return;
-        }
-    };
-    let session = runtime.id();
-    let identity = runtime.handles.identity();
-    let (manager, root) = runtime.handles.manager_and_root();
-    let reservation = manager
-        .lookup(root)
-        .map_err(ConfigChangeError::from)
-        .and_then(|target| reserve_config_change(&target, &runtime.coordinator, None));
-    smol::spawn(async move {
-        let mut committed = None;
-        let result = match reservation {
-            Ok(ticket) => ticket.commit_change(change).await.map(|commit| {
-                committed = Some(commit);
-            }),
-            Err(error) => Err(error),
-        }
-        .map_err(|error| error.to_string());
-        let _ = internal_tx.send(InternalEvent::SessionOp {
-            session,
-            runtime: identity,
-            kind: SessionOpKind::ThinkingSet {
-                commit: committed,
-                set_default,
-                reply_tx,
-            },
-            result,
-        });
-    })
-    .detach();
-}
-
-fn thinking_reply(commit: &ConfigCommit) -> serde_json::Value {
-    json!({ "mode": commit.config.thinking.to_string() })
-}
-
-fn thinking_change(input: &str) -> Result<ConfigChange, String> {
-    if input.trim().is_empty() {
-        return Ok(ConfigChange::ToggleThinking);
-    }
-    let thinking = maki_domain::parse_thinking(input.trim()).map_err(|error| error.to_string())?;
-    Ok(ConfigChange::Patch(ConfigPatch {
-        thinking: Some(thinking),
-        ..Default::default()
-    }))
 }
 
 /// The agent a session's commands and keymaps address: the selected chat's
@@ -735,16 +657,6 @@ fn thinking_change(input: &str) -> Result<ConfigChange, String> {
 fn selected_agent(runtime: &SessionRuntime) -> Option<AgentRef> {
     let (manager, _) = runtime.handles.manager_and_root();
     manager.lookup(runtime.app.selected_agent_id()?).ok()
-}
-
-fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::Value {
-    json!(maki_providers::CompleteModelSelection::from_model(
-        &config.model,
-        maki_providers::RequestOptions {
-            thinking: config.thinking,
-            fast: config.fast
-        },
-    ))
 }
 
 fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
@@ -1657,31 +1569,13 @@ enum SessionOpKind {
         id: &'static str,
         committed: Arc<std::sync::Mutex<Option<bool>>>,
     },
-    /// A committed mode change; the projection follows the new mode. `None`
-    /// when the caller already heard the result, `Some(None)` when an error
-    /// should flash, `Some(Some(reply))` for a Lua caller.
-    ModeChanged {
-        reply: Option<Option<flume::Sender<UiReply>>>,
-    },
+    /// A committed mode change; the projection follows the new mode.
+    ModeChanged,
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
     DirectoryChanged {
         adopted: Arc<std::sync::Mutex<Option<PathBuf>>>,
     },
-    /// `maki.session.set_thinking` from Lua, which owes its caller a reply.
-    ThinkingSet {
-        commit: Option<ConfigCommit>,
-        set_default: bool,
-        reply_tx: flume::Sender<UiReply>,
-    },
-    /// `maki.model.set` from Lua, which owes its caller a reply.
-    ModelSet {
-        commit: Option<ConfigCommit>,
-        spec: Option<String>,
-        reply_tx: flume::Sender<UiReply>,
-    },
-    /// Lua session option mutation and its reply.
-    LuaOptionSet { reply_tx: flume::Sender<UiReply> },
 }
 
 struct OrchestrationRevision {
@@ -2285,18 +2179,6 @@ impl<'t> EventLoop<'t> {
                 });
                 if current {
                     self.handle_session_op(session, kind, result);
-                } else {
-                    match kind {
-                        SessionOpKind::ModelSet { reply_tx, .. }
-                        | SessionOpKind::ThinkingSet { reply_tx, .. }
-                        | SessionOpKind::LuaOptionSet { reply_tx }
-                        | SessionOpKind::ModeChanged {
-                            reply: Some(Some(reply_tx)),
-                        } => {
-                            let _ = reply_tx.send(Err(NOT_LIVE_ERR.into()));
-                        }
-                        _ => {}
-                    }
                 }
             }
             InternalEvent::ProviderUsageFetched {
@@ -2751,17 +2633,6 @@ impl<'t> EventLoop<'t> {
 
     fn handle_ui_action(&mut self, action: UiAction) {
         match action {
-            UiAction::SetAgentMode {
-                target,
-                id,
-                reply_tx,
-            } => {
-                self.dispatch_pinned_mode_set(target, id, reply_tx);
-            }
-            UiAction::GetMode { reply_tx } => {
-                let id = self.focused_app().root_mode().id_key();
-                let _ = reply_tx.try_send(id);
-            }
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
@@ -2816,18 +2687,6 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
-            UiAction::Model { req, reply_tx } => match req {
-                // Touches the coordinator, so it answers once that returns.
-                ModelRequest::Set {
-                    spec,
-                    thinking,
-                    toggle_thinking,
-                    fast,
-                } => self.dispatch_model_set(spec, thinking, toggle_thinking, fast, reply_tx),
-                req => {
-                    let _ = reply_tx.send(self.handle_model_request(req));
-                }
-            },
             UiAction::ProviderUsageAck(ack) => {
                 self.handle_provider_usage_ack(ack);
             }
@@ -3199,17 +3058,6 @@ impl<'t> EventLoop<'t> {
     /// loop, which owns the live runtimes.
     fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
-            SessionRequest::SetOption {
-                session,
-                id,
-                value,
-                version,
-            } => {
-                self.dispatch_lua_option_set(session, id, value, version, reply_tx);
-            }
-            SessionRequest::SetMode { session, id } => {
-                self.dispatch_lua_mode_set(session, id, reply_tx);
-            }
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
                 let cwd = self.session_cwd.clone();
@@ -3330,20 +3178,22 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
             SessionRequest::Read { id } => {
-                let reply = match self.resolve_session_index(id.as_deref()) {
+                let reply = match self.resolve_session_index(id) {
                     Ok(idx) => Ok(self.session_snapshot_json(idx)),
                     Err(e) => Err(e),
                 };
                 let _ = reply_tx.send(reply);
             }
-            SessionRequest::Usage => {
-                let app = &self.sessions[self.focused].app;
-                let reply = session_usage(
-                    &app.state.token_usage,
-                    app.state.cost,
-                    app.state.session.usage_by_model(),
-                );
-                let _ = reply_tx.send(Ok(reply));
+            SessionRequest::Usage { id } => {
+                let reply = self.resolve_session_index(id).map(|idx| {
+                    let app = &self.sessions[idx].app;
+                    session_usage(
+                        &app.state.token_usage,
+                        app.state.cost,
+                        app.state.session.usage_by_model(),
+                    )
+                });
+                let _ = reply_tx.send(reply);
             }
             SessionRequest::New { prompt, focus } => {
                 let (session, provider) =
@@ -3372,13 +3222,9 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(json!(id)));
             }
             SessionRequest::Prompt { id, text } => {
-                let idx = match id {
-                    None => Ok(self.focused),
-                    Some(id) => parse_session_id(&id).and_then(|id| {
-                        self.position(id)
-                            .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
-                    }),
-                };
+                let idx = self
+                    .position(id)
+                    .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"));
                 let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
             }
             SessionRequest::Focus { id } => {
@@ -3403,33 +3249,6 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
-            SessionRequest::Options { session } => {
-                let reply = self.resolve_session_index(Some(&session)).and_then(|idx| {
-                    let config = self.sessions[idx].config().ok_or(NOT_LIVE_ERR)?;
-                    Ok(json!({ "model": config.model.spec(), "thinking": config.thinking.to_string(),
-                        "fast": if config.fast { "enabled" } else { "disabled" },
-                        "workflow": if config.workflow { "enabled" } else { "disabled" } }))
-                });
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::GetThinking => {
-                let options = maki_domain::THINKING_OPTIONS.to_vec();
-                let reply = self.sessions[self.focused]
-                    .config()
-                    .map(|config| {
-                        json!({
-                            "mode": config.thinking.to_string(),
-                            "supports_thinking": config.model.supports_thinking(),
-                            "options": options,
-                        })
-                    })
-                    .ok_or_else(|| NOT_LIVE_ERR.to_owned());
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::SetThinking {
-                set_default,
-                thinking,
-            } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
             SessionRequest::SetDefaultThinking { thinking } => {
                 let reply = maki_domain::parse_thinking(thinking.trim())
                     .map_err(|error| error.to_string())
@@ -3448,202 +3267,6 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn dispatch_lua_option_set(
-        &self,
-        session: String,
-        id: String,
-        value: String,
-        version: u64,
-        reply_tx: flume::Sender<UiReply>,
-    ) {
-        let idx = match parse_session_id(&session).and_then(|id| {
-            self.position(id)
-                .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
-        }) {
-            Ok(idx) => idx,
-            Err(error) => {
-                let _ = reply_tx.send(Err(error));
-                return;
-            }
-        };
-        let session = self.sessions[idx].id();
-        let (manager, root) = self.sessions[idx].handles.manager_and_root();
-        dispatch_lua_option_set(
-            session,
-            id,
-            value,
-            version,
-            self.sessions[idx].coordinator.clone(),
-            (manager, root),
-            self.internal_tx.clone(),
-            reply_tx,
-        );
-    }
-
-    fn dispatch_pinned_mode_set(
-        &self,
-        target: AgentRef,
-        id: String,
-        reply: flume::Sender<Result<(), String>>,
-    ) {
-        let idx = match self
-            .target_runtime_index(&target)
-            .and_then(|idx| self.target_actor(idx, &target).map(|_| idx))
-        {
-            Ok(idx) => idx,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        self.dispatch_mode(
-            idx,
-            Ok(target),
-            Some(Arc::clone(&self.orchestration)),
-            id,
-            ModeReply::Committed(reply),
-        );
-    }
-
-    fn dispatch_lua_mode_set(
-        &self,
-        session: Option<String>,
-        id: String,
-        reply_tx: flume::Sender<UiReply>,
-    ) {
-        let idx = match self.resolve_session_index(session.as_deref()) {
-            Ok(idx) => idx,
-            Err(error) => {
-                let _ = reply_tx.send(Err(error));
-                return;
-            }
-        };
-        let (manager, root) = self.sessions[idx].handles.manager_and_root();
-        self.dispatch_mode(
-            idx,
-            manager.lookup(root).map_err(|error| error.to_string()),
-            None,
-            id,
-            ModeReply::Handled(reply_tx),
-        );
-    }
-
-    fn dispatch_mode(
-        &self,
-        idx: usize,
-        target: Result<AgentRef, String>,
-        services: Option<Arc<AgentOrchestration>>,
-        id: String,
-        reply: ModeReply,
-    ) {
-        dispatch_mode_commit(
-            &self.sessions[idx],
-            target,
-            &self.ctx.storage,
-            self.ctx.lua_event_handle.mode_registry(),
-            services,
-            self.internal_tx.clone(),
-            id,
-            reply,
-        );
-    }
-
-    /// Lua acts on the focused session, the same target the model picker and
-    /// `/thinking` write to.
-    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
-        match req {
-            ModelRequest::Get => self.sessions[self.focused]
-                .config()
-                .map(|config| config_model_state(&config))
-                .ok_or_else(|| NOT_LIVE_ERR.into()),
-            ModelRequest::Available => {
-                let available = self.ctx.available_models.load();
-                Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
-                ))
-            }
-            // Handled by `dispatch_model_set`; it cannot answer inline.
-            ModelRequest::Set { .. } => Err("model set must be dispatched".to_owned()),
-        }
-    }
-
-    fn dispatch_thinking_set(
-        &mut self,
-        set_default: bool,
-        thinking: &str,
-        reply_tx: flume::Sender<UiReply>,
-    ) {
-        dispatch_thinking_change(
-            &self.sessions[self.focused],
-            set_default,
-            thinking,
-            reply_tx,
-            self.internal_tx.clone(),
-        );
-    }
-
-    /// `maki.model.set` reserves one actor update before provider preparation,
-    /// then projects the committed configuration and replies.
-    fn dispatch_model_set(
-        &mut self,
-        spec: Option<String>,
-        thinking: Option<DomainThinkingConfig>,
-        toggle_thinking: bool,
-        fast: Option<bool>,
-        reply_tx: flume::Sender<UiReply>,
-    ) {
-        let idx = self.focused;
-        if spec.is_some() {
-            self.note_if_deferred(idx, "model");
-        }
-        if spec.is_some() || fast.is_some() {
-            self.sessions[idx].app.state.fast_pending = false;
-        }
-        let (manager, root) = self.sessions[idx].handles.manager_and_root();
-        let reservation = manager
-            .lookup(root)
-            .map_err(ConfigChangeError::from)
-            .and_then(|target| {
-                reserve_config_change(&target, &self.sessions[idx].coordinator, None)
-            });
-        let session = self.sessions[idx].id();
-        let identity = self.sessions[idx].handles.identity();
-        let internal_tx = self.internal_tx.clone();
-        let policy = Arc::clone(&self.ctx.model_policy);
-        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
-        smol::spawn(async move {
-            let mut committed = None;
-            let patch = ConfigPatch {
-                thinking,
-                toggle_thinking,
-                fast,
-                ..Default::default()
-            };
-            let result = match reservation {
-                Ok(reservation) => {
-                    commit_model_patch(reservation, patch, spec.as_deref(), &policy, &prepare)
-                        .await
-                        .map(|commit| {
-                            committed = Some(commit);
-                        })
-                }
-                Err(error) => Err(error),
-            }
-            .map_err(|error| error.to_string());
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                runtime: identity,
-                kind: SessionOpKind::ModelSet {
-                    commit: committed,
-                    spec,
-                    reply_tx,
-                },
-                result,
-            });
-        })
-        .detach();
-    }
-
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
         self.sync_orchestration();
         match self.sessions[idx].submit_text(text)? {
@@ -3660,14 +3283,10 @@ impl<'t> EventLoop<'t> {
         self.sessions.iter().position(|rt| rt.id() == id)
     }
 
-    /// No id means the focused session. A plugin holding the id of a tab that
-    /// has since closed gets `session not live` back, so it knows to stop.
-    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
-        let Some(id) = id else {
-            return Ok(self.focused);
-        };
-        let parsed = parse_session_id(id)?;
-        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    /// A plugin holding the id of a tab that has since closed gets `session
+    /// not live` back, so it knows to stop.
+    fn resolve_session_index(&self, id: MakiId) -> Result<usize, String> {
+        self.position(id).ok_or_else(|| NOT_LIVE_ERR.into())
     }
 
     /// The totals live on the session, so a plugin that reloads mid run keeps
@@ -4136,12 +3755,14 @@ impl<'t> EventLoop<'t> {
                 let target = self.selected_target(idx);
                 self.dispatch_model_selection(idx, target, selection, None);
             }
-            Action::ChangeMode(mode) => self.dispatch_mode(
-                idx,
+            Action::ChangeMode(mode) => dispatch_mode_commit(
+                &self.sessions[idx],
                 selected_agent(&self.sessions[idx]).ok_or_else(|| CLOSED_TARGET_ERR.to_owned()),
+                &self.ctx.storage,
+                self.ctx.lua_event_handle.mode_registry(),
                 Some(Arc::clone(&self.orchestration)),
+                self.internal_tx.clone(),
                 mode,
-                ModeReply::None,
             ),
             Action::ApprovePlan {
                 clear_context,
@@ -4270,17 +3891,6 @@ impl<'t> EventLoop<'t> {
     ) {
         // The tab may have been closed or reordered while the operation ran.
         let Some(idx) = self.position(session) else {
-            match kind {
-                SessionOpKind::ModelSet { reply_tx, .. }
-                | SessionOpKind::ThinkingSet { reply_tx, .. }
-                | SessionOpKind::LuaOptionSet { reply_tx }
-                | SessionOpKind::ModeChanged {
-                    reply: Some(Some(reply_tx)),
-                } => {
-                    let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
-                }
-                _ => {}
-            }
             return;
         };
         match kind {
@@ -4322,22 +3932,10 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::ModeChanged { reply } => {
-                if result.is_ok() {
-                    self.sessions[idx].settle_plan_approval();
-                }
-                match reply {
-                    Some(Some(reply_tx)) => {
-                        let _ = reply_tx.send(result.map(|()| json!(true)));
-                    }
-                    Some(None) => {
-                        if let Err(error) = result {
-                            self.sessions[idx].app.flash(error);
-                        }
-                    }
-                    None => {}
-                }
-            }
+            SessionOpKind::ModeChanged => match result {
+                Ok(()) => self.sessions[idx].settle_plan_approval(),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
             SessionOpKind::DirectoryChanged { adopted } => match result {
                 Ok(()) => {
                     let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -4347,54 +3945,6 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(format!("cd: {error}")),
             },
-            SessionOpKind::ThinkingSet {
-                commit,
-                set_default,
-                reply_tx,
-            } => {
-                let reply = result.and_then(|()| {
-                    let commit = commit.ok_or("missing committed thinking configuration")?;
-                    let thinking = commit.config.thinking;
-                    self.sessions[idx].project_config(&commit);
-                    if set_default {
-                        write_prefs(
-                            &self.ctx.storage,
-                            &Prefs {
-                                default_thinking: Some(thinking.into()),
-                            },
-                        )
-                        .map_err(|error| error.to_string())?;
-                    }
-                    let app = &mut self.sessions[idx].app;
-                    let mode = thinking.to_string();
-                    if SessionStatus::of(app) == SessionStatus::Idle {
-                        app.flash(format!("Thinking: {mode}"));
-                    } else {
-                        app.flash("thinking applies when this turn finishes".into());
-                    }
-                    Ok(thinking_reply(&commit))
-                });
-                let _ = reply_tx.send(reply);
-            }
-            SessionOpKind::ModelSet {
-                commit,
-                spec,
-                reply_tx,
-            } => {
-                let reply = result.and_then(|()| {
-                    let commit = commit.ok_or("missing committed model configuration")?;
-                    let rt = &mut self.sessions[idx];
-                    rt.project_config(&commit);
-                    if let Some(spec) = &spec {
-                        rt.app.record_recent_model(spec);
-                    }
-                    Ok(config_model_state(&commit.config))
-                });
-                let _ = reply_tx.send(reply);
-            }
-            SessionOpKind::LuaOptionSet { reply_tx } => {
-                let _ = reply_tx.send(result.map(|()| json!(true)));
-            }
         }
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         if let Some(commit) = manager
@@ -5320,39 +4870,6 @@ where
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_lua_option_set(
-    session: MakiId,
-    id: String,
-    value: String,
-    version: u64,
-    coordinator: SessionCoordinatorHandle,
-    actor: (maki_agent::AgentManagerHandle, maki_agent::AgentId),
-    internal_tx: flume::Sender<InternalEvent>,
-    reply_tx: flume::Sender<UiReply>,
-) {
-    let identity = actor
-        .0
-        .actor(actor.1)
-        .map(|actor| actor.identity())
-        .unwrap_or_default();
-    let internal_tx = internal_tx.clone();
-    smol::spawn(async move {
-        let result = coordinator
-            .set_option_if_version(id, value, Some(version))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string());
-        let _ = internal_tx.send(InternalEvent::SessionOp {
-            session,
-            runtime: identity,
-            kind: SessionOpKind::LuaOptionSet { reply_tx },
-            result,
-        });
-    })
-    .detach();
-}
-
 fn dispatch_option_toggle(
     runtime: &SessionRuntime,
     id: &'static str,
@@ -5590,7 +5107,6 @@ mod tests {
                 None,
                 internal_tx,
                 "plan".into(),
-                ModeReply::None,
             );
 
             assert_eq!(runtime.app.root_config().mode, initial_mode);
@@ -5602,10 +5118,7 @@ mod tests {
                 panic!("expected mode change completion");
             };
             result.unwrap();
-            assert!(matches!(
-                kind,
-                SessionOpKind::ModeChanged { reply: Some(None) }
-            ));
+            assert!(matches!(kind, SessionOpKind::ModeChanged));
             let config = actor.effective_config().unwrap();
             let plan = config.mode.plan_path().unwrap();
             assert!(plan.starts_with(temp_dir.path().join(maki_storage::plans::PLANS_DIR)));
@@ -5743,27 +5256,17 @@ mod tests {
         });
     }
 
-    fn toggle_root_fast(event_loop: &mut EventLoop<'_>) {
-        let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
-        let target = manager.lookup(root).unwrap();
-        event_loop
-            .dispatch_target_toggle(0, &target, FAST_OPTION_ID, None)
-            .unwrap();
-    }
-
-    fn set_root_fast_off(event_loop: &mut EventLoop<'_>) {
-        event_loop.dispatch_model_set(None, None, false, Some(false), flume::unbounded().0);
-    }
-
-    #[test_case(toggle_root_fast ; "fast_toggle")]
-    #[test_case(set_root_fast_off ; "model_set_fast_off")]
-    fn explicit_fast_choice_replaces_the_restored_wish(choose: fn(&mut EventLoop<'_>)) {
+    #[test]
+    fn explicit_fast_toggle_replaces_the_restored_wish() {
         with_event_loop_runtime(
             |_| pending_fast_runtime(),
             |event_loop| {
                 let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
                 let actor = manager.actor(root).unwrap();
-                choose(event_loop);
+                let target = manager.lookup(root).unwrap();
+                event_loop
+                    .dispatch_target_toggle(0, &target, FAST_OPTION_ID, None)
+                    .unwrap();
                 assert!(!event_loop.sessions[0].app.state.fast_pending);
                 smol::block_on(async {
                     assert!(!settled_config(&actor).await.fast);
@@ -5811,109 +5314,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_dispatch_reply_uses_required_model_commit() {
-        smol::block_on(async {
-            let mut unsupported = model_named("test-model");
-            unsupported.thinking_override = Some(maki_providers::ThinkingSupport::No);
-            let runtime = test_runtime(unsupported);
-            let (manager, root) = runtime.handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let model_ticket = actor.reserve_prepared_operation(None).unwrap();
-            let (events, rx) = flume::unbounded();
-            let (reply, _) = flume::bounded(1);
-            dispatch_thinking_change(&runtime, true, "off", reply, events);
-            let mut required = model_named("required");
-            required.thinking_override = Some(maki_providers::ThinkingSupport::Required);
-            model_ticket
-                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
-                    model: Some(maki_agent::actor::PreparedModel {
-                        provider: Arc::new(StubProvider),
-                        model: required,
-                    }),
-                    ..Default::default()
-                })))
-                .await
-                .unwrap();
-            let InternalEvent::SessionOp {
-                kind:
-                    SessionOpKind::ThinkingSet {
-                        commit,
-                        set_default,
-                        ..
-                    },
-                result,
-                ..
-            } = rx.recv_async().await.unwrap()
-            else {
-                panic!("expected thinking completion");
-            };
-            result.unwrap();
-            let commit = commit.unwrap();
-            assert!(set_default);
-            assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
-            actor
-                .reserve_prepared_operation(None)
-                .unwrap()
-                .commit_when_ready(Some(thinking_change("high").unwrap()))
-                .await
-                .unwrap();
-            assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
-            release_runtime(runtime);
-        });
-    }
-
-    #[test]
-    fn thinking_dispatch_toggles_against_fifo_predecessor() {
-        smol::block_on(async {
-            let mut model = model_named("test-model");
-            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
-            let runtime = test_runtime(model);
-            let (manager, root) = runtime.handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let gate = actor.reserve_prepared_operation(None).unwrap();
-            let (events, rx) = flume::unbounded();
-            let (reply, _) = flume::bounded(1);
-            dispatch_thinking_change(&runtime, false, "", reply, events.clone());
-            gate.commit_when_ready(None).await.unwrap();
-            let mut values = Vec::new();
-            for index in 0..2 {
-                let InternalEvent::SessionOp {
-                    kind: SessionOpKind::ThinkingSet { commit, .. },
-                    result,
-                    ..
-                } = rx.recv_async().await.unwrap()
-                else {
-                    panic!("expected thinking completion");
-                };
-                result.unwrap();
-                let commit = commit.unwrap();
-                values.push((commit.generation, commit.config.thinking.is_enabled()));
-                if index == 0 {
-                    let (reply, _) = flume::bounded(1);
-                    dispatch_thinking_change(&runtime, false, "", reply, events.clone());
-                }
-            }
-            values.sort();
-            assert_eq!(
-                values
-                    .iter()
-                    .map(|(_, enabled)| *enabled)
-                    .collect::<Vec<_>>(),
-                vec![true, false]
-            );
-            assert!(!actor.effective_config().unwrap().thinking.is_enabled());
-            release_runtime(runtime);
-        });
-    }
-
-    #[test]
     fn managed_read_observes_committed_option() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             spawn_root_workflow_toggle(&runtime).await.unwrap();
             assert!(runtime.config().unwrap().workflow);
-            let model = config_model_state(&runtime.config().unwrap());
-            assert_eq!(model["spec"], runtime.config().unwrap().model.spec());
             release_runtime(runtime);
         });
     }
@@ -5989,14 +5394,7 @@ mod tests {
                     }))
                     .await
                     .unwrap();
-                let (reply_tx, reply_rx) = flume::bounded(1);
-                event_loop.handle_session_request(
-                    SessionRequest::SetMode {
-                        session: None,
-                        id: "plan".into(),
-                    },
-                    reply_tx,
-                );
+                commit_root_plan_mode(event_loop);
                 let mut completion = event_loop.internal_rx.recv_async().await.unwrap();
                 if failed {
                     let InternalEvent::SessionOp { result, .. } = &mut completion else {
@@ -6007,12 +5405,6 @@ mod tests {
                 let latest = actor.config_snapshot().unwrap();
                 assert!(latest.generation > older.generation);
                 event_loop.handle_internal(completion);
-                let reply = reply_rx.recv_async().await.unwrap();
-                if failed {
-                    assert_eq!(reply.unwrap_err(), FAILURE);
-                } else {
-                    reply.unwrap();
-                }
                 assert_eq!(
                     event_loop.sessions[0]
                         .projected_config
@@ -6037,15 +5429,25 @@ mod tests {
         });
     }
 
-    #[test_case::test_case("model")]
-    #[test_case::test_case("thinking")]
-    #[test_case::test_case("mode")]
-    fn retired_runtime_completion_and_projection_are_ignored(operation: &str) {
+    fn commit_root_plan_mode(event_loop: &EventLoop<'_>) {
+        let runtime = &event_loop.sessions[0];
+        let (manager, root) = runtime.handles.manager_and_root();
+        dispatch_mode_commit(
+            runtime,
+            Ok(manager.lookup(root).unwrap()),
+            &event_loop.ctx.storage,
+            event_loop.ctx.lua_event_handle.mode_registry(),
+            None,
+            event_loop.internal_tx.clone(),
+            "plan".into(),
+        );
+    }
+
+    #[test]
+    fn retired_runtime_completion_and_projection_are_ignored() {
         with_event_loop(|event_loop| {
             smol::block_on(async {
                 let old = &event_loop.sessions[0];
-                let session = old.id();
-                let identity = old.handles.identity();
                 let (manager, root) = old.handles.manager_and_root();
                 let commit =
                     reserve_config_change(&manager.lookup(root).unwrap(), &old.coordinator, None)
@@ -6060,39 +5462,9 @@ mod tests {
                         }))
                         .await
                         .unwrap();
-                let (reply_tx, reply_rx) = flume::bounded(1);
-                let completion = match operation {
-                    "mode" => {
-                        event_loop.handle_session_request(
-                            SessionRequest::SetMode {
-                                session: None,
-                                id: "plan".into(),
-                            },
-                            reply_tx,
-                        );
-                        event_loop.internal_rx.recv_async().await.unwrap()
-                    }
-                    "thinking" => {
-                        event_loop.handle_session_request(
-                            SessionRequest::SetThinking {
-                                set_default: false,
-                                thinking: "off".into(),
-                            },
-                            reply_tx,
-                        );
-                        event_loop.internal_rx.recv_async().await.unwrap()
-                    }
-                    _ => InternalEvent::SessionOp {
-                        session,
-                        runtime: identity,
-                        kind: SessionOpKind::ModelSet {
-                            commit: Some(commit.clone()),
-                            spec: Some(commit.config.model.spec()),
-                            reply_tx,
-                        },
-                        result: Ok(()),
-                    },
-                };
+                let session = old.id();
+                commit_root_plan_mode(event_loop);
+                let completion = event_loop.internal_rx.recv_async().await.unwrap();
                 let mut replacement = test_runtime(model_named("replacement-model"));
                 let replacement_thinking = replacement.app.root_config().thinking;
                 let (replacement_manager, replacement_root) =
@@ -6104,10 +5476,6 @@ mod tests {
                 replacement.config_commits = queued_rx;
                 let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
                 event_loop.handle_internal(completion);
-                assert_eq!(
-                    reply_rx.recv_async().await.unwrap().unwrap_err(),
-                    NOT_LIVE_ERR
-                );
                 queued_tx.send(commit).unwrap();
                 let _ = event_loop.tick();
                 let app = &event_loop.sessions[0].app;
@@ -6134,74 +5502,6 @@ mod tests {
                 assert!(Arc::ptr_eq(&final_config.config, &initial_config.config));
                 release_runtime(old);
             })
-        });
-    }
-
-    #[test]
-    fn lua_option_set_dispatch_updates_actor_and_replies() {
-        smol::block_on(async {
-            let runtime = test_runtime(model_named("test-model"));
-            let id = runtime.id();
-            let (manager, root) = runtime.handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let initial = actor.effective_config().unwrap();
-            let (internal_tx, internal_rx) = flume::unbounded();
-            let (reply_tx, reply_rx) = flume::bounded(1);
-            let request = SessionRequest::SetOption {
-                session: id.to_string(),
-                id: WORKFLOW_OPTION_ID.to_owned(),
-                value: ENABLED_VALUE.to_owned(),
-                version: runtime.coordinator.read().options().version,
-            };
-            let SessionRequest::SetOption {
-                session,
-                id: option_id,
-                value,
-                version,
-            } = request
-            else {
-                unreachable!();
-            };
-            dispatch_lua_option_set(
-                id,
-                option_id,
-                value,
-                version,
-                runtime.coordinator.clone(),
-                (manager, root),
-                internal_tx,
-                reply_tx,
-            );
-
-            let InternalEvent::SessionOp {
-                session: completed_session,
-                kind: SessionOpKind::LuaOptionSet { reply_tx },
-                result,
-                ..
-            } = internal_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected Lua option completion");
-            };
-            assert_eq!(completed_session.to_string(), session);
-            let _ = reply_tx.send(result.map(|()| json!(true)));
-            assert_eq!(reply_rx.recv_async().await.unwrap(), Ok(json!(true)));
-            assert!(!initial.workflow);
-            assert!(actor.effective_config().unwrap().workflow);
-            wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
-            assert_eq!(
-                runtime
-                    .coordinator
-                    .read()
-                    .options()
-                    .options
-                    .iter()
-                    .find(|option| option.definition.id.as_ref() == WORKFLOW_OPTION_ID)
-                    .unwrap()
-                    .current_value
-                    .as_ref(),
-                ENABLED_VALUE
-            );
-            release_runtime(runtime);
         });
     }
 
@@ -8697,7 +7997,7 @@ mod tests {
             let (reply, response) = flume::bounded(1);
             event_loop.handle_session_request(
                 SessionRequest::Prompt {
-                    id: None,
+                    id: event_loop.sessions[0].id(),
                     text: PROMPT.into(),
                 },
                 reply,

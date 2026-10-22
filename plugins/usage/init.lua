@@ -82,7 +82,7 @@ local function refresh_modal(current, force)
 end
 
 local function update_session(current)
-  local usage, err = maki.session.usage()
+  local usage, err = maki.session.usage({ session = current.session_id })
   if modal ~= current then
     return false
   end
@@ -94,9 +94,14 @@ local function update_session(current)
   return true
 end
 
-local function open()
+local function open(_, ctx)
   if modal then
     close_modal(modal.generation)
+    return
+  end
+  local session_id, session_err = ctx and ctx:session_id()
+  if not session_id then
+    maki.ui.flash("Usage: " .. tostring(session_err or "no session"))
     return
   end
 
@@ -111,6 +116,7 @@ local function open()
     footer = { { "Ctrl+R", "refresh" }, { "q", "close" } },
   })
   local current = {
+    session_id = session_id,
     generation = generation,
     buf = buf,
     win = win,

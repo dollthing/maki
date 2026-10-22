@@ -3281,10 +3281,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             maki.api.exec_autocmds("User", { pattern = "pr5_escape" })
             assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == command_error, tostring(pr5_autocmd_escape.err))
             for name, mutate in pairs({
-                mode_set = function() return maki.api.mode.set("build") end,
                 mode_reset = function() return maki.api.mode.reset() end,
-                session_set_thinking = function() return maki.session.set_thinking({ mode = "max" }) end,
-                session_set_option = function() return maki.session.set_option("fast", "true") end,
                 session_set_default_thinking = function() return maki.session.set_default_thinking("max") end,
             }) do
                 local changed, mutate_err = mutate()

@@ -110,8 +110,8 @@ The rules:
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
-| [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
-| [`maki.model`](#maki-model) | Focused-session model access. |
+| [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override and list agent modes. |
+| [`maki.model`](#maki-model) | Model catalog reads that address no agent. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
@@ -1136,14 +1136,14 @@ Validation cannot yield or mutate session options.
 
 Compatible plugin replacement retains current session values. The returned
 handle becomes stale after replacement or unload. Runtime failures from
-`get(opts?)` and `set(value, opts?)` use the normal `(value, err)` convention.
-Both methods accept an optional `{ session = id }` target.
+`get(opts)` and `set(value, opts)` use the normal `(value, err)` convention.
+Both methods take a required `{ session = id }` target.
 
 **Parameters:**
 
 - `{spec}` (`table`) Session option definition and optional validation callback.
 
-**Returns:** userdata Generation-bound handle with `get(opts?)` and `set(value, opts?)`.
+**Returns:** userdata Generation-bound handle with `get(opts)` and `set(value, opts)`.
 
 
 ## maki.perf {#maki-perf}
@@ -3855,9 +3855,9 @@ result as a boolean predicate for `table.sort`:
 
 ## maki.api.mode {#maki-api-mode}
 
-`maki.api.mode`: define, override, list, and switch agent modes.
-Built-in `build` and `plan` are pre-registered, so overrides use the
-same call as defining a custom mode.
+`maki.api.mode`: define, override and list agent modes. Built-in
+`build` and `plan` are pre-registered, so overrides use the same call
+as defining a custom mode. Switch an agent with `Agent:set_mode`.
 
 ---
 
@@ -3879,50 +3879,6 @@ Defines a new mode or fully overrides an existing one (built-ins included).
 
 ```lua
 maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
-```
-
----
-
-### `maki.api.mode.get()` {#maki-api-mode-get}
-
-```lua
-maki.api.mode.get()
-```
-
-Returns the mode id ("build", "plan", or a custom name) of the invocation's
-agent, or the focused agent when called outside an invocation.
-
-**Returns:** (`string|nil`, `string|nil`) Mode id, or nil and an error.
-
-**Example:**
-
-```lua
-local mode = maki.api.mode.get()
-```
-
----
-
-### `maki.api.mode.set()` {#maki-api-mode-set}
-
-```lua
-maki.api.mode.set({name})
-```
-
-Enters a mode by name on the invocation's agent, or the focused agent when
-called outside an invocation. Fails when the mode is not defined. Success
-means the actor committed the mode for subsequent admissions.
-See [Configuration changes](/docs/modes/#configuration-changes).
-
-**Parameters:**
-
-- `{name}` (`string`) Mode id ("build", "plan", or a custom name).
-
-**Returns:** (`boolean`, `string|nil`) `true` on success, or nil and an error.
-
-**Example:**
-
-```lua
-maki.api.mode.set("plan")
 ```
 
 ---
@@ -3969,91 +3925,8 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-Focused-session model access. With a ctx, `get` reads that invocation's
-admitted model. Without a ctx, calls address the focused session and
-need an interactive UI; other hosts use the Agent API with an explicit
-ctx instead.
-
----
-
-### `maki.model.get()` {#maki-model-get}
-
-```lua
-maki.model.get({ctx?})
-```
-
-Reads the model for an explicit tool context, or the focused session when
-a UI is attached. Tool handlers must pass their `ctx`, because they cannot
-read UI focus. `thinking` uses the spelling `set` accepts.
-
-**Parameters:**
-
-- `{ctx?}` (`userdata|nil`) Optional tool handler context.
-
-**Returns:** (`table|nil`, `string|nil`) `{spec, thinking, fast}`, or nil and an error.
-
-**Example:**
-
-```lua
-local m = maki.model.get(ctx)
-if m.spec ~= "anthropic/claude-opus-4-6" then ... end
-```
-
----
-
-### `maki.model.available()` {#maki-model-available}
-
-```lua
-maki.model.available()
-```
-
-Lists the model specs you can switch to: what the providers you are logged
-into offer, minus what your model policy blocks. The list fills in the
-background at startup, so right after launch it can still be empty.
-
-**Returns:** (`table|nil`, `string|nil`) Array of `"provider/id"` specs, or nil and an error.
-
-**Example:**
-
-```lua
-local specs = maki.model.available()
-```
-
----
-
-### `maki.model.set()` {#maki-model-set}
-
-```lua
-maki.model.set({opts})
-```
-
-Switches the focused session's model, thinking level, or fast mode. Fields
-you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the committed state, in the same shape `get` returns. Changes
-apply to subsequent admissions; see
-[Configuration changes](/docs/modes/#configuration-changes). Delegated
-tool handlers cannot call it, because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
-for an explicit target.
-
-**Parameters:**
-
-- `{opts}` (`string|table`) A model spec, or a table with any of:
-  - `spec` (`string`) `"provider/id"`, as listed by `available()`;
-  - `thinking` (`string|number`) `"off"`, `"adaptive"`, an effort level
-
-  (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
-
-  - `fast` (`boolean`) Anthropic fast mode.
-
-**Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
-
-**Example:**
-
-```lua
-maki.model.set("anthropic/claude-opus-4-6")
-maki.model.set({ spec = "zai/glm-5", thinking = "high" })
-maki.model.set({ thinking = "" })
-```
+Model catalog reads that address no agent. `Agent:model`,
+`Agent:set_model` and `Agent:available_models` act on an agent.
 
 ---
 
@@ -4168,10 +4041,10 @@ attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
 a session (`prompt`, `set_option`, `set_title`) accept
-only the session its own turn belongs to, named explicitly. Tool
-handlers cannot read UI focus either: functions that default to the
-focused session need an explicit `session`, and `current`, `usage` and
-`thinking` are refused. `ctx:session_id()` names the tool's session.
+only the session its own turn belongs to. Every function that reads or
+changes one session takes it explicitly; `ctx:session_id()` names the
+invocation's session, and `current` names the focused one. Tool
+handlers cannot read UI focus, so `current` refuses them.
 
 ---
 
@@ -4261,13 +4134,17 @@ local id = maki.session.current()
 ### `maki.session.usage()` {#maki-session-usage}
 
 ```lua
-maki.session.usage()
+maki.session.usage({opts?})
 ```
 
-Returns the focused session's token usage without making a network request.
+Returns a session's token usage without making a network request.
 Costs are the values recorded when each turn was billed and remain nil when
 no turn for that total or model was priced. Models are sorted by total tokens
 descending, then model spec ascending.
+
+**Parameters:**
+
+- `{opts?}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) `{total={input, output, cache_creation,
   cache_read, cost}, models}`, where each model has `{model, input, output,
@@ -4276,7 +4153,7 @@ descending, then model spec ascending.
 **Example:**
 
 ```lua
-local usage, err = maki.session.usage()
+local usage, err = maki.session.usage({ session = ctx:session_id() })
 ```
 
 ---
@@ -4288,8 +4165,7 @@ maki.session.read({opts?})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
-status. Reads the focused session, or the one you name in `session` when
-you act on a background tab.
+status of the session you name in `session`.
 
 The returned table:
 ```lua
@@ -4313,14 +4189,14 @@ lives on the `TurnEnd` autocmd instead.
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+- `{opts?}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
 **Example:**
 
 ```lua
-local s = maki.session.read()
+local s = maki.session.read({ session = ctx:session_id() })
 if s.context_size > s.context_window * 0.8 then
   maki.ui.notify("context is nearly full")
 end
@@ -4413,10 +4289,7 @@ the prompt is queued and picked up when the agent reaches it.
 **Parameters:**
 
 - `{text}` (`string`) The prompt to send. Must not be blank.
-- `{opts?}` (`table?`) Optional fields: session (string) id of a live
-
-  session; defaults to the focused one.
-
+- `{opts?}` (`table`) Required `session` (string) id of a live session.
 
 **Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
 
@@ -4464,7 +4337,7 @@ Returns the complete ordered option snapshot for a live session.
 
 **Parameters:**
 
-- `{opts?}` (`table?`) Optional `session` id; defaults to the focused session.
+- `{opts?}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) `{version, options}`, or nil and an error.
 
@@ -4491,7 +4364,7 @@ See [Configuration changes](/docs/modes/#configuration-changes).
 
 - `{id}` (`string`) Stable option id.
 - `{value}` (`string`) Selectable value id.
-- `{opts?}` (`table?`) Optional `session` id; defaults to the focused session.
+- `{opts?}` (`table`) Required `session` (string) id.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 
@@ -4522,52 +4395,6 @@ Renames a session, live or stored.
 
 ```lua
 local _, err = maki.session.set_title({ id = id, title = "refactor" })
-```
-
----
-
-### `maki.session.thinking()` {#maki-session-thinking}
-
-```lua
-maki.session.thinking()
-```
-
-Returns the current thinking mode of the focused session and whether its
-model supports thinking at all (for hiding/graving the selector).
-
-**Returns:** (`table|nil`, `string|nil`) `{mode, supports_thinking, options}`, or nil and an error.
-
-**Example:**
-
-```lua
-local info = maki.session.thinking()
-```
-
----
-
-### `maki.session.set_thinking()` {#maki-session-set_thinking}
-
-```lua
-maki.session.set_thinking({opts})
-```
-
-Sets the focused session's thinking mode. `mode` accepts any value
-`ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
-level (`minimal` .. `max`), or a token budget. When `set_default` is true,
-the choice is also persisted as the global default for new sessions.
-See [Configuration changes](/docs/modes/#configuration-changes).
-
-**Parameters:**
-
-- `{opts}` (`table`) Required fields: mode (string) the thinking setting;
-  - `set_default` (`boolean`) also persist as the default for new sessions.
-
-**Returns:** (`table|nil`, `string|nil`) `{mode}`, or nil and an error.
-
-**Example:**
-
-```lua
-maki.session.set_thinking({ mode = "medium", set_default = true })
 ```
 
 ---

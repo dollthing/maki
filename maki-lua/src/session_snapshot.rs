@@ -140,10 +140,8 @@ impl HeadlessSnapshot {
         let totals = Arc::clone(&self.0);
         handle.install_session_snapshot(Box::new(move |id| {
             // One session here, so any other id names a tab that is not ours.
-            if let Some(want) = id
-                && want != meta.id
-            {
-                return Err(format!("session {want} not live"));
+            if id.to_string() != meta.id {
+                return Err(format!("session {id} not live"));
             }
             let mode = mode();
             let totals = lock(&totals);

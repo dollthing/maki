@@ -13,7 +13,6 @@ use mlua::{
 };
 
 use crate::api::session::resolve_coordinator;
-use crate::api::util::command::UiAction;
 use crate::api::util::pair::err_pair;
 
 const SPEC_KEYS: &[&str] = &[
@@ -65,7 +64,6 @@ struct SessionOptionHandle {
     plugin: Arc<str>,
     generation: u64,
     id: Arc<str>,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -313,11 +311,10 @@ impl UserData for SessionOptionHandle {
             if let Err(error) = ensure_current(&lua, &this) {
                 return Ok(err_pair(error));
             }
-            let coordinator =
-                match resolve_coordinator(&lua, this.ui_action_tx.as_ref(), opts.as_ref()).await {
-                    Ok(coordinator) => coordinator,
-                    Err(error) => return Ok(err_pair(error)),
-                };
+            let coordinator = match resolve_coordinator(opts.as_ref()) {
+                Ok(coordinator) => coordinator,
+                Err(error) => return Ok(err_pair(error)),
+            };
             let value = coordinator
                 .read()
                 .options()
@@ -339,13 +336,7 @@ impl UserData for SessionOptionHandle {
                 if let Err(error) = ensure_validation_not_in_progress(&lua) {
                     return Ok(err_pair(error));
                 }
-                let coordinator = match resolve_coordinator(
-                    &lua,
-                    this.ui_action_tx.as_ref(),
-                    opts.as_ref(),
-                )
-                .await
-                {
+                let coordinator = match resolve_coordinator(opts.as_ref()) {
                     Ok(coordinator) => coordinator,
                     Err(error) => return Ok(err_pair(error)),
                 };
@@ -383,16 +374,15 @@ impl UserData for SessionOptionHandle {
 ///
 /// Compatible plugin replacement retains current session values. The returned
 /// handle becomes stale after replacement or unload. Runtime failures from
-/// `get(opts?)` and `set(value, opts?)` use the normal `(value, err)` convention.
-/// Both methods accept an optional `{ session = id }` target.
+/// `get(opts)` and `set(value, opts)` use the normal `(value, err)` convention.
+/// Both methods take a required `{ session = id }` target.
 ///
 /// @param spec table Session option definition and optional validation callback.
-/// @return userdata Generation-bound handle with `get(opts?)` and `set(value, opts?)`.
+/// @return userdata Generation-bound handle with `get(opts)` and `set(value, opts)`.
 #[lua_fn]
 fn register_session_option(
     lua: &Lua,
     #[ctx] pending: PendingSessionOptions,
-    #[ctx] ui_action_tx: Option<flume::Sender<UiAction>>,
     spec: Table,
 ) -> LuaResult<mlua::AnyUserData> {
     crate::runtime::require_plugin_load(lua, &pending.plugin, "register_session_option")?;
@@ -411,7 +401,6 @@ fn register_session_option(
         plugin: Arc::clone(&pending.plugin),
         generation: pending.generation,
         id: Arc::clone(&definition.id),
-        ui_action_tx,
     };
     definitions.push(definition);
     drop(definitions);
@@ -423,9 +412,8 @@ fn register_session_option(
 
 lua_table! {
     extend "maki.api" => pub(crate) fn add_session_option_fn(
-        pending: PendingSessionOptions,
-        ui_action_tx: Option<flume::Sender<UiAction>>
-    ), DOCS [register_session_option(pending, ui_action_tx)]
+        pending: PendingSessionOptions
+    ), DOCS [register_session_option(pending)]
 }
 
 pub(crate) async fn commit_catalog(
@@ -601,7 +589,7 @@ mod tests {
             lua.set_app_data(SessionOptionValidation::default());
             let pending = PendingSessionOptions::new(Arc::from("test"), 1);
             let api = lua.create_table().unwrap();
-            add_session_option_fn(&api, &lua, pending.clone(), None).unwrap();
+            add_session_option_fn(&api, &lua, pending.clone()).unwrap();
             lua.globals().set("api", api).unwrap();
             lua.globals().set("first", first_id.to_string()).unwrap();
             lua.globals().set("second", second_id.to_string()).unwrap();
@@ -669,7 +657,7 @@ mod tests {
 
             let pending = PendingSessionOptions::new(Arc::from("test"), 1);
             let api = lua.create_table().unwrap();
-            add_session_option_fn(&api, &lua, pending.clone(), None).unwrap();
+            add_session_option_fn(&api, &lua, pending.clone()).unwrap();
             lua.globals().set("api", api).unwrap();
             let spec = option_spec(&lua);
             lua.globals().set("reject", false).unwrap();
@@ -724,7 +712,7 @@ mod tests {
 
             let next = PendingSessionOptions::new(Arc::from("test"), 2);
             let next_api = lua.create_table().unwrap();
-            add_session_option_fn(&next_api, &lua, next.clone(), None).unwrap();
+            add_session_option_fn(&next_api, &lua, next.clone()).unwrap();
             lua.globals().set("next_api", next_api).unwrap();
             let next_spec = option_spec(&lua);
             next_spec.set("initial_value", "b").unwrap();
@@ -850,7 +838,7 @@ mod tests {
         lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
         let pending = PendingSessionOptions::new(Arc::from("test"), 1);
         let api = lua.create_table().unwrap();
-        add_session_option_fn(&api, &lua, pending, None).unwrap();
+        add_session_option_fn(&api, &lua, pending).unwrap();
         lua.globals().set("api", api).unwrap();
         lua.globals().set("spec", option_spec(&lua)).unwrap();
 
@@ -869,7 +857,7 @@ mod tests {
         lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
         let pending = PendingSessionOptions::new(Arc::from("test"), 1);
         let api = lua.create_table().unwrap();
-        add_session_option_fn(&api, &lua, pending, None).unwrap();
+        add_session_option_fn(&api, &lua, pending).unwrap();
         lua.globals().set("api", api).unwrap();
 
         let error = lua

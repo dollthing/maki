@@ -21,10 +21,13 @@ const EXPANDED_PROMPT: &str = "expanded task";
 const OVERSIZED_PROMPT_BYTES: usize = 300 * 1024;
 
 fn install_expanders(event_loop: &mut EventLoop<'_>) -> maki_lua::PluginHost {
-    let host = maki_lua::PluginHost::with_command_registry(
+    let host = maki_lua::PluginHost::with_session_provider_preparer(
         Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
         event_loop.ctx.command_runtime.registry.clone(),
         false,
+        Arc::new(maki_lua::test_support::InMemoryFs::new()),
+        Some(event_loop.ctx.storage.path().to_path_buf()),
+        None,
     )
     .unwrap();
     host.load_source(
@@ -352,14 +355,12 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
             }})
             maki.api.register_command({{
                 name = "/set-public-mode", tui_only = false,
-                handler = function()
-                    if not {live} then
-                        local focused = maki.ui.focused_agent()
-                        assert(focused == nil)
+                handler = function(_, ctx)
+                    assert((ctx ~= nil) == {live})
+                    if ctx then
+                        local agent = assert(maki.agent.current(ctx))
+                        assert(agent:set_mode(ctx, "plan"))
                     end
-                    local ok, err = maki.api.mode.set("plan")
-                    assert((ok ~= nil) == {live})
-                    if not ok then assert(type(err) == "string") end
                     maki.ui.flash("{DONE}")
                 end,
             }})
@@ -400,18 +401,6 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
                 .dispatch_input(&target, "/set-public-mode".into())
                 .await
         });
-        if let Some(child) = child {
-            let action = host
-                .ui_action_rx()
-                .recv_timeout(SESSION_OP_TIMEOUT)
-                .unwrap();
-            assert!(
-                matches!(&action, UiAction::SetAgentMode { target, .. } if target.id() == child)
-            );
-            event_loop.sessions[0].app.active_chat = 0;
-            event_loop.sync_orchestration();
-            event_loop.handle_ui_action(action);
-        }
         assert!(
             matches!(host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(), UiAction::Flash(text) if text == DONE)
         );
@@ -545,7 +534,7 @@ fn idle_session_prompt_starts_on_root_and_preserves_shell_preamble() {
         let (reply, response) = flume::bounded(1);
         event_loop.handle_session_request(
             SessionRequest::Prompt {
-                id: None,
+                id: event_loop.sessions[0].id(),
                 text: PROMPT.into(),
             },
             reply,

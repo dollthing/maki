@@ -325,15 +325,21 @@ maki.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
   tui_only = false,
-  handler = function()
-    local enabled, err = auto_mode_enabled()
+  handler = function(_, ctx)
+    local session_id, err = ctx and ctx:session_id()
+    if not session_id then
+      maki.ui.flash(err or "no session")
+      return
+    end
+    local enabled
+    enabled, err = auto_mode_enabled(session_id)
     if enabled == nil then
       maki.ui.flash(err)
       return
     end
     local value = enabled and "disabled" or "enabled"
     local ok
-    ok, err = auto_mode:set(value)
+    ok, err = auto_mode:set(value, { session = session_id })
     if not ok then
       maki.ui.flash(err)
       return

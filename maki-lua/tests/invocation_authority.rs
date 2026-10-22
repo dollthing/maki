@@ -69,11 +69,8 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
                     for _, effect in ipairs({
                         function() return maki.api.mode.define({ name = 'revoked_mode' }) end,
                         function() return maki.api.mode.reset('build') end,
-                        function() return maki.api.mode.set('build') end,
-                        function() return maki.model.set({ fast = false }) end,
-                        function() return maki.session.set_thinking({ mode = 'off' }) end,
                         function() return maki.session.set_default_thinking('off') end,
-                        function() return maki.session.set_option('fast', 'disabled') end,
+                        function() return maki.session.set_option('fast', 'disabled', { session = 'x' }) end,
                     }) do
                         local value, effect_err = effect()
                         assert(not value and effect_err == expected_error, effect_err)

@@ -23,7 +23,7 @@ use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
 use maki_lua::agent_errors::{
-    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE,
+    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
 };
 use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_lua::{
@@ -6419,26 +6419,6 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
         .unwrap();
     let session_id = session.read().session_id().to_string();
-    let actions = host.ui_action_rx();
-    let responder_session = session.clone();
-    let responder = std::thread::spawn(move || {
-        let action = actions.recv_timeout(Duration::from_secs(5)).unwrap();
-        if let maki_lua::UiAction::Session {
-            req:
-                maki_lua::SessionRequest::SetOption {
-                    id, value, version, ..
-                },
-            reply_tx,
-        } = action
-        {
-            let result =
-                smol::block_on(responder_session.set_option_if_version(id, value, Some(version)))
-                    .map(|_| json!(true))
-                    .map_err(|error| error.to_string());
-            reply_tx.send(result).unwrap();
-        }
-    });
-
     let (value, _) = plugin_option_state(&session);
     assert_eq!(value, "a");
 
@@ -6467,7 +6447,6 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     let (value, version) = plugin_option_state(&session);
     assert_eq!(value, "b");
     assert_eq!(version, set_version);
-    responder.join().unwrap();
     smol::block_on(session.close()).unwrap();
 }
 
@@ -6492,10 +6471,8 @@ maki.api.register_tool({
             delete = function() return maki.session.delete(input.session) end,
             current = function() return maki.session.current() end,
             usage = function() return maki.session.usage() end,
-            thinking = function() return maki.session.thinking() end,
             read = function() return maki.session.read() end,
             options = function() return maki.session.options() end,
-            model_get = function() return maki.model.get() end,
         }
         local _, err = calls[input.call]()
         return tostring(err)
@@ -6510,11 +6487,9 @@ maki.api.register_tool({
 #[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
 #[test_case::test_case("delete", DELEGATED_SESSION_LIFECYCLE ; "delete")]
 #[test_case::test_case("current", DELEGATED_FOCUS ; "current")]
-#[test_case::test_case("usage", DELEGATED_FOCUS ; "usage")]
-#[test_case::test_case("thinking", DELEGATED_FOCUS ; "thinking")]
-#[test_case::test_case("read", DELEGATED_FOCUS ; "read")]
-#[test_case::test_case("options", DELEGATED_FOCUS ; "options")]
-#[test_case::test_case("model_get", DELEGATED_FOCUS ; "model_get")]
+#[test_case::test_case("usage", SESSION_REQUIRED_ERR ; "usage")]
+#[test_case::test_case("read", SESSION_REQUIRED_ERR ; "read")]
+#[test_case::test_case("options", SESSION_REQUIRED_ERR ; "options")]
 fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
     let (reg, host) = builtins_host();
     host.load_source("session_mutation", SESSION_MUTATION_PLUGIN)
