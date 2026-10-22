@@ -587,7 +587,7 @@ fn set_root_mode(app: &mut App, mode: Mode) {
     let agent_mode = match mode {
         Mode::Build => AgentMode::Build,
         Mode::Plan => {
-            app.state.plan.allocate_path(&app.storage);
+            app.state.plan.allocate_path(&app.storage).unwrap();
             AgentMode::Plan(app.state.plan.path().unwrap().to_path_buf())
         }
         Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(name)),
@@ -11905,7 +11905,7 @@ fn plan_ready_fires_once_per_draft() {
     set_root_mode(&mut app, Mode::Plan);
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = StateDir::from_path(tmp.path().to_path_buf());
-    app.state.plan.allocate_path(&state_dir);
+    app.state.plan.allocate_path(&state_dir).unwrap();
     assert!(!app.state.plan.is_ready());
 
     // First WriteDone marks plan ready

@@ -61,6 +61,7 @@ pub(crate) struct SessionState {
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
+const PLAN_PATH_FAILED_WARNING: &str = "Could not create a plan file, resumed in build mode";
 
 impl SessionState {
     pub fn from_session(
@@ -90,8 +91,11 @@ impl SessionState {
             None => PlanState::None,
         };
 
-        if mode == Mode::Plan {
-            plan.allocate_path(storage);
+        if mode == Mode::Plan
+            && let Err(error) = plan.allocate_path(storage)
+        {
+            warnings.push(format!("{PLAN_PATH_FAILED_WARNING}: {error}"));
+            session.meta.mode = Some(StoredMode::Build);
         }
 
         let fast_pending = session.meta.fast && !model.supports_fast() && model.fast_pending();
@@ -454,6 +458,21 @@ mod tests {
         let state =
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert!(state.plan.path().is_some(), "plan path should be allocated");
+    }
+
+    #[test]
+    fn unallocatable_plan_path_resumes_in_build_mode_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("state");
+        std::fs::write(&blocked, "").unwrap();
+        let storage = StateDir::from_path(blocked);
+        let session = make_plan_session(Some(StoredMode::Plan), None);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        assert!(state.plan.path().is_none());
+        assert_eq!(state.session.meta.mode, Some(StoredMode::Build));
+        assert_eq!(state.warnings.len(), 1);
+        assert!(state.warnings[0].starts_with(PLAN_PATH_FAILED_WARNING));
     }
 
     #[test]
