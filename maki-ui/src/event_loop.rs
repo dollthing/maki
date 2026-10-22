@@ -633,45 +633,53 @@ fn handle_toggle_session_option(
     );
 }
 
-fn dispatch_target_mode_change_op(
+/// Who hears how a mode change ended: a pinned command as soon as the actor
+/// commits, Lua once the runtime that owns the change has handled it.
+enum ModeReply {
+    None,
+    Committed(flume::Sender<Result<(), String>>),
+    Handled(flume::Sender<UiReply>),
+}
+
+/// Commits mode `id` on `target` and reports it as one session op, so a mode
+/// change from a key, a pinned command or Lua projects and replies alike.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mode_commit(
     runtime: &SessionRuntime,
-    target: Option<AgentRef>,
+    target: Result<AgentRef, String>,
     storage: &StateDir,
     modes: Arc<maki_agent::ModeRegistry>,
     services: Option<&dyn OrchestrationServices>,
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
+    reply: ModeReply,
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
-    let root = runtime.handles.manager_and_root().1;
-    let is_root = target.as_ref().is_some_and(|target| target.id() == root);
-    let reservation = target
-        .as_ref()
-        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-        .and_then(|target| reserve_config_change(target, &runtime.coordinator, services));
+    let reservation = target.and_then(|target| {
+        reserve_config_change(&target, &runtime.coordinator, services)
+            .map(|reservation| (target, reservation))
+    });
     let storage = storage.clone();
     smol::spawn(async move {
-        let mut plan = crate::app::mode::PlanState::default();
-        let result = match (reservation, target) {
-            (Ok(reservation), Some(target)) => {
-                commit_mode_change(reservation, target, &id, &storage, &modes)
-                    .await
-                    .map(|committed| {
-                        plan = committed;
-                    })
+        let result = match reservation {
+            Ok((target, reservation)) => {
+                commit_mode_change(reservation, target, &id, &storage, &modes).await
             }
-            (Err(error), _) => Err(error),
-            _ => Err(CLOSED_TARGET_ERR.to_owned()),
+            Err(error) => Err(error),
+        };
+        let reply = match reply {
+            ModeReply::Committed(reply) => {
+                let _ = reply.send(result.clone());
+                None
+            }
+            ModeReply::None => Some(None),
+            ModeReply::Handled(reply_tx) => Some(Some(reply_tx)),
         };
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
-            kind: if is_root {
-                SessionOpKind::ModeChanged { id, plan }
-            } else {
-                SessionOpKind::ProviderRefreshed
-            },
+            kind: SessionOpKind::ModeChanged { reply },
             result,
         });
     })
@@ -755,12 +763,6 @@ fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::
 
 fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
     app.apply_toggled_option(id, enabled);
-}
-
-fn complete_mode_change(app: &mut App, id: String, plan: crate::app::mode::PlanState) {
-    if id == "plan" {
-        app.state.plan = plan;
-    }
 }
 
 fn observe_config_commits(
@@ -1684,9 +1686,11 @@ enum SessionOpKind {
         id: &'static str,
         committed: Arc<std::sync::Mutex<Option<bool>>>,
     },
+    /// A committed mode change; the projection follows the new mode. `None`
+    /// when the caller already heard the result, `Some(None)` when an error
+    /// should flash, `Some(Some(reply))` for a Lua caller.
     ModeChanged {
-        id: String,
-        plan: crate::app::mode::PlanState,
+        reply: Option<Option<flume::Sender<UiReply>>>,
     },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
@@ -1707,11 +1711,6 @@ enum SessionOpKind {
     },
     /// Lua session option mutation and its reply.
     LuaOptionSet { reply_tx: flume::Sender<UiReply> },
-    /// Lua mode transition, committed to the app after the actor accepts it.
-    LuaModeSet {
-        plan_path: Option<PathBuf>,
-        reply_tx: flume::Sender<UiReply>,
-    },
 }
 
 struct OrchestrationRevision {
@@ -2348,7 +2347,9 @@ impl<'t> EventLoop<'t> {
                         SessionOpKind::ModelSet { reply_tx, .. }
                         | SessionOpKind::ThinkingSet { reply_tx, .. }
                         | SessionOpKind::LuaOptionSet { reply_tx }
-                        | SessionOpKind::LuaModeSet { reply_tx, .. } => {
+                        | SessionOpKind::ModeChanged {
+                            reply: Some(Some(reply_tx)),
+                        } => {
                             let _ = reply_tx.send(Err(NOT_LIVE_ERR.into()));
                         }
                         _ => {}
@@ -2603,13 +2604,8 @@ impl<'t> EventLoop<'t> {
                     let result = admission
                         .ok_or(CommandError::StaleTarget)
                         .and_then(|pinned| {
-                            let (manager, root) = self.sessions[index].handles.manager_and_root();
-                            let runtime_root = manager
-                                .lookup(root)
+                            self.target_actor(index, &pinned.target)
                                 .map_err(|_| CommandError::StaleTarget)?;
-                            if !runtime_root.same_manager(&pinned.target) {
-                                return Err(CommandError::StaleTarget);
-                            }
                             self.sessions[index]
                                 .app
                                 .open_pinned_model_picker(pinned.target)
@@ -3551,49 +3547,23 @@ impl<'t> EventLoop<'t> {
         id: String,
         reply: flume::Sender<Result<(), String>>,
     ) {
-        let prepared = (|| {
-            let idx = self.target_runtime_index(&target)?;
-            self.target_actor(idx, &target)?;
-            let reservation = reserve_config_change(
-                &target,
-                &self.sessions[idx].coordinator,
-                Some(&*self.orchestration),
-            )?;
-            let root = self.sessions[idx].handles.manager_and_root().1;
-            Ok::<_, String>((idx, root == target.id(), reservation))
-        })();
-        let (idx, is_root, reservation) = match prepared {
-            Ok(prepared) => prepared,
+        let idx = match self
+            .target_runtime_index(&target)
+            .and_then(|idx| self.target_actor(idx, &target).map(|_| idx))
+        {
+            Ok(idx) => idx,
             Err(error) => {
                 let _ = reply.send(Err(error));
                 return;
             }
         };
-        let session = self.sessions[idx].id();
-        let runtime = self.sessions[idx].handles.identity();
-        let internal_tx = self.internal_tx.clone();
-        let storage = self.ctx.storage.clone();
-        let modes = self.ctx.lua_event_handle.mode_registry();
-        smol::spawn(async move {
-            let mut plan = crate::app::mode::PlanState::default();
-            let result = commit_mode_change(reservation, target, &id, &storage, &modes)
-                .await
-                .map(|committed| {
-                    plan = committed;
-                });
-            let _ = reply.send(result.clone());
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                runtime,
-                kind: if is_root {
-                    SessionOpKind::ModeChanged { id, plan }
-                } else {
-                    SessionOpKind::ProviderRefreshed
-                },
-                result,
-            });
-        })
-        .detach();
+        self.dispatch_mode(
+            idx,
+            Ok(target),
+            Some(&*self.orchestration),
+            id,
+            ModeReply::Committed(reply),
+        );
     }
 
     fn dispatch_lua_mode_set(
@@ -3609,55 +3579,33 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
-        let modes = self.ctx.lua_event_handle.mode_registry();
-        let storage = self.ctx.storage.clone();
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
-        let reservation = manager
-            .lookup(root)
-            .map_err(|error| error.to_string())
-            .and_then(|target| {
-                reserve_config_change(&target, &self.sessions[idx].coordinator, None)
-                    .map(|reservation| (target, reservation))
-            });
-        let session = self.sessions[idx].id();
-        let identity = self.sessions[idx].handles.identity();
-        let internal_tx = self.internal_tx.clone();
-        smol::spawn(async move {
-            let mut plan_path = None;
-            let result = match reservation {
-                Ok((target, reservation)) => {
-                    commit_mode_change(reservation, target, &id, &storage, &modes)
-                        .await
-                        .map(|plan| {
-                            plan_path = (id == "plan")
-                                .then(|| plan.path().map(PathBuf::from))
-                                .flatten();
-                        })
-                }
-                Err(error) => Err(error),
-            };
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                runtime: identity,
-                kind: SessionOpKind::LuaModeSet {
-                    plan_path,
-                    reply_tx,
-                },
-                result,
-            });
-        })
-        .detach();
+        self.dispatch_mode(
+            idx,
+            manager.lookup(root).map_err(|error| error.to_string()),
+            None,
+            id,
+            ModeReply::Handled(reply_tx),
+        );
     }
 
-    fn dispatch_mode_change(&self, idx: usize, id: String) {
-        dispatch_target_mode_change_op(
+    fn dispatch_mode(
+        &self,
+        idx: usize,
+        target: Result<AgentRef, String>,
+        services: Option<&dyn OrchestrationServices>,
+        id: String,
+        reply: ModeReply,
+    ) {
+        dispatch_mode_commit(
             &self.sessions[idx],
-            selected_agent(&self.sessions[idx]),
+            target,
             &self.ctx.storage,
             self.ctx.lua_event_handle.mode_registry(),
-            Some(&*self.orchestration),
+            services,
             self.internal_tx.clone(),
             id,
+            reply,
         );
     }
 
@@ -4269,7 +4217,13 @@ impl<'t> EventLoop<'t> {
                 let target = self.selected_target(idx);
                 self.dispatch_model_selection(idx, target, selection, None);
             }
-            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
+            Action::ChangeMode(mode) => self.dispatch_mode(
+                idx,
+                selected_agent(&self.sessions[idx]).ok_or_else(|| CLOSED_TARGET_ERR.to_owned()),
+                Some(&*self.orchestration),
+                mode,
+                ModeReply::None,
+            ),
             Action::ApprovePlan {
                 clear_context,
                 model,
@@ -4402,7 +4356,9 @@ impl<'t> EventLoop<'t> {
                 SessionOpKind::ModelSet { reply_tx, .. }
                 | SessionOpKind::ThinkingSet { reply_tx, .. }
                 | SessionOpKind::LuaOptionSet { reply_tx }
-                | SessionOpKind::LuaModeSet { reply_tx, .. } => {
+                | SessionOpKind::ModeChanged {
+                    reply: Some(Some(reply_tx)),
+                } => {
                     let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
                 }
                 _ => {}
@@ -4452,14 +4408,22 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::ModeChanged { id, plan } => match result {
-                Ok(()) => {
-                    let rt = &mut self.sessions[idx];
-                    complete_mode_change(&mut rt.app, id, plan);
-                    rt.settle_plan_approval();
+            SessionOpKind::ModeChanged { reply } => {
+                if result.is_ok() {
+                    self.sessions[idx].settle_plan_approval();
                 }
-                Err(error) => self.sessions[idx].app.flash(error),
-            },
+                match reply {
+                    Some(Some(reply_tx)) => {
+                        let _ = reply_tx.send(result.map(|()| json!(true)));
+                    }
+                    Some(None) => {
+                        if let Err(error) = result {
+                            self.sessions[idx].app.flash(error);
+                        }
+                    }
+                    None => {}
+                }
+            }
             SessionOpKind::DirectoryChanged { adopted } => match result {
                 Ok(()) => {
                     let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -4516,20 +4480,6 @@ impl<'t> EventLoop<'t> {
             }
             SessionOpKind::LuaOptionSet { reply_tx } => {
                 let _ = reply_tx.send(result.map(|()| json!(true)));
-            }
-            SessionOpKind::LuaModeSet {
-                plan_path,
-                reply_tx,
-            } => {
-                let reply = result.map(|()| {
-                    let rt = &mut self.sessions[idx];
-                    if let Some(path) = plan_path {
-                        rt.app.state.plan = crate::app::mode::PlanState::Drafting(path);
-                    }
-                    rt.settle_plan_approval();
-                    json!(true)
-                });
-                let _ = reply_tx.send(reply);
             }
         }
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
@@ -4945,7 +4895,7 @@ impl<'t> EventLoop<'t> {
         selection: maki_commands::ModelSelection,
         reply: Option<flume::Sender<Result<HostResponse, CommandError>>>,
     ) {
-        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let (_, root) = self.sessions[idx].handles.manager_and_root();
         let root_spec = target
             .as_ref()
             .filter(|target| target.id() == root)
@@ -4958,11 +4908,7 @@ impl<'t> EventLoop<'t> {
         let reservation = target
             .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
             .and_then(|target| {
-                let runtime_root = manager.lookup(root).map_err(|error| error.to_string())?;
-                if !runtime_root.same_manager(&target) {
-                    return Err(NOT_LIVE_ERR.to_owned());
-                }
-                target.validate_live().map_err(|error| error.to_string())?;
+                self.target_actor(idx, &target)?;
                 reserve_config_change(
                     &target,
                     &self.sessions[idx].coordinator,
@@ -5447,7 +5393,7 @@ async fn commit_mode_change(
     id: &str,
     storage: &StateDir,
     modes: &maki_agent::ModeRegistry,
-) -> Result<crate::app::mode::PlanState, String> {
+) -> Result<(), String> {
     let predecessor = reservation
         .operation
         .wait_predecessor()
@@ -5482,8 +5428,8 @@ async fn commit_mode_change(
             mode_def: Some(mode_def),
         },
     )
-    .await?;
-    Ok(plan)
+    .await
+    .map(|_| ())
 }
 
 fn publication_claim() -> maki_storage::checkpoint::CheckpointClaim {
@@ -5926,7 +5872,7 @@ mod tests {
     #[test]
     fn reserved_mode_change_waits_for_lease_before_committing() {
         smol::block_on(async {
-            let mut runtime = test_runtime(model_named("test-model"));
+            let runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
             let initial_mode = runtime.app.root_config().mode.clone();
@@ -5934,14 +5880,15 @@ mod tests {
             let (internal_tx, internal_rx) = flume::unbounded();
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
-            dispatch_target_mode_change_op(
+            dispatch_mode_commit(
                 &runtime,
-                Some(manager.lookup(root).unwrap()),
+                Ok(manager.lookup(root).unwrap()),
                 &storage,
                 EventHandle::disconnected_for_test().mode_registry(),
                 None,
                 internal_tx,
                 "plan".into(),
+                ModeReply::None,
             );
 
             assert_eq!(runtime.app.root_config().mode, initial_mode);
@@ -5953,11 +5900,10 @@ mod tests {
                 panic!("expected mode change completion");
             };
             result.unwrap();
-            if let SessionOpKind::ModeChanged { id, plan } = kind {
-                complete_mode_change(&mut runtime.app, id, plan);
-            } else {
-                panic!("expected mode change completion");
-            }
+            assert!(matches!(
+                kind,
+                SessionOpKind::ModeChanged { reply: Some(None) }
+            ));
             assert!(matches!(
                 actor.effective_config().unwrap().mode,
                 maki_agent::AgentMode::Plan(_)
