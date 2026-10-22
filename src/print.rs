@@ -1420,6 +1420,8 @@ mod tests {
                         assert(selection.spec == "{SPEC}" and selection.fast)
                         local changed, err = root:set_model(ctx, {{ fast = false }})
                         assert(changed == nil and err == "{fixed_model}")
+                        local set, set_err = maki.session.set_option("model", "{SPEC}")
+                        assert(set == nil and set_err == "{session_required}", set_err)
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
@@ -1428,7 +1430,10 @@ mod tests {
                         maki.ui.flash("{COMMAND_FINISHED}")
                     end,
                 }})
-            "#, fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR),
+            "#,
+                fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR,
+                session_required = maki_lua::agent_errors::SESSION_REQUIRED_ERR,
+            ),
         ).unwrap();
         let mut literal = input(match outcome {
             "unknown" => "/print_unknown",

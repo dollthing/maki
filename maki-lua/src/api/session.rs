@@ -14,7 +14,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::{
     DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION,
-    DELEGATED_SESSION_LIFECYCLE,
+    DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
 };
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
@@ -31,7 +31,6 @@ pub type SessionSnapshotFn =
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
-const SESSION_REQUIRED_ERR: &str = "session is required";
 
 async fn roundtrip(
     lua: Lua,

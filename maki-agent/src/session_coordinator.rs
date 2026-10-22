@@ -2115,16 +2115,28 @@ mod tests {
             first.set_option("test.choice", "b").await.unwrap();
             let before_first = first.read().options();
             let before_second = second.read().options();
-            let reservation = second
-                .reserve_transaction(CheckpointPublication::default())
+            let predecessor = lock(&second.read.binding)
+                .as_ref()
+                .unwrap()
+                .agent
+                .actor()
+                .unwrap()
+                .reserve_prepared_operation(None)
                 .unwrap();
+            let mut mutation = Box::pin(second.set_model(None, Some(false), None));
+            assert!(
+                futures_lite::future::poll_once(mutation.as_mut())
+                    .await
+                    .is_none()
+            );
             assert!(
                 matches!(catalog.replace_plugin_options("test", vec![plugin_option(2, &["c"], "c")]).await, Err(SessionCoordinatorError::SessionBusy(busy)) if busy == ids[1])
             );
             assert_eq!(catalog.plugin_definitions("test"), initial);
             assert_eq!(first.read().options(), before_first);
             assert_eq!(second.read().options(), before_second);
-            drop(reservation);
+            drop(predecessor);
+            mutation.await.unwrap();
             catalog
                 .replace_plugin_options("test", vec![plugin_option(2, &["c"], "c")])
                 .await
