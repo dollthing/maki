@@ -739,9 +739,7 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
         reservation.wait_ready().await.unwrap();
         assert_eq!(actor.snapshot().queued, usize::from(turn));
         assert_eq!(actor.snapshot().queue.len(), usize::from(turn));
-        let mut published = false;
-        actor.publish_if_empty(|| published = true);
-        assert!(!published);
+        assert!(has_pending_work(&actor));
         let candidate = reservation.ready_config().unwrap();
         assert_eq!(
             actor.config_snapshot().unwrap().generation,
@@ -776,8 +774,7 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
             before.generation
         );
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
-        actor.publish_if_empty(|| published = true);
-        assert!(published);
+        assert!(!has_pending_work(&actor));
         if !matches!(action, "close" | "shutdown") {
             let next = actor.reserve_prepared_operation(None).unwrap();
             next.resolve(None).unwrap();
@@ -833,9 +830,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         assert_eq!(turn.wait_ready().await, Err(ActorError::PolicyCancelled));
         assert_eq!(actor.snapshot().queued, 0);
         assert!(actor.snapshot().queue.is_empty());
-        let mut published = false;
-        actor.publish_if_empty(|| published = true);
-        assert!(!published);
+        assert!(has_pending_work(&actor));
         assert_eq!(
             actor.config_snapshot().unwrap().generation,
             before.generation
@@ -855,8 +850,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         let after = setter.await.unwrap().config;
         assert_eq!(after.generation, before.generation + 2);
         assert_eq!(after.config.workflow, before.config.workflow);
-        actor.publish_if_empty(|| published = true);
-        assert!(published);
+        assert!(!has_pending_work(&actor));
         actor.close();
         task.await;
     });
@@ -1088,12 +1082,14 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
         assert!(actor.inner.outcomes.lock().unwrap().is_empty());
         assert!(observed.runs.lock().unwrap().is_empty());
         assert!(events_rx.try_recv().is_err());
-        let mut published = false;
-        actor.publish_if_empty(|| published = true);
-        assert!(published);
+        assert!(!has_pending_work(&actor));
         actor.close();
         task.await;
     });
+}
+
+fn has_pending_work(actor: &crate::actor::AgentActorHandle) -> bool {
+    !actor.inner.state.lock().unwrap().operations.is_empty() || !actor.inner.queue.is_empty()
 }
 
 fn empty_snapshot() -> crate::agent::TurnAdmissionSnapshot {

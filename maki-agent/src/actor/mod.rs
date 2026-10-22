@@ -1558,10 +1558,9 @@ impl AgentActorHandle {
             ActorWork::Turn(admission) if !deliveries.contains(&admission.turn_id))
         });
         drive_operations(&self.inner, state);
-        state.presentation = state.presentation.max(displayed) + 1;
         LocalCancellationCut {
             turn_id,
-            fence: state.presentation,
+            fence: state.reserve_presentation(displayed),
             deferred,
             drained,
         }
@@ -1769,9 +1768,11 @@ impl AgentActorHandle {
     }
 
     pub fn reserve_presentation(&self, displayed: u64) -> u64 {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.presentation = next_presentation(state.presentation, displayed);
-        state.presentation
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reserve_presentation(displayed)
     }
 
     pub fn allocate_processing_presentation(
@@ -2747,16 +2748,6 @@ impl AgentActorHandle {
             ?reason,
             "correlation cancelled"
         );
-    }
-
-    /// Runs the drain publication only when the queue is empty, under the
-    /// queue lock, so a drain event can never interleave with a concurrent
-    /// push.
-    pub fn publish_if_empty(&self, publish: impl FnOnce()) {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.operations.is_empty() {
-            self.inner.queue.publish_if_empty(publish);
-        }
     }
 
     pub fn snapshot(&self) -> ActorSnapshot {

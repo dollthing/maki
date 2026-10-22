@@ -22,7 +22,7 @@ fn test_image() -> ImageSource {
     ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
 }
 
-use super::queue::{ActorQueue, QueueProjection};
+use super::queue::QueueProjection;
 use super::types::{
     ActorLifecycle, ActorStatus, BackendResult, ControlWork, TurnContext, WorkKind,
 };
@@ -36,8 +36,7 @@ use crate::tools::{
     ToolSource,
 };
 use crate::types::{
-    ActorWorkIdentity, ActorWorkKind, AgentId, DoneReason, Envelope, EventSender,
-    TurnCancellationReason, TurnId, TurnOutcome,
+    AgentId, DoneReason, Envelope, EventSender, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
 use std::borrow::Cow;
@@ -3528,36 +3527,6 @@ fn cancelled_running_turn_does_not_fold_next_generation() {
         handle.close();
         task.await;
     });
-}
-
-#[test]
-fn queue_drain_publication_is_ordered() {
-    let queue = ActorQueue::new();
-    let published = Arc::new(Mutex::new(0));
-    queue.publish_if_empty(|| *published.lock().unwrap() += 1);
-    assert_eq!(*published.lock().unwrap(), 1, "empty queue publishes");
-    queue.push(ActorWork::Compact {
-        operation_id: 1,
-        run_id: 1,
-        instructions: None,
-        generation: 0,
-        policy: None,
-        work: ActorWorkIdentity::new(
-            AgentId::generate(),
-            ActorWorkKind::Compact { operation_id: 1 },
-            1,
-        ),
-    });
-    queue.publish_if_empty(|| *published.lock().unwrap() += 1);
-    assert_eq!(
-        *published.lock().unwrap(),
-        1,
-        "non-empty queue must not publish"
-    );
-    // After a drain the queue is empty again and publishes.
-    assert_eq!(queue.drain_all().len(), 1);
-    queue.publish_if_empty(|| *published.lock().unwrap() += 1);
-    assert_eq!(*published.lock().unwrap(), 2);
 }
 
 #[test]

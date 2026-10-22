@@ -1,9 +1,7 @@
 //! The actor's sole FIFO deque.
 //!
 //! Every push, pop, interrupt extraction, removal, clear, snapshot, and drain
-//! goes through this one lock-backed deque. `publish_if_empty` runs its
-//! closure under the queue lock, so a drain publication can never interleave
-//! with a concurrent push, matching the TUI's expectation.
+//! goes through this one lock-backed deque.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -209,15 +207,6 @@ impl ActorQueue {
 
     pub fn snapshot(&self) -> Vec<QueueProjection> {
         lock(&self.items).iter().map(Into::into).collect()
-    }
-
-    /// Runs `publish` under the queue lock, and only when the queue is empty,
-    /// so a drain publication can never interleave with a concurrent push.
-    pub fn publish_if_empty(&self, publish: impl FnOnce()) {
-        let items = lock(&self.items);
-        if items.is_empty() {
-            publish();
-        }
     }
 
     /// Wakes the runner. Debounced by the bounded channel: at most one token
