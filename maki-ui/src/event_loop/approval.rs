@@ -469,7 +469,7 @@ impl EventLoop<'_> {
             let (_, root) = runtime.handles.manager_and_root();
             let sender =
                 (target.id() == root).then(|| EventSender::new(runtime.handles.agent_tx.clone()));
-            let operation = actor
+            let operation = idle
                 .reserve_prepared_operation(Some(implementation_turn(
                     String::new(),
                     sender,

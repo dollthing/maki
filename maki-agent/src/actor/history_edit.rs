@@ -523,7 +523,7 @@ mod tests {
             let checkpoint: HistoryEditCheckpoint =
                 Arc::new(|_| panic!("closed edit must not checkpoint"));
             let boundary = actor.history_boundaries().unwrap().remove(0);
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let edit = async move {
@@ -584,7 +584,7 @@ mod tests {
             let guard = actor.prepare_idle().unwrap();
             let checkpoint: HistoryEditCheckpoint = Arc::new(|_| Box::pin(async { Ok(()) }));
             let boundary = actor.history_boundaries().unwrap().remove(0);
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let mut edit = Box::pin(async move {
@@ -644,7 +644,7 @@ mod tests {
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let idle = actor.prepare_idle().unwrap();
-            let operation = actor
+            let operation = idle
                 .reserve_prepared_operation(Some(PreparedTurn {
                     input: input(IMPLEMENT),
                     event_sender: None,
@@ -770,7 +770,7 @@ mod tests {
             let original = actor.config_snapshot().unwrap();
             let guard = actor.prepare_idle().unwrap();
             let source = guard.source_snapshot().unwrap();
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let later = actor.reserve_config_update().unwrap();
@@ -903,7 +903,7 @@ mod tests {
                 event_sender: None,
                 correlation: "prepared-close".into(),
             });
-            let operation = actor.reserve_prepared_operation(turn).unwrap();
+            let operation = guard.reserve_prepared_operation(turn).unwrap();
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let (entered, entry) = flume::bounded(1);
@@ -971,7 +971,7 @@ mod tests {
                 .unwrap();
             let history = actor.inner.history.load_full();
             let guard = actor.prepare_idle().unwrap();
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let publication = CheckpointPublication::default();
@@ -1105,7 +1105,11 @@ mod tests {
             let staged_commit = Arc::new(Mutex::new(None));
             let published_commit = Arc::clone(&staged_commit);
             let guard = replace_history.then(|| actor.prepare_idle().unwrap());
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = match &guard {
+                Some(guard) => guard.reserve_prepared_operation(None),
+                None => actor.reserve_prepared_operation(None),
+            }
+            .unwrap();
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let publication = CheckpointPublication::default();
@@ -1166,14 +1170,26 @@ mod tests {
                     .is_none()
             );
             entry.recv_async().await.unwrap();
-            let later = actor.reserve_prepared_operation(None).unwrap();
-            let mut predecessor = Box::pin(later.wait_predecessor());
-            assert!(future::poll_once(&mut predecessor).await.is_none());
-            later.resolve(None).unwrap();
-            assert!(matches!(
-                later.ready_config(),
-                Err(ActorError::PolicyPending)
-            ));
+            let later = if replace_history {
+                assert!(matches!(
+                    actor.reserve_prepared_operation(None),
+                    Err(ActorError::Busy)
+                ));
+                None
+            } else {
+                Some(actor.reserve_prepared_operation(None).unwrap())
+            };
+            let mut predecessor = later
+                .as_ref()
+                .map(|later| Box::pin(later.wait_predecessor()));
+            if let (Some(later), Some(predecessor)) = (&later, &mut predecessor) {
+                assert!(future::poll_once(predecessor).await.is_none());
+                later.resolve(None).unwrap();
+                assert!(matches!(
+                    later.ready_config(),
+                    Err(ActorError::PolicyPending)
+                ));
+            }
             assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 1);
             assert!(!actor.effective_config().unwrap().fast);
             match invalidation {
@@ -1236,18 +1252,24 @@ mod tests {
                     &actor.inner.history.load().messages
                 ));
             }
-            let predecessor = predecessor.await;
-            if invalidation == "close" {
-                assert!(matches!(predecessor, Err(ActorError::Closed)));
-            } else {
-                let predecessor = predecessor.unwrap();
-                assert_eq!(predecessor.fast, succeeds);
-                assert!(Arc::ptr_eq(
-                    &predecessor,
-                    &actor.config_snapshot().unwrap().config
-                ));
-                later.wait_ready().await.unwrap();
-                assert_eq!(later.ready_config().unwrap().fast, succeeds);
+            if let (Some(later), Some(predecessor)) = (&later, predecessor) {
+                let predecessor = predecessor.await;
+                if invalidation == "close" {
+                    assert!(matches!(predecessor, Err(ActorError::Closed)));
+                } else {
+                    let predecessor = predecessor.unwrap();
+                    assert_eq!(predecessor.fast, succeeds);
+                    assert!(Arc::ptr_eq(
+                        &predecessor,
+                        &actor.config_snapshot().unwrap().config
+                    ));
+                    later.wait_ready().await.unwrap();
+                    assert_eq!(later.ready_config().unwrap().fast, succeeds);
+                }
+            }
+            if let Some(later) = later
+                && invalidation != "close"
+            {
                 later.commit().unwrap();
             }
             actor.close();
@@ -1271,7 +1293,7 @@ mod tests {
             let original = actor.config_snapshot().unwrap();
             let epoch = actor.inner.history.load().epoch;
             let guard = actor.prepare_idle().unwrap();
-            let operation = actor.reserve_prepared_operation(None).unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
             operation
                 .resolve(Some(ConfigChange::Patch(ConfigPatch {
                     fast: Some(true),

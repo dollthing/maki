@@ -120,9 +120,20 @@ pub struct PreparedOperationTicket {
 }
 
 impl AgentActorHandle {
+    /// Reserves the next FIFO operation slot. Fails with
+    /// [`ActorError::Busy`] while an idle guard is held; the guard owner
+    /// reserves through [`ActorIdleGuard::reserve_prepared_operation`].
     pub fn reserve_prepared_operation(
         &self,
         turn: Option<PreparedTurn>,
+    ) -> Result<PreparedOperationTicket, ActorError> {
+        self.reserve_operation(turn, None)
+    }
+
+    pub(super) fn reserve_operation(
+        &self,
+        turn: Option<PreparedTurn>,
+        idle_owner: Option<&Arc<()>>,
     ) -> Result<PreparedOperationTicket, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
@@ -134,7 +145,9 @@ impl AgentActorHandle {
         {
             return Err(ActorError::PolicyCancelled);
         }
-        if state.idle.is_some() && !state.operations.is_empty() {
+        if let Some(idle) = &state.idle
+            && idle_owner.is_none_or(|owner| !Arc::ptr_eq(&idle.owner, owner))
+        {
             return Err(ActorError::Busy);
         }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);

@@ -2807,10 +2807,17 @@ impl<'t> EventLoop<'t> {
                             .as_ref()
                             .ok_or(CommandError::StaleTarget)
                             .and_then(|pinned| {
-                                self.dispatch_target_toggle(index, &pinned.target, id)
-                                    .map_err(|error| CommandError::Producer(Arc::from(error)))
+                                self.dispatch_target_toggle(
+                                    index,
+                                    &pinned.target,
+                                    id,
+                                    Some(reply.clone()),
+                                )
+                                .map_err(|error| CommandError::Producer(Arc::from(error)))
                             });
-                        let _ = reply.send(result.map(|()| HostResponse::Completed));
+                        if let Err(error) = result {
+                            let _ = reply.send(Err(error));
+                        }
                         return;
                     }
                     if let BuiltinOperation::Compact(instructions) = operation {
@@ -4561,7 +4568,7 @@ impl<'t> EventLoop<'t> {
                     let result = self
                         .selected_target(idx)
                         .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                        .and_then(|target| self.dispatch_target_toggle(idx, &target, id));
+                        .and_then(|target| self.dispatch_target_toggle(idx, &target, id, None));
                     if let Err(error) = result {
                         self.sessions[idx].app.flash(error);
                     }
@@ -5115,11 +5122,15 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
+    /// Commits the toggle in the background. `reply` hears the settled
+    /// commit; a reservation refusal (such as a held idle guard) returns
+    /// synchronously instead.
     fn dispatch_target_toggle(
         &self,
         idx: usize,
         target: &AgentRef,
         id: &'static str,
+        reply: Option<flume::Sender<Result<HostResponse, CommandError>>>,
     ) -> Result<(), String> {
         self.target_actor(idx, target)?;
         let change = match id {
@@ -5137,6 +5148,14 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let result = commit_config_change(ticket, change).await.map(|_| ());
+            if let Some(reply) = reply {
+                let _ = reply.send(
+                    result
+                        .clone()
+                        .map(|()| HostResponse::Completed)
+                        .map_err(|error| CommandError::Producer(Arc::from(error))),
+                );
+            }
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -6222,11 +6241,13 @@ mod tests {
         });
     }
 
-    #[test]
-    fn workflow_host_command_commits_on_the_pinned_actor() {
+    #[test_case(false ; "workflow_host_command_commits_on_the_pinned_actor")]
+    #[test_case(true ; "workflow_host_command_is_busy_during_a_held_idle_guard")]
+    fn workflow_host_command_on_the_pinned_actor(held: bool) {
         with_event_loop(|event_loop| {
             let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
+            let guard = held.then(|| actor.prepare_idle().unwrap());
             let commits = actor.subscribe_config_commits();
             let (reply, response) = flume::bounded(1);
             event_loop.handle_command(CommandEvent::Host {
@@ -6241,7 +6262,19 @@ mod tests {
                 })),
                 reply,
             });
-            assert_eq!(response.recv().unwrap().unwrap(), HostResponse::Completed);
+            let response = response.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+            if held {
+                assert!(matches!(
+                    response,
+                    Err(CommandError::Producer(message))
+                        if *message == *maki_agent::ActorError::Busy.to_string()
+                ));
+                drop(guard);
+                assert!(commits.is_empty());
+                assert!(!actor.effective_config().unwrap().workflow);
+                return;
+            }
+            assert_eq!(response.unwrap(), HostResponse::Completed);
             loop {
                 let commit = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
                 if commit.config.workflow {

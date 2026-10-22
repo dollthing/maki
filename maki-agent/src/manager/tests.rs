@@ -1504,7 +1504,7 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
             source.history.messages[0].first_text_content(),
             Some(SOURCE)
         );
-        let operation = actor.reserve_prepared_operation(None).unwrap();
+        let operation = guard.reserve_prepared_operation(None).unwrap();
         let predecessor = operation.wait_predecessor().await.unwrap();
         assert!(Arc::ptr_eq(&predecessor, &source.config.config));
         operation

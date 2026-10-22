@@ -5,7 +5,8 @@ use maki_storage::sessions::HistorySnapshot;
 
 use super::{
     ActorError, ActorLifecycle, ActorOperation, ActorQueue, ActorState, ActorStatus, ActorWork,
-    AgentActorHandle, ConfigCommit, HistoryEditWork, TurnTicket, lifecycle_error,
+    AgentActorHandle, ConfigCommit, HistoryEditWork, PreparedOperationTicket, PreparedTurn,
+    TurnTicket, lifecycle_error,
 };
 use crate::{AgentId, TurnId};
 
@@ -17,7 +18,7 @@ pub struct ActorSourceSnapshot {
 }
 
 pub(super) struct IdleReservation {
-    owner: Arc<()>,
+    pub(super) owner: Arc<()>,
     pub(super) permission: Option<TurnId>,
     pub(super) committing: bool,
     pub(super) edit: Option<HistoryEditWork>,
@@ -31,6 +32,15 @@ pub struct ActorIdleGuard {
 }
 
 impl ActorIdleGuard {
+    /// Reserves an operation for the guard owner, which other callers cannot
+    /// do while the guard is held.
+    pub fn reserve_prepared_operation(
+        &self,
+        turn: Option<PreparedTurn>,
+    ) -> Result<PreparedOperationTicket, ActorError> {
+        self.actor.reserve_operation(turn, Some(&self.owner))
+    }
+
     pub fn source_snapshot(&self) -> Result<ActorSourceSnapshot, ActorError> {
         let mut state = self
             .actor
