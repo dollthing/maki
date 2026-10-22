@@ -16,8 +16,7 @@ reference is at the end of this document.
 
 Plugins live in the makima config dir. There are two of them, same layout:
 
-- `~/.config/makima/` - global, every project (if `~/.makima/` exists, makima reads
-  that one instead)
+- `~/.config/makima/` - global, every project
 - `<project>/.makima/` - this project only
 
 ```

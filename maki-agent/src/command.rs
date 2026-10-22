@@ -674,18 +674,18 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::config_dir().ok().as_deref(),
     )
 }
 
 fn discover_commands_inner(
     cwd: &Path,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    global_config: Option<&Path>,
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+    if let Some(dir) = global_config {
         scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
@@ -1374,7 +1374,7 @@ mod tests {
         .unwrap();
 
         let global = TempDir::new().unwrap();
-        let global_cmd_dir = global.path().join(".makima/commands");
+        let global_cmd_dir = global.path().join(COMMANDS_DIR);
         fs::create_dir_all(&global_cmd_dir).unwrap();
         fs::write(
             global_cmd_dir.join("overlap.md"),
@@ -1382,7 +1382,7 @@ mod tests {
         )
         .unwrap();
 
-        let commands = discover_commands_inner(project.path(), Some(global.path()), None);
+        let commands = discover_commands_inner(project.path(), None, Some(global.path()));
         let overlap: Vec<_> = commands.iter().filter(|c| c.name == "overlap").collect();
         assert_eq!(overlap.len(), 1);
         assert_eq!(overlap[0].description, "Project version");

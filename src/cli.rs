@@ -266,11 +266,6 @@ pub enum Command {
         #[arg(long, requires = "tools")]
         names: bool,
     },
-    /// Data migration utilities
-    Migrate {
-        #[command(subcommand)]
-        action: MigrateAction,
-    },
     /// Manage projects that may load automatic shared project configuration
     Trust {
         #[command(subcommand)]
@@ -295,12 +290,6 @@ pub enum TrustAction {
     },
     /// List stored project trust decisions
     List,
-}
-
-#[derive(Subcommand)]
-pub enum MigrateAction {
-    /// Migrate files from ~/.makima/ to XDG directories
-    Xdg,
 }
 
 #[derive(Subcommand)]

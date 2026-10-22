@@ -421,18 +421,6 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\makima` on Windows; that is separate from these runtime dirs.
 
-`~/.makima/` (or `%USERPROFILE%\\.makima\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
-
-### Migrating from ~/.makima/
-
-```
-makima migrate xdg
-```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
-
 ## Personal Instructions
 
 On top of the project instruction files Makima loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:

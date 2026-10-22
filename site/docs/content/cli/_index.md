@@ -164,14 +164,6 @@ makima prompt --tools --names  # tool names only, one per line
 
 Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` is rejected on non-system variants.
 
-### `makima migrate`
-
-```bash
-makima migrate xdg
-```
-
-Moves data from `~/.makima/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
-
 ## Everyday examples
 
 ```bash

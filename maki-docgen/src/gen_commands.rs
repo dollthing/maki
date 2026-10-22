@@ -299,11 +299,7 @@ pub fn generate() -> color_eyre::Result<String> {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "1. User config: `~/.config/makima/commands/` (and legacy `~/.makima/commands/` if present)"
-    )
-    .unwrap();
+    writeln!(out, "1. User config: `~/.config/makima/commands/`").unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();
     writeln!(
         out,

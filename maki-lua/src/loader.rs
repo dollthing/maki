@@ -355,11 +355,7 @@ impl PluginHost {
         init_files: InitFiles,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        self.load_init_files_from_dirs(
-            init_files,
-            maki_storage::paths::config_search_dirs(),
-            warnings,
-        )
+        self.load_init_files_from_dirs(init_files, maki_storage::paths::config_dir().ok(), warnings)
     }
 
     fn load_init_files_from_dirs(

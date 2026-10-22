@@ -1,5 +1,4 @@
 mod acp;
-mod migrate;
 mod subcmd;
 mod tui;
 
@@ -9,7 +8,7 @@ use color_eyre::eyre::Context;
 use maki_config::project::TrustMode;
 use maki_storage::StateDir;
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, TrustAction};
+use crate::cli::{AuthAction, Cli, Command, McpAction, TrustAction};
 use crate::project_trust;
 use crate::update;
 
@@ -84,9 +83,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 trust_mode,
             )?;
         }
-        Some(Command::Migrate { action }) => match action {
-            MigrateAction::Xdg => migrate::xdg()?,
-        },
         Some(Command::Trust { action }) => {
             let storage = StateDir::resolve().context("resolve state directory")?;
             match action {
