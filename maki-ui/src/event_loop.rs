@@ -21,7 +21,7 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use maki_agent::actor::{ConfigChange, HistoryChange};
+use maki_agent::actor::{ConfigChange, ConfigPatch, HistoryChange};
 use maki_agent::command::CustomCommand;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
@@ -736,7 +736,7 @@ fn thinking_change(input: &str) -> Result<ConfigChange, String> {
         return Ok(ConfigChange::ToggleThinking);
     }
     let thinking = maki_domain::parse_thinking(input.trim()).map_err(|error| error.to_string())?;
-    Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+    Ok(ConfigChange::Patch(ConfigPatch {
         thinking: Some(thinking),
         ..Default::default()
     }))
@@ -1196,9 +1196,39 @@ impl SessionRuntime {
             |projected| projected.config.mode.clone(),
         );
         self.app.update_model(&commit.config.model);
+        if self.app.state.resolve_pending_fast(commit.config.fast) {
+            self.restore_pending_fast();
+        }
         self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
         true
+    }
+
+    /// Commits a saved `/fast` that was restored while discovery was pending,
+    /// once discovery says the model supports it.
+    fn restore_pending_fast(&self) {
+        let (manager, root) = self.handles.manager_and_root();
+        let reservation = manager
+            .lookup(root)
+            .map_err(|error| error.to_string())
+            .and_then(|target| reserve_config_change(&target, &self.coordinator, None));
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                warn!(%error, "failed to reserve the restored fast mode");
+                return;
+            }
+        };
+        let change = ConfigChange::Patch(ConfigPatch {
+            fast: Some(true),
+            ..Default::default()
+        });
+        smol::spawn(async move {
+            if let Err(error) = commit_config_change(reservation, change).await {
+                warn!(%error, "failed to commit the restored fast mode");
+            }
+        })
+        .detach();
     }
 
     fn config(&self) -> Option<Arc<maki_agent::EffectiveAgentConfig>> {
@@ -3619,7 +3649,7 @@ impl<'t> EventLoop<'t> {
                     reservation,
                     prepare_model_patch(
                         spec.as_deref().map(Arc::from),
-                        maki_agent::actor::ConfigPatch {
+                        ConfigPatch {
                             thinking,
                             toggle_thinking,
                             fast,
@@ -4863,7 +4893,7 @@ impl<'t> EventLoop<'t> {
                     ticket,
                     prepare_model_patch(
                         selection.spec,
-                        maki_agent::actor::ConfigPatch {
+                        ConfigPatch {
                             thinking: selection.thinking,
                             fast: selection.fast,
                             ..Default::default()
@@ -5620,6 +5650,7 @@ mod tests {
     };
     use maki_config::PermissionsConfig;
     use maki_lua::BuiltinAction;
+    use maki_providers::model::FastSupport;
     use maki_providers::{Effort, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::atomic::AtomicBool;
@@ -5627,6 +5658,7 @@ mod tests {
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+    const PENDING_FAST_MODEL: &str = "pending-fast-model";
     const DISCOVERY_PROVIDER: &str = "synthetic";
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
@@ -5883,6 +5915,42 @@ mod tests {
     }
 
     #[test]
+    fn discovered_fast_support_commits_the_restored_fast_wish() {
+        smol::block_on(async {
+            let mut model = model_named(PENDING_FAST_MODEL);
+            model.supports_fast_override = Some(FastSupport::Pending);
+            let mut runtime = test_runtime(model.clone());
+            runtime.app.state.fast_pending = true;
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let commits = actor.subscribe_config_commits();
+            model.supports_fast_override = Some(FastSupport::Supported);
+            let discovered = actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                    model: Some(maki_agent::actor::PreparedModel {
+                        provider: Arc::new(StubProvider),
+                        model,
+                    }),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap()
+                .config;
+            assert!(!discovered.config.fast);
+            assert!(runtime.project_config(&discovered));
+            let observed = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+            assert_eq!(observed.generation, discovered.generation);
+            let restored = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+            assert!(restored.config.fast);
+            assert!(runtime.project_config(&restored));
+            assert!(!runtime.app.state.fast_pending);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
     fn combined_model_thinking_toggle_uses_predecessor_atomically() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
@@ -5893,7 +5961,7 @@ mod tests {
             let mut model = model_named("replacement");
             model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
             let combined = smol::spawn(combined.commit_when_ready(Some(ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
+                ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model,
@@ -5903,7 +5971,7 @@ mod tests {
                 },
             ))));
             predecessor
-                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                     workflow: Some(true),
                     ..Default::default()
                 })))
@@ -5932,7 +6000,7 @@ mod tests {
             let mut required = model_named("required");
             required.thinking_override = Some(maki_providers::ThinkingSupport::Required);
             model_ticket
-                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model: required,
@@ -6102,7 +6170,7 @@ mod tests {
                 .unwrap();
                 let older = commit_config_change(
                     reservation,
-                    ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                    ConfigChange::Patch(ConfigPatch {
                         workflow: Some(true),
                         ..Default::default()
                     }),
@@ -6170,7 +6238,7 @@ mod tests {
                 let commit = commit_config_change(
                     reserve_config_change(&manager.lookup(root).unwrap(), &old.coordinator, None)
                         .unwrap(),
-                    ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                    ConfigChange::Patch(ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             model: model_named("retired-model"),
                             provider: Arc::new(StubProvider),
@@ -6343,7 +6411,7 @@ mod tests {
                     .await
             });
             reservation
-                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model: target_model.clone(),
@@ -7531,7 +7599,7 @@ mod tests {
 
         fn model(spec: &str) -> Model {
             let mut model = Model::from_spec(spec).unwrap();
-            model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+            model.supports_fast_override = Some(FastSupport::Supported);
             model
         }
 
@@ -8509,7 +8577,7 @@ mod tests {
         with_event_loop(|event_loop| {
             if !workflow {
                 let mut model = model_named("fast-model");
-                model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+                model.supports_fast_override = Some(FastSupport::Supported);
                 let replacement = test_runtime(model);
                 let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
                 release_runtime(old);
@@ -9197,7 +9265,7 @@ mod tests {
                 actor
                     .reserve_prepared_operation(None)
                     .unwrap()
-                    .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                    .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(StubProvider),
                             model: model_named("child-model"),

@@ -203,10 +203,20 @@ impl SessionState {
         }
     }
 
+    /// A model switch drops a pending fast wish; discovery answering for the
+    /// same model keeps it while the model can still honour it.
     pub fn update_model(&mut self, model: &Model) {
-        self.fast_pending &= model.fast_pending();
+        self.fast_pending &=
+            self.model.spec() == model.spec() && (model.fast_pending() || model.supports_fast());
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
+    }
+
+    /// Whether a pending fast wish can now be committed. A committed fast
+    /// settles the wish.
+    pub fn resolve_pending_fast(&mut self, fast: bool) -> bool {
+        self.fast_pending &= !fast;
+        self.fast_pending && self.model.supports_fast()
     }
 }
 
@@ -416,11 +426,11 @@ mod tests {
         );
     }
 
-    #[test_case(FastSupport::Supported, false, false ; "discovery_answers_supported")]
+    #[test_case(FastSupport::Supported, false, true ; "discovery_answers_supported")]
     #[test_case(FastSupport::Unsupported, false, false ; "discovery_rejects_fast")]
-    #[test_case(FastSupport::Pending, false, true ; "still_pending_keeps_intent")]
+    #[test_case(FastSupport::Pending, false, false ; "still_pending_keeps_intent")]
     #[test_case(FastSupport::Supported, true, false ; "switch_answers_pending_intent")]
-    fn pending_fast_model_update(support: FastSupport, switch: bool, pending: bool) {
+    fn pending_fast_model_update(support: FastSupport, switch: bool, ready: bool) {
         let mut session = session_with_counters();
         session.meta.fast = true;
         let mut model = test_model();
@@ -432,7 +442,10 @@ mod tests {
         }
         model.supports_fast_override = Some(support);
         state.update_model(&model);
-        assert_eq!(state.fast_pending, pending);
+        assert_eq!(state.fast_pending, ready || support == FastSupport::Pending);
+        assert_eq!(state.resolve_pending_fast(false), ready);
+        assert!(!state.resolve_pending_fast(true));
+        assert!(!state.fast_pending);
     }
 
     #[test]
