@@ -219,7 +219,6 @@ fn gated_config_mutations(
                     config.thinking,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
                 model: Arc::from(config.model.spec()),
                 cwd: config.context.cwd().to_path_buf(),
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),

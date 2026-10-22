@@ -37,6 +37,11 @@ impl AgentActorHandle {
         self.inner.history.load().messages.len()
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn committed_history(&self) -> std::sync::Arc<Vec<Message>> {
+        std::sync::Arc::clone(&self.inner.history.load().messages)
+    }
+
     pub fn transcript(&self, request: TranscriptRequest) -> Result<TranscriptSnapshot, ActorError> {
         self.transcript_inner(
             request,

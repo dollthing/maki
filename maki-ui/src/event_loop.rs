@@ -1369,7 +1369,6 @@ struct CoordinatorDeps {
 fn prepare_coordinator(
     deps: &CoordinatorDeps,
     session: &AppSession,
-    history: Vec<Message>,
     available_models: Vec<Arc<str>>,
     handles: &PreparedAgentHandles,
     permissions: &Arc<PermissionManager>,
@@ -1392,7 +1391,6 @@ fn prepare_coordinator(
         catalog: deps.catalog.clone(),
         definitions,
         persisted_options: session.meta.session_options.clone(),
-        history,
         model: Arc::from(model_spec.as_str()),
         cwd: PathBuf::from(&session.cwd),
         model_policy: Arc::clone(&deps.model_policy),
@@ -1511,7 +1509,6 @@ impl SpawnCtx {
                 &SessionRef::from(session_id),
             )))
         });
-        let history = session.messages().to_vec();
         let cwd = PathBuf::from(&session.cwd);
         let (model, runtime_provider): (Model, Arc<dyn Provider>) = match provider.as_ref() {
             Some(provider) => (provider.model.clone(), Arc::clone(&provider.provider)),
@@ -1594,7 +1591,6 @@ impl SpawnCtx {
         let coordinator = prepare_coordinator(
             &deps,
             &session,
-            history,
             self.available_model_specs(),
             &handles,
             &permissions,
@@ -6764,7 +6760,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            history: Vec::new(),
             model: Arc::from("anthropic/test-model"),
             cwd: PathBuf::from("/tmp"),
             model_policy: Arc::default(),

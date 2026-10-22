@@ -1026,7 +1026,6 @@ mod tests {
                     ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
                 model: Arc::from(model),
                 cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),

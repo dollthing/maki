@@ -671,7 +671,6 @@ mod tests {
                 maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
-            history: Vec::new(),
             model: Arc::from("test/model"),
             cwd: PathBuf::from("/project"),
             model_policy: Arc::default(),

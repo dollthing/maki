@@ -195,7 +195,6 @@ fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCo
             maki_agent::ThinkingConfig::Off,
         ),
         persisted_options: Default::default(),
-        history: Vec::new(),
         model: Arc::from("test/model"),
         cwd: "/tmp".into(),
         model_policy: Arc::default(),

@@ -255,7 +255,6 @@ struct InstallSession<'a> {
     root_target: Receiver<TrustedTarget>,
     mcp: Option<McpHandle>,
     current_model: String,
-    history: Vec<Message>,
     initial_cost: Option<f64>,
     cwd: PathBuf,
     fast: bool,
@@ -540,7 +539,6 @@ async fn new_session(
             mcp,
             root_target,
             current_model: spec,
-            history: Vec::new(),
             initial_cost: None,
             cwd,
             fast: false,
@@ -601,7 +599,6 @@ async fn load_session(
         .filter(|_| recorded_model.supports_thinking())
         .unwrap_or_default();
     let replay_history = Arc::clone(&restored.history.messages);
-    let coordinator_history = restored.history.messages.as_ref().clone();
     let history_snapshot = restored.history;
     let (handle, root_target) = spawn_session_with_history(
         params,
@@ -637,7 +634,6 @@ async fn load_session(
             mcp,
             current_model: spec,
             root_target,
-            history: coordinator_history,
             initial_cost: restored_cost,
             cwd: session_cwd.clone(),
             fast,
@@ -973,7 +969,6 @@ async fn install_session_with_lock(
         root_target,
         mcp,
         current_model,
-        history,
         initial_cost,
         cwd,
         fast,
@@ -1027,7 +1022,6 @@ async fn install_session_with_lock(
             catalog: params.lua_event_handle.session_option_catalog(),
             definitions,
             persisted_options: persisted_options.clone(),
-            history,
             model: Arc::from(current_model.as_str()),
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
@@ -2983,7 +2977,6 @@ mod tests {
                     maki_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
                 model: Arc::from(model),
                 cwd,
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
@@ -3262,7 +3255,6 @@ mod tests {
                     root_target,
                     mcp: None,
                     current_model: OFFLINE_SPEC.to_owned(),
-                    history: Vec::new(),
                     initial_cost: None,
                     cwd: cwd.path().to_path_buf(),
                     fast: false,
@@ -3336,7 +3328,6 @@ mod tests {
                     root_target,
                     mcp: None,
                     current_model: OFFLINE_SPEC.to_owned(),
-                    history: Vec::new(),
                     initial_cost: None,
                     cwd: cwd.path().to_path_buf(),
                     fast: false,
@@ -5138,8 +5129,7 @@ mod tests {
             let read = coordinator.read();
             let options = read.options();
             format!(
-                "history={},model={},cwd={},options_version={}",
-                read.history().len(),
+                "model={},cwd={},options_version={}",
                 read.model(),
                 read.cwd().display(),
                 options.version

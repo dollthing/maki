@@ -841,7 +841,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
-    let coordinator_history = initial_history.messages.as_ref().clone();
     let models = available_model_specs(&model_policy);
     let (binding, root_target) = sdk_root_binding();
     let prepare: headless::ProviderPreparation = Box::new(|mut model, timeouts| {
@@ -913,7 +912,6 @@ pub fn run(params: SdkParams) -> Result<()> {
             catalog: session_options.clone(),
             definitions,
             persisted_options,
-            history: coordinator_history,
             model: Arc::from(startup_model.spec()),
             cwd: cwd.clone(),
             model_policy: Arc::clone(&model_policy),
@@ -2898,7 +2896,6 @@ mod tests {
                     thinking,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
                 model: Arc::from(STARTUP_MODEL),
                 cwd: cwd.clone(),
                 model_policy: Arc::new(ModelPolicy::default()),
@@ -3293,7 +3290,6 @@ mod tests {
                     maki_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
-                history: Vec::new(),
                 model: Arc::from(STARTUP_MODEL),
                 cwd: PathBuf::from("/project"),
                 model_policy: Arc::new(ModelPolicy::default()),

@@ -343,7 +343,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         }
         let child_before = child.snapshot();
         assert!(matches!(child_before.status, ActorStatus::Running(_)));
-        let history = event_loop.sessions[index].coordinator.read().history();
+        let history = actor.committed_history();
         let recent = read_recents(&event_loop.ctx.storage);
         let saved_model = read_model(&event_loop.ctx.storage);
         let run = event_loop.sessions[index].app.run_id;
@@ -359,10 +359,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         assert_eq!(child.snapshot().status, child_before.status);
         assert_eq!(child.snapshot().active_turn, child_before.active_turn);
         assert_eq!(child.snapshot().lifecycle, child_before.lifecycle);
-        assert!(Arc::ptr_eq(
-            &history,
-            &event_loop.sessions[index].coordinator.read().history()
-        ));
+        assert!(Arc::ptr_eq(&history, &actor.committed_history()));
         assert_eq!(read_recents(&event_loop.ctx.storage), recent);
         assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
         assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
@@ -393,7 +390,7 @@ fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let config = actor.effective_config().unwrap();
-        let history = event_loop.sessions[index].coordinator.read().history();
+        let history = actor.committed_history();
         let run_id = event_loop.sessions[index].app.run_id;
         let app = &mut event_loop.sessions[index].app;
         let mut child = crate::chat::Chat::new(
@@ -414,10 +411,7 @@ fn historical_child_approval_never_falls_back_to_root(clear_context: bool) {
             Some(path.as_path())
         );
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
-        assert!(Arc::ptr_eq(
-            &history,
-            &event_loop.sessions[index].coordinator.read().history()
-        ));
+        assert!(Arc::ptr_eq(&history, &actor.committed_history()));
         assert!(requests.is_empty());
         shutdown_manager(&manager);
     });
@@ -489,7 +483,7 @@ fn managed_child_approval_is_pinned(
                     failure.diagnostic
                 );
             }
-            let history = event_loop.sessions[index].coordinator.read().history();
+            let history = root_actor.committed_history();
             for message in history.iter() {
                 for block in &message.content {
                     if let ContentBlock::ToolResult {
@@ -618,7 +612,7 @@ fn managed_child_approval_is_pinned(
         );
         event_loop.sessions[index].app.checkpoint_now();
         let root_config = root_actor.effective_config().unwrap();
-        let root_history = event_loop.sessions[index].coordinator.read().history();
+        let root_history = root_actor.committed_history();
         let session = event_loop.sessions[index].id();
         let root_run = event_loop.sessions[index].app.run_id;
         let child_chat = event_loop.sessions[index]
@@ -850,10 +844,7 @@ fn managed_child_approval_is_pinned(
             &root_config,
             &root_actor.effective_config().unwrap()
         ));
-        assert!(Arc::ptr_eq(
-            &root_history,
-            &event_loop.sessions[index].coordinator.read().history()
-        ));
+        assert!(Arc::ptr_eq(&root_history, &root_actor.committed_history()));
         assert_eq!(event_loop.sessions[index].id(), session);
         assert_eq!(event_loop.sessions[index].app.run_id, root_run);
         shutdown_manager(&manager);

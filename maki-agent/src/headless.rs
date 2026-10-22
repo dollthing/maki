@@ -1247,7 +1247,6 @@ fn spawn_one_shot(
             params.input.thinking,
         ),
         persisted_options: Default::default(),
-        history: Vec::new(),
         model: Arc::from(spec),
         cwd: params.initial_wd.clone(),
         model_policy: Arc::clone(&params.model_policy),
@@ -1562,11 +1561,7 @@ mod tests {
         )
     }
 
-    fn coordinator(
-        session_id: MakiId,
-        history: Vec<Message>,
-        checkpoint: Checkpoint,
-    ) -> SessionCoordinatorHandle {
+    fn coordinator(session_id: MakiId, checkpoint: Checkpoint) -> SessionCoordinatorHandle {
         let model = test_params().model.spec();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id,
@@ -1580,7 +1575,6 @@ mod tests {
                 Default::default(),
             ),
             persisted_options: Default::default(),
-            history,
             model: Arc::from(model),
             cwd: PathBuf::from("/tmp"),
             model_policy: Arc::default(),
@@ -1596,7 +1590,7 @@ mod tests {
         provider: Arc<dyn Provider>,
     ) -> (InteractiveHandle, SessionCoordinatorHandle) {
         let session_id = MakiId::generate();
-        let coordinator = coordinator(session_id, history.clone(), checkpoint);
+        let coordinator = coordinator(session_id, checkpoint);
         let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
         let handle = spawn_interactive_with_binding(
             interactive_params(session_id, history),
@@ -1697,7 +1691,7 @@ mod tests {
                 },
             );
             let session_id = MakiId::generate();
-            let coordinator = coordinator(session_id, Vec::new(), checkpoint);
+            let coordinator = coordinator(session_id, checkpoint);
             let (provider, _) = recording();
             let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
             let mut params = interactive_params(session_id, Vec::new());
@@ -1790,16 +1784,8 @@ mod tests {
                 assert!(
                     matches!(terminal, ManualCompactionEvent::Failed(error) if error.contains(SAVE_ERROR))
                 );
-                assert_eq!(
-                    serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
-                    serde_json::to_value(&original).unwrap()
-                );
             } else {
                 assert_eq!(terminal, ManualCompactionEvent::Completed);
-                assert_ne!(
-                    serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
-                    serde_json::to_value(&original).unwrap()
-                );
             }
             let root = handle.initialized_root().await.unwrap();
             let actor = root.actor().unwrap();
@@ -1939,7 +1925,8 @@ mod tests {
             release.send_async(()).await.unwrap();
             bounded(primary.wait()).await;
             bounded(response.recv_async()).await.unwrap().unwrap();
-            assert!(coordinator.read().history().is_empty());
+            let root = handle.initialized_root().await.unwrap();
+            assert_eq!(root.actor().unwrap().committed_message_count(), 0);
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
         });
@@ -2215,7 +2202,7 @@ mod tests {
     #[test]
     fn spawn_stops_when_coordinator_registration_fails() {
         let session_id = MakiId::generate();
-        let existing = coordinator(session_id, Vec::new(), checkpoint());
+        let existing = coordinator(session_id, checkpoint());
         let error = match spawn_with_session_id(test_params(), session_id) {
             Ok(_) => panic!("duplicate registration succeeded"),
             Err(error) => error,

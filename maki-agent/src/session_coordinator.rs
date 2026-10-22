@@ -222,10 +222,8 @@ pub struct SessionReadHandle {
 }
 
 struct CoordinatorState {
-    history: HistorySnapshot<Message>,
     checkpoint_revision: u64,
     history_revision: u64,
-    acknowledged_history_revision: u64,
 }
 
 pub struct SessionCoordinatorParams {
@@ -233,7 +231,6 @@ pub struct SessionCoordinatorParams {
     pub catalog: SessionOptionCatalog,
     pub definitions: Vec<SessionOptionDefinition>,
     pub persisted_options: BTreeMap<String, String>,
-    pub history: Vec<Message>,
     pub model: Arc<str>,
     pub cwd: PathBuf,
     pub model_policy: Arc<ModelPolicy>,
@@ -686,8 +683,6 @@ impl SessionCoordinatorHandle {
         let runtime_epoch = self.generation;
         let registration = Arc::new(registration);
         let final_registration = Arc::clone(&registration);
-        let published_history = Arc::new(Mutex::new(None));
-        let finalized_history = Arc::clone(&published_history);
         Ok(PreparedTransaction {
             publication,
             publish: Box::new(move |snapshot, publication| {
@@ -703,9 +698,6 @@ impl SessionCoordinatorHandle {
                 let history = history_changed.then_some(snapshot.history);
                 let (version, history_revision) =
                     publish_read.next_version(options.version, history.is_some());
-                if let (Some(history), Some(revision)) = (&history, history_revision) {
-                    *lock(&published_history) = Some((history.clone(), revision));
-                }
                 let checkpoint = publish_read.checkpoint.checkpoint_guarded(
                     CheckpointRequest {
                         session_id,
@@ -738,9 +730,6 @@ impl SessionCoordinatorHandle {
             finalize: Box::new(move |commit| {
                 let _registration = final_registration;
                 (binding.project_config)(commit);
-                if let Some((history, revision)) = lock(&finalized_history).take() {
-                    read.acknowledge_history(history, revision);
-                }
                 reservation.commit(candidate);
             }),
         })
@@ -760,28 +749,14 @@ impl SessionCoordinatorHandle {
             snapshot: Arc::new(SessionCheckpoint {
                 kind: SessionCheckpointKind::History,
                 history_revision: Some(revision),
-                history: Some(history.clone()),
+                history: Some(history),
                 model: self.read.model(),
                 cwd: self.read.cwd(),
                 options,
                 config: None,
             }),
         });
-        let read = self.read.clone();
-        let session_id = self.session_id;
-        let (reply, response) = flume::bounded(1);
-        smol::spawn(async move {
-            let result = verify_ack(session_id, version, checkpoint)
-                .await
-                .map(|()| read.acknowledge_history(history, revision))
-                .map_err(Into::into);
-            let _ = reply.send(result);
-        })
-        .detach();
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(SessionCoordinatorError::StaleSession(session_id)))
+        Ok(verify_ack(self.session_id, version, checkpoint).await?)
     }
 
     async fn commit_actor_change(
@@ -1109,7 +1084,6 @@ impl PreparedSessionCoordinator {
             catalog,
             mut definitions,
             persisted_options,
-            history,
             model,
             cwd,
             model_policy,
@@ -1136,10 +1110,8 @@ impl PreparedSessionCoordinator {
             initial_model: model,
             initial_cwd: cwd,
             state: Arc::new(Mutex::new(CoordinatorState {
-                history: HistorySnapshot::new(history),
                 checkpoint_revision: 0,
                 history_revision: 0,
-                acknowledged_history_revision: 0,
             })),
         };
         let (tx, rx) = flume::unbounded();
@@ -1232,12 +1204,6 @@ impl SessionReadHandle {
     pub fn options(&self) -> SessionOptionsSnapshot {
         self.options.snapshot()
     }
-    pub fn history(&self) -> Arc<Vec<Message>> {
-        Arc::clone(&lock(&self.state).history.messages)
-    }
-    pub fn history_snapshot(&self) -> HistorySnapshot<Message> {
-        lock(&self.state).history.clone()
-    }
 
     fn config(&self) -> Option<Arc<EffectiveAgentConfig>> {
         let binding = lock(&self.binding).clone()?;
@@ -1272,14 +1238,6 @@ impl SessionReadHandle {
             },
             revision,
         )
-    }
-
-    fn acknowledge_history(&self, history: HistorySnapshot<Message>, revision: u64) {
-        let mut state = lock(&self.state);
-        if revision > state.acknowledged_history_revision {
-            state.acknowledged_history_revision = revision;
-            state.history = history;
-        }
     }
 }
 
@@ -1974,7 +1932,6 @@ mod tests {
                 ThinkingConfig::Off,
             ),
             persisted_options: BTreeMap::new(),
-            history: Vec::new(),
             model: Arc::from(OLD),
             cwd: PathBuf::from("/project"),
             model_policy: Arc::new(ModelPolicy::default()),
@@ -2598,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn history_replacement_checkpoints_before_publication() {
+    fn persisted_history_saves_a_history_checkpoint() {
         smol::block_on(async {
             let saved = Arc::new(Mutex::new(Vec::new()));
             let coordinator = SessionCoordinatorHandle::register(params(
@@ -2613,13 +2570,12 @@ mod tests {
             let mut history = HistorySnapshot::new(vec![Message::user("terminal".into())]);
             history.compacted = true;
             coordinator.persist_history(history.clone()).await.unwrap();
-            let acknowledged = coordinator.read().history_snapshot();
-            assert_eq!(acknowledged.epoch, history.epoch);
-            assert!(acknowledged.compacted);
             {
                 let saved = lock(&saved);
                 assert_eq!(saved[0].kind, SessionCheckpointKind::History);
-                assert_eq!(saved[0].history.as_ref().unwrap().epoch, history.epoch);
+                let saved_history = saved[0].history.as_ref().unwrap();
+                assert_eq!(saved_history.epoch, history.epoch);
+                assert!(saved_history.compacted);
                 assert!(saved[0].history_revision.is_some());
             }
             coordinator.close().await.unwrap();
