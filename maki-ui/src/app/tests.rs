@@ -1,6 +1,5 @@
 use super::shell::ShellEvent;
 use super::*;
-use crate::app::session_state::FastIntent;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
@@ -29,7 +28,7 @@ use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::{ContentBlock, Effort, Message, Role, ThinkingConfig, TokenUsage};
-use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
+use maki_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -7521,26 +7520,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_restored_from_session_meta() {
-    let tmp = TempDir::new().unwrap();
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-    let mut session = AppSession::new("test-model", "/tmp/test");
-    session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
-
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
-    assert_eq!(state.thinking, maki_domain::ThinkingConfig::Budget(4096));
-}
-
-fn set_opus_model(app: &mut App) {
-    app.state.model = maki_providers::Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-}
-
-#[test]
 fn deferred_fast_toggle_flash_says_when_it_applies() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -7551,47 +7530,6 @@ fn deferred_fast_toggle_flash_says_when_it_applies() {
         app.status_bar.flash_text(),
         Some("fast applies when this turn finishes")
     );
-}
-
-#[test]
-fn fast_toggle_on_off_on_opus() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
-    assert!(!app.state.fast.active());
-
-    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
-    assert!(app.state.fast.active());
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_ON_MSG));
-
-    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, false);
-    assert!(!app.state.fast.active());
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
-}
-
-fn pending_app() -> App {
-    let mut app = test_app();
-    app.state.model.supports_fast_override = Some(maki_providers::model::FastSupport::Pending);
-    app
-}
-
-#[test_case(false ; "kept")]
-#[test_case(true ; "cancelled")]
-fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
-    let mut app = pending_app();
-    app.set_fast(true).unwrap();
-    if cancel {
-        app.set_fast(false).unwrap();
-    }
-    assert!(!app.state.fast.active());
-    assert_eq!(app.state.fast.is_pending(), !cancel);
-    assert_eq!(app.build_meta().fast, !cancel);
-
-    let mut model = app.state.model.clone();
-    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
-    app.update_model(&model);
-    assert_eq!(app.state.fast.active(), !cancel);
-    assert!(!app.state.fast.is_pending());
-    assert_eq!(app.build_meta().fast, !cancel);
 }
 
 #[test]
@@ -7618,35 +7556,6 @@ fn model_switch_updates_active_run_status() {
     assert!(status.contains(SWITCHED_MODEL_SPEC));
     assert!(status.contains(&maki_providers::format_tokens(expected_context_window)));
     assert!(!status.contains(&maki_providers::format_tokens(INITIAL_CONTEXT_WINDOW)));
-}
-
-#[test]
-fn fast_command_flashes_pending_while_discovery_runs() {
-    let mut app = pending_app();
-    for (enabled, expected) in [(true, FAST_PENDING_MSG), (false, FAST_OFF_MSG)] {
-        app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, enabled);
-        assert_eq!(app.status_bar.flash_text(), Some(expected));
-        assert!(!app.state.fast.active());
-    }
-    assert!(!app.state.fast.is_pending());
-}
-
-#[test]
-fn workflow_toggle_flows_into_agent_input() {
-    let mut app = test_app();
-    let msg = QueuedMessage {
-        text: "hi".into(),
-        images: Vec::new(),
-    };
-    assert!(!app.build_agent_input(&msg).workflow);
-
-    app.apply_toggled_option(maki_agent::session_options::WORKFLOW_OPTION_ID, true);
-    assert!(app.build_agent_input(&msg).workflow);
-    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
-
-    app.apply_toggled_option(maki_agent::session_options::WORKFLOW_OPTION_ID, false);
-    assert!(!app.build_agent_input(&msg).workflow);
-    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
 }
 
 /// Workflow sessions have synthetic ids that no ToolDone matches, so
@@ -7916,61 +7825,6 @@ fn failed_subagent_is_presented_without_ui_delivery(parent_is_root: bool, auto_d
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
     assert!(app.queue.text_messages().is_empty());
-}
-
-#[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
-#[test_case("openai/gpt-5.5" ; "non_anthropic")]
-fn fast_flashes_error_on_ineligible_model(spec: &str) {
-    let mut app = test_app();
-    app.state.model = maki_providers::Model::from_spec(spec).unwrap();
-
-    assert!(app.set_fast(true).is_err());
-    assert!(!app.state.fast.active());
-}
-
-#[test]
-fn fast_restored_from_session_meta() {
-    let tmp = TempDir::new().unwrap();
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-    let mut session = AppSession::new("anthropic/claude-opus-4-8", "/tmp/test");
-    session.meta.fast = true;
-
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
-    assert!(state.fast.active());
-}
-
-#[test]
-fn fast_normalized_off_when_restored_onto_ineligible_model() {
-    let tmp = TempDir::new().unwrap();
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-    // Saved as fast=true, but sonnet cannot do fast mode, so restoring must drop
-    // it to false or the UI would show a phantom [fast] badge.
-    let mut session = AppSession::new("anthropic/claude-sonnet-4-5", "/tmp/test");
-    session.meta.fast = true;
-
-    let state = SessionState::from_session(
-        session,
-        &test_model(),
-        &storage,
-        &maki_config::ModelPolicy::default(),
-    );
-    assert!(!state.fast.active());
-}
-
-#[test]
-fn update_model_to_ineligible_resets_fast() {
-    let mut app = test_app();
-    set_opus_model(&mut app);
-    app.state.fast = FastIntent::Active;
-
-    let sonnet = maki_providers::Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
-    app.state.update_model(&sonnet);
-    assert!(!app.state.fast.active());
 }
 
 #[test]

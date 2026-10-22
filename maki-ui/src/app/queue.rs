@@ -5,9 +5,10 @@ use maki_agent::actor::{
     AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use maki_agent::{AgentId, AgentInput, AgentRef};
+use maki_agent::{AgentId, AgentInput, AgentRef, EffectiveAgentConfig};
 use maki_commands::COMPACT_COMMAND_NAME;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::{Action, App, Status};
 
@@ -147,6 +148,10 @@ impl MessageQueue {
         if !self.child_selected {
             self.unfocus();
         }
+    }
+
+    pub(crate) fn root_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
+        self.shared.as_ref()?.effective_config()
     }
 
     pub(crate) fn root_text_messages(&self) -> Vec<String> {

@@ -206,14 +206,15 @@ impl App {
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
         // `msg.text` is already `@`-expanded at submit time (`submit_prompt`);
         // no second expansion here.
+        let config = self.root_config();
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
-            thinking: self.state.thinking,
-            fast: self.state.fast.active(),
-            workflow: self.state.workflow,
+            thinking: config.thinking,
+            fast: config.fast,
+            workflow: config.workflow,
             prompt: None,
             cancel: None,
         }

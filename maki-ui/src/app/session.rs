@@ -147,6 +147,7 @@ impl App {
     /// and an empty `Vec` does not allocate.
     pub(super) fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
+        let config = self.root_config();
         let draft = self.input_box.buffer.value();
         SessionMeta {
             compacted: state.session.meta.compacted,
@@ -161,9 +162,9 @@ impl App {
             } else {
                 self.recoverable_queue.clone()
             },
-            thinking: Some(state.thinking.into()),
-            fast: state.fast_intent(),
-            workflow: state.workflow,
+            thinking: Some(config.thinking.into()),
+            fast: config.fast || state.fast_pending,
+            workflow: config.workflow,
             yolo: self.permissions.persisted_yolo(),
             session_options: Default::default(),
         }
@@ -329,9 +330,10 @@ impl App {
         let mut session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
         session.meta.mode = Some(self.state.mode.clone().into());
         session.meta.session_rules = self.state.session.meta.session_rules.clone();
-        session.meta.thinking = Some(self.state.thinking.into());
-        session.meta.fast = self.state.fast_intent();
-        session.meta.workflow = self.state.workflow;
+        let config = self.root_config();
+        session.meta.thinking = Some(config.thinking.into());
+        session.meta.fast = config.fast || self.state.fast_pending;
+        session.meta.workflow = config.workflow;
         session.meta.yolo = self.permissions.persisted_yolo();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {

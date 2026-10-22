@@ -127,9 +127,7 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
-const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
 const FAST_ON_MSG: &str = "Fast mode: on";
-const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
@@ -407,6 +405,8 @@ pub struct App {
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
+    /// The config the root was seeded with, shown until the root answers.
+    seed_config: Arc<maki_agent::EffectiveAgentConfig>,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
@@ -607,6 +607,7 @@ impl App {
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
+            seed_config: Arc::new(config),
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
@@ -699,6 +700,7 @@ impl App {
             model,
             PathBuf::from(&session.cwd),
             &lua_event_handle.mode_registry(),
+            &storage,
         );
         Self::prepare(
             config,
@@ -733,21 +735,20 @@ impl App {
     /// exactly one source so a frame cannot show one source's thinking next to
     /// another's fast flag.
     pub(crate) fn displayed_config(&self, chat_index: usize) -> ConfigSource {
-        let chat = &self.chats[chat_index];
         if let Some(config) = self.focused_config() {
             ConfigSource::Actor(config)
-        } else if let Some(options) = chat.opts {
-            ConfigSource::Chat {
-                options,
-                workflow: self.state.workflow,
-            }
+        } else if chat_index == 0 {
+            ConfigSource::Actor(self.root_config())
         } else {
-            ConfigSource::Seed {
-                thinking: self.state.thinking,
-                fast: self.state.fast,
-                workflow: self.state.workflow,
-            }
+            ConfigSource::Chat(self.chats[chat_index].opts.unwrap_or_default())
         }
+    }
+
+    /// The root's committed config, or the seed before the root is bound.
+    pub(crate) fn root_config(&self) -> Arc<maki_agent::EffectiveAgentConfig> {
+        self.queue
+            .root_config()
+            .unwrap_or_else(|| Arc::clone(&self.seed_config))
     }
 
     pub(super) fn focused_model_spec(&self) -> String {
@@ -892,15 +893,6 @@ impl App {
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
-    }
-
-    pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
-        let model = &self.state.model;
-        if fast && !model.supports_fast() && !model.fast_pending() {
-            return Err(FAST_UNSUPPORTED_MSG.into());
-        }
-        self.state.set_fast(fast);
-        Ok(())
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -2711,17 +2703,10 @@ impl App {
                 }
             }
             FAST_OPTION_ID => {
-                let _ = self.set_fast(enabled);
-                if self.state.fast.is_pending() {
-                    FAST_PENDING_MSG
-                } else if self.state.fast.active() {
-                    FAST_ON_MSG
-                } else {
-                    FAST_OFF_MSG
-                }
+                self.state.fast_pending = false;
+                if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }
             }
             WORKFLOW_OPTION_ID => {
-                self.state.workflow = enabled;
                 if enabled {
                     WORKFLOW_ON_MSG
                 } else {

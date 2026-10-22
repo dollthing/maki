@@ -83,7 +83,7 @@ use crate::agent::{
     SystemPromptOverride, shared_queue::QueueItem,
 };
 use crate::app::EMPTY_PROMPT_ERR;
-use crate::app::session_state::{FastIntent, SessionState};
+use crate::app::session_state::SessionState;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
@@ -755,9 +755,6 @@ fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::
 
 fn project_actor_config(app: &mut App, config: &maki_agent::EffectiveAgentConfig) {
     app.update_model(&config.model);
-    app.state.thinking = config.thinking;
-    app.state.fast = FastIntent::clamp(config.fast, &config.model);
-    app.state.workflow = config.workflow;
     let mode = match &config.mode {
         maki_agent::AgentMode::Build => {
             app.state.plan = crate::app::mode::PlanState::None;
@@ -1578,6 +1575,7 @@ impl SpawnCtx {
                 &model,
                 cwd.clone(),
                 &self.lua_event_handle.mode_registry(),
+                &self.storage,
             )
         });
         let mut app = App::prepare(
@@ -3826,13 +3824,14 @@ impl<'t> EventLoop<'t> {
     fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
         let rt = &self.sessions[idx];
         let app = &rt.app;
+        let config = app.root_config();
         let snapshot = SessionSnapshot {
             id: rt.id().to_string(),
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
             model: app.state.model.spec(),
-            fast: app.state.fast.active(),
-            thinking: app.state.thinking.to_string(),
+            fast: config.fast,
+            thinking: config.thinking.to_string(),
             mode: if app.state.mode == crate::app::mode::Mode::Plan {
                 MODE_PLAN
             } else {
@@ -5887,9 +5886,9 @@ mod tests {
             };
             complete_option_toggle(&mut changed.app, id, enabled);
 
-            assert!(changed.app.state.workflow);
+            assert!(changed.app.root_config().workflow);
             assert!(changed_actor.effective_config().unwrap().workflow);
-            assert!(!untouched.app.state.workflow);
+            assert!(!untouched.app.root_config().workflow);
             assert_eq!(untouched.app.state.session.model, initial_app_model);
             let untouched_config = untouched_actor.effective_config().unwrap();
             assert_eq!(untouched_config.settings.model.spec(), initial_actor_model);
@@ -6181,7 +6180,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_read_observes_commit_before_ui_projection() {
+    fn managed_read_observes_committed_option() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             let (tx, rx) = flume::unbounded();
@@ -6196,7 +6195,6 @@ mod tests {
                 panic!("expected option completion");
             };
             result.unwrap();
-            assert!(!runtime.app.state.workflow);
             assert!(runtime.config().unwrap().workflow);
             let model = config_model_state(&runtime.config().unwrap());
             assert_eq!(model["spec"], runtime.config().unwrap().model.spec());
@@ -6313,7 +6311,7 @@ mod tests {
                     Some(latest.generation)
                 );
                 assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
-                assert!(event_loop.sessions[0].app.state.workflow);
+                assert!(event_loop.sessions[0].app.root_config().workflow);
                 drop(observer);
             })
         });
@@ -6377,7 +6375,7 @@ mod tests {
                     },
                 };
                 let mut replacement = test_runtime(model_named("replacement-model"));
-                let replacement_thinking = replacement.app.state.thinking;
+                let replacement_thinking = replacement.app.root_config().thinking;
                 let (replacement_manager, replacement_root) =
                     replacement.handles.manager_and_root();
                 let replacement_actor = replacement_manager.actor(replacement_root).unwrap();
@@ -6399,8 +6397,8 @@ mod tests {
                     model_named("replacement-model").spec()
                 );
                 assert_eq!(app.state.mode.id_key(), "build");
-                assert_eq!(app.state.thinking, replacement_thinking);
-                assert!(!app.state.workflow);
+                assert_eq!(app.root_config().thinking, replacement_thinking);
+                assert!(!app.root_config().workflow);
                 assert_eq!(event_loop.sessions[0].projected_config_generation, None);
                 let final_config = replacement_actor.config_snapshot().unwrap();
                 assert_eq!(final_config.generation, initial_config.generation);
@@ -8030,7 +8028,7 @@ mod tests {
         drain_config_commits(&mut runtime);
 
         assert!(runtime.app.permissions.is_yolo());
-        assert!(runtime.app.state.workflow);
+        assert!(runtime.app.root_config().workflow);
         let (manager, root) = runtime.handles.manager_and_root();
         let policy = manager.effective_config(root).unwrap().unwrap();
         assert_eq!(policy.model.spec(), runtime.model_slot.load().model.spec());

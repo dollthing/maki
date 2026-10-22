@@ -9,7 +9,7 @@ use maki_agent::actor::{
     ActorError, AgentActorHandle, PendingQueueEntry, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use maki_agent::{AgentInput, ImageSource};
+use maki_agent::{AgentInput, EffectiveAgentConfig, ImageSource};
 use tracing::warn;
 
 use crate::components::input::Submission;
@@ -109,6 +109,10 @@ impl QueueSender {
             },
         )?;
         Ok(())
+    }
+
+    pub(crate) fn effective_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
+        self.actor.effective_config()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
