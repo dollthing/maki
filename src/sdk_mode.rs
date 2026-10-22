@@ -1265,7 +1265,11 @@ pub fn run(params: SdkParams) -> Result<()> {
         coordinator
             .close()
             .await
-            .map_err(|error| eyre!("close session coordinator: {error}"))
+            .map_err(|error| eyre!("close session coordinator: {error}"))?;
+        checkpoint
+            .drain()
+            .await
+            .map_err(|error| eyre!("drain session checkpoint: {error}"))
     })?;
     drop(lock_guard);
     drop(writer);
