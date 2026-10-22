@@ -837,7 +837,7 @@ mod tests {
             },
         )
         .unwrap();
-        let handle = crate::headless::spawn_command_fixture(
+        let handle = crate::headless::tests::command_fixture(
             Model::from_spec(model).unwrap(),
             coordinator.clone(),
         );

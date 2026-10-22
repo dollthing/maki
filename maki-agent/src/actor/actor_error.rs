@@ -18,8 +18,6 @@ pub enum ActorError {
     InvalidConfig(String),
     #[error(transparent)]
     UnsupportedOption(#[from] crate::session_options::SessionOptionError),
-    #[error("configuration preparation expired")]
-    ConfigExpired,
     #[error("transcript caps must be 1..=1000 messages and 2..=1048576 bytes")]
     InvalidTranscriptCaps,
     #[error("turn is still pending: {0}")]

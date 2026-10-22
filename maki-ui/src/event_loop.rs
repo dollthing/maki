@@ -118,6 +118,7 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
+const CONFIG_EXPIRED_ERR: &str = "configuration preparation expired";
 const UNSUPPORTED_AGENT_OPTION_PREFIX: &str = "unsupported agent option";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
@@ -5452,7 +5453,7 @@ where
     .await
     {
         Some(result) => result,
-        None if publication.cancel() => Err(maki_agent::ActorError::ConfigExpired.to_string()),
+        None if publication.cancel() => Err(CONFIG_EXPIRED_ERR.to_owned()),
         None => operation.await,
     }
 }
@@ -6219,10 +6220,7 @@ mod tests {
                     .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
             );
             expire_tx.send(()).unwrap();
-            assert_eq!(
-                pending.await.err().unwrap(),
-                maki_agent::ActorError::ConfigExpired.to_string()
-            );
+            assert_eq!(pending.await.err().unwrap(), CONFIG_EXPIRED_ERR);
             assert!(successor.await.unwrap().config.config.workflow);
             release_tx.send(()).unwrap();
             finished_rx.recv_async().await.unwrap();

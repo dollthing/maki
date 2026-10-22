@@ -1256,15 +1256,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-pub(crate) fn spawn_command_fixture(
-    model: Model,
-    coordinator: SessionCoordinatorHandle,
-) -> InteractiveHandle {
-    tests::command_fixture(model, coordinator)
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::TurnOutcome;
     use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
@@ -1445,7 +1437,7 @@ mod tests {
         }
     }
 
-    pub(super) fn command_fixture(
+    pub(crate) fn command_fixture(
         model: Model,
         coordinator: SessionCoordinatorHandle,
     ) -> InteractiveHandle {

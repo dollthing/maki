@@ -1632,24 +1632,6 @@ fn release_operation(pending: &PendingState, operation_id: u64, kind: OperationK
     finish_operation(pending, operation_id, kind, |_| {});
 }
 
-#[cfg(test)]
-fn take_operation(
-    pending: &PendingState,
-    operation_id: u64,
-    kind: OperationKind,
-) -> Option<RequestId> {
-    let mut request_id = None;
-    finish_operation(pending, operation_id, kind, |id| request_id = Some(id));
-    request_id
-}
-
-#[cfg(test)]
-fn take_active_operation(pending: &PendingState, kind: OperationKind) -> Option<RequestId> {
-    let mut request_id = None;
-    finish_active_operation(pending, kind, |id| request_id = Some(id));
-    request_id
-}
-
 fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
     send(
         out_tx,
@@ -2621,6 +2603,22 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    fn take_operation(
+        pending: &PendingState,
+        operation_id: u64,
+        kind: OperationKind,
+    ) -> Option<RequestId> {
+        let mut request_id = None;
+        finish_operation(pending, operation_id, kind, |id| request_id = Some(id));
+        request_id
+    }
+
+    fn take_active_operation(pending: &PendingState, kind: OperationKind) -> Option<RequestId> {
+        let mut request_id = None;
+        finish_active_operation(pending, kind, |id| request_id = Some(id));
+        request_id
     }
 
     fn test_params(model: Model, cwd: PathBuf) -> AcpParams {
