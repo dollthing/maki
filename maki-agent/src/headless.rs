@@ -16,6 +16,7 @@ use maki_providers::provider::{self, BoxFuture, Provider};
 use maki_providers::{RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::actor::{AdmissionPreparation, AgentContextSnapshot, ConfigChange, PreparedTurn};
 use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
@@ -42,6 +43,7 @@ use crate::{
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_CLOSED: &str = "session ended before initialization";
+const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -658,10 +660,8 @@ impl ActorBackend for HeadlessBackend {
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
             let config = match self.config(&context).await {
                 Ok(config) => config,
-                Err(message) => {
-                    let _ = self
-                        .event_sender(&context)
-                        .send(AgentEvent::ControlError { message });
+                Err(error) => {
+                    warn!(%turn_id, %error, "headless turn setup failed");
                     return BackendResult::SetupFailed {
                         agent_id: context.agent_id,
                         turn_id,
@@ -696,18 +696,29 @@ impl ActorBackend for HeadlessBackend {
             .with_mcp(self.mcp.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
-            if self.persist
-                && let Err(error) = persist_history(
+            if !self.persist {
+                return BackendResult::EnteredRun(outcome);
+            }
+            let persisted = future::or(
+                persist_history(
                     self.params.session_id.as_ref().unwrap().id(),
                     history.snapshot().clone(),
-                )
-                .await
-            {
-                let _ = event_tx.send(AgentEvent::ControlError {
-                    message: format!("failed to checkpoint completed turn: {error}"),
-                });
+                ),
+                async {
+                    smol::Timer::after(self.params.timeouts.low_speed).await;
+                    Err(TERMINAL_CHECKPOINT_TIMEOUT.to_owned())
+                },
+            )
+            .await;
+            match persisted {
+                Ok(()) => BackendResult::EnteredRun(outcome),
+                Err(error) => {
+                    let _ = event_tx.send(AgentEvent::ControlError {
+                        message: format!("failed to checkpoint completed turn: {error}"),
+                    });
+                    BackendResult::Reported(outcome)
+                }
             }
-            BackendResult::EnteredRun(outcome)
         })
     }
 
@@ -1674,12 +1685,16 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_failure_after_terminal_is_forwarded_to_frontend() {
+    #[test_case(false, SAVE_ERROR ; "checkpoint_failure_replaces_the_outcome_with_one_error")]
+    #[test_case(true, TERMINAL_CHECKPOINT_TIMEOUT ; "hung_checkpoint_times_out_into_one_error")]
+    fn checkpoint_failure_after_terminal_is_forwarded_to_frontend(hang: bool, expected: &str) {
         smol::block_on(async {
             let checkpoint: Checkpoint = Arc::new(
-                |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
                     Box::pin(async move {
+                        if hang {
+                            future::pending::<()>().await;
+                        }
                         Err(CheckpointError::Save {
                             session_id: request.session_id,
                             message: Arc::from(SAVE_ERROR),
@@ -1687,22 +1702,43 @@ mod tests {
                     }) as CheckpointFuture
                 },
             );
+            let session_id = MakiId::generate();
+            let coordinator = coordinator(session_id, Vec::new(), checkpoint);
             let (provider, _) = recording();
-            let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
+            let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let mut params = interactive_params(session_id, Vec::new());
+            if hang {
+                params.timeouts.low_speed = Duration::ZERO;
+            }
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+                None,
+                Some(binding),
+            );
             let ticket = handle.input_tx.admit(test_params().input).await.unwrap();
             assert!(matches!(
                 bounded(ticket.wait()).await,
                 TurnOutcome::Completed { .. }
             ));
-            let events: Vec<_> = handle.event_rx.try_iter().collect();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
-                    .count(),
-                1
+            let terminals: Vec<_> = handle
+                .event_rx
+                .try_iter()
+                .filter(|envelope| {
+                    matches!(
+                        envelope.event,
+                        AgentEvent::TurnOutcome(_) | AgentEvent::ControlError { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    terminals.as_slice(),
+                    [Envelope { event: AgentEvent::ControlError { message }, .. }]
+                        if message.contains(expected)
+                ),
+                "{terminals:?}"
             );
-            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::ControlError { message } if message.contains(SAVE_ERROR))).count(), 1);
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
         });

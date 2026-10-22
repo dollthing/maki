@@ -2200,6 +2200,7 @@ mod tests {
     const SDK_CHILD_RESPONSE: &str = "sdk child response";
     const SDK_GRANDCHILD_RESPONSE: &str = "sdk grandchild response";
     const SDK_SETTLEMENT_TIMEOUT: &str = "SDK managed turn did not settle";
+    const CHECKPOINT_FAILED: &str = "checkpoint failed";
 
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
     const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
@@ -3945,8 +3946,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persistence_error_after_outcome_emits_one_result_and_warning() {
+    #[test_case(true ; "persistence_error_after_outcome_emits_one_result_and_warning")]
+    #[test_case(false ; "persistence_error_instead_of_outcome_emits_one_error_result")]
+    fn persistence_error_emits_exactly_one_result(outcome_first: bool) {
         let (out_tx, out_rx) = flume::unbounded();
         let mut pump = EventPump {
             writer: SdkWriter {
@@ -3973,26 +3975,36 @@ mod tests {
             session_id: "test".into(),
             snapshot: HeadlessSnapshot::default(),
         };
-        let outcome = TurnOutcome::completed(
-            maki_agent::AgentId::generate(),
-            maki_agent::TurnId::generate(),
-            TokenUsage::default(),
+        let agent_id = maki_agent::AgentId::generate();
+        let turn_id = maki_agent::TurnId::generate();
+        let identity = Some(maki_agent::ActorWorkIdentity::new(
+            agent_id,
+            maki_agent::ActorWorkKind::Turn {
+                operation_id: 0,
+                turn_id,
+            },
             1,
-            maki_agent::DoneReason::EndTurn,
-        );
-
-        pump.handle(Envelope {
-            event: AgentEvent::TurnOutcome(outcome),
-            subagent: None,
-            identity: None,
-        })
-        .unwrap();
+        ));
+        if outcome_first {
+            pump.handle(Envelope {
+                event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+                    agent_id,
+                    turn_id,
+                    TokenUsage::default(),
+                    1,
+                    maki_agent::DoneReason::EndTurn,
+                )),
+                subagent: None,
+                identity,
+            })
+            .unwrap();
+        }
         pump.handle(Envelope {
             event: AgentEvent::ControlError {
-                message: "checkpoint failed".into(),
+                message: CHECKPOINT_FAILED.into(),
             },
             subagent: None,
-            identity: None,
+            identity,
         })
         .unwrap();
 
@@ -4007,11 +4019,17 @@ mod tests {
                 .count(),
             1
         );
-        assert!(records.iter().any(|record| {
+        let warned = records.iter().any(|record| {
             record["type"] == "system"
                 && record["subtype"] == "warning"
-                && record["message"] == "checkpoint failed"
-        }));
+                && record["message"] == CHECKPOINT_FAILED
+        });
+        let failed = records.iter().any(|record| {
+            record["type"] == "result"
+                && record["is_error"] == true
+                && record["result"] == CHECKPOINT_FAILED
+        });
+        assert_eq!((warned, failed), (outcome_first, !outcome_first));
     }
 
     #[test]

@@ -461,9 +461,16 @@ impl Runner {
             (None, None) => backend.await,
             _ => unreachable!("managed guard and context are created together"),
         };
-        let history_ready = matches!(&result, BackendResult::EnteredRun(_));
+        let history_ready = matches!(
+            &result,
+            BackendResult::EnteredRun(_) | BackendResult::Reported(_)
+        );
         let (outcome, deliver) = match result {
             BackendResult::EnteredRun(outcome) => (outcome, true),
+            BackendResult::Reported(outcome) => {
+                admission.ticket.output().take_terminal_sender();
+                (outcome, false)
+            }
             // A setup failure never entered a run: synthesize one Failed
             // outcome and attempt its single delivery.
             BackendResult::SetupFailed { .. } => (

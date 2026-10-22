@@ -126,6 +126,10 @@ pub struct TurnContext {
 pub enum BackendResult {
     /// The backend entered the run and produced a real outcome.
     EnteredRun(TurnOutcome),
+    /// The run entered, but the backend already reported its terminal to the
+    /// frontend (a failed terminal checkpoint). The ticket settles with this
+    /// outcome and no `TurnOutcome` event is sent.
+    Reported(TurnOutcome),
     /// Setup failed before the run entered; the actor synthesizes one
     /// `TurnOutcome::Failed` for the admission and delivers it once.
     SetupFailed {

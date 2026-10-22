@@ -36,8 +36,8 @@ use crate::tools::{
     ToolSource,
 };
 use crate::types::{
-    ActorWorkIdentity, ActorWorkKind, AgentId, DoneReason, EventSender, TurnCancellationReason,
-    TurnId, TurnOutcome,
+    ActorWorkIdentity, ActorWorkKind, AgentId, DoneReason, Envelope, EventSender,
+    TurnCancellationReason, TurnId, TurnOutcome,
 };
 use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
 use std::borrow::Cow;
@@ -1762,10 +1762,20 @@ fn failed_actor_is_reusable() {
         let backend = ScriptedBackend::failing_setup();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let a = handle.admit_turn(input("one"), None, "a".into()).unwrap();
-        // The actor synthesizes and delivers exactly one Failed outcome.
+        let (sink, delivered) = flume::unbounded();
+        let a = handle
+            .admit_turn(input("one"), Some(EventSender::new(sink)), "a".into())
+            .unwrap();
+        // The actor synthesizes and delivers exactly one Failed outcome,
+        // stamped with the admitted work so frontends can fence on it.
         let outcome = a.wait().await;
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
+        let terminals: Vec<_> = delivered.try_iter().collect();
+        assert!(matches!(
+            terminals.as_slice(),
+            [Envelope { event: AgentEvent::TurnOutcome(TurnOutcome::Failed { .. }), identity: Some(identity), .. }]
+                if identity.turn_id() == Some(a.turn_id())
+        ));
 
         // Reuse: the second turn succeeds.
         let b = handle.admit_turn(input("two"), None, "b".into()).unwrap();

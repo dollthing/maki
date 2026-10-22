@@ -1318,9 +1318,10 @@ fn retire_and_publish(
     settle_runner: bool,
     history_ready: bool,
 ) {
-    let presentation = admission
-        .filter(|_| deliver)
-        .and_then(|admission| admission.event_sender.as_ref());
+    let presentation = admission.filter(|_| deliver).and_then(|admission| {
+        let sender = admission.event_sender.as_ref()?;
+        Some(sender.with_identity_of(sender.identity().or(Some(admission.work))))
+    });
     let mut outcome = outcome;
     if let Some(ticket) = retire_turn(
         inner,
@@ -1346,7 +1347,7 @@ fn retire_and_publish(
         let registered_sender = ticket
             .as_ref()
             .and_then(|ticket| ticket.output().take_terminal_sender());
-        if let Some(sender) = registered_sender.as_ref().or(presentation) {
+        if let Some(sender) = registered_sender.or(presentation) {
             let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
         }
         if let Some(ticket) = &ticket {
