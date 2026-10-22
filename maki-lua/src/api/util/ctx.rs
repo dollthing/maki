@@ -798,7 +798,7 @@ mod tests {
                 assert!(publication.is_cancelled());
             } else {
                 assert!(!publication.is_cancelled());
-                assert!(publication.finish_commit());
+                assert!(!publication.try_publish());
             }
         }
     }
@@ -827,7 +827,7 @@ mod tests {
         assert_eq!(publication.is_cancelled(), !claim_first);
         assert!(!aborted.is_cancelled());
         if claim_first {
-            assert!(publication.finish_commit());
+            assert!(!publication.try_publish());
         } else {
             assert_eq!(
                 claim(&publication).unwrap_err().as_ref(),

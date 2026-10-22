@@ -470,7 +470,7 @@ mod tests {
         }
         trigger.cancel();
         assert_eq!(publication.is_cancelled(), !claim_first);
-        assert_eq!(publication.finish_commit(), claim_first);
+        assert!(!publication.try_publish());
         drop(registration);
         assert!(token.0.state.lock().unwrap().publications.is_empty());
     }

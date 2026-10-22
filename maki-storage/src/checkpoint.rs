@@ -51,10 +51,6 @@ impl CheckpointPublication {
             .is_ok()
     }
 
-    pub fn finish_commit(&self) -> bool {
-        self.try_publish() || self.0.phase.load(Ordering::Acquire) == PUBLISHING
-    }
-
     pub async fn cancelled(&self) {
         loop {
             let listener = self.0.cancelled.listen();
