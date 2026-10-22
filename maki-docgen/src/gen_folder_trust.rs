@@ -30,9 +30,7 @@ Trust, `n` answers Not now, and "Never" needs the arrow keys and Enter. Ctrl-C
 exits Makima. A project that ships no gated file is never asked about.
 
 One answer covers one project root: the active Git checkout, or the working
-directory outside Git. Linked worktrees answer for themselves. Starting Makima in
-your home directory loads no project configuration, because `~/.makima` there is
-your global configuration.
+directory outside Git. Linked worktrees answer for themselves.
 
 ## What Trust Does Not Cover
 
