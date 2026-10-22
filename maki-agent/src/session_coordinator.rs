@@ -22,7 +22,7 @@ use crate::actor::{
     PreparedTransaction,
 };
 use crate::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
-use crate::config_change::{ConfigChangeError, ConfigChangeTicket, prepare_patch};
+use crate::config_change::{ConfigChangeError, ConfigChangeTicket, prepare_patch, reserve_in_turn};
 use crate::manager::AgentRef;
 use crate::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
@@ -776,7 +776,14 @@ impl SessionCoordinatorHandle {
                 (None, patch)
             }
             _ => {
-                let reservation = self.reserve_options(version)?;
+                let binding = lock(&self.read.binding).clone();
+                let reservation = match binding {
+                    Some(binding) => {
+                        reserve_in_turn(&binding.agent, || Ok(self.reserve_options(version)?))
+                            .await?
+                    }
+                    None => self.reserve_options(version)?,
+                };
                 let (reply, response) = flume::bounded(1);
                 self.tx
                     .send(Operation::SetOption {
@@ -2224,11 +2231,13 @@ mod tests {
                         coordinator.read.options.try_reserve(None),
                         Err(SessionOptionError::Busy)
                     ));
-                    assert!(matches!(
-                        coordinator.set_option(YOLO_OPTION_ID, value).await,
-                        Err(ConfigChangeError::Coordinator(SessionCoordinatorError::SessionBusy(id)))
-                            if id == coordinator.session_id
-                    ));
+                    assert!(
+                        futures_lite::future::poll_once(
+                            coordinator.set_option(YOLO_OPTION_ID, value)
+                        )
+                        .await
+                        .is_none()
+                    );
                 }
             }
             assert_eq!(lock(&saved).len(), 2);
@@ -2590,6 +2599,32 @@ mod tests {
     }
 
     #[test]
+    fn option_set_waits_for_the_lease_instead_of_failing_busy() {
+        smol::block_on(async {
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let coordinator = SessionCoordinatorHandle::register(params(
+                MakiId::generate(),
+                Arc::new(GuardedWriter {
+                    fail: false,
+                    saved: Arc::clone(&saved),
+                }),
+            ))
+            .unwrap();
+            let _agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
+            let lease = coordinator.reserve_options(None).unwrap();
+            let mut set = std::pin::pin!(coordinator.set_option(YOLO_OPTION_ID, ENABLED_VALUE));
+            assert!(futures_lite::future::poll_once(&mut set).await.is_none());
+            drop(lease);
+            set.await.unwrap();
+            assert!(coordinator.read().options().options.iter().any(|option| {
+                option.definition.id.as_ref() == YOLO_OPTION_ID
+                    && option.current_value.as_ref() == ENABLED_VALUE
+            }));
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn revoked_model_preparation_does_not_install_or_checkpoint() {
         smol::block_on(async {
             let saved = Arc::new(Mutex::new(Vec::new()));
@@ -2638,12 +2673,13 @@ mod tests {
                 }
             });
             started_rx.recv_async().await.unwrap();
-            assert!(matches!(
-                coordinator.set_option(YOLO_OPTION_ID, ENABLED_VALUE).await,
-                Err(ConfigChangeError::Coordinator(
-                    SessionCoordinatorError::SessionBusy(_)
-                ))
-            ));
+            assert!(
+                futures_lite::future::poll_once(
+                    coordinator.set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                )
+                .await
+                .is_none()
+            );
             publication.cancel();
             release_tx.send_async(()).await.unwrap();
             assert!(operation.await.is_err());

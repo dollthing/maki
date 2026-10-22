@@ -5511,7 +5511,7 @@ mod tests {
     }
 
     #[test]
-    fn rapid_double_toggle_preserves_both_intents() {
+    fn toggle_behind_a_held_lease_waits_and_keeps_both_intents() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
             let id = runtime.id();
@@ -5522,20 +5522,13 @@ mod tests {
                 .reserve_transaction(CheckpointPublication::default())
                 .unwrap();
             dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
-            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected busy toggle completion");
-            };
-            assert_eq!(
-                result.unwrap_err(),
-                maki_agent::session_coordinator::SessionCoordinatorError::SessionBusy(id)
-                    .to_string()
-            );
             drop(reservation);
 
             let mut committed = Vec::new();
-            for _ in 0..2 {
-                dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
+            for index in 0..2 {
+                if index > 0 {
+                    dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
+                }
                 let InternalEvent::SessionOp {
                     session,
                     kind:

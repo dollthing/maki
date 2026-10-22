@@ -112,6 +112,31 @@ impl Drop for QueuedChange {
     }
 }
 
+/// Takes {target}'s place in its config FIFO for a change that holds only the
+/// durable lease, not an actor operation: it waits behind changes already
+/// queued and retries {reserve} after each release, so it neither fails Busy
+/// nor overtakes a waiting change.
+pub async fn reserve_in_turn<T>(
+    target: &AgentRef,
+    mut reserve: impl FnMut() -> Result<T, ConfigChangeError>,
+) -> Result<T, ConfigChangeError> {
+    let actor = target.actor()?;
+    if waiting(&actor).is_empty() {
+        match reserve() {
+            Err(error) if error.is_busy() => {}
+            result => return result,
+        }
+    }
+    let place = QueuedChange::enqueue(actor);
+    place.wait_turn().await;
+    loop {
+        match reserve() {
+            Err(error) if error.is_busy() => error.wait_released(&place.actor).await,
+            result => return result,
+        }
+    }
+}
+
 fn waiting(actor: &AgentActorHandle) -> MutexGuard<'_, VecDeque<Arc<()>>> {
     actor
         .inner
