@@ -365,13 +365,21 @@ impl PreparedOperationTicket {
         }
     }
 
+    /// Resolves `change`, waits until it is the FIFO head and commits it
+    /// without a durable publication.
+    pub async fn commit_when_ready(
+        self,
+        change: Option<ConfigChange>,
+    ) -> Result<PreparedCommit, ActorError> {
+        self.resolve(change)?;
+        self.wait_ready().await?;
+        self.commit()
+    }
+
     pub fn commit(self) -> Result<PreparedCommit, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
-        }
-        if state.idle.is_some() {
-            return Err(ActorError::Busy);
         }
         let pending = self.take_ready_locked(&mut state)?;
         Ok(pending.commit_locked(&self.inner, &mut state, Box::new(|_| {})))
@@ -389,9 +397,6 @@ impl PreparedOperationTicket {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.lifecycle != ActorLifecycle::Open {
                 return Err(lifecycle_error(state.lifecycle));
-            }
-            if state.idle.is_some() {
-                return Err(ActorError::Busy);
             }
             if state
                 .pending_prepared(self.id)

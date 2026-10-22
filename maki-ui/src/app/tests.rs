@@ -9450,13 +9450,11 @@ fn cd_slash_completion_uses_child_cwd_before_argument_dispatch() {
     std::fs::create_dir(child.path().join("alpha-child")).unwrap();
     let (target, _) = spawn_input_child(&mut app, TASK_ID, "research");
     let actor = target.actor().unwrap();
-    let update = actor.reserve_config_update().unwrap();
-    update
-        .resolve(Ok(maki_agent::actor::ConfigChange::WorkingDirectory(
-            child.path().to_path_buf(),
-        )))
-        .unwrap();
-    smol::block_on(update.wait()).unwrap();
+    let update = actor.reserve_prepared_operation(None).unwrap();
+    smol::block_on(update.commit_when_ready(Some(
+        maki_agent::actor::ConfigChange::WorkingDirectory(child.path().to_path_buf()),
+    )))
+    .unwrap();
     app.active_chat = 1;
     bind_actor_target(&app, target);
     app.sync_focused_queue();

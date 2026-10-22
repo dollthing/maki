@@ -749,14 +749,14 @@ mod tests {
                 .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
                 .unwrap();
             let epoch = actor.inner.history.load().epoch;
-            let earlier = actor.reserve_config_update().unwrap();
+            let earlier = actor.reserve_prepared_operation(None).unwrap();
             assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
-            earlier.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
-            earlier.wait().await.unwrap();
+            earlier
+                .commit_when_ready(Some(ConfigChange::ToggleFast))
+                .await
+                .unwrap();
             let guard = actor.prepare_idle().unwrap();
             let source = guard.source_snapshot().unwrap();
-            let between = actor.reserve_config_update().unwrap();
-            between.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
             assert!(matches!(
                 actor.reserve_prepared_operation(None),
                 Err(ActorError::Busy)
@@ -766,15 +766,16 @@ mod tests {
                 &guard.source_snapshot().unwrap().config.config
             ));
             drop(guard);
-            between.wait().await.unwrap();
             let original = actor.config_snapshot().unwrap();
             let guard = actor.prepare_idle().unwrap();
             let source = guard.source_snapshot().unwrap();
             let operation = guard.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
-            let later = actor.reserve_config_update().unwrap();
-            later.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+            assert!(matches!(
+                actor.reserve_prepared_operation(None),
+                Err(ActorError::Busy)
+            ));
             assert!(Arc::ptr_eq(
                 &source.config.config,
                 &guard.source_snapshot().unwrap().config.config
@@ -806,8 +807,6 @@ mod tests {
                 &held.source_snapshot().unwrap().config.config
             ));
             drop(held);
-            let later = later.wait().await.unwrap();
-            assert!(later.config.settings.workflow);
             assert!(Arc::ptr_eq(&original.identity, &commit.config.identity));
             assert_eq!(original.generation, commit.config.generation);
             assert_eq!(change.is_some(), clear);

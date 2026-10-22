@@ -1513,11 +1513,10 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
         operation.wait_ready().await.unwrap();
         assert!(operation.ready_config().unwrap().settings.workflow);
         assert!(!actor.effective_config().unwrap().settings.workflow);
-        let update = explicit.then(|| {
-            let update = actor.reserve_config_update().unwrap();
-            update.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-            update
-        });
+        assert!(matches!(
+            actor.reserve_prepared_operation(None),
+            Err(ActorError::Busy)
+        ));
         let queued: Vec<_> = if explicit {
             [FIRST, SECOND]
                 .into_iter()
@@ -1577,11 +1576,6 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
         assert!(root_rx.is_empty());
         assert!(matches!(actor.prepare_idle(), Err(ActorError::Busy)));
         drop(guard);
-        if let Some(update) = update {
-            let committed = update.wait().await.unwrap();
-            assert!(!committed.config.settings.fast);
-            assert!(committed.config.settings.workflow);
-        }
         let first = root_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
         if let Some(ticket) = queued.first() {
             assert_eq!(first.turn_id(), ticket.turn_id());
@@ -2273,9 +2267,13 @@ fn child_configuration_can_change_independently() {
         assert_eq!(manager.snapshot().len(), before);
         let mut updated = config("anthropic/claude-opus-5", true);
         updated.settings.workflow = true;
-        let update = child.actor().unwrap().reserve_config_update().unwrap();
+        let update = child
+            .actor()
+            .unwrap()
+            .reserve_prepared_operation(None)
+            .unwrap();
         update
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                 model: Some(PreparedModel {
                     provider: Arc::clone(&updated.provider),
                     model: updated.model.clone(),
@@ -2284,8 +2282,8 @@ fn child_configuration_can_change_independently() {
                 workflow: Some(true),
                 ..Default::default()
             })))
+            .await
             .unwrap();
-        update.wait().await.unwrap();
         let actual = child.effective_config().unwrap().unwrap();
         assert_eq!(actual.model.id, updated.model.id);
         assert!(actual.fast);
@@ -2858,13 +2856,13 @@ fn child_spawn_inherits_running_turn_cwd_not_later_config() {
         let actor = root.actor().unwrap();
         actor.admit_turn(input(), None, ORIGINAL.into()).unwrap();
         let current = rx.recv_async().await.unwrap();
-        let update = actor.reserve_config_update().unwrap();
+        let update = actor.reserve_prepared_operation(None).unwrap();
         update
-            .resolve(Ok(crate::actor::ConfigChange::WorkingDirectory(
+            .commit_when_ready(Some(crate::actor::ConfigChange::WorkingDirectory(
                 CHANGED.into(),
             )))
+            .await
             .unwrap();
-        update.wait().await.unwrap();
         assert_eq!(
             actor.effective_config().unwrap().context.cwd(),
             std::path::Path::new(CHANGED)
@@ -4124,7 +4122,7 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
             )
             .unwrap();
         let parent_actor = parent.actor().unwrap();
-        let barrier = parent_actor.reserve_config_update().unwrap();
+        let barrier = parent_actor.reserve_prepared_operation(None).unwrap();
         let parent_events = parent_actor.subscribe_events();
         let root_events = root.actor().unwrap().subscribe_events();
         let child = manager
@@ -4216,7 +4214,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
             .create_root(Vec::new(), None, TestBackend::boxed())
             .unwrap();
         let parent = root.actor().unwrap();
-        let barrier = parent.reserve_config_update().unwrap();
+        let barrier = parent.reserve_prepared_operation(None).unwrap();
         let parent_events = parent.subscribe_events();
         let child = manager
             .spawn_child_trusted_with_config(

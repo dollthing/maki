@@ -958,9 +958,10 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
         updated.settings.fast = false;
         updated.settings.thinking = maki_providers::ThinkingConfig::Budget(4096);
         updated.settings.workflow = true;
-        let update = actor.reserve_config_update().unwrap();
-        update
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+        actor
+            .reserve_prepared_operation(None)
+            .unwrap()
+            .commit_when_ready(Some(maki_agent::actor::ConfigChange::Patch(
                 maki_agent::actor::ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::clone(&updated.provider),
@@ -972,8 +973,8 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     ..Default::default()
                 },
             )))
+            .await
             .unwrap();
-        update.wait().await.unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         let requests: Vec<_> = updated_rx.try_iter().collect();

@@ -884,7 +884,7 @@ mod tests {
                 Some(rx),
             );
             child.configure_parent_delivery(true).unwrap();
-            let barrier = child.reserve_config_update().unwrap();
+            let barrier = child.reserve_prepared_operation(None).unwrap();
             let events = parent.subscribe_events();
             let ticket = child
                 .admit_turn(

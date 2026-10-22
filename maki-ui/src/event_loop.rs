@@ -5947,22 +5947,6 @@ where
     .await
 }
 
-#[cfg(test)]
-async fn bounded_reserved_session_op<T, F>(
-    reservation: &maki_agent::ConfigUpdateTicket,
-    op: F,
-    timeout: Duration,
-) -> Result<T, String>
-where
-    F: std::future::Future<Output = Result<T, String>>,
-{
-    let result = bounded_session_op(op, timeout).await;
-    if result.is_err() {
-        let _ = reservation.cancel();
-    }
-    result
-}
-
 #[allow(clippy::too_many_arguments)]
 fn dispatch_lua_option_set(
     session: MakiId,
@@ -6164,7 +6148,6 @@ mod tests {
                 panic!("expected option completion");
             };
             result.unwrap();
-            actor.wait_policy_updates().await.unwrap();
             let selected = actor.effective_config().unwrap();
             assert!(!initial.workflow);
             assert!(selected.workflow);
@@ -6214,7 +6197,6 @@ mod tests {
                 panic!("expected committed workflow state");
             };
             complete_option_toggle(&mut changed.app, id, enabled);
-            changed_actor.wait_policy_updates().await.unwrap();
 
             assert!(changed.app.state.workflow);
             assert!(changed_actor.effective_config().unwrap().workflow);
@@ -6382,28 +6364,28 @@ mod tests {
             let runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let predecessor = actor.reserve_config_update().unwrap();
-            let combined = actor.reserve_config_update().unwrap();
+            let predecessor = actor.reserve_prepared_operation(None).unwrap();
+            let combined = actor.reserve_prepared_operation(None).unwrap();
             let mut model = model_named("replacement");
             model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
-            combined
-                .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+            let combined = smol::spawn(combined.commit_when_ready(Some(ConfigChange::Patch(
+                maki_agent::actor::ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model,
                     }),
                     toggle_thinking: true,
                     ..Default::default()
-                })))
-                .unwrap();
+                },
+            ))));
             predecessor
-                .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
                     workflow: Some(true),
                     ..Default::default()
                 })))
+                .await
                 .unwrap();
-            predecessor.wait().await.unwrap();
-            let commit = combined.wait().await.unwrap();
+            let commit = combined.await.unwrap().config;
             assert!(commit.config.workflow);
             assert!(commit.config.thinking.is_enabled());
             assert_eq!(commit.config.model.id, "replacement");
@@ -6419,20 +6401,21 @@ mod tests {
             let runtime = test_runtime(unsupported);
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let model_ticket = actor.reserve_config_update().unwrap();
+            let model_ticket = actor.reserve_prepared_operation(None).unwrap();
             let (events, rx) = flume::unbounded();
             let (reply, _) = flume::bounded(1);
             dispatch_thinking_change(&runtime, true, "off", reply, events);
             let mut required = model_named("required");
             required.thinking_override = Some(maki_providers::ThinkingSupport::Required);
             model_ticket
-                .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model: required,
                     }),
                     ..Default::default()
                 })))
+                .await
                 .unwrap();
             let InternalEvent::SessionOp {
                 kind:
@@ -6451,11 +6434,12 @@ mod tests {
             let commit = commit.unwrap();
             assert!(set_default);
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
-            let later = actor.reserve_config_update().unwrap();
-            later
-                .resolve(thinking_change("high").map_err(maki_agent::ActorError::InvalidConfig))
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(thinking_change("high").unwrap()))
+                .await
                 .unwrap();
-            later.wait().await.unwrap();
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
             release_runtime(runtime);
         });
@@ -6469,13 +6453,11 @@ mod tests {
             let runtime = test_runtime(model);
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let gate = actor.reserve_config_update().unwrap();
+            let gate = actor.reserve_prepared_operation(None).unwrap();
             let (events, rx) = flume::unbounded();
             let (reply, _) = flume::bounded(1);
             dispatch_thinking_change(&runtime, false, "", reply, events.clone());
-            gate.resolve(Ok(ConfigChange::Patch(Default::default())))
-                .unwrap();
-            gate.wait().await.unwrap();
+            gate.commit_when_ready(None).await.unwrap();
             let mut values = Vec::new();
             for index in 0..2 {
                 let InternalEvent::SessionOp {
@@ -6559,59 +6541,21 @@ mod tests {
                 },
             ));
             started_rx.recv_async().await.unwrap();
-            let successor = actor.reserve_config_update().unwrap();
-            successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+            let successor = smol::spawn(
+                actor
+                    .reserve_prepared_operation(None)
+                    .unwrap()
+                    .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+            );
             expire_tx.send(()).unwrap();
             assert_eq!(
                 pending.await.err().unwrap(),
                 maki_agent::ActorError::ConfigExpired.to_string()
             );
-            assert!(successor.wait().await.unwrap().config.workflow);
+            assert!(successor.await.unwrap().config.config.workflow);
             release_tx.send(()).unwrap();
             finished_rx.recv_async().await.unwrap();
             assert!(actor.effective_config().unwrap().workflow);
-            release_runtime(runtime);
-        });
-    }
-
-    #[test]
-    fn timed_out_setter_releases_ticket_and_reports_failure() {
-        smol::block_on(async {
-            let runtime = test_runtime(model_named("test-model"));
-            let (manager, root) = runtime.handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let ticket = actor.reserve_config_update().unwrap();
-            let (_gate_tx, gate_rx) = flume::bounded::<()>(0);
-            let result = bounded_reserved_session_op(
-                &ticket,
-                async move {
-                    gate_rx.recv_async().await.unwrap();
-                    Ok(())
-                },
-                Duration::from_millis(1),
-            )
-            .await;
-            assert_eq!(result.unwrap_err(), SESSION_OP_TIMEOUT_ERR);
-            actor.wait_policy_updates().await.unwrap();
-            assert!(
-                actor
-                    .admit_turn(
-                        maki_agent::AgentInput {
-                            message: "after timeout".into(),
-                            mode: Default::default(),
-                            images: Vec::new(),
-                            preamble: Vec::new(),
-                            thinking: Default::default(),
-                            fast: false,
-                            workflow: false,
-                            prompt: None,
-                            cancel: None,
-                        },
-                        None,
-                        String::new(),
-                    )
-                    .is_ok()
-            );
             release_runtime(runtime);
         });
     }
@@ -6627,14 +6571,21 @@ mod tests {
                 let (queued_tx, queued_rx) = flume::unbounded();
                 let observer =
                     std::mem::replace(&mut event_loop.sessions[0].config_commits, queued_rx);
-                let ticket = actor.reserve_config_update().unwrap();
-                ticket
-                    .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                let reservation = reserve_config_change(
+                    &manager.lookup(root).unwrap(),
+                    &event_loop.sessions[0].coordinator,
+                    None,
+                )
+                .unwrap();
+                let older = commit_config_change(
+                    reservation,
+                    ConfigChange::Patch(maki_agent::actor::ConfigPatch {
                         workflow: Some(true),
                         ..Default::default()
-                    })))
-                    .unwrap();
-                let older = ticket.wait().await.unwrap();
+                    }),
+                )
+                .await
+                .unwrap();
                 let (reply_tx, reply_rx) = flume::bounded(1);
                 event_loop.handle_session_request(
                     SessionRequest::SetMode {
@@ -6687,19 +6638,20 @@ mod tests {
                 let session = old.id();
                 let identity = old.handles.identity();
                 let (manager, root) = old.handles.manager_and_root();
-                let actor = manager.actor(root).unwrap();
-                let ticket = actor.reserve_config_update().unwrap();
-                ticket
-                    .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                let commit = commit_config_change(
+                    reserve_config_change(&manager.lookup(root).unwrap(), &old.coordinator, None)
+                        .unwrap(),
+                    ConfigChange::Patch(maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             model: model_named("retired-model"),
                             provider: Arc::new(StubProvider),
                         }),
                         workflow: Some(true),
                         ..Default::default()
-                    })))
-                    .unwrap();
-                let commit = ticket.wait().await.unwrap();
+                    }),
+                )
+                .await
+                .unwrap();
                 let (reply_tx, reply_rx) = flume::bounded(1);
                 let completion = match operation {
                     "mode" => {
@@ -6819,7 +6771,6 @@ mod tests {
             assert_eq!(completed_session.to_string(), session);
             let _ = reply_tx.send(result.map(|()| json!(true)));
             assert_eq!(reply_rx.recv_async().await.unwrap(), Ok(json!(true)));
-            actor.wait_policy_updates().await.unwrap();
             assert!(!initial.workflow);
             assert!(actor.effective_config().unwrap().workflow);
             wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
@@ -6846,7 +6797,7 @@ mod tests {
             let runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let reservation = actor.reserve_config_update().unwrap();
+            let reservation = actor.reserve_prepared_operation(None).unwrap();
             let coordinator = runtime.coordinator.clone();
             let target_model = model_named("test-model");
             let version = coordinator.read().options().version;
@@ -6857,15 +6808,15 @@ mod tests {
                     .await
             });
             reservation
-                .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
                     model: Some(maki_agent::actor::PreparedModel {
                         provider: Arc::new(StubProvider),
                         model: target_model.clone(),
                     }),
                     ..Default::default()
                 })))
+                .await
                 .unwrap();
-            reservation.wait().await.unwrap();
             setter.await.unwrap();
             runtime.config_commits.recv_async().await.unwrap();
             assert_eq!(
@@ -6918,7 +6869,6 @@ mod tests {
                 panic!("expected option completion");
             };
             result.unwrap();
-            actor.wait_policy_updates().await.unwrap();
             assert!(
                 runtime
                     .handles
@@ -9832,17 +9782,19 @@ mod tests {
                 .unwrap()
                 .agent_id;
             let actor = manager.actor(child).unwrap();
-            let ticket = actor.reserve_config_update().unwrap();
-            ticket
-                .resolve(Ok(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
-                    model: Some(maki_agent::actor::PreparedModel {
-                        provider: Arc::new(StubProvider),
-                        model: model_named("child-model"),
-                    }),
-                    ..Default::default()
-                })))
-                .unwrap();
-            smol::block_on(ticket.wait()).unwrap();
+            smol::block_on(
+                actor
+                    .reserve_prepared_operation(None)
+                    .unwrap()
+                    .commit_when_ready(Some(ConfigChange::Patch(maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(StubProvider),
+                            model: model_named("child-model"),
+                        }),
+                        ..Default::default()
+                    }))),
+            )
+            .unwrap();
             select_child_chat(event_loop, child, CHILD_CHAT);
             let root_model = event_loop.sessions[0].app.state.model.spec();
             assert_ne!(root_model, CHILD_MODEL);
@@ -10170,13 +10122,17 @@ mod tests {
                 &original,
             ));
             let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
-            let ticket = manager
-                .actor(root)
-                .unwrap()
-                .reserve_config_update()
-                .unwrap();
-            ticket.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-            smol::block_on(ticket.wait()).unwrap();
+            let reservation = reserve_config_change(
+                &manager.lookup(root).unwrap(),
+                &event_loop.sessions[0].coordinator,
+                None,
+            )
+            .unwrap();
+            smol::block_on(commit_config_change(
+                reservation,
+                ConfigChange::ToggleWorkflow,
+            ))
+            .unwrap();
             event_loop.sync_orchestration();
             assert!(!Arc::ptr_eq(
                 event_loop.orchestration_revisions[0]

@@ -9,7 +9,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use maki_agent::AgentMode;
 use maki_agent::actor::{
     ActorEvent, ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch,
-    ConfigUpdateTicket, PreparedModel,
+    PreparedModel,
 };
 use maki_agent::manager::ManagerError;
 use maki_agent::tools::ToolRegistry;
@@ -29,7 +29,8 @@ use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
 use super::super::{
-    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, start_runtime_heartbeat_with,
+    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, commit_config_change,
+    reserve_config_change, start_runtime_heartbeat_with,
 };
 use super::ApprovalStep;
 use crate::AppSession;
@@ -450,14 +451,20 @@ fn managed_child_approval_is_pinned(
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let root_actor = manager.actor(root).unwrap();
         let mode = AgentMode::Build;
-        let ticket = root_actor.reserve_config_update().unwrap();
-        ticket
-            .resolve(Ok(ConfigChange::Mode {
+        let reservation = reserve_config_change(
+            &manager.lookup(root).unwrap(),
+            &event_loop.sessions[index].coordinator,
+            None,
+        )
+        .unwrap();
+        smol::block_on(commit_config_change(
+            reservation,
+            ConfigChange::Mode {
                 mode: mode.clone(),
                 mode_def: Some(host.event_handle().mode_registry().current(&mode)),
-            }))
-            .unwrap();
-        smol::block_on(ticket.wait()).unwrap();
+            },
+        ))
+        .unwrap();
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         apply_patch(
@@ -591,14 +598,12 @@ fn managed_child_approval_is_pinned(
             settled
         });
         let mode = AgentMode::Plan(path.clone());
-        let ticket = child.reserve_config_update().unwrap();
-        ticket
-            .resolve(Ok(ConfigChange::Mode {
-                mode: mode.clone(),
-                mode_def: Some(host.event_handle().mode_registry().current(&mode)),
-            }))
-            .unwrap();
-        smol::block_on(ticket.wait()).unwrap();
+        let ticket = child.reserve_prepared_operation(None).unwrap();
+        smol::block_on(ticket.commit_when_ready(Some(ConfigChange::Mode {
+            mode: mode.clone(),
+            mode_def: Some(host.event_handle().mode_registry().current(&mode)),
+        })))
+        .unwrap();
         let config = child.effective_config().unwrap();
         let child_epoch = child.history_boundaries().unwrap()[0].epoch;
         assert!(
@@ -984,14 +989,11 @@ fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_
     }
 }
 
-fn queue_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigUpdateTicket {
-    let ticket = actor.reserve_config_update().unwrap();
-    ticket.resolve(Ok(ConfigChange::Patch(patch))).unwrap();
-    ticket
-}
-
 fn apply_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigCommit {
-    smol::block_on(queue_patch(actor, patch).wait()).unwrap()
+    let ticket = actor.reserve_prepared_operation(None).unwrap();
+    smol::block_on(ticket.commit_when_ready(Some(ConfigChange::Patch(patch))))
+        .unwrap()
+        .config
 }
 
 fn model_patch(spec: &str, provider: Arc<dyn Provider>) -> ConfigPatch {
@@ -1543,11 +1545,12 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
             cwd.display().to_string();
         event_loop.sessions[index].app.state.plan = PlanState::Ready(relative.clone());
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
         let mode = AgentMode::Plan(relative);
-        let ticket = actor.reserve_config_update().unwrap();
-        ticket
-            .resolve(Ok(ConfigChange::Mode {
+        let reservation =
+            reserve_config_change(&manager.lookup(root).unwrap(), &coordinator, None).unwrap();
+        smol::block_on(commit_config_change(
+            reservation,
+            ConfigChange::Mode {
                 mode: mode.clone(),
                 mode_def: Some(
                     event_loop
@@ -1556,9 +1559,9 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
                         .mode_registry()
                         .current(&mode),
                 ),
-            }))
-            .unwrap();
-        smol::block_on(ticket.wait()).unwrap();
+            },
+        ))
+        .unwrap();
         approve(event_loop, index, true);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {

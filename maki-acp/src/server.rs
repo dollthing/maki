@@ -5438,9 +5438,10 @@ mod tests {
                 "spawned session provider did not initialize"
             );
             let actor = handle.initialized_root().await.unwrap().actor().unwrap();
-            let update = actor.reserve_config_update().unwrap();
-            update
-                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(maki_agent::actor::ConfigChange::Patch(
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
@@ -5449,8 +5450,8 @@ mod tests {
                         ..Default::default()
                     },
                 )))
+                .await
                 .unwrap();
-            update.wait().await.unwrap();
             let session = srv.session.as_mut().unwrap();
             let previous_handle = std::mem::replace(&mut session.handle, handle);
             previous_handle.task.cancel().await;
@@ -5959,9 +5960,10 @@ mod tests {
                 .unwrap()
                 .actor()
                 .unwrap();
-            let update = actor.reserve_config_update().unwrap();
-            update
-                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(maki_agent::actor::ConfigChange::Patch(
                     maki_agent::actor::ConfigPatch {
                         model: Some(maki_agent::actor::PreparedModel {
                             provider: Arc::new(EndTurnProvider),
@@ -5970,8 +5972,8 @@ mod tests {
                         ..Default::default()
                     },
                 )))
+                .await
                 .unwrap();
-            update.wait().await.unwrap();
 
             let prompt_result = handle_prompt(
                 &mut srv,

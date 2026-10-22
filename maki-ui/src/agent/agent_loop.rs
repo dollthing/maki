@@ -1068,18 +1068,6 @@ mod tests {
                         },
                     )
                     .unwrap();
-                let barrier = actor.reserve_config_update().unwrap();
-                barrier
-                    .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
-                    .unwrap();
-                assert!(matches!(
-                    futures_lite::future::or(barrier.wait(), async {
-                        smol::Timer::after(std::time::Duration::from_secs(10)).await;
-                        panic!("interrupt admission never became runnable");
-                    })
-                    .await,
-                    Err(maki_agent::actor::ActorError::PolicyCancelled)
-                ));
                 assert_eq!(
                     actor.config_snapshot().unwrap().generation,
                     active_policy_generation
@@ -1124,8 +1112,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let successor = if deferred {
-                let barrier = actor.reserve_config_update().unwrap();
+            let (successor, successor_presentation) = if deferred {
+                let barrier = actor.reserve_prepared_operation(None).unwrap();
                 let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
                 for text in ["earlier deferred", "final deferred"] {
                     let input = make_input(text);
@@ -1136,27 +1124,20 @@ mod tests {
                         displayed: false,
                     });
                 }
-                barrier
-                    .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
-                    .unwrap();
-                assert!(matches!(
-                    barrier.wait().await,
-                    Err(maki_agent::actor::ActorError::PolicyCancelled)
-                ));
-                None
+                (None, barrier.presentation_id() + 1)
             } else {
-                Some(
-                    actor
-                        .admit_turn(make_input("successor"), None, String::new())
-                        .unwrap(),
+                (
+                    Some(
+                        actor
+                            .admit_turn(make_input("successor"), None, String::new())
+                            .unwrap(),
+                    ),
+                    RUN_ID + 1,
                 )
             };
             // The explicit turn is admitted right after the prior UI turn, so
             // the actor stamps it with RUN_ID; the successor queued behind it
-            // takes the next presentation.
-            // Both paths queue their successor behind the explicit turn, so it
-            // takes the next presentation.
-            const SUCCESSOR_PRESENTATION: u64 = RUN_ID + 1;
+            // takes the next presentation after any barrier's reservation.
             let mut explicit_presentation = None;
             let mut visible = Vec::new();
             const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1236,14 +1217,14 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                if envelope.presentation() == Some(SUCCESSOR_PRESENTATION)
+                if envelope.presentation() == Some(successor_presentation)
                     && let AgentEvent::QueueItemConsumed { text, .. } = &envelope.event
                 {
                     successor_bubbles.push(text.clone());
                 }
                 terminal |= envelope.presentation() == Some(explicit_presentation)
                     && matches!(&envelope.event, AgentEvent::TurnOutcome(_));
-                let streamed = envelope.presentation() == Some(SUCCESSOR_PRESENTATION)
+                let streamed = envelope.presentation() == Some(successor_presentation)
                     && matches!(&envelope.event, AgentEvent::TextDelta { .. });
                 app.update(crate::app::Msg::Agent(Box::new(envelope)));
                 if streamed {
@@ -1253,7 +1234,7 @@ mod tests {
             assert!(terminal);
             crate::app::tests::assert_actor_presentation(
                 &mut app,
-                RUN_ID + 1,
+                successor_presentation,
                 RESPONSE,
                 if deferred {
                     "final deferred"
@@ -1267,7 +1248,7 @@ mod tests {
             assert_eq!(explicit_presentation, RUN_ID);
             assert_eq!(
                 actor.presentation_id(),
-                SUCCESSOR_PRESENTATION,
+                successor_presentation,
                 "the actor owns the presentation counter"
             );
             manager
@@ -1366,7 +1347,6 @@ mod tests {
     #[test_case(true; "undisplayed_deferred_root")]
     fn ui_cancel_targets_buffered_active_root_without_cancelling_future_turn(deferred: bool) {
         const FIRST_RUN: u64 = 7;
-        const SECOND_RUN: u64 = FIRST_RUN + 1;
         const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const SHARED_CORRELATION: &str = "plugin-shared-correlation";
 
@@ -1428,24 +1408,23 @@ mod tests {
                         break;
                     }
                 }
-                let second = if deferred {
-                    let boundary = actor.reserve_config_update().unwrap();
+                let (second, second_run) = if deferred {
+                    let boundary = actor.reserve_prepared_operation(None).unwrap();
                     queue.push(crate::agent::shared_queue::QueueItem::Message {
                         text: "deferred root".into(),
                         input: make_input(),
                         run_id: FIRST_RUN,
                         displayed: false,
                     });
-                    boundary
-                        .resolve(Err(maki_agent::actor::ActorError::PolicyCancelled))
-                        .unwrap();
-                    assert!(boundary.wait().await.is_err());
-                    None
+                    (None, boundary.presentation_id() + 1)
                 } else {
-                    Some(
-                        actor
-                            .admit_turn(make_input(), None, SHARED_CORRELATION.into())
-                            .unwrap(),
+                    (
+                        Some(
+                            actor
+                                .admit_turn(make_input(), None, SHARED_CORRELATION.into())
+                                .unwrap(),
+                        ),
+                        FIRST_RUN + 1,
                     )
                 };
                 release.send(()).unwrap();
@@ -1454,7 +1433,7 @@ mod tests {
                 let mut buffered = Vec::new();
                 loop {
                     let envelope = events.recv_async().await.unwrap();
-                    let second_streaming = envelope.presentation() == Some(SECOND_RUN)
+                    let second_streaming = envelope.presentation() == Some(second_run)
                         && matches!(envelope.event, AgentEvent::TextDelta { .. });
                     buffered.push(envelope);
                     if second_streaming {
@@ -1467,7 +1446,7 @@ mod tests {
                         .unwrap()
                 });
                 assert!(buffered.iter().any(|envelope| {
-                    envelope.presentation() == Some(SECOND_RUN)
+                    envelope.presentation() == Some(second_run)
                         && matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })
                 }));
                 assert_eq!(app.run_id, FIRST_RUN);
@@ -2249,7 +2228,7 @@ mod tests {
                 None,
                 Box::new(backend),
             );
-            let boundary = actor.reserve_config_update().unwrap();
+            let boundary = actor.reserve_prepared_operation(None).unwrap();
             let queue = crate::agent::shared_queue::actor_queue(Arc::new(actor.clone()));
             let push = |text: &str| {
                 queue

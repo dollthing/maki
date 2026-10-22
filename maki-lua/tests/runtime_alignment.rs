@@ -569,10 +569,14 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
         let queued = actor
             .admit_turn(ordinary_input(QUEUED), None, QUEUED.into())
             .unwrap();
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(ConfigChange::WorkingDirectory(new.path().to_path_buf())))
-            .unwrap();
+        let change = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::WorkingDirectory(
+                    new.path().to_path_buf(),
+                ))),
+        );
         let after = actor
             .submit(
                 ordinary_input(AFTER),
@@ -627,7 +631,7 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
                 break;
             }
         }
-        common::bounded(change.wait()).await.unwrap();
+        common::bounded(change).await.unwrap();
         for ticket in [queued, after] {
             assert!(matches!(
                 common::bounded(ticket.wait()).await,
@@ -684,16 +688,18 @@ fn lua_local_cancel_releases_task_wait_and_preserves_child_config_and_input() {
             )
             .unwrap();
         assert_eq!(joined.turn_id(), original.turn_id());
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
-                model: Some(PreparedModel {
-                    provider: Arc::clone(&fixture.context.provider),
-                    model: Model::from_spec(UPDATED_MODEL).unwrap(),
-                }),
-                ..Default::default()
-            })))
-            .unwrap();
+        let change = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                    model: Some(PreparedModel {
+                        provider: Arc::clone(&fixture.context.provider),
+                        model: Model::from_spec(UPDATED_MODEL).unwrap(),
+                    }),
+                    ..Default::default()
+                }))),
+        );
         actor.cancel_local(0);
         let after = actor
             .submit(
@@ -709,7 +715,7 @@ fn lua_local_cancel_releases_task_wait_and_preserves_child_config_and_input() {
         assert!(child_ticket.peek_result().is_none());
         assert!(!child_request.reply.is_disconnected());
         assert!(child_actor.snapshot().active_turn.is_some());
-        common::bounded(change.wait()).await.unwrap();
+        common::bounded(change).await.unwrap();
         let resumed = fixture.request_for(PROMPTS[0]).await;
         assert_eq!(resumed.model, UPDATED_MODEL);
         assert!(resumed.contains(AFTER_CUT));
@@ -775,16 +781,18 @@ fn lua_submission_preserves_exact_and_configuration_boundaries() {
             .unwrap();
         assert_ne!(before.turn_id(), first.turn_id());
         assert_ne!(before.turn_id(), exact.turn_id());
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
-                model: Some(PreparedModel {
-                    provider: Arc::clone(&fixture.context.provider),
-                    model: Model::from_spec(UPDATED_MODEL).unwrap(),
-                }),
-                ..Default::default()
-            })))
-            .unwrap();
+        let change = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                    model: Some(PreparedModel {
+                        provider: Arc::clone(&fixture.context.provider),
+                        model: Model::from_spec(UPDATED_MODEL).unwrap(),
+                    }),
+                    ..Default::default()
+                }))),
+        );
         let after = actor
             .submit(
                 ordinary_input(AFTER_CHANGE),
@@ -821,7 +829,7 @@ fn lua_submission_preserves_exact_and_configuration_boundaries() {
             }
             request.respond(common::canned_reply(REPLY));
         }
-        common::bounded(change.wait()).await.unwrap();
+        common::bounded(change).await.unwrap();
         for ticket in [first, exact, before, after] {
             assert!(matches!(
                 common::bounded(ticket.wait()).await,

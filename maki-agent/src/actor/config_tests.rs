@@ -43,9 +43,8 @@ fn admitted_prompt_dependencies_remain_pinned() {
         let queued = actor
             .admit_turn(input("queued"), None, "queued".into())
             .unwrap();
-        let barrier = actor.reserve_config_update().unwrap();
-        barrier.resolve(Err(ActorError::PolicyCancelled)).unwrap();
-        assert!(barrier.wait().await.is_err());
+        let barrier = actor.reserve_prepared_operation(None).unwrap();
+        assert!(barrier.commit_when_ready(None).await.is_err());
         *source.lock().unwrap() = "after".into();
         let work = actor.inner.queue.remove_turn(queued.turn_id()).unwrap();
         let prompt = work
@@ -85,14 +84,14 @@ fn mode_change_without_definition_preserves_config(mode: AgentMode) {
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
         let before = actor.config_snapshot().unwrap();
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(ConfigChange::Mode {
+        let change = actor.reserve_prepared_operation(None).unwrap();
+        let Err(ActorError::InvalidConfig(message)) = change
+            .commit_when_ready(Some(ConfigChange::Mode {
                 mode,
                 mode_def: None,
             }))
-            .unwrap();
-        let Err(ActorError::InvalidConfig(message)) = change.wait().await else {
+            .await
+        else {
             panic!("unresolved mode change must fail")
         };
         const MISSING_DEFINITION: &str = "mode change requires a resolved definition";
@@ -138,7 +137,7 @@ fn mode_ceiling_is_captured_at_creation(child: bool, combined: bool) {
             ),
         ] {
             actor.validate_mode_change(&mode, &mode_def).unwrap();
-            let change = actor.reserve_config_update().unwrap();
+            let change = actor.reserve_prepared_operation(None).unwrap();
             let change_value = if combined {
                 ConfigChange::PatchAndMode {
                     patch: ConfigPatch {
@@ -154,8 +153,8 @@ fn mode_ceiling_is_captured_at_creation(child: bool, combined: bool) {
                     mode_def: Some(mode_def),
                 }
             };
-            change.resolve(Ok(change_value)).unwrap();
-            assert_eq!(change.wait().await.unwrap().config.mode, mode);
+            let committed = change.commit_when_ready(Some(change_value)).await;
+            assert_eq!(committed.unwrap().config.config.mode, mode);
         }
         actor.close();
         task.await;
@@ -214,7 +213,7 @@ fn child_mode_ceiling_rejects_widening(tools: bool, combined: bool, inherit: boo
         );
         let before = actor.config_snapshot().unwrap();
         let commits = actor.subscribe_config_commits();
-        let change = actor.reserve_config_update().unwrap();
+        let change = actor.reserve_prepared_operation(None).unwrap();
         let change_value = if combined {
             ConfigChange::PatchAndMode {
                 patch: ConfigPatch {
@@ -230,8 +229,9 @@ fn child_mode_ceiling_rejects_widening(tools: bool, combined: bool, inherit: boo
                 mode_def: Some(mode_def),
             }
         };
-        change.resolve(Ok(change_value)).unwrap();
-        assert!(matches!(change.wait().await, Err(error) if error == expected));
+        assert!(
+            matches!(change.commit_when_ready(Some(change_value)).await, Err(error) if error == expected)
+        );
         let after = actor.config_snapshot().unwrap();
         assert_eq!(after.generation, before.generation);
         assert!(Arc::ptr_eq(&after.config, &before.config));
@@ -253,46 +253,49 @@ fn combined_model_options_and_metadata_refresh() {
             provider: replacement.provider,
             model: replacement.model,
         };
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+        let change = actor.reserve_prepared_operation(None).unwrap();
+        let committed = change
+            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                 model: Some(prepared.clone()),
                 fast: Some(true),
                 workflow: Some(true),
                 ..Default::default()
             })))
-            .unwrap();
-        let committed = change.wait().await.unwrap();
+            .await
+            .unwrap()
+            .config;
         assert_eq!(committed.generation, 1);
         assert!(committed.config.fast && committed.config.workflow);
         assert!(Arc::ptr_eq(&committed.config.provider, &prepared.provider));
         let mut metadata = prepared.clone();
         metadata.model.context_window += 1;
-        let refresh = actor.reserve_config_update().unwrap();
-        refresh
-            .resolve(Ok(ConfigChange::Refresh {
+        let refresh = actor.reserve_prepared_operation(None).unwrap();
+        let refreshed = refresh
+            .commit_when_ready(Some(ConfigChange::Refresh {
                 expected: prepared.clone(),
                 replacement: metadata.clone(),
             }))
-            .unwrap();
-        let refreshed = refresh.wait().await.unwrap();
+            .await
+            .unwrap()
+            .config;
         assert_eq!(refreshed.generation, 2);
         assert_eq!(
             refreshed.config.model.context_window,
             metadata.model.context_window
         );
-        let obsolete = actor.reserve_config_update().unwrap();
+        let obsolete = actor.reserve_prepared_operation(None).unwrap();
         let stale = policy(false);
-        obsolete
-            .resolve(Ok(ConfigChange::Refresh {
+        let unchanged = obsolete
+            .commit_when_ready(Some(ConfigChange::Refresh {
                 expected: crate::PreparedModel {
                     provider: stale.provider,
                     model: stale.model,
                 },
                 replacement: prepared,
             }))
+            .await
             .unwrap();
-        assert_eq!(obsolete.wait().await.unwrap().generation, 2);
+        assert_eq!(unchanged.config.generation, 2);
         actor.close();
         task.await;
     });
@@ -408,8 +411,12 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
             .unwrap();
         let publication = CheckpointPublication::default();
         reservation.register_publication(&publication).unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let successor = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         match action {
             "drop" => drop(reservation),
             "cancel" => {
@@ -434,7 +441,7 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
         }
         assert!(publication.is_cancelled());
         if action != "close" {
-            successor.wait().await.unwrap();
+            successor.await.unwrap();
         }
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         actor.close();
@@ -569,7 +576,7 @@ fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
         actor
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
-        let first = actor.reserve_config_update().unwrap();
+        let first = actor.reserve_prepared_operation(None).unwrap();
         let prepared = actor.reserve_prepared_operation(None).unwrap();
         let predecessor = {
             let waiting = prepared.wait_predecessor();
@@ -579,8 +586,11 @@ fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
                     .await
                     .is_none()
             );
-            first.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-            let predecessor = first.wait().await.unwrap();
+            let predecessor = first
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow))
+                .await
+                .unwrap()
+                .config;
             let config = waiting.await.unwrap();
             assert!(Arc::ptr_eq(&config, &predecessor.config));
             predecessor
@@ -802,8 +812,12 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
                 correlation: WORK.into(),
             }))
             .unwrap();
-        let setter = actor.reserve_config_update().unwrap();
-        setter.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let setter = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         if cancel {
             actor.cancel_existing();
         } else {
@@ -831,7 +845,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         );
         let committed = snapshot.commit().unwrap();
         assert_eq!(committed.config.generation, before.generation + 1);
-        let after = setter.wait().await.unwrap();
+        let after = setter.await.unwrap().config;
         assert_eq!(after.generation, before.generation + 2);
         assert_eq!(after.config.workflow, before.config.workflow);
         actor.publish_if_empty(|| published = true);
@@ -966,14 +980,18 @@ fn prepared_callback_panic_settles_and_releases_successor(readiness: bool) {
                 correlation: WORK.into(),
             }))
             .unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let successor = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         reservation.resolve(None).unwrap();
         assert!(matches!(
             reservation.wait_ready().await,
             Err(ActorError::InvalidConfig(_))
         ));
-        successor.wait().await.unwrap();
+        successor.await.unwrap();
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         actor.close();
         task.await;
@@ -1025,8 +1043,12 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
                 correlation: WORK.into(),
             }))
             .unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+        let successor = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleFast)),
+        );
         reservation
             .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
@@ -1038,7 +1060,7 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
         reservation.cancel();
         let expected = ActorError::PolicyCancelled;
         assert_eq!(waiting.await, Err(expected.clone()));
-        let committed = successor.wait().await.unwrap();
+        let committed = successor.await.unwrap().config;
         assert_eq!(committed.generation, before.generation + 1);
         assert_ne!(committed.config.fast, before.config.fast);
         assert_eq!(committed.config.workflow, before.config.workflow);
@@ -1234,11 +1256,15 @@ fn acceptance_does_not_run_blocking_preparation_inline(root: bool) {
             )
         };
         entered_rx.recv_async().await.unwrap();
-        let change = actor.reserve_config_update().unwrap();
-        change.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let change = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         assert!(!actor.effective_config().unwrap().workflow);
         release_tx.send(()).unwrap();
-        assert!(change.wait().await.unwrap().config.workflow);
+        assert!(change.await.unwrap().config.config.workflow);
         if let Some(ticket) = ticket {
             ticket.wait().await;
         } else {
@@ -1371,15 +1397,19 @@ fn close_settles_fifo() {
         actor
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
-        let first = actor.reserve_config_update().unwrap();
+        let first = actor.reserve_prepared_operation(None).unwrap();
         let turn = actor
             .admit_turn(input("queued"), None, "queued".into())
             .unwrap();
-        let second = actor.reserve_config_update().unwrap();
-        second.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let second = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         actor.close();
-        assert!(matches!(first.wait().await, Err(ActorError::Closed)));
-        assert!(matches!(second.wait().await, Err(ActorError::Closed)));
+        assert!(matches!(first.wait_ready().await, Err(ActorError::Closed)));
+        assert!(matches!(second.await, Err(ActorError::Closed)));
         assert!(matches!(turn.wait().await, TurnOutcome::Cancelled { .. }));
         assert!(!actor.effective_config().unwrap().workflow);
         task.await;
@@ -1393,24 +1423,26 @@ fn config_changes_compose_fifo() {
         actor
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
-        let first = actor.reserve_config_update().unwrap();
-        let second = actor.reserve_config_update().unwrap();
-        second
-            .resolve(Ok(ConfigChange::Mode {
-                mode: AgentMode::Plan("plan.md".into()),
-                mode_def: Some(
-                    crate::modes::ModeRegistry::builtin()
-                        .current(&AgentMode::Plan("plan.md".into())),
-                ),
-            }))
-            .unwrap();
+        let first = actor.reserve_prepared_operation(None).unwrap();
+        let second = actor.reserve_prepared_operation(None).unwrap();
+        let second =
+            smol::spawn(
+                second.commit_when_ready(Some(ConfigChange::Mode {
+                    mode: AgentMode::Plan("plan.md".into()),
+                    mode_def: Some(
+                        crate::modes::ModeRegistry::builtin()
+                            .current(&AgentMode::Plan("plan.md".into())),
+                    ),
+                })),
+            );
         first
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                 workflow: Some(true),
                 ..Default::default()
             })))
+            .await
             .unwrap();
-        let committed = second.wait().await.unwrap();
+        let committed = second.await.unwrap().config;
         assert!(committed.config.workflow);
         assert_eq!(committed.config.mode, AgentMode::Plan("plan.md".into()));
         assert_eq!(committed.generation, 2);
@@ -1426,11 +1458,11 @@ fn config_noop_preserves_generation() {
         actor
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
-        let reservation = actor.reserve_config_update().unwrap();
-        reservation
-            .resolve(Ok(ConfigChange::Patch(ConfigPatch::default())))
-            .unwrap();
-        assert_eq!(reservation.wait().await.unwrap().generation, 0);
+        let reservation = actor.reserve_prepared_operation(None).unwrap();
+        let committed = reservation
+            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch::default())))
+            .await;
+        assert_eq!(committed.unwrap().config.generation, 0);
         actor.close();
         task.await;
     });
@@ -1447,58 +1479,13 @@ fn settings_change_preserves_mode_definition() {
                     .with_mode_def(Some(definition.clone())),
             )
             .unwrap();
-        let change = actor.reserve_config_update().unwrap();
-        change.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-        assert_eq!(
-            change.wait().await.unwrap().config.mode_def.as_ref(),
-            Some(&definition)
-        );
-        actor.close();
-        task.await;
-    });
-}
-
-#[test]
-fn expired_preparation_cannot_commit_late() {
-    smol::block_on(async {
-        let (actor, task) = spawn(ScriptedBackend::new());
-        actor
-            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+        let change = actor.reserve_prepared_operation(None).unwrap();
+        let committed = change
+            .commit_when_ready(Some(ConfigChange::ToggleWorkflow))
+            .await
             .unwrap();
-        let reservation = actor.reserve_config_update().unwrap();
-        assert!(reservation.expire().unwrap().is_none());
-        assert!(matches!(
-            reservation.resolve(Ok(ConfigChange::ToggleWorkflow)),
-            Err(ActorError::ConfigExpired)
-        ));
-        assert!(matches!(
-            reservation.wait().await,
-            Err(ActorError::ConfigExpired)
-        ));
-        assert!(!actor.effective_config().unwrap().workflow);
+        assert_eq!(committed.config.config.mode_def.as_ref(), Some(&definition));
         actor.close();
-        task.await;
-    });
-}
-
-#[test]
-fn commit_wins_cancel_race() {
-    smol::block_on(async {
-        let (actor, task) = spawn(ScriptedBackend::new());
-        actor
-            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
-            .unwrap();
-        let reservation = actor.reserve_config_update().unwrap();
-        reservation
-            .resolve(Ok(ConfigChange::ToggleWorkflow))
-            .unwrap();
-        let committed = reservation.cancel().unwrap().unwrap();
-        assert!(committed.config.workflow);
-        actor.close();
-        assert_eq!(
-            reservation.wait().await.unwrap().generation,
-            committed.generation
-        );
         task.await;
     });
 }
@@ -1534,17 +1521,25 @@ fn cancelled_preparation_does_not_block_successors() {
             .admit_turn(input("blocked"), None, "blocked".into())
             .unwrap();
         entered_rx.recv_async().await.unwrap();
-        let config = actor.reserve_config_update().unwrap();
-        config.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let config = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         actor.cancel_turn(blocked.turn_id()).unwrap();
-        assert!(config.wait().await.unwrap().config.workflow);
+        assert!(config.await.unwrap().config.config.workflow);
         let next = actor
             .admit_turn(input("next"), None, "next".into())
             .unwrap();
         successor_rx.recv_async().await.unwrap();
         let owner = actor.inner.state.lock().unwrap().preparing;
-        let later = actor.reserve_config_update().unwrap();
-        later.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let later = smol::spawn(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
+        );
         let (stale_tx, stale_rx) = flume::bounded(1);
         *actor.inner.stale_preparation.lock().unwrap() = Some(stale_tx);
         release_tx.send(()).unwrap();
@@ -1554,7 +1549,7 @@ fn cancelled_preparation_does_not_block_successors() {
         assert!(next.peek().is_none());
         release_successor_tx.send(()).unwrap();
         assert!(matches!(next.wait().await, TurnOutcome::Completed { .. }));
-        assert!(!later.wait().await.unwrap().config.workflow);
+        assert!(!later.await.unwrap().config.config.workflow);
         assert!(matches!(
             blocked.wait().await,
             TurnOutcome::Cancelled { .. }

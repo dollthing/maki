@@ -363,14 +363,11 @@ pub(crate) struct ActorState {
     settled: Option<ActorWorkIdentity>,
 }
 
-struct ConfigOperation {
-    id: u64,
-    result: Option<Result<ConfigChange, ActorError>>,
-    completion: Arc<Mutex<Option<Result<ConfigCommit, ActorError>>>>,
-}
-
+#[expect(
+    clippy::large_enum_variant,
+    reason = "queued turns keep their input inline until they start"
+)]
 enum ActorOperation {
-    Config(ConfigOperation),
     Prepared(Box<prepared::PreparedOperation>),
     Control {
         id: u64,
@@ -396,7 +393,6 @@ enum ActorOperation {
 impl ActorOperation {
     fn id(&self) -> u64 {
         match self {
-            Self::Config(config) => config.id,
             Self::Prepared(pending) => pending.id,
             Self::Turn { id: after, .. }
             | Self::Control { id: after, .. }
@@ -406,7 +402,6 @@ impl ActorOperation {
 
     fn projection(&self) -> Option<QueueProjection> {
         match self {
-            Self::Config(_) => None,
             Self::Prepared(pending) => pending
                 .turn
                 .as_ref()
@@ -417,87 +412,6 @@ impl ActorOperation {
                 Some(QueueProjection::Compact(instructions.clone()))
             }
         }
-    }
-}
-
-pub struct ConfigUpdateTicket {
-    inner: Arc<ActorInner>,
-    id: u64,
-    completion: Arc<Mutex<Option<Result<ConfigCommit, ActorError>>>>,
-}
-
-impl ConfigUpdateTicket {
-    pub fn resolve(&self, result: Result<ConfigChange, ActorError>) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = self
-            .completion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return result.map(|_| ());
-        }
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        let pending = state
-            .pending_config(self.id)
-            .ok_or(ActorError::PolicyCancelled)?;
-        if pending.result.is_some() {
-            return Err(ActorError::PolicyPending);
-        }
-        pending.result = Some(result);
-        drive_operations(&self.inner, &mut state);
-        Ok(())
-    }
-
-    pub fn cancel(&self) -> Result<Option<ConfigCommit>, ActorError> {
-        self.cancel_with(ActorError::PolicyCancelled)
-    }
-
-    pub fn expire(&self) -> Result<Option<ConfigCommit>, ActorError> {
-        self.cancel_with(ActorError::ConfigExpired)
-    }
-
-    fn cancel_with(&self, error: ActorError) -> Result<Option<ConfigCommit>, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = self
-            .completion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return result.map(Some);
-        }
-        let pending = state
-            .pending_config(self.id)
-            .ok_or(ActorError::PolicyCancelled)?;
-        pending.result = Some(Err(error.clone()));
-        *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(error));
-        drive_operations(&self.inner, &mut state);
-        self.inner.policy_changed.notify(usize::MAX);
-        Ok(None)
-    }
-
-    pub async fn wait(&self) -> Result<ConfigCommit, ActorError> {
-        loop {
-            let listener = self.inner.policy_changed.listen();
-            if let Some(result) = self
-                .completion
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
-                return result;
-            }
-            listener.await;
-        }
-    }
-}
-
-impl Drop for ConfigUpdateTicket {
-    fn drop(&mut self) {
-        let _ = self.cancel();
     }
 }
 
@@ -584,46 +498,6 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
         if matches!(head, ActorOperation::Prepared(_)) {
             prepared::drive(inner, state);
             return;
-        }
-        if let ActorOperation::Config(pending) = head {
-            if pending.result.is_none() {
-                return;
-            }
-            let ActorOperation::Config(pending) = state.operations.pop_front().unwrap() else {
-                unreachable!()
-            };
-            let previous_generation = state.policy_generation;
-            let result = pending.result.unwrap().and_then(|change| {
-                let current = state.policy.as_ref().ok_or_else(|| {
-                    ActorError::InvalidConfig("actor configuration is not initialized".into())
-                })?;
-                let config = change.apply(current)?;
-                inner.validate_mode_config(&config)?;
-                if !config::equivalent(current, &config) {
-                    state.policy_generation = state.policy_generation.wrapping_add(1);
-                    state.policy = Some(Arc::new(config));
-                }
-                Ok(ConfigCommit {
-                    identity: Arc::clone(&inner.identity),
-                    generation: state.policy_generation,
-                    config: state.policy.clone().unwrap(),
-                })
-            });
-            if result.is_ok() {
-                state.delivery_suspended = false;
-                inner.queue.notify();
-            }
-            if let Ok(commit) = &result
-                && commit.generation != previous_generation
-            {
-                state
-                    .config_observers
-                    .retain(|observer| observer.send(commit.clone()).is_ok());
-                state.emit(ActorEvent::Config(commit.clone()));
-            }
-            *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
-            inner.policy_changed.notify(usize::MAX);
-            continue;
         }
         if let ActorOperation::Turn { ticket, .. } = head
             && let Some(inbox) = state.instructions.get_mut(&ticket.turn_id())
@@ -887,7 +761,7 @@ fn materialize(
             ),
         }),
         ActorOperation::Control { control, .. } => inner.queue.push(ActorWork::Control(control)),
-        ActorOperation::Config(_) | ActorOperation::Prepared(_) => unreachable!(),
+        ActorOperation::Prepared(_) => unreachable!(),
     }
 }
 
@@ -1031,13 +905,6 @@ impl ActorState {
         })
     }
 
-    fn pending_config(&mut self, id: u64) -> Option<&mut ConfigOperation> {
-        self.operations.iter_mut().find_map(|entry| match entry {
-            ActorOperation::Config(pending) if pending.id == id => Some(pending),
-            _ => None,
-        })
-    }
-
     fn drain_work(&mut self) -> Vec<ActorOperation> {
         self.drain_work_except(|_| false)
     }
@@ -1048,8 +915,7 @@ impl ActorState {
         let mut work = Vec::new();
         let mut configs = VecDeque::new();
         for entry in self.operations.drain(..) {
-            if matches!(entry, ActorOperation::Config(_))
-                || matches!(&entry, ActorOperation::Prepared(pending) if pending.turn.is_none())
+            if matches!(&entry, ActorOperation::Prepared(pending) if pending.turn.is_none())
                 || keep(&entry)
             {
                 configs.push_back(entry);
@@ -2476,51 +2342,6 @@ impl AgentActorHandle {
             .map(|config| Arc::new(config.settings.clone()))
     }
 
-    pub fn reserve_config_update(&self) -> Result<ConfigUpdateTicket, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        state.next_operation_id = state.next_operation_id.wrapping_add(1);
-        let id = state.next_operation_id;
-        let completion = Arc::new(Mutex::new(None));
-        state
-            .operations
-            .push_back(ActorOperation::Config(ConfigOperation {
-                id,
-                result: None,
-                completion: Arc::clone(&completion),
-            }));
-        Ok(ConfigUpdateTicket {
-            inner: Arc::clone(&self.inner),
-            id,
-            completion,
-        })
-    }
-
-    fn has_pending_policy_updates(&self) -> Result<bool, ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        Ok(state.operations.iter().any(|entry| {
-            matches!(
-                entry,
-                ActorOperation::Config(_) | ActorOperation::Prepared(_)
-            )
-        }))
-    }
-
-    pub async fn wait_policy_updates(&self) -> Result<(), ActorError> {
-        loop {
-            let listener = self.inner.policy_changed.listen();
-            if !self.has_pending_policy_updates()? {
-                return Ok(());
-            }
-            listener.await;
-        }
-    }
-
     pub fn initialize_config(&self, config: EffectiveAgentConfig) -> Result<u64, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
@@ -2857,7 +2678,7 @@ impl AgentActorHandle {
         let mut remaining = VecDeque::new();
         while let Some(admission) = state.operations.pop_front() {
             let matches = match &admission {
-                ActorOperation::Config(_) | ActorOperation::Control { .. } => false,
+                ActorOperation::Control { .. } => false,
                 ActorOperation::Prepared(pending) => pending
                     .turn
                     .as_ref()
@@ -3036,13 +2857,6 @@ impl AgentActorHandle {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get_or_insert_with(|| lifecycle_error(lifecycle));
-                }
-                if let ActorOperation::Config(pending) = entry {
-                    pending
-                        .completion
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_or_insert_with(|| Err(lifecycle_error(lifecycle)));
                 }
             }
             state.cancelled_correlations.clear();

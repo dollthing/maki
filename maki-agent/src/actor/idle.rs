@@ -4,9 +4,9 @@ use maki_providers::Message;
 use maki_storage::sessions::HistorySnapshot;
 
 use super::{
-    ActorError, ActorLifecycle, ActorOperation, ActorQueue, ActorState, ActorStatus, ActorWork,
-    AgentActorHandle, ConfigCommit, HistoryEditWork, PreparedOperationTicket, PreparedTurn,
-    TurnTicket, lifecycle_error,
+    ActorError, ActorLifecycle, ActorQueue, ActorState, ActorStatus, ActorWork, AgentActorHandle,
+    ConfigCommit, HistoryEditWork, PreparedOperationTicket, PreparedTurn, TurnTicket,
+    lifecycle_error,
 };
 use crate::{AgentId, TurnId};
 
@@ -142,10 +142,7 @@ impl ActorState {
             || self.active.is_some()
             || self.processing.is_some()
             || self.pending_publications != 0
-            || self
-                .operations
-                .iter()
-                .any(|operation| !matches!(operation, ActorOperation::Config(_)))
+            || !self.operations.is_empty()
             || !queue.is_empty()
     }
 

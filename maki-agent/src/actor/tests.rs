@@ -552,13 +552,19 @@ fn typed_actor_events_are_ordered_future_only_and_broadcast() {
         );
         let second = actor.subscribe_events();
         assert!(second.is_empty());
-        let update = actor.reserve_config_update().unwrap();
-        update.resolve(Ok(fast_change(true))).unwrap();
-        update.wait().await.unwrap();
+        let update = actor.reserve_prepared_operation(None).unwrap();
+        update
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         for events in [&first, &second] {
             assert!(
                 matches!(events.recv_async().await.unwrap(), super::ActorEvent::Config(commit) if commit.config.fast)
             );
+            assert!(matches!(
+                events.recv_async().await.unwrap(),
+                super::ActorEvent::Idle { .. }
+            ));
         }
         let ticket = actor
             .admit_turn(input("events"), None, "events".into())
@@ -983,7 +989,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
         );
         actor.configure_parent_delivery(true).unwrap();
         let events = parent.subscribe_events();
-        let barrier = actor.reserve_config_update().unwrap();
+        let barrier = actor.reserve_prepared_operation(None).unwrap();
         let constraint_actor = actor.clone();
         let ticket = actor
             .admit_turn_with_options(
@@ -1014,7 +1020,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
         let mut model = Model::from_spec(MODEL).unwrap();
         model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
         barrier
-            .resolve(Ok(super::ConfigChange::PatchAndMode {
+            .commit_when_ready(Some(super::ConfigChange::PatchAndMode {
                 patch: super::ConfigPatch {
                     model: Some(super::PreparedModel {
                         provider: Arc::new(PolicyTestProvider),
@@ -1027,6 +1033,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
                 mode: AgentMode::Custom(crate::modes::ModeId::parse(MODE)),
                 mode_def: crate::ModeDef::default_for(crate::modes::ModeId::parse(MODE)),
             }))
+            .await
             .unwrap();
         let outcome = ticket.wait().await;
         let diagnostic = if preparation_panic {
@@ -1142,7 +1149,7 @@ fn default_transcript_ignores_cancelled_queued_turn() {
         let (actor, task) = spawn(ScriptedBackend::new());
         let first = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
         first.wait().await;
-        let barrier = actor.reserve_config_update().unwrap();
+        let barrier = actor.reserve_prepared_operation(None).unwrap();
         for _ in 0..=super::MAX_RETAINED_TURN_RESULTS {
             let queued = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
             actor.cancel_turn(queued.turn_id()).unwrap();
@@ -1264,7 +1271,7 @@ fn busy_parent_consumes_delivery_without_reordering_config_fifo() {
         let before = parent
             .admit_turn(input(BEFORE), None, BEFORE.into())
             .unwrap();
-        let config = parent.reserve_config_update().unwrap();
+        let config = parent.reserve_prepared_operation(None).unwrap();
         let source_agent = AgentId::generate();
         let source_turn = crate::TurnId::generate();
         let envelope = Arc::new(super::ChildDelivery {
@@ -1285,12 +1292,12 @@ fn busy_parent_consumes_delivery_without_reordering_config_fifo() {
         });
         super::delivery::admit_delivery(&parent.inner, envelope).unwrap();
         let after = parent.admit_turn(input(AFTER), None, AFTER.into()).unwrap();
-        config.resolve(Ok(fast_change(true))).unwrap();
+        let config = smol::spawn(config.commit_when_ready(Some(fast_change(true))));
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
         gate.open();
         active.wait().await;
         before.wait().await;
-        config.wait().await.unwrap();
+        config.await.unwrap();
         after.wait().await;
         assert_eq!(
             *state.policies.lock().unwrap(),
@@ -1648,12 +1655,8 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
         let second = handle
             .admit_turn(input("second"), None, "second".into())
             .unwrap();
-        let barrier = handle.reserve_config_update().unwrap();
-        barrier.resolve(Err(ActorError::PolicyCancelled)).unwrap();
-        assert!(matches!(
-            barrier.wait().await,
-            Err(ActorError::PolicyCancelled)
-        ));
+        let barrier = handle.reserve_prepared_operation(None).unwrap();
+        assert!(barrier.commit_when_ready(None).await.is_err());
         modes
             .define(crate::modes::ModeDefSpec {
                 name: "build".into(),
@@ -1991,9 +1994,11 @@ fn compact_keeps_admitted_policy() {
             ))
             .unwrap();
         handle.push_compact(1, None).unwrap();
-        let change = handle.reserve_config_update().unwrap();
-        change.resolve(Ok(fast_change(true))).unwrap();
-        change.wait().await.unwrap();
+        let change = handle.reserve_prepared_operation(None).unwrap();
+        change
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         handle.push_control("fence".into(), "fence".into()).unwrap();
         until(|| state.controls.lock().unwrap().len() == 1).await;
         assert_eq!(
@@ -2915,13 +2920,13 @@ fn no_op_policy_update_keeps_generation() {
             ))
             .unwrap();
         let before = handle.inner.state.lock().unwrap().policy_generation;
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         reservation
-            .resolve(Ok(
-                super::ConfigChange::Patch(super::ConfigPatch::default()),
-            ))
+            .commit_when_ready(Some(super::ConfigChange::Patch(
+                super::ConfigPatch::default(),
+            )))
+            .await
             .unwrap();
-        reservation.wait().await.unwrap();
         assert_eq!(handle.inner.state.lock().unwrap().policy_generation, before);
         handle.close();
         task.await;
@@ -2929,7 +2934,7 @@ fn no_op_policy_update_keeps_generation() {
 }
 
 #[test]
-fn reserved_policy_orders_admissions_and_failed_updates() {
+fn reserved_policy_orders_admissions() {
     smol::block_on(async {
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
@@ -2943,21 +2948,23 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
             .unwrap();
         let a = handle.admit_turn(input("a"), None, "a".into()).unwrap();
         until(|| backend_reached(&handle)).await;
-        let options = handle.reserve_config_update().unwrap();
-        let reservation = handle.reserve_config_update().unwrap();
+        let options = handle.reserve_prepared_operation(None).unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         let next = handle.clone();
         let b = next.admit_turn(input("b"), None, "b".into()).unwrap();
         assert!(handle.policy_snapshot().is_some_and(|p| !p.fast));
-        options.resolve(Ok(fast_change(true))).unwrap();
-        reservation
-            .resolve(Ok(super::ConfigChange::Mode {
+        let options = smol::spawn(options.commit_when_ready(Some(fast_change(true))));
+        let reservation = smol::spawn(
+            reservation.commit_when_ready(Some(super::ConfigChange::Mode {
                 mode: AgentMode::Plan("plan.md".into()),
                 mode_def: Some(
                     crate::modes::ModeRegistry::builtin()
                         .current(&AgentMode::Plan("plan.md".into())),
                 ),
-            }))
-            .unwrap();
+            })),
+        );
+        options.await.unwrap();
+        reservation.await.unwrap();
         gate.open();
         a.wait().await;
         b.wait().await;
@@ -2977,18 +2984,6 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
             ]
         );
 
-        let failed = handle.reserve_config_update().unwrap();
-        failed.resolve(Err(ActorError::PolicyCancelled)).unwrap();
-        assert!(matches!(
-            failed.wait().await,
-            Err(ActorError::PolicyCancelled)
-        ));
-        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        c.wait().await;
-        assert_eq!(
-            state.policies.lock().unwrap()[2],
-            ("c".into(), Some(true), 2)
-        );
         handle.close();
         task.await;
     });
@@ -3006,7 +3001,7 @@ fn compact_uses_fifo_config() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         handle.push_compact(7, Some("compact".into())).unwrap();
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.queued, 1);
@@ -3015,15 +3010,15 @@ fn compact_uses_fifo_config() {
             [QueueProjection::Compact(Some("compact".into()))]
         );
         reservation
-            .resolve(Ok(super::ConfigChange::Mode {
+            .commit_when_ready(Some(super::ConfigChange::Mode {
                 mode: AgentMode::Plan("pinned-plan.md".into()),
                 mode_def: Some(
                     crate::modes::ModeRegistry::builtin()
                         .current(&AgentMode::Plan("pinned-plan.md".into())),
                 ),
             }))
+            .await
             .unwrap();
-        reservation.wait().await.unwrap();
         until(|| observed.compacts.load(Ordering::SeqCst) == 1).await;
         assert_eq!(
             observed.compact_policies.lock().unwrap().as_slice(),
@@ -3050,22 +3045,27 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let first = handle.reserve_config_update().unwrap();
-        let second = handle.reserve_config_update().unwrap();
-        second
-            .resolve(Ok(super::ConfigChange::Mode {
-                mode: AgentMode::Plan("plan.md".into()),
-                mode_def: Some(
-                    crate::modes::ModeRegistry::builtin()
-                        .current(&AgentMode::Plan("plan.md".into())),
-                ),
-            }))
-            .unwrap();
+        let first = handle.reserve_prepared_operation(None).unwrap();
+        let second = handle.reserve_prepared_operation(None).unwrap();
+        let second =
+            smol::spawn(
+                second.commit_when_ready(Some(super::ConfigChange::Mode {
+                    mode: AgentMode::Plan("plan.md".into()),
+                    mode_def: Some(
+                        crate::modes::ModeRegistry::builtin()
+                            .current(&AgentMode::Plan("plan.md".into())),
+                    ),
+                })),
+            );
         assert!(!handle.policy_snapshot().unwrap().fast);
         let after = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
-        first.resolve(Ok(fast_change(true))).unwrap();
+        first
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
+        second.await.unwrap();
         after.wait().await;
         assert_eq!(
             state.policies.lock().unwrap()[0],
@@ -3075,13 +3075,15 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
             handle.effective_config().unwrap().mode,
             AgentMode::Plan("plan.md".into())
         );
-        let pending = handle.reserve_config_update().unwrap();
+        let pending = handle.reserve_prepared_operation(None).unwrap();
         let cancelled = handle
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         handle.cancel_existing();
-        pending.resolve(Ok(fast_change(true))).unwrap();
-        pending.wait().await.unwrap();
+        pending
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         assert!(matches!(
             cancelled.wait().await,
             TurnOutcome::Cancelled { .. }
@@ -3090,8 +3092,6 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         assert_eq!(after_cancel.wait().await.agent_id(), handle.agent_id());
-        pending.resolve(Ok(fast_change(false))).unwrap();
-        assert!(pending.wait().await.unwrap().config.fast);
         handle.close();
         task.await;
     });
@@ -3109,12 +3109,12 @@ fn cancel_all_preserves_config_changes() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let pending = handle.reserve_config_update().unwrap();
+        let pending = handle.reserve_prepared_operation(None).unwrap();
         let gate = Gate::new();
         let setter_gate = Arc::clone(&gate);
         let setter = smol::spawn(async move {
             setter_gate.wait().await;
-            pending.resolve(Ok(fast_change(true)))
+            pending.commit_when_ready(Some(fast_change(true))).await
         });
         let deferred = handle
             .admit_turn(input("deferred"), None, "deferred".into())
@@ -3129,7 +3129,6 @@ fn cancel_all_preserves_config_changes() {
 
         gate.open();
         setter.await.unwrap();
-        handle.wait_policy_updates().await.unwrap();
         assert!(handle.policy_snapshot().is_some_and(|policy| policy.fast));
 
         let next = handle
@@ -3157,14 +3156,18 @@ fn admissions_between_setters_keep_their_fifo_policy() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let first = handle.reserve_config_update().unwrap();
+        let first = handle.reserve_prepared_operation(None).unwrap();
         let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_config_update().unwrap();
+        let second = handle.reserve_prepared_operation(None).unwrap();
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        second.resolve(Ok(fast_change(false))).unwrap();
+        let second = smol::spawn(second.commit_when_ready(Some(fast_change(false))));
         assert!(b.peek().is_none());
-        first.resolve(Ok(fast_change(true))).unwrap();
+        first
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         b.wait().await;
+        second.await.unwrap();
         c.wait().await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -3187,18 +3190,24 @@ fn first_setter_releases_b_while_second_still_blocks_c() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let first = handle.reserve_config_update().unwrap();
+        let first = handle.reserve_prepared_operation(None).unwrap();
         let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_config_update().unwrap();
+        let second = handle.reserve_prepared_operation(None).unwrap();
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        first.resolve(Ok(fast_change(true))).unwrap();
+        first
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         b.wait().await;
         assert!(c.peek().is_none());
         assert_eq!(
             *observed.policies.lock().unwrap(),
             vec![("b".into(), Some(true), 1)]
         );
-        second.resolve(Ok(fast_change(false))).unwrap();
+        second
+            .commit_when_ready(Some(fast_change(false)))
+            .await
+            .unwrap();
         c.wait().await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -3213,7 +3222,7 @@ fn first_setter_releases_b_while_second_still_blocks_c() {
 fn deferred_work_projects_and_removes_without_orphan_tickets() {
     smol::block_on(async {
         let (handle, task) = spawn(ScriptedBackend::new());
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         let removed = handle
             .admit_turn(input("removed"), None, "removed".into())
             .unwrap();
@@ -3303,8 +3312,8 @@ fn root_batch_and_interrupt_respect_policy_generation() {
                 )
                 .unwrap();
         }
-        let reservation = handle.reserve_config_update().unwrap();
-        reservation.resolve(Ok(fast_change(true))).unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
+        let reservation = smol::spawn(reservation.commit_when_ready(Some(fast_change(true))));
         handle
             .submit(
                 input("new"),
@@ -3315,6 +3324,7 @@ fn root_batch_and_interrupt_respect_policy_generation() {
             .unwrap();
         gate.open();
         active.wait().await;
+        reservation.await.unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
         assert_eq!(
             observed.folds.lock().unwrap().as_slice(),
@@ -3340,7 +3350,7 @@ fn deferred_roots_keep_setter_order() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let first = handle.reserve_config_update().unwrap();
+        let first = handle.reserve_prepared_operation(None).unwrap();
         handle
             .submit(
                 input("b"),
@@ -3349,7 +3359,7 @@ fn deferred_roots_keep_setter_order() {
                 super::TurnAdmissionOptions::default(),
             )
             .unwrap();
-        let second = handle.reserve_config_update().unwrap();
+        let second = handle.reserve_prepared_operation(None).unwrap();
         handle
             .submit(
                 input("c"),
@@ -3358,8 +3368,12 @@ fn deferred_roots_keep_setter_order() {
                 super::TurnAdmissionOptions::default(),
             )
             .unwrap();
-        second.resolve(Ok(fast_change(false))).unwrap();
-        first.resolve(Ok(fast_change(true))).unwrap();
+        let second = smol::spawn(second.commit_when_ready(Some(fast_change(false))));
+        first
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
+        second.await.unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -3382,7 +3396,7 @@ fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         let cancelled = handle
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
@@ -3391,7 +3405,10 @@ fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
             cancelled.wait().await,
             TurnOutcome::Cancelled { .. }
         ));
-        reservation.resolve(Ok(fast_change(true))).unwrap();
+        reservation
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         assert!(observed.policies.lock().unwrap().is_empty());
         handle.close();
         task.await;
@@ -3410,12 +3427,15 @@ fn precancelled_deferred_turn_is_cancelled_after_policy_commit() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         handle.cancel_correlation("deferred", TurnCancellationReason::User);
         let ticket = handle
             .admit_turn(input("cancelled"), None, "deferred".into())
             .unwrap();
-        reservation.resolve(Ok(fast_change(true))).unwrap();
+        reservation
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
         assert!(observed.policies.lock().unwrap().is_empty());
         handle.close();
@@ -3435,7 +3455,7 @@ fn dropped_reservation_releases_async_admission() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         let ticket = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
@@ -3455,7 +3475,7 @@ fn dropped_reservation_releases_async_admission() {
 fn close_wakes_policy_waiter() {
     smol::block_on(async {
         let (handle, task) = spawn(ScriptedBackend::new());
-        let reservation = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_prepared_operation(None).unwrap();
         let ticket = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
@@ -4025,10 +4045,12 @@ fn steering_resumes_after_reserved_config_disappears(commit: bool) {
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
         until(|| state.entered.load(Ordering::SeqCst) == 1).await;
-        let config = actor.reserve_config_update().unwrap();
+        let config = actor.reserve_prepared_operation(None).unwrap();
         if commit {
-            config.resolve(Ok(fast_change(false))).unwrap();
-            config.wait().await.unwrap();
+            config
+                .commit_when_ready(Some(fast_change(false)))
+                .await
+                .unwrap();
         } else {
             drop(config);
         }
@@ -4344,7 +4366,7 @@ fn compact_removal_uses_unique_operation_id(reserved: bool) {
             None,
             Some(rx),
         );
-        let reservation = reserved.then(|| actor.reserve_config_update().unwrap());
+        let reservation = reserved.then(|| actor.reserve_prepared_operation(None).unwrap());
         actor.push_compact(RUN, Some(FIRST.into())).unwrap();
         actor.push_compact(RUN, Some(SECOND.into())).unwrap();
         let entries = actor.pending_queue();
@@ -4461,7 +4483,7 @@ fn constrained_join_waits_for_ordered_policy(reject: bool) {
             ))),
             Some(rx),
         );
-        let boundary = actor.reserve_config_update().unwrap();
+        let boundary = actor.reserve_prepared_operation(None).unwrap();
         let first = actor
             .submit(input(FIRST), None, FIRST.into(), Default::default())
             .unwrap();
@@ -4487,8 +4509,10 @@ fn constrained_join_waits_for_ordered_policy(reject: bool) {
         assert_eq!(joined.turn_id(), first.turn_id());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(actor.pending_submissions().len(), 2);
-        boundary.resolve(Ok(fast_change(true))).unwrap();
-        boundary.wait().await.unwrap();
+        boundary
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         if reject {
             assert!(
                 matches!(joined.wait().await, TurnOutcome::Failed { failure, .. }
@@ -4704,7 +4728,7 @@ fn local_cancellation_preserves_pending_configuration_and_advances_fence() {
                 AgentMode::Build,
             ))
             .unwrap();
-        let config = actor.reserve_config_update().unwrap();
+        let config = actor.reserve_prepared_operation(None).unwrap();
         let ticket = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
@@ -4719,8 +4743,10 @@ fn local_cancellation_preserves_pending_configuration_and_advances_fence() {
                 ..
             }
         ));
-        config.resolve(Ok(fast_change(true))).unwrap();
-        config.wait().await.unwrap();
+        config
+            .commit_when_ready(Some(fast_change(true)))
+            .await
+            .unwrap();
         assert!(actor.policy_snapshot().unwrap().fast);
         let next = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
@@ -4762,7 +4788,7 @@ fn submit_pending_work_and_configuration_boundaries() {
                 .unwrap()
                 .turn_id()
         );
-        let config = actor.reserve_config_update().unwrap();
+        let config = actor.reserve_prepared_operation(None).unwrap();
         let after = actor
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();

@@ -186,17 +186,17 @@ fn live_slash_controls_commit_on_the_admitted_actor(command: &str) {
             let config = actor.effective_config().unwrap();
             let mut model = config.model.clone();
             model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
-            let ticket = actor.reserve_config_update().unwrap();
-            ticket
-                .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+            let ticket = actor.reserve_prepared_operation(None).unwrap();
+            smol::block_on(
+                ticket.commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                     model: Some(PreparedModel {
                         model,
                         provider: Arc::clone(&config.settings.provider),
                     }),
                     ..Default::default()
-                })))
-                .unwrap();
-            smol::block_on(ticket.wait()).unwrap();
+                }))),
+            )
+            .unwrap();
         }
         event_loop.sync_orchestration();
         let previous = actor.effective_config().unwrap();

@@ -2849,7 +2849,7 @@ mod tests {
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
             let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
-            let reservation = actor.reserve_config_update().unwrap();
+            let reservation = actor.reserve_prepared_operation(None).unwrap();
             let ticket = admit(&state, &actor, MESSAGE);
             assert!(ticket.peek().is_none());
             drop(reservation);
@@ -2893,7 +2893,7 @@ mod tests {
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
             let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
-            let reservation = actor.reserve_config_update().unwrap();
+            let reservation = actor.reserve_prepared_operation(None).unwrap();
             let ticket = admit(&state, &actor, MESSAGE);
             let mut pending = Box::pin(ticket.wait_result());
             assert!(

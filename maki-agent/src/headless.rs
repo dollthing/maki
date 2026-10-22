@@ -388,14 +388,8 @@ async fn admit_input(
         }))
         .map_err(|error| error.to_string())?;
     operation
-        .resolve(Some(ConfigChange::Mode { mode, mode_def }))
-        .map_err(|error| error.to_string())?;
-    operation
-        .wait_ready()
+        .commit_when_ready(Some(ConfigChange::Mode { mode, mode_def }))
         .await
-        .map_err(|error| error.to_string())?;
-    operation
-        .commit()
         .map_err(|error| error.to_string())?
         .ticket
         .ok_or_else(|| "turn admission produced no ticket".to_owned())
@@ -1877,9 +1871,9 @@ mod tests {
             let root = handle.initialized_root().await.unwrap();
             let actor = root.actor().unwrap();
             let first = handle.input_tx.admit(test_params().input).await.unwrap();
-            let update = actor.reserve_config_update().unwrap();
+            let update = actor.reserve_prepared_operation(None).unwrap();
             update
-                .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
                     model: Some(PreparedModel {
                         provider: Arc::new(RecordingProvider {
                             name: SECOND,
@@ -1891,6 +1885,7 @@ mod tests {
                     workflow: Some(true),
                     ..Default::default()
                 })))
+                .await
                 .unwrap();
             let second = handle.input_tx.admit(test_params().input).await.unwrap();
             bounded(first.wait()).await;
