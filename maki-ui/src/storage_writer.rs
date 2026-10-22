@@ -1679,12 +1679,7 @@ impl Writer {
         if !current {
             return;
         }
-        match (result, save.config_version) {
-            (Err(message), Some((epoch, generation))) => self.report(id, Err(format!(
-                "Configuration applied but not saved (runtime {epoch}, generation {generation}): {message}"
-            ))),
-            (result, _) => self.report(id, result),
-        }
+        self.report(id, result);
     }
 
     fn report(&mut self, id: MakiId, result: Result<(), impl std::fmt::Display>) {
@@ -2398,7 +2393,6 @@ mod tests {
     #[test_case(true; "older_untagged_save")]
     fn stale_save_does_not_publish_or_clear_latest_config_warning(untagged: bool) {
         const FAILURE: &str = "test disk failure";
-        const WARNING: &str = "Configuration applied but not saved (runtime 2, generation 0)";
         let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
         let session = Arc::new(AppSession::new(MODEL, CWD));
@@ -2428,7 +2422,10 @@ mod tests {
         assert!(warn_rx.try_recv().is_err());
         assert!(!disk.failing.contains(&id));
         disk.report_save(&writer.pending, &latest, Err(FAILURE));
-        assert!(warn_rx.try_recv().unwrap().contains(WARNING));
+        assert_eq!(
+            warn_rx.try_recv().unwrap(),
+            format!("{SAVE_FAILED_PREFIX}: {FAILURE}")
+        );
         disk.report_save(&writer.pending, &latest, Err(FAILURE));
         assert!(warn_rx.try_recv().is_err());
         disk.report_save(&writer.pending, &old, Ok(()));
