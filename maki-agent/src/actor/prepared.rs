@@ -116,6 +116,7 @@ pub(super) struct PreparedOperation {
 pub struct PreparedOperationTicket {
     inner: Arc<ActorInner>,
     id: u64,
+    presentation_id: u64,
     failure: Arc<Mutex<Option<ActorError>>>,
 }
 
@@ -178,12 +179,19 @@ impl AgentActorHandle {
         Ok(PreparedOperationTicket {
             inner: Arc::clone(&self.inner),
             id,
+            presentation_id,
             failure,
         })
     }
 }
 
 impl PreparedOperationTicket {
+    /// The presentation this operation reserved; its turn, if any, is
+    /// stamped with it.
+    pub fn presentation_id(&self) -> u64 {
+        self.presentation_id
+    }
+
     /// Registers cancellation before asynchronous host preparation begins.
     pub fn register_publication(
         &self,

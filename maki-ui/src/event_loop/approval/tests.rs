@@ -1076,11 +1076,23 @@ fn observed(event_loop: &EventLoop<'_>, index: usize, prefix: &str) -> Vec<(Stri
         .collect()
 }
 
-#[test_case(false; "existing_context")]
-#[test_case(true; "fresh_context")]
-fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
+#[test_case(false, false; "existing_context")]
+#[test_case(true, false; "fresh_context")]
+#[test_case(false, true; "after_config_only_commit")]
+fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_config: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
+        if prior_config {
+            let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+            let operation = manager
+                .actor(root)
+                .unwrap()
+                .reserve_prepared_operation(None)
+                .unwrap();
+            operation.resolve(None).unwrap();
+            smol::block_on(operation.wait_ready()).unwrap();
+            operation.commit().unwrap();
+        }
         let original_id = event_loop.sessions[index].id();
         let prefs = serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap();
         let stored_model = read_model(&event_loop.ctx.storage);
@@ -1123,6 +1135,11 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(starts, [format!("{START_COMMAND_PREFIX}1")]);
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        assert_eq!(
+            event_loop.sessions[index].app.run_id,
+            manager.actor(root).unwrap().presentation_id()
+        );
         assert_eq!(
             read_recents(&event_loop.ctx.storage)
                 .first()

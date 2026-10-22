@@ -17,7 +17,6 @@ use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
     bounded_session_op,
 };
-use crate::agent::shared_queue::correlation;
 use crate::app::session_state::rules_to_stored;
 use crate::plan_approval::{
     APPROVAL_CANCELLED, APPROVAL_CHANGED, APPROVAL_LOCK_LOST, ApprovedPlan, idle_error_message,
@@ -29,6 +28,7 @@ mod tests;
 
 const APPROVAL_CHECKPOINT_TIMEOUT: &str =
     "Plan approval timed out before its checkpoint was published";
+const IMPLEMENTATION_CORRELATION: &str = "plan-implementation";
 
 pub(super) type PlanApprovalTransaction =
     Box<dyn FnOnce(Arc<EffectiveAgentConfig>, bool) -> Result<PreparedTransaction, String> + Send>;
@@ -182,11 +182,11 @@ impl SessionRuntime {
     }
 }
 
-fn implementation_turn(message: String, sender: Option<EventSender>, run_id: u64) -> PreparedTurn {
+fn implementation_turn(message: String, sender: Option<EventSender>) -> PreparedTurn {
     PreparedTurn {
         input: build_input(message),
         event_sender: sender,
-        correlation: correlation(run_id),
+        correlation: IMPLEMENTATION_CORRELATION.into(),
     }
 }
 
@@ -457,25 +457,21 @@ impl EventLoop<'_> {
             if source.config.config.mode.plan_path() != Some(path.as_path()) {
                 return Err(APPROVAL_CHANGED.into());
             }
+            let (_, root) = runtime.handles.manager_and_root();
+            let sender =
+                (target.id() == root).then(|| EventSender::new(runtime.handles.agent_tx.clone()));
+            let operation = idle
+                .reserve_prepared_operation(Some(implementation_turn(String::new(), sender)))
+                .map_err(|error| error.to_string())?;
             let request = PlanApprovalRequest {
                 path,
                 model,
                 parallel,
                 clear_context,
-                run_id: runtime.app.run_id.wrapping_add(1),
+                run_id: operation.presentation_id(),
                 yolo: runtime.app.permissions.persisted_yolo(),
                 rules: rules_to_stored(&runtime.app.permissions.session_rules_snapshot()),
             };
-            let (_, root) = runtime.handles.manager_and_root();
-            let sender =
-                (target.id() == root).then(|| EventSender::new(runtime.handles.agent_tx.clone()));
-            let operation = idle
-                .reserve_prepared_operation(Some(implementation_turn(
-                    String::new(),
-                    sender,
-                    request.run_id,
-                )))
-                .map_err(|error| error.to_string())?;
             let publication = CheckpointPublication::default();
             operation
                 .register_publication(&publication)
