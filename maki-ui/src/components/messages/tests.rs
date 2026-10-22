@@ -4,7 +4,7 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use crate::theme::InMemoryThemesProvider;
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, TASK_SPAWN_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, TASK_SPAWN_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
@@ -100,12 +100,6 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     assert!(panel.messages[0].text.contains("output"));
 }
 
-#[test_case(
-    WRITE_TOOL_NAME,
-    ToolOutput::WriteCode { path: "src/main.rs".into(), byte_count: 42, lines: vec!["fn main() {}".into()] },
-    Some("42 bytes")
-    ; "write_bytes"
-)]
 #[test_case(
     "grep",
     grep_output(2),

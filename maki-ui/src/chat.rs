@@ -1299,24 +1299,6 @@ mod tests {
     }
 
     #[test]
-    fn history_stored_write_has_annotation() {
-        let write_output = ToolOutput::WriteCode {
-            path: "/src/main.rs".into(),
-            byte_count: 12,
-            lines: vec!["fn main() {}".into()],
-        };
-        let msgs = tool_use_pair(
-            "write",
-            serde_json::json!({"path": "/src/main.rs", "content": "fn main() {}"}),
-            "wrote 12 bytes",
-            false,
-        );
-        let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default(), &[]).0;
-        assert!(display[0].annotation.is_some());
-    }
-
-    #[test]
     fn history_bash_output_truncated() {
         let long_output = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let joined = long_output.join("\n");

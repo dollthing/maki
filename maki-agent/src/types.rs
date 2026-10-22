@@ -12,7 +12,6 @@ use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
 };
 use maki_storage::id::{MakiId, MakiIdParseError};
-use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
@@ -113,16 +112,7 @@ pub enum TodoPriority {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolInput {
-    Code {
-        language: String,
-        code: String,
-    },
-    /// Nothing produces this anymore (script rendering moved to Lua), but
-    /// old persisted sessions still contain it and must keep loading.
-    Script {
-        language: String,
-        code: String,
-    },
+    Code { language: String, code: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,7 +130,7 @@ fn append_instructions(out: &mut String, blocks: &[InstructionBlock]) {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextOutput {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,35 +161,6 @@ impl From<&str> for TextOutput {
     }
 }
 
-impl<'de> Deserialize<'de> for TextOutput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Legacy(String),
-            Full {
-                text: String,
-                #[serde(default)]
-                instructions: Option<Vec<InstructionBlock>>,
-                #[serde(default)]
-                state: Option<serde_json::Value>,
-            },
-        }
-        match Raw::deserialize(deserializer)? {
-            Raw::Legacy(text) => Ok(text.into()),
-            Raw::Full {
-                text,
-                instructions,
-                state,
-            } => Ok(Self {
-                text,
-                instructions,
-                state,
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
     Plain(TextOutput),
@@ -208,7 +169,6 @@ pub enum ToolOutput {
         path: String,
         start_line: usize,
         lines: Vec<String>,
-        #[serde(default)]
         total_lines: usize,
         #[serde(default)]
         instructions: Option<Vec<InstructionBlock>>,
@@ -221,20 +181,9 @@ pub enum ToolOutput {
         summary: String,
     },
     TodoList(Vec<TodoItem>),
-    WriteCode {
-        path: String,
-        byte_count: usize,
-        lines: Vec<String>,
-    },
 
     GrepResult {
         entries: Vec<GrepFileEntry>,
-    },
-    /// Only here so legacy sessions still deserialize. Batch is a Lua
-    /// plugin now and stores plain text plus a `state` payload, so the old
-    /// per-child `entries` are dropped on load: nothing can render them.
-    Batch {
-        text: String,
     },
     Instructions {
         blocks: Vec<InstructionBlock>,
@@ -269,7 +218,6 @@ impl ToolOutput {
                     Some(format!("{shown} lines"))
                 }
             }
-            Self::WriteCode { byte_count, .. } => Some(format!("{byte_count} bytes")),
             Self::GrepResult { entries } => {
                 let matches: usize = entries.iter().map(|e| e.match_count()).sum();
                 let files = entries.len();
@@ -294,11 +242,9 @@ impl ToolOutput {
         }
     }
 
-    /// Only here for old persisted sessions that still have `WriteCode`/`Diff` variants.
-    /// New code should use `ToolDoneEvent::written_path` instead.
     pub fn written_path(&self) -> Option<&str> {
         match self {
-            Self::WriteCode { path, .. } | Self::Diff { path, .. } => Some(path),
+            Self::Diff { path, .. } => Some(path),
             _ => None,
         }
     }
@@ -333,7 +279,6 @@ impl ToolOutput {
             Self::Diff { .. }
             | Self::ReadCode { .. }
             | Self::ReadDir(_)
-            | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::TodoList(_) => Some(self.as_display_text()),
             _ => None,
@@ -436,12 +381,6 @@ impl ToolOutput {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            Self::WriteCode {
-                path, byte_count, ..
-            } => {
-                let display = crate::tools::relative_path(path);
-                format!("wrote {byte_count} bytes to {display}")
-            }
             Self::GrepResult { entries } => {
                 let mut out = String::new();
                 for (i, entry) in entries.iter().enumerate() {
@@ -463,7 +402,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text } | Self::Image { text, .. } => text.clone(),
+            Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -1745,7 +1684,6 @@ mod tests {
     #[test_case(ToolOutput::Plain(String::new().into()),             None                ; "plain_empty_no_annotation")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 1, lines: vec!["x".into(); 5], total_lines: 5, instructions: None }, Some("5 lines") ; "read_code_full_file")]
     #[test_case(ToolOutput::ReadCode { path: "a.rs".into(), start_line: 10, lines: vec!["x".into(); 5], total_lines: 100, instructions: None }, Some("5 of 100 lines") ; "read_code_partial")]
-    #[test_case(ToolOutput::WriteCode { path: "a.rs".into(), byte_count: 99, lines: vec![] }, Some("99 bytes") ; "write_code_bytes")]
     #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }] }, Some("1 matches in 1 file") ; "grep_file_count")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
@@ -1845,14 +1783,6 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn legacy_batch_output_with_entries_still_deserializes() {
-        let json = r#"{"Batch":{"entries":[{"tool":"read","summary":"s","status":"Success","input":null,"output":null}],"text":"stored"}}"#;
-        let out: ToolOutput =
-            serde_json::from_str(json).expect("old persisted session JSON must load");
-        assert_eq!(out.as_text(), "stored");
-    }
-
     /// Search and the UI's error-dedup guard depend on this exact shape:
     /// spans join bare, lines join with one newline, no trailing newline.
     #[test]
@@ -1945,7 +1875,6 @@ mod tests {
         assert!(text.contains("20: fn bar()"), "second group: {text}");
     }
 
-    #[test_case(ToolOutput::WriteCode { path: "src/lib.rs".into(), byte_count: 10, lines: vec![] }, Some("src/lib.rs") ; "write_code")]
     #[test_case(ToolOutput::Diff { path: "src/lib.rs".into(), before: String::new(), after: String::new(), summary: String::new() }, Some("src/lib.rs") ; "diff")]
     #[test_case(ToolOutput::Plain("ok".into()), None ; "non_write_variant")]
     fn output_written_path(output: ToolOutput, expected: Option<&str>) {
@@ -2090,29 +2019,11 @@ mod tests {
         assert!(!err_event.wrote_to(Path::new("/plans/slug.md")));
     }
 
-    #[test]
-    fn read_code_backward_compat_deserialization() {
-        let json = r#"{"ReadCode":{"path":"a.rs","start_line":1,"lines":["x"]}}"#;
-        let output: ToolOutput = serde_json::from_str(json).unwrap();
-        match output {
-            ToolOutput::ReadCode {
-                total_lines,
-                instructions,
-                ..
-            } => {
-                assert_eq!(total_lines, 0);
-                assert!(instructions.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
     #[test_case(100, 10, 2, 89 ; "middle_of_file")]
     #[test_case(100, 1, 1, 99  ; "first_line_only")]
     #[test_case(5, 1, 5, 0     ; "all_lines_shown")]
     #[test_case(5, 1, 2, 3     ; "partial_from_start")]
     #[test_case(5, 3, 3, 0     ; "partial_to_end")]
-    #[test_case(0, 1, 1, 0     ; "backward_compat_total_zero")]
     #[test_case(0, 1, 0, 0     ; "empty_lines_total_zero")]
     #[test_case(10, 10, 1, 0   ; "last_line")]
     fn lines_remaining(total: usize, start: usize, shown: usize, expected: usize) {
@@ -2230,9 +2141,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
+    fn agent_event_tool_snapshot_omits_absent_theme_gen() {
         const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
-        const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
 
         let event = AgentEvent::ToolSnapshot {
             id: "t1".into(),
@@ -2243,31 +2153,6 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("theme_gen"), "{OMIT_MSG}");
-
-        #[derive(Deserialize)]
-        struct ToolSnapshotFields {
-            #[allow(dead_code)]
-            id: String,
-            #[serde(default)]
-            theme_gen: Option<u64>,
-        }
-        let json_without = r#"{"id":"t1"}"#;
-        let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
-        assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
-    }
-
-    #[test]
-    fn text_output_serde_legacy_bare_string() {
-        const MSG: &str = "old sessions store Plain as a bare string";
-        let json = r#"{"Plain":"hello world"}"#;
-        let output: ToolOutput = serde_json::from_str(json).unwrap();
-        match &output {
-            ToolOutput::Plain(t) => {
-                assert_eq!(t.text, "hello world", "{MSG}");
-                assert!(t.instructions.is_none(), "{MSG}");
-            }
-            _ => panic!("wrong variant"),
-        }
     }
 
     #[test]
@@ -2297,7 +2182,7 @@ mod tests {
     }
 
     #[test_case(
-        ToolOutput::WriteCode { path: "/old/path".into(), byte_count: 10, lines: vec![] },
+        ToolOutput::Diff { path: "/old/path".into(), before: String::new(), after: String::new(), summary: String::new() },
         Some("/new/path".into()), false, Some("/new/path")
         ; "prefers_field_over_output"
     )]

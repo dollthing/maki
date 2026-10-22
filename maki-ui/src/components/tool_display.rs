@@ -165,7 +165,6 @@ impl HighlightRequest {
         }
         let output = output.and_then(|o| match *o {
             ToolOutput::ReadCode { .. }
-            | ToolOutput::WriteCode { .. }
             | ToolOutput::Diff { .. }
             | ToolOutput::GrepResult { .. }
             | ToolOutput::Instructions { .. } => Some(o),
@@ -173,7 +172,6 @@ impl HighlightRequest {
             | ToolOutput::Markdown(_)
             | ToolOutput::ReadDir(_)
             | ToolOutput::TodoList(_)
-            | ToolOutput::Batch { .. }
             | ToolOutput::Image { .. } => None,
         });
         if input.is_none() && output.is_none() {
@@ -709,9 +707,7 @@ pub fn search_text_for(msg: &DisplayMessage) -> String {
     );
 
     let output = msg.tool_output.as_deref();
-    if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
-        msg.tool_input.as_deref()
-    {
+    if let Some(ToolInput::Code { code, .. }) = msg.tool_input.as_deref() {
         push_section(&mut out, code.trim_end());
     }
     if let Some(text) = output.and_then(ToolOutput::structured_display_text) {
@@ -759,7 +755,6 @@ fn plain_output_text(output: &ToolOutput) -> Option<&str> {
         ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
             Some(t.text.as_str())
         }
-        ToolOutput::Batch { text } => Some(text.as_str()),
         _ => None,
     }
 }
@@ -1395,11 +1390,6 @@ mod tests {
     #[test_case(
         Some(ToolOutput::Plain(String::new().into())), None, "bash", false
         ; "empty_plain_resolves_to_none"
-    )]
-    #[test_case(
-        Some(ToolOutput::Batch { text: "legacy batch text".into() }),
-        None, "batch", true
-        ; "legacy_batch_falls_back_to_text"
     )]
     #[test_case(
         Some(ToolOutput::ReadDir(TextOutput { text: "dir listing".into(), instructions: None, state: None })),

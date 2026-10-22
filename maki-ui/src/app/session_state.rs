@@ -271,21 +271,7 @@ pub(crate) fn rules_to_stored(rules: &[maki_config::PermissionRule]) -> Vec<Stor
         .collect()
 }
 
-/// Migrate old stored tool key formats to `ToolKey`.
-/// Handles `"mcp:server__tool"` (pre-PR1 format) -> `McpTool`.
-/// All other formats go through `ToolKey::parse` (current format: `server.tool`).
-fn migrate_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
-    // Pre-PR1 format: "mcp:server__tool" — rewrite to new format and parse.
-    if let Some(rest) = s.strip_prefix("mcp:")
-        && let Some((server, tool)) = rest.split_once("__")
-    {
-        let new_form = format!("{server}.{tool}");
-        return maki_config::ToolKey::parse(&new_form)
-            .map_err(
-                |e| tracing::warn!(key = s, error = %e, "malformed stored tool key — skipping"),
-            )
-            .ok();
-    }
+fn parse_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
     match maki_config::ToolKey::parse(s) {
         Ok(key) => Some(key),
         Err(e) => {
@@ -299,7 +285,7 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
     stored
         .iter()
         .filter_map(|r| {
-            let tool = match migrate_stored_tool_key(&r.tool) {
+            let tool = match parse_stored_tool_key(&r.tool) {
                 Some(t) => t,
                 None => {
                     if matches!(r.effect, StoredEffect::Deny) {
