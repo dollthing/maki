@@ -1262,15 +1262,9 @@ impl SessionRuntime {
             prompt: None,
             cancel: None,
         };
-        let run_id = if starting {
-            self.handles.queue.reserve_run_id(self.app.run_id)
-        } else {
-            self.handles.queue.current_run_id()
-        };
         if let Err(error) = self.handles.queue.try_push(QueueItem {
             input,
-            run_id,
-            displayed: false,
+            displayed: None,
         }) {
             return Err(error.to_string());
         }
@@ -4238,8 +4232,7 @@ impl<'t> EventLoop<'t> {
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem {
                     input,
-                    run_id,
-                    displayed: true,
+                    displayed: Some(run_id),
                 });
             }
             Action::CancelAgent { .. } => {
@@ -5835,8 +5828,7 @@ mod tests {
                     prompt: None,
                     cancel: None,
                 },
-                run_id: 1,
-                displayed: false,
+                displayed: None,
             });
             assert_eq!(runtime.handles.queue.text_messages(), vec!["after barrier"]);
             drop(lease);
@@ -6557,8 +6549,7 @@ mod tests {
                     prompt: None,
                     cancel: None,
                 },
-                run_id: 1,
-                displayed: false,
+                displayed: None,
             });
             assert!(!runtime.handles.queue.is_empty());
             drop(lease);

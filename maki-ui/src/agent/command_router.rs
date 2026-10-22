@@ -60,7 +60,6 @@ mod tests {
     use test_case::test_case;
 
     use super::{AgentCommand, AgentManagerHandle, Arc, CancelMap, spawn_command_router};
-    use crate::agent::shared_queue::correlation;
 
     struct CancellableBackend {
         current: Option<flume::Sender<CurrentManagedTurn>>,
@@ -242,9 +241,7 @@ mod tests {
                 })
                 .unwrap();
             let root_actor = root.actor().unwrap();
-            let root_ticket = root_actor
-                .admit_turn(input(), None, correlation(1))
-                .unwrap();
+            let root_ticket = root_actor.admit_turn(input(), None, String::new()).unwrap();
             let current = current_rx.recv_async().await.unwrap();
             assert!(current.policy_snapshot().is_some());
 
@@ -293,9 +290,7 @@ mod tests {
             assert!(manager.actor(child.id()).is_ok());
             assert_eq!(root_actor.snapshot().lifecycle, ActorLifecycle::Open);
 
-            let later = root_actor
-                .admit_turn(input(), None, correlation(2))
-                .unwrap();
+            let later = root_actor.admit_turn(input(), None, String::new()).unwrap();
             current_rx.recv_async().await.unwrap();
             later_release_tx.send_async(()).await.unwrap();
             assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));

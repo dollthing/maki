@@ -343,8 +343,7 @@ impl App {
         shared
             .try_push(QueueItem {
                 input,
-                run_id: self.run_id,
-                displayed: false,
+                displayed: None,
             })
             .is_ok()
     }

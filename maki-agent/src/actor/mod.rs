@@ -1793,39 +1793,6 @@ impl AgentActorHandle {
         Ok(state.presentation)
     }
 
-    pub fn bind_active_correlation(
-        &self,
-        turn_id: TurnId,
-        correlation: String,
-    ) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        if state.status != ActorStatus::Running(turn_id) {
-            return Err(ActorError::UnknownTurn(turn_id));
-        }
-        let reason = state.cancelled_correlations.remove(&correlation);
-        let processing = state
-            .processing
-            .as_mut()
-            .ok_or(ActorError::UnknownTurn(turn_id))?;
-        if !processing.matches_correlation(&correlation) {
-            processing.correlations.push(correlation);
-        }
-        let reason = reason.map(|reason| *processing.cancellation_reason.get_or_insert(reason));
-        let active = if reason.is_some() {
-            state.active.take().zip(reason)
-        } else {
-            None
-        };
-        drop(state);
-        if let Some((active, reason)) = active {
-            active.fire(reason);
-        }
-        Ok(())
-    }
-
     pub fn identity(&self) -> Arc<()> {
         Arc::clone(&self.inner.identity)
     }

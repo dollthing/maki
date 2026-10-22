@@ -30,12 +30,10 @@ impl From<Submission> for QueuedMessage {
 
 pub(crate) struct QueueItem {
     pub(crate) input: AgentInput,
-    pub(crate) run_id: u64,
-    /// `true` when the UI already drew the bubble (immediate dispatch).
-    /// Consumption retains this flag so the UI does not draw it twice.
-    /// `false` when the user typed while the agent was busy: the UI waits
-    /// for `QueueItemConsumed` before drawing.
-    pub(crate) displayed: bool,
+    /// The presentation the UI already drew the bubble under, which the turn
+    /// keeps. `None` when the user typed while the agent was busy: the turn
+    /// gets a fresh presentation and the UI draws on `QueueItemConsumed`.
+    pub(crate) displayed: Option<u64>,
 }
 
 /// Queue facade shared with the app. Clones all reference the same actor.
@@ -71,12 +69,6 @@ pub(crate) fn pending_texts(entries: Vec<PendingQueueEntry>) -> Vec<String> {
         .collect()
 }
 
-/// Correlation the TUI stamps on actor root/turn admissions. Purely
-/// presentation: the actor owns identity and the TUI only correlates events.
-pub(crate) fn correlation(run_id: u64) -> String {
-    format!("r{run_id}")
-}
-
 impl QueueSender {
     /// The presentation the app should treat as current; the actor owns the
     /// counter.
@@ -100,25 +92,19 @@ impl QueueSender {
 
     pub(crate) fn try_push(
         &self,
-        QueueItem {
-            input,
-            run_id,
-            displayed,
-        }: QueueItem,
+        QueueItem { input, displayed }: QueueItem,
     ) -> Result<(), ActorError> {
         self.actor.submit(
             input,
             None,
-            correlation(run_id),
+            String::new(),
             TurnAdmissionOptions {
                 provenance: TurnProvenance {
                     origin: TurnOrigin::User,
                     ..Default::default()
                 },
-                already_displayed: displayed,
-                // Only a bubble the UI already drew keeps its id; a
-                // deferred item gets a fresh presentation when it runs.
-                displayed_presentation: displayed.then_some(run_id),
+                already_displayed: displayed.is_some(),
+                displayed_presentation: displayed,
                 ..Default::default()
             },
         )?;

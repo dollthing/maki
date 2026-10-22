@@ -710,23 +710,6 @@ impl ActorBackend for TuiActorBackend {
                     self.agent_tx.clone(),
                     Some(work_identity),
                 ));
-            if let Some(current) = &context.managed_turn {
-                let bound = current.manager().actor(context.agent_id).and_then(|actor| {
-                    actor
-                        .bind_active_correlation(
-                            turn_id,
-                            crate::agent::shared_queue::correlation(work_identity.presentation_id),
-                        )
-                        .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
-                });
-                if bound.is_err() || context.cancel.is_cancelled() {
-                    return BackendResult::EnteredRun(self.cancel_setup(
-                        &context,
-                        turn_id,
-                        work_identity,
-                    ));
-                }
-            }
             if let Some(policy) = &context.policy {
                 EventSender::with_identity(self.agent_tx.clone(), Some(work_identity)).try_send(
                     AgentEvent::ModelSwitched {
@@ -1032,7 +1015,7 @@ mod tests {
                     .submit(
                         make_input("successor"),
                         None,
-                        crate::agent::shared_queue::correlation(RUN_ID - 1),
+                        String::new(),
                         TurnAdmissionOptions {
                             already_displayed: true,
                             displayed_presentation: Some(RUN_ID - 1),
@@ -1058,7 +1041,7 @@ mod tests {
                     .submit(
                         make_input("folded user input"),
                         None,
-                        crate::agent::shared_queue::correlation(RUN_ID - 1),
+                        String::new(),
                         TurnAdmissionOptions {
                             already_displayed: false,
                             ..Default::default()
@@ -1116,8 +1099,7 @@ mod tests {
                     let input = make_input(text);
                     queue.push(crate::agent::shared_queue::QueueItem {
                         input,
-                        run_id: RUN_ID + 1,
-                        displayed: false,
+                        displayed: None,
                     });
                 }
                 (None, barrier.presentation_id() + 1)
@@ -1172,13 +1154,7 @@ mod tests {
             if cancel {
                 // Cancel the explicit turn under the presentation it was
                 // admitted with, not the successor queued behind it.
-                manager
-                    .cancel_correlation(
-                        root.id(),
-                        &crate::agent::shared_queue::correlation(explicit_presentation),
-                        TurnCancellationReason::User,
-                    )
-                    .unwrap();
+                actor.cancel_turn(ticket.turn_id()).unwrap();
             } else {
                 release.send(()).unwrap();
             }
@@ -1247,23 +1223,12 @@ mod tests {
                 successor_presentation,
                 "the actor owns the presentation counter"
             );
-            manager
-                .cancel_correlation(
-                    root.id(),
-                    &crate::agent::shared_queue::correlation(RUN_ID),
-                    TurnCancellationReason::User,
-                )
-                .unwrap();
             if let Some(successor) = &successor {
                 assert!(successor.peek().is_none());
             }
             if deferred && cancel {
-                manager
-                    .cancel_correlation(
-                        root.id(),
-                        &crate::agent::shared_queue::correlation(RUN_ID + 1),
-                        TurnCancellationReason::User,
-                    )
+                actor
+                    .cancel_turn(actor.snapshot().active_turn.unwrap())
                     .unwrap();
             } else {
                 release.send(()).unwrap();
@@ -1408,8 +1373,7 @@ mod tests {
                     let boundary = actor.reserve_prepared_operation(None).unwrap();
                     queue.push(crate::agent::shared_queue::QueueItem {
                         input: make_input(),
-                        run_id: FIRST_RUN,
-                        displayed: false,
+                        displayed: None,
                     });
                     (None, boundary.presentation_id() + 1)
                 } else {
@@ -1452,8 +1416,7 @@ mod tests {
                 let displayed_presentation = queue.current_run_id();
                 queue.push(crate::agent::shared_queue::QueueItem {
                     input: make_input(),
-                    run_id: displayed_presentation,
-                    displayed: true,
+                    displayed: Some(displayed_presentation),
                 });
                 assert_eq!(queue.current_run_id(), displayed_presentation);
                 assert_eq!(actor.snapshot().active_turn, Some(second.turn_id()));
@@ -1498,8 +1461,7 @@ mod tests {
                 let future = if deferred {
                     queue.push(crate::agent::shared_queue::QueueItem {
                         input: make_input(),
-                        run_id: FIRST_RUN,
-                        displayed: false,
+                        displayed: None,
                     });
                     None
                 } else {
@@ -1621,8 +1583,7 @@ mod tests {
                     input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {text}"))];
                     QueueItem {
                         input,
-                        run_id: 0,
-                        displayed: false,
+                        displayed: None,
                     }
                 };
                 queue.push(submission(INITIAL));

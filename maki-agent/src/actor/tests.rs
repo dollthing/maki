@@ -1574,9 +1574,6 @@ fn clearing_pending_work_waits_for_processing_before_idle() {
         assert!(events.is_empty());
         release.send(()).unwrap();
         until(|| observations.entered.load(Ordering::SeqCst) == 1).await;
-        handle
-            .bind_active_correlation(active.turn_id(), "presentation".into())
-            .unwrap();
         assert_eq!(handle.processing_turn_id(), Some(active.turn_id()));
         assert!(matches!(
             events.try_recv().unwrap(),
