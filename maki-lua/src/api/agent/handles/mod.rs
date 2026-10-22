@@ -241,7 +241,7 @@ mod tests {
             Ok(Some(self.0.clone()))
         }
 
-        fn register_target(&self, target: TrustedTarget) -> Result<(), String> {
+        fn register_child_target(&self, target: TrustedTarget, _: String) -> Result<(), String> {
             if target.target.same_manager(&self.0.target) {
                 Ok(())
             } else {

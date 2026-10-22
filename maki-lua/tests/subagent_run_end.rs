@@ -133,7 +133,7 @@ impl OrchestrationServices for ProbeServices {
         Ok(self.0.template.clone())
     }
 
-    fn register_target(&self, _: TrustedTarget) -> Result<(), String> {
+    fn register_child_target(&self, _: TrustedTarget, _: String) -> Result<(), String> {
         Ok(())
     }
 }

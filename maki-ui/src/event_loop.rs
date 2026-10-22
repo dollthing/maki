@@ -2063,16 +2063,16 @@ impl<'t> EventLoop<'t> {
             if let Some(config) = runtime.config() {
                 template.cwd = config.context.cwd().to_path_buf();
             }
-            self.orchestration.register_root_with_config_mutations(
+            self.orchestration.register_root(
                 maki_lua::orchestration::TrustedTarget {
                     target: root.clone(),
                     template,
                 },
-                runtime_config_mutations(
+                Some(runtime_config_mutations(
                     runtime,
                     Arc::clone(&self.ctx.storage_writer),
                     Arc::clone(&self.orchestration),
-                ),
+                )),
             );
             if let Some(target) = selected_agent(runtime) {
                 if let Ok(template) = maki_lua::orchestration::OrchestrationServices::template(

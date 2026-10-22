@@ -11,14 +11,14 @@ use maki_commands::CommandInvocation;
 use maki_providers::Message;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::warn;
 
 use crate::agent_errors::FIXED_MODEL_ERROR;
 
 use super::{
     ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
-    TurnCompletion, TurnCompletionFuture, nonpersistent_config_mutation,
+    TurnCompletion, TurnCompletionFuture, default_config_mutation,
 };
 
 struct RootTarget {
@@ -28,7 +28,7 @@ struct RootTarget {
 
 struct ChildTarget {
     target: TrustedTarget,
-    history_key: Option<String>,
+    history_key: String,
 }
 
 #[derive(Default)]
@@ -42,8 +42,11 @@ pub struct AgentOrchestration {
     targets: Mutex<Targets>,
     models: Arc<ArcSwapOption<Vec<String>>>,
     fixed_root: Option<AgentRef>,
-    config_mutations: Option<ConfigMutationReserver>,
     completion: Option<TurnCompletion>,
+}
+
+fn same_agent(left: &AgentRef, right: &AgentRef) -> bool {
+    left.same_manager(right) && left.id() == right.id()
 }
 
 impl AgentOrchestration {
@@ -52,7 +55,6 @@ impl AgentOrchestration {
             targets: Mutex::new(Targets::default()),
             models,
             fixed_root: None,
-            config_mutations: None,
             completion: None,
         }
     }
@@ -60,7 +62,7 @@ impl AgentOrchestration {
     pub fn bind_root(models: Arc<ArcSwapOption<Vec<String>>>, root: TrustedTarget) -> Self {
         let target = root.target.clone();
         let services = Self::new(models);
-        services.register_root(root);
+        services.register_root(root, None);
         services.select(Some(target));
         services
     }
@@ -72,37 +74,23 @@ impl AgentOrchestration {
         services
     }
 
-    pub fn with_config_mutations(mut self, reserve: ConfigMutationReserver) -> Self {
-        self.config_mutations = Some(reserve);
-        self
-    }
-
     pub fn with_completion(mut self, completion: TurnCompletion) -> Self {
         self.completion = Some(completion);
         self
     }
 
-    pub fn register_root(&self, target: TrustedTarget) {
-        self.register_root_binding(target, None);
+    fn lock(&self) -> MutexGuard<'_, Targets> {
+        self.targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub fn register_root_with_config_mutations(
-        &self,
-        target: TrustedTarget,
-        reserve: ConfigMutationReserver,
-    ) {
-        self.register_root_binding(target, Some(reserve));
-    }
-
-    fn register_root_binding(
+    pub fn register_root(
         &self,
         target: TrustedTarget,
         config_mutations: Option<ConfigMutationReserver>,
     ) {
-        let mut targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut targets = self.lock();
         targets.roots.retain(|entry| {
             entry.target.target.validate_live().is_ok()
                 && !entry.target.target.same_manager(&target.target)
@@ -115,61 +103,19 @@ impl AgentOrchestration {
 
     pub fn history_key(&self, target: &AgentRef) -> Result<String, String> {
         self.validate_target(target)?;
-        let targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        targets
+        self.lock()
             .children
             .iter()
-            .find(|entry| {
-                entry.target.target.same_manager(target) && entry.target.target.id() == target.id()
-            })
-            .and_then(|entry| entry.history_key.clone())
+            .find(|entry| same_agent(&entry.target.target, target))
+            .map(|entry| entry.history_key.clone())
             .ok_or_else(|| "child agent history key is unavailable".into())
-    }
-
-    fn register_child_binding(
-        &self,
-        target: TrustedTarget,
-        history_key: Option<String>,
-    ) -> Result<(), String> {
-        self.validate_target(&target.target)?;
-        let mut targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !targets.roots.iter().any(|root| {
-            root.target.target.same_manager(&target.target)
-                && root.target.target.validate_live().is_ok()
-        }) {
-            return Err("agent does not belong to this plugin host".into());
-        }
-        if targets.roots.iter().any(|root| {
-            root.target.target.same_manager(&target.target)
-                && root.target.target.id() == target.target.id()
-        }) {
-            return Err("root template registration is owned by the host".into());
-        }
-        targets.children.retain(|entry| {
-            entry.target.target.validate_live().is_ok()
-                && !(entry.target.target.same_manager(&target.target)
-                    && entry.target.target.id() == target.target.id())
-        });
-        targets.children.push(ChildTarget {
-            target,
-            history_key,
-        });
-        Ok(())
     }
 
     /// Commits a metadata refresh for every live agent whose model resolves
     /// differently now that discovery has run. `None` when none does.
     pub fn refresh_discovered_models(self: &Arc<Self>) -> Option<BoxFuture<'static, ()>> {
         let roots = self
-            .targets
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
             .roots
             .iter()
             .map(|entry| entry.target.target.clone())
@@ -233,10 +179,7 @@ impl AgentOrchestration {
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {
-        let mut targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut targets = self.lock();
         targets.selected = selected;
         targets
             .roots
@@ -270,13 +213,7 @@ impl OrchestrationServices for AgentOrchestration {
             self.validate_target(&pinned.target)?;
             return Ok(Some(pinned.clone()));
         }
-        let target = {
-            let targets = self
-                .targets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            targets.selected.clone()
-        };
+        let target = self.lock().selected.clone();
         target
             .map(|target| {
                 self.template(&target)
@@ -285,24 +222,34 @@ impl OrchestrationServices for AgentOrchestration {
             .transpose()
     }
 
-    fn register_target(&self, target: TrustedTarget) -> Result<(), String> {
-        self.register_child_binding(target, None)
-    }
-
     fn register_child_target(
         &self,
         target: TrustedTarget,
         history_key: String,
     ) -> Result<(), String> {
-        self.register_child_binding(target, Some(history_key))
+        self.validate_target(&target.target)?;
+        let mut targets = self.lock();
+        if targets
+            .roots
+            .iter()
+            .any(|root| same_agent(&root.target.target, &target.target))
+        {
+            return Err("root template registration is owned by the host".into());
+        }
+        targets.children.retain(|entry| {
+            entry.target.target.validate_live().is_ok()
+                && !same_agent(&entry.target.target, &target.target)
+        });
+        targets.children.push(ChildTarget {
+            target,
+            history_key,
+        });
+        Ok(())
     }
 
     fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
         target.validate_live().map_err(|error| error.to_string())?;
-        let targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let targets = self.lock();
         let root = targets
             .roots
             .iter()
@@ -317,10 +264,7 @@ impl OrchestrationServices for AgentOrchestration {
             targets
                 .children
                 .iter()
-                .find(|entry| {
-                    entry.target.target.same_manager(target)
-                        && entry.target.target.id() == target.id()
-                })
+                .find(|entry| same_agent(&entry.target.target, target))
                 .map(|entry| &entry.target)
                 .ok_or("child agent template is unavailable")?
         };
@@ -344,11 +288,7 @@ impl OrchestrationServices for AgentOrchestration {
 
     fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
         target.validate_live().map_err(|error| error.to_string())?;
-        let targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if targets.roots.iter().any(|entry| {
+        if self.lock().roots.iter().any(|entry| {
             entry.target.target.same_manager(target) && entry.target.target.validate_live().is_ok()
         }) {
             Ok(())
@@ -362,7 +302,7 @@ impl OrchestrationServices for AgentOrchestration {
         if self
             .fixed_root
             .as_ref()
-            .is_some_and(|root| root.same_manager(target) && root.id() == target.id())
+            .is_some_and(|root| same_agent(root, target))
         {
             return Err(FIXED_MODEL_ERROR.into());
         }
@@ -375,30 +315,16 @@ impl OrchestrationServices for AgentOrchestration {
         publication: CheckpointPublication,
     ) -> Result<ConfigMutationReservation, String> {
         self.validate_target(target)?;
-        let reserve = {
-            let targets = self
-                .targets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            targets
-                .roots
-                .iter()
-                .find(|root| root.target.target.same_manager(target))
-                .and_then(|root| root.config_mutations.clone())
+        let reserve = self
+            .lock()
+            .roots
+            .iter()
+            .find(|root| root.target.target.same_manager(target))
+            .and_then(|root| root.config_mutations.clone());
+        match reserve {
+            Some(reserve) => reserve(target, publication),
+            None => default_config_mutation(target, publication),
         }
-        .or_else(|| self.config_mutations.clone());
-        if let Some(reserve) = reserve {
-            return reserve(target, publication);
-        }
-        if target
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .parent_id
-            .is_none()
-        {
-            return Err("durable root configuration adapter is unavailable".into());
-        }
-        Ok(nonpersistent_config_mutation(publication))
     }
 
     fn complete_turn(

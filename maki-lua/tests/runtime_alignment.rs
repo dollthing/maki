@@ -249,7 +249,7 @@ impl OrchestrationServices for Targets {
         Ok(self.0.lock().unwrap().first().cloned())
     }
 
-    fn register_target(&self, target: TrustedTarget) -> Result<(), String> {
+    fn register_child_target(&self, target: TrustedTarget, _: String) -> Result<(), String> {
         self.0.lock().unwrap().push(target);
         Ok(())
     }

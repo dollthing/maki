@@ -296,8 +296,11 @@ pub fn frontend_root(
     + 'static,
 ) -> AgentOrchestration {
     let root_id = target.target.id();
-    AgentOrchestration::bind_root(models, target).with_config_mutations(Arc::new(
-        move |target, publication| {
+    let root = target.target.clone();
+    let services = AgentOrchestration::new(models);
+    services.register_root(
+        target,
+        Some(Arc::new(move |target, publication| {
             if target.id() != root_id {
                 return child_config(target, publication);
             }
@@ -305,8 +308,27 @@ pub fn frontend_root(
                 .reserve_transaction(publication)
                 .map(SessionTransactionReservation::into_config_mutation)
                 .map_err(|error| error.to_string())
-        },
-    ))
+        })),
+    );
+    services.select(Some(root));
+    services
+}
+
+/// Children apply config changes without persistence; a root needs a durable
+/// adapter.
+fn default_config_mutation(
+    target: &AgentRef,
+    publication: CheckpointPublication,
+) -> Result<ConfigMutationReservation, String> {
+    if target
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .parent_id
+        .is_none()
+    {
+        return Err("durable root configuration adapter is unavailable".into());
+    }
+    Ok(nonpersistent_config_mutation(publication))
 }
 
 pub fn nonpersistent_config_mutation(
@@ -343,15 +365,7 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         publication: CheckpointPublication,
     ) -> Result<ConfigMutationReservation, String> {
         self.validate_target(target)?;
-        if target
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .parent_id
-            .is_none()
-        {
-            return Err("durable root configuration adapter is unavailable".into());
-        }
-        Ok(nonpersistent_config_mutation(publication))
+        default_config_mutation(target, publication)
     }
 
     /// Completes the host's persistence attempt before the backend returns.
@@ -364,16 +378,12 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
-    fn register_target(&self, _target: TrustedTarget) -> Result<(), String> {
-        Err("host target registration is unavailable".into())
-    }
-
     fn register_child_target(
         &self,
-        target: TrustedTarget,
+        _target: TrustedTarget,
         _history_key: String,
     ) -> Result<(), String> {
-        self.register_target(target)
+        Err("host target registration is unavailable".into())
     }
 
     fn template(&self, _target: &AgentRef) -> Result<ToolContext, String> {

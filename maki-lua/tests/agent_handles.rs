@@ -287,7 +287,7 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
             .transpose()
     }
 
-    fn register_target(&self, target: TrustedTarget) -> Result<(), String> {
+    fn register_child_target(&self, target: TrustedTarget, _: String) -> Result<(), String> {
         target.target.actor().map_err(|error| error.to_string())?;
         let mut targets = self.targets.lock().unwrap();
         if !targets.iter().any(|registered| {

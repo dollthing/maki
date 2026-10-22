@@ -2269,7 +2269,7 @@ mod tests {
                 target: root.clone(),
                 template,
             };
-            orchestration.register_root(pinned.clone());
+            orchestration.register_root(pinned.clone(), None);
             let pinned = TrustedTarget {
                 target: root.clone(),
                 template: maki_lua::orchestration::OrchestrationServices::template(
