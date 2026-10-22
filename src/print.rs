@@ -1389,6 +1389,7 @@ mod tests {
             nested: nested.then_some((entered, gate)),
         });
         let child_provider = Arc::clone(&provider);
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
         let host = maki_lua::PluginHost::with_session_provider_preparer(
             Arc::clone(ToolRegistry::global_arc()),
             registry.clone(),
@@ -1398,10 +1399,9 @@ mod tests {
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&child_provider)))
             })),
+            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        host.serve_ui(ui);
         if nested {
             host.load_source(
                 "print_bundled_task",

@@ -14,7 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
-use maki_lua::ui_sink::HeadlessUi;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -162,6 +162,11 @@ fn build_stack(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry,
         !cli.no_jit,
+        if cli.print || cli.is_sdk_mode() {
+            HostUi::Sink(Box::new(HeadlessUi))
+        } else {
+            HostUi::Frontend
+        },
     )
     .context("initialize lua plugin host")?;
 
@@ -360,7 +365,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
         for warning in &startup_warnings {
             eprintln!("warning: {warning}");
         }
-        stack.plugin_host.serve_ui(HeadlessUi);
     }
 
     if cli.is_sdk_mode() {
@@ -716,8 +720,9 @@ mod tests {
         let cli = Cli::parse_from(["makima", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
-            .expect("live host boots under --no-plugins");
+        let mut plugin_host =
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true, HostUi::Frontend)
+                .expect("live host boots under --no-plugins");
 
         let config = load_config(
             &plugin_host,
@@ -871,7 +876,8 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true, HostUi::Frontend)
+                .expect("live host boots");
 
         match load_config(
             &plugin_host,

@@ -20,6 +20,15 @@ pub trait UiSink {
     }
 }
 
+/// Who renders a host's UI actions; every frontend names one when it spawns
+/// its host, so none is left without a reader.
+pub enum HostUi {
+    /// The frontend drains `PluginHost::ui_action_rx` on its own loop.
+    Frontend,
+    /// The host renders on this sink from a thread of its own.
+    Sink(Box<dyn UiSink + Send>),
+}
+
 /// The sink of a frontend without an interactive UI: notifications go to
 /// stderr, which no headless protocol uses for its output.
 pub struct HeadlessUi;
@@ -32,7 +41,7 @@ impl UiSink for HeadlessUi {
 
 /// Renders every action from {actions} on {sink} until the host closes the
 /// channel.
-pub(crate) fn serve(actions: flume::Receiver<UiAction>, mut sink: impl UiSink) {
+pub(crate) fn serve(actions: flume::Receiver<UiAction>, mut sink: Box<dyn UiSink + Send>) {
     while let Ok(action) = actions.recv() {
         sink.render(action);
     }

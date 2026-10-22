@@ -2357,6 +2357,7 @@ mod tests {
             grandchild_release: grandchild_resume,
         });
         let child_provider = Arc::clone(&provider);
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
         let host = maki_lua::PluginHost::with_session_provider_preparer(
             Arc::clone(ToolRegistry::global_arc()),
             Default::default(),
@@ -2366,12 +2367,11 @@ mod tests {
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&child_provider)))
             })),
+            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
         host.load_source("sdk_bundled_task", include_str!("../plugins/task/init.lua"))
             .unwrap();
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        host.serve_ui(ui);
         host.load_source(
             "sdk_command_spawn",
             &format!(

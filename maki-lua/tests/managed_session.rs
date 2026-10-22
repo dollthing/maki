@@ -849,6 +849,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                 }
                 Ok((model, Arc::clone(&prepared_provider)))
             })),
+            maki_lua::ui_sink::HostUi::Frontend,
         )
         .unwrap();
         host.load_source(

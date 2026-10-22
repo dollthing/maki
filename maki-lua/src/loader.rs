@@ -28,7 +28,7 @@ use crate::runtime::{
     SplashFrameRequest, lifecycle_superseded,
 };
 use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
-use crate::ui_sink::UiSink;
+use crate::ui_sink::HostUi;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -236,29 +236,38 @@ impl Drop for PluginHost {
 }
 
 impl PluginHost {
+    /// A host whose UI actions the caller drains itself, for tests and
+    /// tools that never show them.
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        Self::with_jit(registry, true)
+        Self::with_jit(registry, true, HostUi::Frontend)
     }
 
     pub fn with_command_registry(
         registry: Arc<ToolRegistry>,
         command_registry: CommandRegistry,
         jit: bool,
+        ui: HostUi,
     ) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, command_registry, jit, Arc::new(RealFs), None)
+        Self::with_session_provider_preparer(
+            registry,
+            command_registry,
+            jit,
+            Arc::new(RealFs),
+            None,
+            None,
+            ui,
+        )
     }
 
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
-    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(
-            registry,
-            CommandRegistry::new(),
-            jit,
-            Arc::new(RealFs),
-            None,
-        )
+    pub fn with_jit(
+        registry: Arc<ToolRegistry>,
+        jit: bool,
+        ui: HostUi,
+    ) -> Result<Self, PluginError> {
+        Self::with_command_registry(registry, CommandRegistry::new(), jit, ui)
     }
 
     #[cfg(feature = "test-support")]
@@ -267,17 +276,15 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, CommandRegistry::new(), true, fs, Some(state_dir))
-    }
-
-    fn with_jit_and_state_dir(
-        registry: Arc<ToolRegistry>,
-        command_registry: CommandRegistry,
-        jit: bool,
-        fs: Arc<dyn FsBackend>,
-        state_dir: Option<PathBuf>,
-    ) -> Result<Self, PluginError> {
-        Self::with_session_provider_preparer(registry, command_registry, jit, fs, state_dir, None)
+        Self::with_session_provider_preparer(
+            registry,
+            CommandRegistry::new(),
+            true,
+            fs,
+            Some(state_dir),
+            None,
+            HostUi::Frontend,
+        )
     }
 
     pub fn with_session_provider_preparer(
@@ -287,6 +294,7 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: Option<PathBuf>,
         session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+        ui: HostUi,
     ) -> Result<Self, PluginError> {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
@@ -306,6 +314,10 @@ impl PluginHost {
                 orchestration_services: Default::default(),
             },
         )?;
+        if let HostUi::Sink(sink) = ui {
+            let actions = lua.ui_action_rx.clone();
+            std::thread::spawn(move || crate::ui_sink::serve(actions, sink));
+        }
         Ok(Self {
             inner: lua,
             plugin_rules,
@@ -756,13 +768,6 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
-    }
-
-    /// Renders this host's UI actions on {sink} from a thread of its own, for
-    /// a frontend that has no event loop draining `ui_action_rx`.
-    pub fn serve_ui(&self, sink: impl UiSink + Send + 'static) {
-        let actions = self.ui_action_rx();
-        std::thread::spawn(move || crate::ui_sink::serve(actions, sink));
     }
 }
 
@@ -1419,7 +1424,7 @@ mod tests {
     #[test]
     fn with_jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        let mut host = PluginHost::with_jit(Arc::clone(&reg), false, HostUi::Frontend).unwrap();
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));

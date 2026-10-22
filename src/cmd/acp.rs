@@ -8,7 +8,7 @@ use maki_agent::{command, tools::ToolRegistry};
 use maki_config::project::{self, TrustMode};
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
-use maki_lua::ui_sink::HeadlessUi;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_storage::StateDir;
 
 use crate::setup;
@@ -42,6 +42,7 @@ pub fn run(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry.clone(),
         !no_jit,
+        HostUi::Sink(Box::new(HeadlessUi)),
     )
     .context("initialize lua plugin host")?;
 
@@ -76,7 +77,6 @@ pub fn run(
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    plugin_host.serve_ui(HeadlessUi);
     let lua_event_handle = plugin_host.event_handle();
     let prompt_slots = lua_event_handle.collect_prompt_slots();
     let yolo = config.permissions.yolo;

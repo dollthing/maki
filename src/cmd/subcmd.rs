@@ -16,6 +16,7 @@ use maki_config::providers::{
 };
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
+use maki_lua::ui_sink::{HeadlessUi, HostUi};
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth};
@@ -29,6 +30,11 @@ use maki_ui::AppSession;
 
 const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
+
+/// Subcommands have no UI, so their hosts print notifications to stderr.
+fn headless() -> HostUi {
+    HostUi::Sink(Box::new(HeadlessUi))
+}
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     let provider = provider.map(slugify);
@@ -547,7 +553,7 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
         .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
@@ -605,8 +611,9 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host =
+        PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
+            .context("initialize lua plugin host")?;
 
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
@@ -707,8 +714,8 @@ pub fn prompt(
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
+    let mut host = PluginHost::with_jit(Arc::clone(reg), !no_jit, headless())
+        .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
         .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)

@@ -24,6 +24,7 @@ fn host(registry: Arc<ToolRegistry>) -> PluginHost {
         Arc::new(InMemoryFs::new()),
         None,
         None,
+        maki_lua::ui_sink::HostUi::Frontend,
     )
     .unwrap()
 }

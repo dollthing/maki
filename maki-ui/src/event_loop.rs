@@ -7425,6 +7425,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()
@@ -7798,6 +7799,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 event_loop.ctx.command_runtime.registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()
@@ -8025,6 +8027,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 command_runtime.registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()
@@ -8219,6 +8222,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 command_runtime.registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()
@@ -8391,6 +8395,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()
@@ -8481,6 +8486,7 @@ mod tests {
                 Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 registry.clone(),
                 false,
+                maki_lua::ui_sink::HostUi::Frontend,
             )
             .unwrap();
             host.event_handle()

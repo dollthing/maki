@@ -28,6 +28,7 @@ fn install_expanders(event_loop: &mut EventLoop<'_>) -> maki_lua::PluginHost {
         Arc::new(maki_lua::test_support::InMemoryFs::new()),
         Some(event_loop.ctx.storage.path().to_path_buf()),
         None,
+        maki_lua::ui_sink::HostUi::Frontend,
     )
     .unwrap();
     host.load_source(

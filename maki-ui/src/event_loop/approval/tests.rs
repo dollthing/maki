@@ -861,6 +861,7 @@ fn setup_with_registry(
         registry,
         event_loop.ctx.command_runtime.registry.clone(),
         false,
+        maki_lua::ui_sink::HostUi::Frontend,
     )
     .unwrap();
     host.event_handle()

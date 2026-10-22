@@ -654,6 +654,7 @@ impl Fixture {
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&prepared_provider)))
             })),
+            maki_lua::ui_sink::HostUi::Frontend,
         )
         .unwrap();
         if bundled_tasks {

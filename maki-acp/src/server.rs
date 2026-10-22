@@ -1949,9 +1949,9 @@ fn start_event_pump(
                                 raw_input,
                                 &session.cwd().unwrap_or_default(),
                                 home.as_deref(),
-                            ),
+                    ),
                             permissions::permission_options(project_trusted),
-                        ));
+                ));
                     let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
                     let should_send = {
                         let mut pending = pending.lock().unwrap();
@@ -1969,8 +1969,8 @@ fn start_event_pump(
                                     permission_answer_tx
                                         .clone()
                                         .unwrap_or_else(|| answer_tx.clone()),
-                                ),
-                            );
+                        ),
+                    );
                             true
                         }
                     };
@@ -1983,7 +1983,7 @@ fn start_event_pump(
                                 params: Some(request),
                             },
                             "/params/toolCall",
-                        );
+                );
                     } else {
                         let answer_tx = permission_answer_tx.unwrap_or_else(|| answer_tx.clone());
                         let _ = answer_tx.send(TaggedAnswer::new(&id, PermissionAnswer::Deny).encode());
@@ -2026,7 +2026,7 @@ fn start_event_pump(
                                     method: Arc::from(request.method()),
                                     params: Some(request),
                                 },
-                            );
+                    );
                         } else {
                             let _ = answer_tx
                                 .send(serde_json::json!({ "dismissed": true }).to_string());
@@ -2052,8 +2052,8 @@ fn start_event_pump(
                                     Response::new(
                                         request_id,
                                         Ok(AgentResponse::PromptResponse(resp)),
-                                    ),
-                                );
+                            ),
+                        );
                             }
                             maki_agent::TurnOutcome::Cancelled { .. } => {
                                 respond_prompt(&out_tx, request_id, StopReason::Cancelled);
@@ -2064,7 +2064,7 @@ fn start_event_pump(
                                 send(
                                     &out_tx,
                                     Response::<AgentResponse>::new(request_id, Err(error)),
-                                );
+                        );
                             }
                         }
                     });
@@ -2084,7 +2084,7 @@ fn start_event_pump(
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(request_id, Err(error)),
-                        );
+                );
                     });
                     continue;
                 }
@@ -2395,6 +2395,7 @@ mod tests {
             });
         let prepared = Arc::clone(&provider);
         let registry = Arc::clone(maki_agent::tools::ToolRegistry::global_arc());
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
         let host = maki_lua::PluginHost::with_session_provider_preparer(
             registry,
             Default::default(),
@@ -2402,10 +2403,9 @@ mod tests {
             Arc::new(maki_lua::test_support::InMemoryFs::new()),
             None,
             Some(Arc::new(move |model| Ok((model, Arc::clone(&prepared))))),
+            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        host.serve_ui(ui);
         host.load_source(
             "acp_bundled_task",
             include_str!("../../plugins/task/init.lua"),
@@ -5322,7 +5322,7 @@ mod tests {
             let terminal = response.unwrap_or_else(|| {
                 panic!(
                     "PromptResponse timed out; visible_complete={visible_complete}, pending={pending}"
-                )
+        )
             });
             assert_eq!(terminal["result"]["stopReason"], "end_turn");
             assert!(
