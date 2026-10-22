@@ -1386,7 +1386,7 @@ mod tests {
                             local root = assert(maki.agent.get(ctx, root_ref))
                             assert(root:id() == agent:id())
                             local value, err = root:set_model(ctx, {{ fast = false }})
-                            assert(value == nil and err == "{fixed_model}")
+                            assert(value == nil and err == "{fixed_root}")
                         end
                         local prompt = input.child and "{GRANDCHILD_PROMPT}" or "{CHILD_PROMPT}"
                         local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
@@ -1406,7 +1406,7 @@ mod tests {
                         return result.result.text
                     end,
                 }})
-            "#, fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR)).unwrap();
+            "#, fixed_root = maki_lua::agent_errors::FIXED_ROOT_CONFIG_ERROR)).unwrap();
         }
         host.load_source(
             "print_initialized_command",
@@ -1419,7 +1419,9 @@ mod tests {
                         local selection = assert(root:model(ctx))
                         assert(selection.spec == "{SPEC}" and selection.fast)
                         local changed, err = root:set_model(ctx, {{ fast = false }})
-                        assert(changed == nil and err == "{fixed_model}")
+                        assert(changed == nil and err == "{fixed_root}")
+                        local mode, mode_err = root:set_mode(ctx, "build")
+                        assert(mode == nil and mode_err == "{fixed_root}", mode_err)
                         local set, set_err = maki.session.set_option("model", "{SPEC}")
                         assert(set == nil and set_err == "{session_required}", set_err)
                         local child = assert(maki.agent.spawn(ctx, {{
@@ -1431,7 +1433,7 @@ mod tests {
                     end,
                 }})
             "#,
-                fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR,
+                fixed_root = maki_lua::agent_errors::FIXED_ROOT_CONFIG_ERROR,
                 session_required = maki_lua::agent_errors::SESSION_REQUIRED_ERR,
             ),
         ).unwrap();

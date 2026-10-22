@@ -14,7 +14,7 @@ use maki_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::warn;
 
-use crate::agent_errors::FIXED_MODEL_ERROR;
+use crate::agent_errors::FIXED_ROOT_CONFIG_ERROR;
 
 use super::{
     ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
@@ -268,7 +268,7 @@ impl OrchestrationServices for AgentOrchestration {
             .as_ref()
             .is_some_and(|root| same_agent(root, target))
         {
-            return Err(FIXED_MODEL_ERROR.into());
+            return Err(FIXED_ROOT_CONFIG_ERROR.into());
         }
         Ok(())
     }
