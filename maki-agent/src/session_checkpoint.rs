@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_providers::{Message, ThinkingConfig, TokenUsage};
@@ -5,6 +7,7 @@ use maki_storage::checkpoint::{
     CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointPublication,
     CheckpointRequest, CheckpointWriter,
 };
+use maki_storage::id::MakiId;
 use maki_storage::sessions::{
     HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionLog, StoredMode, StoredSubagent,
 };
@@ -53,34 +56,13 @@ impl RetainedSession {
     }
 }
 
-enum SaveJob {
-    Save {
-        request: CheckpointRequest<SessionCheckpoint>,
-        reply: flume::Sender<Result<CheckpointAck, CheckpointError>>,
-    },
-    Guarded {
-        request: CheckpointRequest<SessionCheckpoint>,
-        publication: CheckpointPublication,
-        claim: CheckpointClaim,
-        reply: flume::Sender<Result<CheckpointAck, CheckpointError>>,
-    },
-    Child {
-        child: StoredSubagent,
-        history: HistorySnapshot<Message>,
-        reply: flume::Sender<Result<(), CheckpointError>>,
-    },
-    ChildConfig {
-        child: StoredSubagent,
-        publication: CheckpointPublication,
-        claim: CheckpointClaim,
-        reply: flume::Sender<Result<(), CheckpointError>>,
-    },
-    Drain(flume::Sender<()>),
-}
+type SaveJob =
+    Box<dyn FnOnce(&StateDir, &Mutex<RetainedSession>, Option<&SessionPublicationGuard>) + Send>;
+type SaveFuture<R> = Pin<Box<dyn Future<Output = Result<R, CheckpointError>> + Send>>;
 
 #[derive(Clone)]
 pub struct SessionLogCheckpoint {
-    session_id: maki_storage::id::MakiId,
+    session_id: MakiId,
     save_tx: flume::Sender<SaveJob>,
     #[cfg(test)]
     session: Arc<Mutex<RetainedSession>>,
@@ -93,26 +75,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl SessionLogCheckpoint {
     pub fn open(
         dir: StateDir,
-        session_id: maki_storage::id::MakiId,
-        model: &str,
-        cwd: &str,
-    ) -> Result<Self, CheckpointError> {
-        Self::open_inner(dir, session_id, model, cwd, None)
-    }
-
-    pub fn open_owned(
-        dir: StateDir,
-        session_id: maki_storage::id::MakiId,
-        model: &str,
-        cwd: &str,
-        publication_guard: SessionPublicationGuard,
-    ) -> Result<Self, CheckpointError> {
-        Self::open_inner(dir, session_id, model, cwd, Some(publication_guard))
-    }
-
-    fn open_inner(
-        dir: StateDir,
-        session_id: maki_storage::id::MakiId,
+        session_id: MakiId,
         model: &str,
         cwd: &str,
         publication_guard: Option<SessionPublicationGuard>,
@@ -139,86 +102,10 @@ impl SessionLogCheckpoint {
         let worker_session = Arc::clone(&session);
         smol::spawn(async move {
             while let Ok(job) = save_rx.recv_async().await {
-                match job {
-                    SaveJob::Save { request, reply } => {
-                        let dir = dir.clone();
-                        let session = Arc::clone(&worker_session);
-                        let publication_guard = publication_guard.clone();
-                        let result = smol::unblock(move || {
-                            Self::save(&dir, &session, request, publication_guard.as_ref())
-                        })
-                        .await;
-                        let _ = reply.send(result);
-                    }
-                    SaveJob::Guarded {
-                        request,
-                        publication,
-                        claim,
-                        reply,
-                    } => {
-                        let dir = dir.clone();
-                        let session = Arc::clone(&worker_session);
-                        let publication_guard = publication_guard.clone();
-                        let result = smol::unblock(move || {
-                            Self::save_guarded(
-                                &dir,
-                                &session,
-                                request,
-                                publication_guard.as_ref(),
-                                &publication,
-                                &claim,
-                            )
-                        })
-                        .await;
-                        let _ = reply.send(result);
-                    }
-                    SaveJob::Child {
-                        child,
-                        history,
-                        reply,
-                    } => {
-                        let dir = dir.clone();
-                        let session = Arc::clone(&worker_session);
-                        let publication_guard = publication_guard.clone();
-                        let result = smol::unblock(move || {
-                            Self::save_child(
-                                &dir,
-                                &session,
-                                session_id,
-                                child,
-                                &history,
-                                publication_guard.as_ref(),
-                            )
-                        })
-                        .await;
-                        let _ = reply.send(result);
-                    }
-                    SaveJob::ChildConfig {
-                        child,
-                        publication,
-                        claim,
-                        reply,
-                    } => {
-                        let dir = dir.clone();
-                        let session = Arc::clone(&worker_session);
-                        let publication_guard = publication_guard.clone();
-                        let result = smol::unblock(move || {
-                            Self::save_child_config(
-                                &dir,
-                                &session,
-                                child,
-                                publication_guard.as_ref(),
-                                &publication,
-                                &claim,
-                            )
-                        })
-                        .await;
-                        let _ = reply.send(result);
-                    }
-                    SaveJob::Drain(reply) => {
-                        let _ = reply.send(());
-                    }
-                }
+                let dir = dir.clone();
+                let session = Arc::clone(&worker_session);
+                let publication_guard = publication_guard.clone();
+                smol::unblock(move || job(&dir, &session, publication_guard.as_ref())).await;
             }
         })
         .detach();
@@ -230,16 +117,29 @@ impl SessionLogCheckpoint {
         })
     }
 
-    pub fn resolve(
-        session_id: maki_storage::id::MakiId,
-        model: &str,
-        cwd: &str,
-    ) -> Result<Self, CheckpointError> {
-        let dir = StateDir::resolve().map_err(|error| CheckpointError::Save {
-            session_id,
-            message: Arc::from(error.to_string()),
-        })?;
-        Self::open(dir, session_id, model, cwd)
+    /// Runs `job` on the blocking pool after every earlier job has finished.
+    fn submit<R: Send + 'static>(
+        &self,
+        job: impl FnOnce(
+            &StateDir,
+            &Mutex<RetainedSession>,
+            Option<&SessionPublicationGuard>,
+        ) -> Result<R, CheckpointError>
+        + Send
+        + 'static,
+    ) -> SaveFuture<R> {
+        let session_id = self.session_id;
+        let (reply, response) = flume::bounded(1);
+        let sent = self.save_tx.send(Box::new(move |dir, session, guard| {
+            let _ = reply.send(job(dir, session, guard));
+        }));
+        Box::pin(async move {
+            sent.map_err(|_| CheckpointError::Closed(session_id))?;
+            response
+                .recv_async()
+                .await
+                .unwrap_or(Err(CheckpointError::Closed(session_id)))
+        })
     }
 
     /// `child.tool_use_id` is the canonical history key supplied by the host.
@@ -249,18 +149,11 @@ impl SessionLogCheckpoint {
         child: StoredSubagent,
         history: HistorySnapshot<Message>,
     ) -> Result<(), CheckpointError> {
-        let (reply, response) = flume::bounded(1);
-        self.save_tx
-            .send(SaveJob::Child {
-                child,
-                history,
-                reply,
-            })
-            .map_err(|_| CheckpointError::Closed(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(CheckpointError::Closed(self.session_id)))
+        let session_id = self.session_id;
+        self.submit(move |dir, session, guard| {
+            Self::save_child(dir, session, session_id, child, &history, guard)
+        })
+        .await
     }
 
     /// Publishes only metadata for the host-authorized canonical child key.
@@ -271,30 +164,14 @@ impl SessionLogCheckpoint {
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> Result<(), CheckpointError> {
-        let (reply, response) = flume::bounded(1);
-        self.save_tx
-            .send(SaveJob::ChildConfig {
-                child,
-                publication,
-                claim,
-                reply,
-            })
-            .map_err(|_| CheckpointError::Closed(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(CheckpointError::Closed(self.session_id)))
+        self.submit(move |dir, session, guard| {
+            Self::save_child_config(dir, session, child, guard, &publication, &claim)
+        })
+        .await
     }
 
     pub async fn drain(&self) -> Result<(), CheckpointError> {
-        let (reply, response) = flume::bounded(1);
-        self.save_tx
-            .send(SaveJob::Drain(reply))
-            .map_err(|_| CheckpointError::Closed(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| CheckpointError::Closed(self.session_id))
+        self.submit(|_, _, _| Ok(())).await
     }
 
     fn save(
@@ -346,7 +223,7 @@ impl SessionLogCheckpoint {
     fn save_child(
         dir: &StateDir,
         session: &Mutex<RetainedSession>,
-        session_id: maki_storage::id::MakiId,
+        session_id: MakiId,
         child: StoredSubagent,
         history: &HistorySnapshot<Message>,
         guard: Option<&SessionPublicationGuard>,
@@ -492,40 +369,13 @@ impl CheckpointWriter<SessionCheckpoint> for SessionLogCheckpoint {
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> CheckpointFuture {
-        let session_id = request.session_id;
-        let (reply, response) = flume::bounded(1);
-        if self
-            .save_tx
-            .send(SaveJob::Guarded {
-                request,
-                publication,
-                claim,
-                reply,
-            })
-            .is_err()
-        {
-            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
-        }
-        Box::pin(async move {
-            response
-                .recv_async()
-                .await
-                .unwrap_or(Err(CheckpointError::Closed(session_id)))
+        self.submit(move |dir, session, guard| {
+            Self::save_guarded(dir, session, request, guard, &publication, &claim)
         })
     }
 
     fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
-        let session_id = request.session_id;
-        let (reply, response) = flume::bounded(1);
-        if self.save_tx.send(SaveJob::Save { request, reply }).is_err() {
-            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
-        }
-        Box::pin(async move {
-            response
-                .recv_async()
-                .await
-                .unwrap_or(Err(CheckpointError::Closed(session_id)))
-        })
+        self.submit(move |dir, session, guard| Self::save(dir, session, request, guard))
     }
 }
 
@@ -744,8 +594,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            let writer =
-                Arc::new(SessionLogCheckpoint::open(dir, id, "test/model", "/project").unwrap());
+            let writer = Arc::new(SessionLogCheckpoint::open(dir, id, MODEL, CWD, None).unwrap());
             let session_guard = lock(&writer.session);
             let (checkpoint_tx, checkpoint_rx) = flume::bounded(1);
             let checkpoint_writer = Arc::clone(&writer);
@@ -777,7 +626,7 @@ mod tests {
                 initial.set_subagents(vec![child(SIBLING_KEY)]);
             }
             initial.save(&dir).unwrap();
-            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD).unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
             let sibling_writer = writer.clone();
             let history = HistorySnapshot::new(vec![Message::user(TERMINAL.into())]);
             let sibling_history = HistorySnapshot::new(vec![Message::user(COMMITTED_MODEL.into())]);
@@ -970,16 +819,13 @@ mod tests {
                     .unwrap()
                     .unwrap()
             });
-            let writer = match &owner {
-                Some(owner) => SessionLogCheckpoint::open_owned(
-                    dir.clone(),
-                    id,
-                    MODEL,
-                    CWD,
-                    owner.publication_guard(),
-                ),
-                None => SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD),
-            }
+            let writer = SessionLogCheckpoint::open(
+                dir.clone(),
+                id,
+                MODEL,
+                CWD,
+                owner.as_ref().map(|owner| owner.publication_guard()),
+            )
             .unwrap();
             let publication = CheckpointPublication::default();
             let claim: CheckpointClaim = Arc::new(|publication| {
@@ -1165,7 +1011,7 @@ mod tests {
         )
         .unwrap();
         child_session(id).save(&dir).unwrap();
-        let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD).unwrap();
+        let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
         let original = Message::user(ORIGINAL.into());
         let history = HistorySnapshot::new(vec![original.clone()]);
         let mut accepted = request(id, 1, MODEL, &options);
@@ -1303,7 +1149,7 @@ mod tests {
         let id = MakiId::generate();
         let old = session_lock::claim(&sessions, &id).unwrap().unwrap();
         let writer =
-            SessionLogCheckpoint::open_owned(dir.clone(), id, MODEL, CWD, old.publication_guard())
+            SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, Some(old.publication_guard()))
                 .unwrap();
         let owner = if cancelled {
             old
@@ -1376,7 +1222,7 @@ mod tests {
             let dir = StateDir::from_path(state_path);
             let id = MakiId::generate();
             assert!(matches!(
-                SessionLogCheckpoint::open(dir, id, "test/model", "/project"),
+                SessionLogCheckpoint::open(dir, id, MODEL, CWD, None),
                 Err(CheckpointError::Save { session_id, .. }) if session_id == id
             ));
         });
@@ -1405,7 +1251,7 @@ mod tests {
         std::fs::write(&path, CORRUPT).unwrap();
 
         assert!(matches!(
-            SessionLogCheckpoint::open(dir, id, "test/model", "/project"),
+            SessionLogCheckpoint::open(dir, id, MODEL, CWD, None),
             Err(CheckpointError::Save { session_id, .. }) if session_id == id
         ));
         assert_eq!(std::fs::read(path).unwrap(), CORRUPT);
@@ -1429,8 +1275,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            let writer =
-                SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project").unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
 
             writer
                 .checkpoint(CheckpointRequest {

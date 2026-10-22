@@ -964,23 +964,13 @@ async fn install_session_with_lock(
             return Err(error);
         }
     };
-    let checkpoint = match match lock.publication_guard() {
-        Some(publication_guard) => {
-            maki_agent::session_checkpoint::SessionLogCheckpoint::open_owned(
-                params.storage.clone(),
-                handle.session_id.id(),
-                &current_model,
-                &cwd.to_string_lossy(),
-                publication_guard,
-            )
-        }
-        None => maki_agent::session_checkpoint::SessionLogCheckpoint::open(
-            params.storage.clone(),
-            handle.session_id.id(),
-            &current_model,
-            &cwd.to_string_lossy(),
-        ),
-    } {
+    let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+        params.storage.clone(),
+        handle.session_id.id(),
+        &current_model,
+        &cwd.to_string_lossy(),
+        lock.publication_guard(),
+    ) {
         Ok(checkpoint) => Arc::new(checkpoint),
         Err(error) => {
             warn!(%error, "failed to open session checkpoint");

@@ -897,12 +897,12 @@ pub fn run(params: SdkParams) -> Result<()> {
         .ok_or_else(|| eyre!("session is open in another terminal; close it there first"))?;
     let publication_guard = claimed_lock.publication_guard();
     let checkpoint = Arc::new(
-        maki_agent::session_checkpoint::SessionLogCheckpoint::open_owned(
+        maki_agent::session_checkpoint::SessionLogCheckpoint::open(
             storage.clone(),
             handle.session_id.id(),
             &startup_model.spec(),
             &working_dir,
-            publication_guard,
+            Some(publication_guard),
         )
         .map_err(|error| eyre!(error))?,
     );
@@ -2950,6 +2950,7 @@ mod tests {
                 id,
                 STARTUP_MODEL,
                 &cwd.to_string_lossy(),
+                None,
             )
             .unwrap(),
         );
