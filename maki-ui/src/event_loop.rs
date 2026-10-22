@@ -1386,7 +1386,7 @@ fn prepare_coordinator(
         session.meta.workflow,
         thinking,
     );
-    SessionCoordinatorHandle::prepare(SessionCoordinatorParams {
+    PreparedSessionCoordinator::new(SessionCoordinatorParams {
         session_id: session.id,
         catalog: deps.catalog.clone(),
         definitions,
@@ -6723,7 +6723,7 @@ mod tests {
     }
 
     fn test_coordinator(session_id: MakiId) -> SessionCoordinatorHandle {
-        SessionCoordinatorHandle::prepare(SessionCoordinatorParams {
+        PreparedSessionCoordinator::new(SessionCoordinatorParams {
             session_id,
             catalog: Default::default(),
             definitions: builtin_option_definitions(

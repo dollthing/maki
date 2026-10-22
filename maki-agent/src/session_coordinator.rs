@@ -372,7 +372,7 @@ fn actor_options(
             &config.model.spec(),
             boolean(config.fast),
             &config.thinking.to_string(),
-            Some(boolean(config.workflow)),
+            boolean(config.workflow),
         )?
         .unwrap_or_else(|| read.options.unchanged_candidate()))
 }
@@ -417,8 +417,7 @@ impl SessionOptionCatalog {
         Fut: Future<Output = Result<(), SessionCoordinatorError>>,
     {
         let plugin = plugin.into();
-        let mut prepared: Vec<(PreparedPluginOptions, flume::Sender<PluginOptionDecision>)> =
-            Vec::new();
+        let mut prepared: Vec<PluginOptionParticipant> = Vec::new();
         let (snapshots, previous_definitions) = loop {
             let mut sessions = lock(&self.state)
                 .sessions
@@ -560,51 +559,12 @@ impl SessionOptionCatalog {
         let catalog = self.clone();
         let (finished, response) = flume::bounded(1);
         smol::spawn(async move {
-            let result = async move {
-                let reservations = prepared.iter().map(|(staged, _)| Arc::clone(&staged.reservation)).collect::<Vec<_>>();
-                let restore: Vec<_> = prepared.iter().zip(&snapshots).map(|((prepared, _), snapshot)| (snapshot.version, prepared.previous.clone())).collect();
-                let mut committed = Vec::with_capacity(prepared.len());
-                let mut commit_error = None;
-                for ((prepared, decision), snapshot) in prepared.iter().zip(snapshots) {
-                    let (reply, response) = flume::bounded(1);
-                    let result = if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
-                        Err(SessionCoordinatorError::StaleSession(prepared.session_id))
-                    } else { response.recv_async().await.unwrap_or(Err(SessionCoordinatorError::StaleSession(prepared.session_id))) };
-                    if let Err(error) = result { commit_error.get_or_insert(error); }
-                    committed.push((prepared.session_id, snapshot));
-                }
-                if let Some(error) = commit_error {
-                    {
-                        let _directory = lock(&DIRECTORY);
-                        let mut state = lock(&catalog.state);
-                        if SessionOptions::restore_reserved_batch_if_versions(reservations.iter().zip(restore)
-                            .map(|(reservation, (version, previous))| (reservation.as_ref(), version, previous)).collect()) {
-                            if let Some(definitions) = previous_definitions { state.definitions.insert(Arc::clone(&plugin), definitions); }
-                            else { state.definitions.remove(plugin.as_ref()); }
-                            state.revision += 1;
-                        } else { tracing::warn!(%plugin, "session options advanced before plugin rollback"); }
-                    }
-                    drop(reservations);
-                    if let Err(rollback) = abort_plugin_options(prepared).await {
-                        return Err(SessionOptionError::CallbackFailed(Arc::from(format!("{error}; checkpoint rollback: {rollback}"))).into());
-                    }
-                    return Err(error);
-                }
-                drop(reservations);
-                let mut release_error = None;
-                for (staged, decision) in prepared {
-                    let session_id = staged.session_id;
-                    drop(staged);
-                    let (reply, response) = flume::bounded(1);
-                    let result = if decision.send(PluginOptionDecision::Complete(reply)).is_err() {
-                        Err(SessionCoordinatorError::StaleSession(session_id))
-                    } else { response.recv_async().await.unwrap_or(Err(SessionCoordinatorError::StaleSession(session_id))) };
-                    if let Err(error) = result { release_error.get_or_insert(error); }
-                }
-                release_error.map_or(Ok(committed), Err)
-            }.await;
+            let result =
+                finish_plugin_options(catalog, plugin, prepared, snapshots, previous_definitions)
+                    .await;
             let _ = finished.send(result);
-        }).detach();
+        })
+        .detach();
         response.recv_async().await.unwrap_or_else(|_| {
             Err(
                 SessionOptionError::CallbackFailed(Arc::from("catalog decision task stopped"))
@@ -615,14 +575,8 @@ impl SessionOptionCatalog {
 }
 
 impl SessionCoordinatorHandle {
-    pub fn prepare(
-        params: SessionCoordinatorParams,
-    ) -> Result<PreparedSessionCoordinator, SessionCoordinatorError> {
-        PreparedSessionCoordinator::new(params)
-    }
-
     pub fn register(params: SessionCoordinatorParams) -> Result<Self, SessionCoordinatorError> {
-        Self::prepare(params)?.activate()
+        PreparedSessionCoordinator::new(params)?.activate()
     }
 
     pub fn resolve(session_id: MakiId) -> Result<Self, SessionCoordinatorError> {
@@ -1056,7 +1010,7 @@ impl SessionCoordinatorHandle {
 }
 
 impl PreparedSessionCoordinator {
-    fn new(params: SessionCoordinatorParams) -> Result<Self, SessionCoordinatorError> {
+    pub fn new(params: SessionCoordinatorParams) -> Result<Self, SessionCoordinatorError> {
         let SessionCoordinatorParams {
             session_id,
             catalog,
@@ -1458,8 +1412,98 @@ fn reconcile_options(
     Ok(())
 }
 
+type PluginOptionParticipant = (PreparedPluginOptions, flume::Sender<PluginOptionDecision>);
+
+async fn decide_plugin_options(
+    decision: &flume::Sender<PluginOptionDecision>,
+    session_id: MakiId,
+    make: fn(flume::Sender<Result<(), SessionCoordinatorError>>) -> PluginOptionDecision,
+) -> Result<(), SessionCoordinatorError> {
+    let (reply, response) = flume::bounded(1);
+    if decision.send(make(reply)).is_err() {
+        return Err(SessionCoordinatorError::StaleSession(session_id));
+    }
+    response
+        .recv_async()
+        .await
+        .unwrap_or(Err(SessionCoordinatorError::StaleSession(session_id)))
+}
+
+/// Runs detached so a dropped catalog caller cannot abandon a decision.
+async fn finish_plugin_options(
+    catalog: SessionOptionCatalog,
+    plugin: Arc<str>,
+    prepared: Vec<PluginOptionParticipant>,
+    snapshots: Vec<SessionOptionsSnapshot>,
+    previous_definitions: Option<Vec<SessionOptionDefinition>>,
+) -> Result<Vec<(MakiId, SessionOptionsSnapshot)>, SessionCoordinatorError> {
+    let reservations = prepared
+        .iter()
+        .map(|(staged, _)| Arc::clone(&staged.reservation))
+        .collect::<Vec<_>>();
+    let restore = prepared
+        .iter()
+        .zip(&snapshots)
+        .map(|((staged, _), snapshot)| (snapshot.version, staged.previous.clone()))
+        .collect::<Vec<_>>();
+    let mut committed = Vec::with_capacity(prepared.len());
+    let mut commit_error = None;
+    for ((staged, decision), snapshot) in prepared.iter().zip(snapshots) {
+        let result =
+            decide_plugin_options(decision, staged.session_id, PluginOptionDecision::Commit).await;
+        if let Err(error) = result {
+            commit_error.get_or_insert(error);
+        }
+        committed.push((staged.session_id, snapshot));
+    }
+    if let Some(error) = commit_error {
+        {
+            let _directory = lock(&DIRECTORY);
+            let mut state = lock(&catalog.state);
+            let restored = SessionOptions::restore_reserved_batch_if_versions(
+                reservations
+                    .iter()
+                    .zip(restore)
+                    .map(|(reservation, (version, previous))| {
+                        (reservation.as_ref(), version, previous)
+                    })
+                    .collect(),
+            );
+            if restored {
+                match previous_definitions {
+                    Some(definitions) => state.definitions.insert(Arc::clone(&plugin), definitions),
+                    None => state.definitions.remove(plugin.as_ref()),
+                };
+                state.revision += 1;
+            } else {
+                tracing::warn!(%plugin, "session options advanced before plugin rollback");
+            }
+        }
+        drop(reservations);
+        if let Err(rollback) = abort_plugin_options(prepared).await {
+            return Err(SessionOptionError::CallbackFailed(Arc::from(format!(
+                "{error}; checkpoint rollback: {rollback}"
+            )))
+            .into());
+        }
+        return Err(error);
+    }
+    drop(reservations);
+    let mut release_error = None;
+    for (staged, decision) in prepared {
+        let session_id = staged.session_id;
+        drop(staged);
+        let result =
+            decide_plugin_options(&decision, session_id, PluginOptionDecision::Complete).await;
+        if let Err(error) = result {
+            release_error.get_or_insert(error);
+        }
+    }
+    release_error.map_or(Ok(committed), Err)
+}
+
 async fn abort_plugin_options(
-    prepared: Vec<(PreparedPluginOptions, flume::Sender<PluginOptionDecision>)>,
+    prepared: Vec<PluginOptionParticipant>,
 ) -> Result<(), SessionCoordinatorError> {
     let mut responses = Vec::with_capacity(prepared.len());
     let mut first_error = None;
@@ -2125,12 +2169,10 @@ mod tests {
                 )
                 .await;
                 for coordinator in [&first, &second] {
-                    for value in [ENABLED_VALUE, DISABLED_VALUE] {
-                        assert!(matches!(
-                            coordinator.read.options.set(YOLO_OPTION_ID, value),
-                            Err(SessionOptionError::Busy)
-                        ));
-                    }
+                    assert!(matches!(
+                        coordinator.read.options.try_reserve(None),
+                        Err(SessionOptionError::Busy)
+                    ));
                 }
                 assert!(
                     matches!(first.set_model(None, Some(false), None).await, Err(SessionCoordinatorError::SessionBusy(busy)) if busy == ids[0])
@@ -2240,7 +2282,7 @@ mod tests {
             for coordinator in [&first, &second] {
                 for value in [ENABLED_VALUE, DISABLED_VALUE] {
                     assert!(matches!(
-                        coordinator.read.options.set(YOLO_OPTION_ID, value),
+                        coordinator.read.options.try_reserve(None),
                         Err(SessionOptionError::Busy)
                     ));
                     assert!(matches!(
@@ -2302,7 +2344,7 @@ mod tests {
             let id = MakiId::generate();
             let mut session_params = params(id, writer(false));
             session_params.catalog = catalog.clone();
-            let prepared = SessionCoordinatorHandle::prepare(session_params).unwrap();
+            let prepared = PreparedSessionCoordinator::new(session_params).unwrap();
             catalog
                 .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
                 .await
@@ -2329,7 +2371,7 @@ mod tests {
             let current = register_with_catalog(id, writer(false), &catalog);
             let mut replacement_params = params(id, writer(false));
             replacement_params.catalog = catalog.clone();
-            let replacement = SessionCoordinatorHandle::prepare(replacement_params).unwrap();
+            let replacement = PreparedSessionCoordinator::new(replacement_params).unwrap();
             let (started_tx, started_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -2357,12 +2399,10 @@ mod tests {
                 }
             });
             started_rx.recv_async().await.unwrap();
-            for value in [ENABLED_VALUE, DISABLED_VALUE] {
-                assert!(matches!(
-                    current.read.options.set(YOLO_OPTION_ID, value),
-                    Err(SessionOptionError::Busy)
-                ));
-            }
+            assert!(matches!(
+                current.read.options.try_reserve(None),
+                Err(SessionOptionError::Busy)
+            ));
             let activated = replacement.activate_replacing(&current).unwrap();
             release_tx.send_async(()).await.unwrap();
             let committed = replace.await.unwrap();

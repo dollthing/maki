@@ -292,7 +292,7 @@ impl SessionOptions {
         model: &str,
         fast: &str,
         thinking: &str,
-        workflow: Option<&str>,
+        workflow: &str,
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         let state = lock(&self.state);
         let mut candidate = state.clone();
@@ -309,15 +309,15 @@ impl SessionOptions {
             });
             definition.values = choices.into();
         }
-        let mut values = vec![
-            (MODEL_OPTION_ID, model),
-            (FAST_OPTION_ID, fast),
-            (THINKING_OPTION_ID, thinking),
-        ];
-        if let Some(workflow) = workflow {
-            values.push((WORKFLOW_OPTION_ID, workflow));
-        }
-        Self::prepare_set_values_from_state(&candidate, &values)
+        Self::prepare_set_values_from_state(
+            &candidate,
+            &[
+                (MODEL_OPTION_ID, model),
+                (FAST_OPTION_ID, fast),
+                (THINKING_OPTION_ID, thinking),
+                (WORKFLOW_OPTION_ID, workflow),
+            ],
+        )
     }
 
     fn prepare_set_values_from_state(
@@ -484,45 +484,23 @@ impl SessionOptions {
         Ok(snapshots)
     }
 
-    #[cfg(test)]
-    pub(crate) fn restore_batch_if_versions(
-        snapshots: Vec<(Arc<SessionOptions>, u64, SessionOptionsSnapshot)>,
-    ) -> bool {
-        Self::restore_batch(snapshots, false)
-    }
-
     pub(crate) fn restore_reserved_batch_if_versions(
         snapshots: Vec<(&SessionOptionsReservation, u64, SessionOptionsSnapshot)>,
-    ) -> bool {
-        Self::restore_batch(
-            snapshots
-                .into_iter()
-                .map(|(reservation, version, snapshot)| {
-                    (Arc::clone(&reservation.options), version, snapshot)
-                })
-                .collect(),
-            true,
-        )
-    }
-
-    fn restore_batch(
-        snapshots: Vec<(Arc<SessionOptions>, u64, SessionOptionsSnapshot)>,
-        reserved: bool,
     ) -> bool {
         if snapshots
             .iter()
             .enumerate()
-            .any(|(index, (options, _, _))| {
+            .any(|(index, (reservation, _, _))| {
                 snapshots[..index]
                     .iter()
-                    .any(|(previous, _, _)| Arc::ptr_eq(options, previous))
+                    .any(|(previous, _, _)| Arc::ptr_eq(&reservation.options, &previous.options))
             })
         {
             return false;
         }
         let changed = snapshots
             .iter()
-            .map(|(options, _, _)| Arc::clone(options))
+            .map(|(reservation, _, _)| Arc::clone(&reservation.options))
             .collect::<Vec<_>>();
         let mut guards = changed
             .iter()
@@ -531,9 +509,7 @@ impl SessionOptions {
         if guards
             .iter()
             .zip(&snapshots)
-            .any(|(guard, (_, expected_version, _))| {
-                guard.version != *expected_version || guard.reserved != reserved
-            })
+            .any(|(guard, (_, expected_version, _))| guard.version != *expected_version)
         {
             return false;
         }
@@ -624,53 +600,6 @@ impl SessionOptions {
         snapshot(&candidate.state)
     }
 
-    pub(crate) fn commit(
-        &self,
-        candidate: SessionOptionsCandidate,
-    ) -> Result<SessionOptionsSnapshot, SessionOptionError> {
-        let mut state = lock(&self.state);
-        if state.reserved {
-            return Err(SessionOptionError::Busy);
-        }
-        if state.version != candidate.base_version {
-            return Err(SessionOptionError::StaleHandle(Arc::from(
-                "session option snapshot changed during commit",
-            )));
-        }
-        state.committed = candidate.state;
-        let snapshot = snapshot(&state);
-        drop(state);
-        self.changed.notify(usize::MAX);
-        Ok(snapshot)
-    }
-
-    pub fn set(&self, id: &str, value: &str) -> Result<SessionOptionsSnapshot, SessionOptionError> {
-        let Some(candidate) = self.prepare_set(id, value)? else {
-            let state = lock(&self.state);
-            return if state.reserved {
-                Err(SessionOptionError::Busy)
-            } else {
-                Ok(snapshot(&state))
-            };
-        };
-        self.commit(candidate)
-    }
-
-    pub fn persistent_values(&self) -> BTreeMap<String, String> {
-        let state = lock(&self.state);
-        state
-            .definitions
-            .iter()
-            .filter(|definition| definition.persistent)
-            .filter_map(|definition| {
-                state
-                    .values
-                    .get(&definition.id)
-                    .map(|value| (definition.id.to_string(), value.to_string()))
-            })
-            .collect()
-    }
-
     pub fn subscribe(self: &Arc<Self>) -> SessionOptionsSubscription {
         SessionOptionsSubscription {
             options: Arc::clone(self),
@@ -756,13 +685,25 @@ mod tests {
         }
     }
 
+    fn set(
+        options: &Arc<SessionOptions>,
+        id: &str,
+        value: &str,
+    ) -> Result<SessionOptionsSnapshot, SessionOptionError> {
+        let reservation = options.try_reserve(None)?;
+        Ok(match options.prepare_set(id, value)? {
+            Some(candidate) => reservation.commit(candidate),
+            None => options.snapshot(),
+        })
+    }
+
     #[test]
     fn session_option_values_are_isolated_per_session() {
         let definitions = vec![definition(YOLO_OPTION_ID, DISABLED_VALUE)];
         let first = SessionOptions::new(definitions.clone(), &BTreeMap::new()).unwrap();
         let second = SessionOptions::new(definitions, &BTreeMap::new()).unwrap();
 
-        first.set(YOLO_OPTION_ID, ENABLED_VALUE).unwrap();
+        set(&first, YOLO_OPTION_ID, ENABLED_VALUE).unwrap();
 
         assert_eq!(
             first.snapshot().options[0].current_value.as_ref(),
@@ -812,6 +753,7 @@ mod tests {
                 model,
                 definition(FAST_OPTION_ID, DISABLED_VALUE),
                 definition(THINKING_OPTION_ID, DISABLED_VALUE),
+                definition(WORKFLOW_OPTION_ID, DISABLED_VALUE),
             ],
             &BTreeMap::new(),
         )
@@ -819,7 +761,7 @@ mod tests {
         let before = options.snapshot();
 
         let candidate = options
-            .prepare_actor_config("new/model", ENABLED_VALUE, ENABLED_VALUE, None)
+            .prepare_actor_config("new/model", ENABLED_VALUE, ENABLED_VALUE, DISABLED_VALUE)
             .unwrap()
             .unwrap();
         let staged = SessionOptions::candidate_snapshot(&candidate);
@@ -830,7 +772,10 @@ mod tests {
         assert!(staged.options[0].definition.accepts("new/model"));
         assert_eq!(staged.options[1].current_value.as_ref(), ENABLED_VALUE);
         assert_eq!(staged.options[2].current_value.as_ref(), ENABLED_VALUE);
-        assert_eq!(options.commit(candidate).unwrap(), staged);
+        assert_eq!(
+            options.reserve(&candidate).unwrap().commit(candidate),
+            staged
+        );
     }
 
     #[test]
@@ -843,7 +788,7 @@ mod tests {
         let before = options.snapshot();
 
         assert!(matches!(
-            options.set(FAST_OPTION_ID, "maybe"),
+            set(&options, FAST_OPTION_ID, "maybe"),
             Err(SessionOptionError::InvalidValue { .. })
         ));
         assert_eq!(options.snapshot(), before);
@@ -854,13 +799,9 @@ mod tests {
         let reservation = options.reserve(&candidate).unwrap();
         let concurrent = Arc::clone(&options);
         std::thread::spawn(move || {
-            assert!(matches!(
-                concurrent.try_reserve(None),
-                Err(SessionOptionError::Busy)
-            ));
             for value in [ENABLED_VALUE, DISABLED_VALUE] {
                 assert!(matches!(
-                    concurrent.set(FAST_OPTION_ID, value),
+                    set(&concurrent, FAST_OPTION_ID, value),
                     Err(SessionOptionError::Busy)
                 ));
             }
@@ -868,11 +809,6 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(options.snapshot(), before);
-        assert!(!SessionOptions::restore_batch_if_versions(vec![(
-            Arc::clone(&options),
-            before.version,
-            before.clone(),
-        )]));
         drop(reservation);
         let reservation = options.reserve(&candidate).unwrap();
         let committed = reservation.commit(candidate.clone());
@@ -881,7 +817,7 @@ mod tests {
             options.reserve(&candidate),
             Err(SessionOptionError::StaleHandle(_))
         ));
-        options.set(FAST_OPTION_ID, DISABLED_VALUE).unwrap();
+        set(&options, FAST_OPTION_ID, DISABLED_VALUE).unwrap();
     }
 
     #[test]
@@ -896,15 +832,18 @@ mod tests {
             .prepare_set(YOLO_OPTION_ID, ENABLED_VALUE)
             .unwrap()
             .unwrap();
-        let committed = options.commit(candidate).unwrap();
-        let concurrent = options.set(YOLO_OPTION_ID, DISABLED_VALUE).unwrap();
+        let reservation = options.reserve(&candidate).unwrap();
+        let committed = SessionOptions::commit_batch(vec![(&reservation, candidate)]).unwrap();
+        drop(reservation);
+        let newer = set(&options, YOLO_OPTION_ID, DISABLED_VALUE).unwrap();
+        let reservation = options.try_reserve(None).unwrap();
 
-        assert!(!SessionOptions::restore_batch_if_versions(vec![(
-            Arc::clone(&options),
-            committed.version,
+        assert!(!SessionOptions::restore_reserved_batch_if_versions(vec![(
+            &reservation,
+            committed[0].version,
             previous,
         )]));
-        assert_eq!(options.snapshot(), concurrent);
+        assert_eq!(options.snapshot(), newer);
     }
 
     #[test]
@@ -915,10 +854,11 @@ mod tests {
         )
         .unwrap();
         let snapshot = options.snapshot();
+        let reservation = options.try_reserve(None).unwrap();
 
-        assert!(!SessionOptions::restore_batch_if_versions(vec![
-            (Arc::clone(&options), snapshot.version, snapshot.clone()),
-            (Arc::clone(&options), snapshot.version, snapshot),
+        assert!(!SessionOptions::restore_reserved_batch_if_versions(vec![
+            (&reservation, snapshot.version, snapshot.clone()),
+            (&reservation, snapshot.version, snapshot),
         ]));
     }
 
