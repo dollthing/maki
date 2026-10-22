@@ -2685,7 +2685,16 @@ mod tests {
         target: &AgentRef,
         patch: ConfigPatch,
     ) -> maki_agent::actor::ConfigCommit {
-        smol::block_on(services.commit_config_change(target, ConfigChange::Patch(patch))).unwrap()
+        let change = async |_, _| {
+            Ok((
+                maki_agent::session_coordinator::publication_claim(),
+                ConfigChange::Patch(patch),
+            ))
+        };
+        smol::block_on(maki_lua::orchestration::commit_config_change(
+            services, target, change,
+        ))
+        .unwrap()
     }
 
     #[test]

@@ -10,7 +10,6 @@ use maki_agent::{
 };
 use maki_lua_macro::{lua_class, lua_fn};
 use maki_storage::StateDir;
-use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::plans::new_plan_path;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
@@ -398,44 +397,43 @@ async fn agent_set_model(
     try_pair!(authorize(&lua, &ctx, &this));
     let selection = try_pair!(selection_from_lua(&lua, patch));
     let spec = selection.spec.map(|spec| spec.to_string());
-    let actor = try_pair!(this.manager.actor(this.id));
-    let mut template = try_pair!(destination_template(&lua, &this));
+    let template = try_pair!(destination_template(&lua, &this));
     let target = try_pair!(this.manager.lookup(this.id));
     let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
     try_pair!(services.validate_config_mutation(&target));
-    let operation = try_pair!(actor.reserve_prepared_operation(None));
-    let publication = CheckpointPublication::default();
-    try_pair!(operation.register_publication(&publication));
-    let predecessor = try_pair!(operation.wait_predecessor().await);
-    let mut captured = template.to_tool_context();
-    captured.apply_effective_config(&predecessor);
-    template = AgentContext::from(&captured);
-    let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
-    let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
-    let prepare = lua
-        .app_data_ref::<SessionProviderPreparer>()
-        .map(|prepare| Arc::clone(&prepare));
-    let model = if spec.is_some() {
-        let (model, provider) =
-            try_pair!(build_session_provider(&spec, false, &template, prepare).await);
-        Some(PreparedModel { model, provider })
-    } else {
-        None
-    };
-    try_pair!(authorize(&lua, &ctx, &this));
-    let patch = ConfigPatch {
-        model,
-        thinking: selection.thinking,
-        fast: selection.fast,
-        ..Default::default()
-    };
-    try_pair!(operation.resolve(Some(ConfigChange::Patch(patch))));
-    try_pair!(operation.wait_ready().await);
-    let config = try_pair!(operation.ready_config());
-    let transaction = try_pair!(reserve(config, claim));
-    drop(this);
-    drop(ctx);
-    let commit = try_pair!(operation.commit_durable(transaction).await).config;
+    let commit = orchestration::commit_config_change(
+        &*services,
+        &target,
+        async |publication, predecessor| {
+            let claim = ctx.agent_publication_claim(&lua, &target, &publication)?;
+            let mut captured = template.to_tool_context();
+            captured.apply_effective_config(&predecessor);
+            let template = AgentContext::from(&captured);
+            let prepare = lua
+                .app_data_ref::<SessionProviderPreparer>()
+                .map(|prepare| Arc::clone(&prepare));
+            let model = match spec {
+                Some(_) => {
+                    let (model, provider) =
+                        build_session_provider(&spec, false, &template, prepare).await?;
+                    Some(PreparedModel { model, provider })
+                }
+                None => None,
+            };
+            authorize(&lua, &ctx, &this)?;
+            drop(this);
+            drop(ctx);
+            let patch = ConfigPatch {
+                model,
+                thinking: selection.thinking,
+                fast: selection.fast,
+                ..Default::default()
+            };
+            Ok((claim, ConfigChange::Patch(patch)))
+        },
+    )
+    .await;
+    let commit = try_pair!(commit);
     Ok((Some(selection_table(&lua, &commit.config)?), None))
 }
 
@@ -503,39 +501,33 @@ async fn agent_set_mode(
             .is_some_and(|state| state.structured.is_some()),
         Some(&definition),
     ));
-    let actor = try_pair!(this.manager.actor(this.id));
     let target = try_pair!(this.manager.lookup(this.id));
     let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-    let operation = try_pair!(actor.reserve_prepared_operation(None));
-    let publication = CheckpointPublication::default();
-    try_pair!(operation.register_publication(&publication));
-    let predecessor = try_pair!(operation.wait_predecessor().await);
-    let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
-    let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
-    let mode = match name.as_str() {
-        "build" => AgentMode::Build,
-        "plan" => {
-            let path = match predecessor.mode.plan_path() {
-                Some(path) => path.to_path_buf(),
-                None => try_pair!(prepare_plan_path(&lua).await),
+    let commit = orchestration::commit_config_change(
+        &*services,
+        &target,
+        async |publication, predecessor| {
+            let claim = ctx.agent_publication_claim(&lua, &target, &publication)?;
+            let mode = match name.as_str() {
+                "build" => AgentMode::Build,
+                "plan" => match predecessor.mode.plan_path() {
+                    Some(path) => AgentMode::Plan(path.to_path_buf()),
+                    None => AgentMode::Plan(prepare_plan_path(&lua).await?),
+                },
+                _ => AgentMode::Custom(ModeId::parse(&name)),
             };
-            try_pair!(authorize(&lua, &ctx, &this));
-            AgentMode::Plan(path)
-        }
-        _ => AgentMode::Custom(ModeId::parse(&name)),
-    };
-    let change = ConfigChange::Mode {
-        mode,
-        mode_def: Some(definition),
-    };
-    try_pair!(authorize(&lua, &ctx, &this));
-    try_pair!(operation.resolve(Some(change)));
-    try_pair!(operation.wait_ready().await);
-    let config = try_pair!(operation.ready_config());
-    let transaction = try_pair!(reserve(config, claim));
-    drop(this);
-    drop(ctx);
-    let commit = try_pair!(operation.commit_durable(transaction).await).config;
+            authorize(&lua, &ctx, &this)?;
+            drop(this);
+            drop(ctx);
+            let change = ConfigChange::Mode {
+                mode,
+                mode_def: Some(definition),
+            };
+            Ok((claim, change))
+        },
+    )
+    .await;
+    let commit = try_pair!(commit);
     Ok((Some(commit.config.mode.id().key().to_string()), None))
 }
 

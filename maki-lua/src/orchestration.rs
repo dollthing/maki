@@ -3,13 +3,13 @@ use crate::agent_errors::{
 };
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use arc_swap::ArcSwapOption;
-use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
+use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::session_coordinator::{ConfigMutation, SessionTransactionReservation};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
-use maki_storage::checkpoint::CheckpointPublication;
+use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use maki_storage::sessions::{HistorySnapshot, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
 use std::{
@@ -312,6 +312,50 @@ pub fn frontend_root(
     );
     services.select(Some(root));
     services
+}
+
+/// Commits one config change through {target}'s FIFO. Once the predecessor has
+/// settled and the durable mutation is reserved, `prepare` claims the
+/// publication and derives the change from the predecessor's config.
+pub async fn commit_config_change(
+    services: &(impl OrchestrationServices + ?Sized),
+    target: &AgentRef,
+    prepare: impl AsyncFnOnce(
+        CheckpointPublication,
+        Arc<EffectiveAgentConfig>,
+    ) -> Result<(CheckpointClaim, ConfigChange), String>,
+) -> Result<ConfigCommit, String> {
+    let operation = target
+        .actor()
+        .map_err(|error| error.to_string())?
+        .reserve_prepared_operation(None)
+        .map_err(|error| error.to_string())?;
+    let publication = CheckpointPublication::default();
+    operation
+        .register_publication(&publication)
+        .map_err(|error| error.to_string())?;
+    let predecessor = operation
+        .wait_predecessor()
+        .await
+        .map_err(|error| error.to_string())?;
+    let reserve = services.reserve_config_mutation(target, publication.clone())?;
+    let (claim, change) = prepare(publication, predecessor).await?;
+    operation
+        .resolve(Some(change))
+        .map_err(|error| error.to_string())?;
+    operation
+        .wait_ready()
+        .await
+        .map_err(|error| error.to_string())?;
+    let config = operation
+        .ready_config()
+        .map_err(|error| error.to_string())?;
+    let transaction = reserve(config, claim)?;
+    operation
+        .commit_durable(transaction)
+        .await
+        .map(|commit| commit.config)
+        .map_err(|error| error.to_string())
 }
 
 /// Children apply config changes without persistence; a root needs a durable

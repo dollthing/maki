@@ -1,7 +1,7 @@
 use arc_swap::ArcSwapOption;
 use maki_agent::{
     AgentRef,
-    actor::{ConfigChange, ConfigCommit},
+    actor::ConfigChange,
     agent::LoadedInstructions,
     cancel::CancelToken,
     session_coordinator::publication_claim,
@@ -18,7 +18,7 @@ use crate::agent_errors::FIXED_MODEL_ERROR;
 
 use super::{
     ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
-    TurnCompletion, TurnCompletionFuture, default_config_mutation,
+    TurnCompletion, TurnCompletionFuture, commit_config_change, default_config_mutation,
 };
 
 struct RootTarget {
@@ -134,48 +134,12 @@ impl AgentOrchestration {
         let services = Arc::clone(self);
         Some(Box::pin(async move {
             for (target, change) in refreshes {
-                if let Err(error) = services.commit_config_change(&target, change).await {
+                let fixed = async |_, _| Ok((publication_claim(), change));
+                if let Err(error) = commit_config_change(&*services, &target, fixed).await {
                     warn!(agent = %target.id(), %error, "failed to refresh discovered model");
                 }
             }
         }))
-    }
-
-    pub async fn commit_config_change(
-        &self,
-        target: &AgentRef,
-        change: ConfigChange,
-    ) -> Result<ConfigCommit, String> {
-        let operation = target
-            .actor()
-            .map_err(|error| error.to_string())?
-            .reserve_prepared_operation(None)
-            .map_err(|error| error.to_string())?;
-        let publication = CheckpointPublication::default();
-        operation
-            .register_publication(&publication)
-            .map_err(|error| error.to_string())?;
-        operation
-            .wait_predecessor()
-            .await
-            .map_err(|error| error.to_string())?;
-        let reserve = self.reserve_config_mutation(target, publication)?;
-        operation
-            .resolve(Some(change))
-            .map_err(|error| error.to_string())?;
-        operation
-            .wait_ready()
-            .await
-            .map_err(|error| error.to_string())?;
-        let config = operation
-            .ready_config()
-            .map_err(|error| error.to_string())?;
-        let transaction = reserve(config, publication_claim())?;
-        operation
-            .commit_durable(transaction)
-            .await
-            .map(|commit| commit.config)
-            .map_err(|error| error.to_string())
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {
