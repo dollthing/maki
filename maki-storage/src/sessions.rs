@@ -16,11 +16,9 @@ use std::time::UNIX_EPOCH;
 
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::id::MakiId;
 use crate::offload_cleanup::Root;
-use crate::paths::canonical_key;
 use crate::session_lock::SessionPublicationGuard;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1009,37 +1007,6 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok())
         .unwrap_or_default()
-}
-
-/// The directories sessions were recorded in, most recently used first and at
-/// most `limit` of them.
-///
-/// The index is append only and the caller pays filesystem work per entry, so
-/// a limit is what keeps a long history off a startup path. Order comes from
-/// the session id, which is a UUIDv7 and carries the time it was made, so a
-/// history over the limit keeps the directories somebody still works in.
-///
-/// Keys go through `canonical_key`, because the index holds whatever string a
-/// session was saved with while callers compare against canonicalized paths: a
-/// symlinked home would otherwise hide a folder's own history from it. A key
-/// that is not valid UTF-8 is dropped, because the callers store what they get
-/// back as text and a lossy path must never stand in for a real one.
-pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
-    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
-        .into_iter()
-        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
-        .collect();
-    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    entries.truncate(limit);
-    entries
-        .into_iter()
-        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
-        .collect()
-}
-
-fn session_time(session_id: &str) -> Option<(u64, u32)> {
-    let id: MakiId = session_id.parse().ok()?;
-    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
 }
 
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
