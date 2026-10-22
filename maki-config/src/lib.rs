@@ -854,21 +854,12 @@ impl PermissionsFileConfig {
     }
 }
 
-/// Where in a permissions file a rule failed to parse, and why.
-#[derive(Debug)]
-struct RuleError {
-    section: String,
-    key: String,
-    reason: String,
-}
-
-impl RuleError {
-    fn new(section: &str, key: &str, reason: impl Into<String>) -> Self {
-        Self {
-            section: section.into(),
-            key: key.into(),
-            reason: reason.into(),
-        }
+fn rule_error(path: &Path, section: &str, key: &str, reason: impl Into<String>) -> ConfigError {
+    ConfigError::PermissionRule {
+        path: path.to_path_buf(),
+        section: section.into(),
+        key: key.into(),
+        reason: reason.into(),
     }
 }
 
@@ -877,40 +868,47 @@ fn expected(what: &str, got: &toml::Value) -> String {
 }
 
 impl PermissionsFileConfig {
-    fn parse(table: &toml::Table) -> Result<Self, RuleError> {
+    fn parse(path: &Path, table: &toml::Table) -> Result<Self, ConfigError> {
         let mut config = Self::default();
         for (key, value) in table {
             match key.as_str() {
                 "default" => {
                     config.default = Some(
-                        default_effect(value).map_err(|reason| RuleError::new("", key, reason))?,
+                        default_effect(value)
+                            .map_err(|reason| rule_error(path, "", key, reason))?,
                     );
                 }
                 "mcp" => {
                     let servers = value.as_table().ok_or_else(|| {
-                        RuleError::new("", key, expected("a table of MCP servers", value))
+                        rule_error(path, "", key, expected("a table of MCP servers", value))
                     })?;
                     for (server, value) in servers {
-                        config.parse_mcp_server(server, value)?;
+                        config.parse_mcp_server(path, server, value)?;
                     }
                 }
                 tool => {
                     config
                         .tools
-                        .insert(tool.to_owned(), ToolPermissions::parse(tool, value)?);
+                        .insert(tool.to_owned(), ToolPermissions::parse(path, tool, value)?);
                 }
             }
         }
         Ok(config)
     }
 
-    fn parse_mcp_server(&mut self, server: &str, value: &toml::Value) -> Result<(), RuleError> {
+    fn parse_mcp_server(
+        &mut self,
+        path: &Path,
+        server: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
         let section = format!("mcp.{server}");
         let table = value
             .as_table()
-            .ok_or_else(|| RuleError::new("mcp", server, expected("a table", value)))?;
+            .ok_or_else(|| rule_error(path, "mcp", server, expected("a table", value)))?;
         if !is_valid_server_name(server) {
-            return Err(RuleError::new(
+            return Err(rule_error(
+                path,
                 "mcp",
                 server,
                 "invalid server name; use only alphanumeric characters and hyphens",
@@ -922,7 +920,7 @@ impl PermissionsFileConfig {
                 "deny" => Effect::Deny,
                 "default" => {
                     let effect = default_effect(value)
-                        .map_err(|reason| RuleError::new(&section, key, reason))?;
+                        .map_err(|reason| rule_error(path, &section, key, reason))?;
                     self.mcp_defaults.insert(
                         ToolKey::McpServer {
                             server: server.into(),
@@ -931,19 +929,12 @@ impl PermissionsFileConfig {
                     );
                     continue;
                 }
-                _ if value.is_table() => {
-                    return Err(RuleError::new(
-                        &section,
-                        key,
-                        "server names cannot contain dots",
-                    ));
-                }
-                _ => return Err(RuleError::new(&section, key, "unknown key")),
+                _ => return Err(rule_error(path, &section, key, "unknown key")),
             };
             let tools = string_list(value, "an array of tool names")
-                .map_err(|reason| RuleError::new(&section, key, reason))?;
+                .map_err(|reason| rule_error(path, &section, key, reason))?;
             for tool in tools {
-                let key_error = |reason: String| RuleError::new(&section, key, reason);
+                let key_error = |reason: String| rule_error(path, &section, key, reason);
                 let tool = match tool.as_str() {
                     "*" => ToolKey::McpServer {
                         server: server.into(),
@@ -990,12 +981,13 @@ struct ToolPermissions {
 }
 
 impl ToolPermissions {
-    fn parse(tool: &str, value: &toml::Value) -> Result<Self, RuleError> {
+    fn parse(path: &Path, tool: &str, value: &toml::Value) -> Result<Self, ConfigError> {
         let table = value
             .as_table()
-            .ok_or_else(|| RuleError::new("", tool, expected("a table", value)))?;
+            .ok_or_else(|| rule_error(path, "", tool, expected("a table", value)))?;
         if tool.is_empty() || tool.contains('.') {
-            return Err(RuleError::new(
+            return Err(rule_error(
+                path,
                 "",
                 tool,
                 "invalid tool name; MCP servers go under [mcp.<server>]",
@@ -1003,7 +995,7 @@ impl ToolPermissions {
         }
         let mut permissions = Self::default();
         for (key, value) in table {
-            let error = |reason: String| RuleError::new(tool, key, reason);
+            let error = |reason: String| rule_error(path, tool, key, reason);
             match key.as_str() {
                 "allow" => permissions.allow = Some(ScopeSet::parse(value).map_err(error)?),
                 "deny" => permissions.deny = Some(ScopeSet::parse(value).map_err(error)?),
@@ -1011,11 +1003,6 @@ impl ToolPermissions {
                     return Err(error("use the top-level `default` instead".into()));
                 }
                 "default" => permissions.default = Some(default_effect(value).map_err(error)?),
-                _ if value.is_table() => {
-                    return Err(error(
-                        "nested table; MCP servers go under [mcp.<server>]".into(),
-                    ));
-                }
                 _ => return Err(error("unknown key".into())),
             }
         }
@@ -2155,12 +2142,7 @@ fn read_permissions_file(path: &Path) -> Result<PermissionsFileConfig, ConfigErr
     };
     let table: toml::Table =
         toml::from_str(&content).map_err(|error| file_error(error.to_string()))?;
-    PermissionsFileConfig::parse(&table).map_err(|error| ConfigError::PermissionRule {
-        path: path.to_path_buf(),
-        section: error.section,
-        key: error.key,
-        reason: error.reason,
-    })
+    PermissionsFileConfig::parse(path, &table)
 }
 
 pub fn global_config_dir() -> Option<PathBuf> {

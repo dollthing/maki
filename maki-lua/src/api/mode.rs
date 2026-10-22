@@ -44,13 +44,6 @@ fn registry(lua: &Lua) -> Result<Arc<ModeRegistry>, mlua::Error> {
         .ok_or_else(|| mlua::Error::runtime(NO_REGISTRY_ERR))
 }
 
-fn mode_err(err: ModeError) -> String {
-    match err {
-        ModeError::EmptyName => "mode name must be non-empty".to_owned(),
-        ModeError::Unknown(name) => format!("unknown mode '{name}'"),
-    }
-}
-
 /// Evaluate a Lua `system_prompt` function (or pass a plain string through)
 /// with the `{ cwd, plan_path }` context.
 fn eval_system_prompt(lua: &Lua, value: Value) -> LuaResult<Option<String>> {
@@ -113,7 +106,7 @@ fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
     let reg = registry(lua)?;
     match reg.define(spec) {
         Ok(()) => Ok((Some(true), None)),
-        Err(e) => Ok(err_pair(mode_err(e))),
+        Err(e) => Ok(err_pair(e.to_string())),
     }
 }
 
@@ -173,8 +166,8 @@ async fn set_inner(
 ) -> LuaResult<Pair<bool>> {
     let id = ModeId::parse(&name);
     let reg = registry(lua)?;
-    if !reg.contains(id.key()) {
-        return Ok(err_pair(mode_err(ModeError::Unknown(name))));
+    if reg.get(&id).is_none() {
+        return Ok(err_pair(ModeError::Unknown(name).to_string()));
     }
     if let Some(target) = try_pair!(target(lua)) {
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -252,7 +245,7 @@ fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
     };
     match result {
         Ok(()) => Ok((Some(true), None)),
-        Err(e) => Ok(err_pair(mode_err(e))),
+        Err(e) => Ok(err_pair(e.to_string())),
     }
 }
 
@@ -269,7 +262,6 @@ mod tests {
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
     use serde_json::json;
-    use test_case::test_case;
 
     fn prep(reg: Option<Arc<ModeRegistry>>) -> Lua {
         let lua = Lua::new();
@@ -372,14 +364,6 @@ mod tests {
             .exec_async(),
         )
         .unwrap();
-    }
-
-    #[test_case("build", true ; "build_defined")]
-    #[test_case("plan", true ; "plan_defined")]
-    #[test_case("nope", false ; "custom_missing")]
-    fn registry_contains(key: &str, expected: bool) {
-        let reg = ModeRegistry::builtin();
-        assert_eq!(reg.contains(key), expected);
     }
 
     #[test]

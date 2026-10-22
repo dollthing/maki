@@ -14,7 +14,6 @@ use agent_client_protocol_schema::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const MODE_BUILD: &str = "build";
-const MODE_PLAN: &str = "plan";
 
 pub const MODEL_CONFIG_ID: &str = "model";
 
@@ -118,21 +117,6 @@ pub fn session_config_options(
                 .description(definition.description.to_string())
         })
         .collect()
-}
-
-pub fn mode_id_to_agent_mode(mode_id: &str, modes: &ModeRegistry) -> Option<maki_agent::AgentMode> {
-    match mode_id {
-        MODE_BUILD => Some(maki_agent::AgentMode::Build),
-        MODE_PLAN => {
-            let storage = maki_storage::StateDir::resolve().ok()?;
-            let plan_path = maki_storage::plans::new_plan_path(&storage).ok()?;
-            Some(maki_agent::AgentMode::Plan(plan_path))
-        }
-        name if modes.contains(name) => {
-            Some(maki_agent::AgentMode::Custom(ModeId::Custom(name.into())))
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

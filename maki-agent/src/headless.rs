@@ -18,9 +18,7 @@ use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::actor::{
-    AdmissionPreparation, AgentContextSnapshot, ConfigChange, PreparedModel, PreparedTurn,
-};
+use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel};
 use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
@@ -50,7 +48,6 @@ const OPERATION_CANCELLED: &str = "operation cancelled";
 #[cfg(any(test, feature = "test-util"))]
 const SESSION_ENDED: &str = "session ended";
 const PRINT_SESSION_ENDED: &str = "print session ended";
-const ADMISSION_WITHOUT_TICKET: &str = "turn admission produced no ticket";
 const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
 const COMPACTION_CANCELLED: &str = "compaction cancelled";
 
@@ -299,7 +296,6 @@ pub struct InteractiveInputSender {
     events: flume::Sender<Envelope>,
     next: Arc<AtomicU64>,
     _lifetime: flume::Sender<()>,
-    modes: Arc<crate::ModeRegistry>,
     #[cfg(any(test, feature = "test-util"))]
     mirror: Option<flume::Sender<AgentInput>>,
 }
@@ -328,14 +324,13 @@ impl InteractiveInputSender {
         let actor = root.actor().map_err(|error| error.to_string())?;
         let run = self.next.fetch_add(1, Ordering::Relaxed);
         let cancel = input.cancel.clone();
-        let ticket = admit_input(
-            &actor,
-            &self.modes,
-            input,
-            EventSender::new(self.events.clone()),
-            format!("run:{run}"),
-        )
-        .await?;
+        let ticket = actor
+            .admit_turn(
+                input,
+                Some(EventSender::new(self.events.clone())),
+                format!("run:{run}"),
+            )
+            .map_err(|error| error.to_string())?;
         if let Some(cancel) = cancel {
             let ticket = ticket.clone();
             smol::spawn(async move {
@@ -354,33 +349,6 @@ impl InteractiveInputSender {
         }
         Ok(ticket)
     }
-}
-
-async fn admit_input(
-    actor: &crate::AgentActorHandle,
-    modes: &crate::ModeRegistry,
-    input: AgentInput,
-    event_sender: EventSender,
-    correlation: String,
-) -> Result<TurnTicket, String> {
-    let mode = input.mode.clone();
-    let mode_def = match &mode {
-        AgentMode::Custom(id) => modes.get(id),
-        _ => Some(modes.current(&mode)),
-    };
-    let operation = actor
-        .reserve_prepared_operation(Some(PreparedTurn {
-            input,
-            event_sender: Some(event_sender),
-            correlation,
-        }))
-        .map_err(|error| error.to_string())?;
-    operation
-        .commit_when_ready(Some(ConfigChange::Mode { mode, mode_def }))
-        .await
-        .map_err(|error| error.to_string())?
-        .ticket
-        .ok_or_else(|| ADMISSION_WITHOUT_TICKET.to_owned())
 }
 
 pub struct InteractiveHandle {
@@ -444,7 +412,7 @@ pub fn spawn_interactive_with_binding(
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
 ) -> InteractiveHandle {
-    spawn_managed(params, prepare, history, binding, None, AgentMode::Build)
+    spawn_managed(params, prepare, history, binding, None)
 }
 
 struct HeadlessBackend {
@@ -941,7 +909,6 @@ fn spawn_managed(
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
     one_shot: Option<(Receiver<TurnTicket>, SessionCoordinatorHandle)>,
-    initial_mode: AgentMode,
 ) -> InteractiveHandle {
     let session_ref = params
         .session_id
@@ -963,7 +930,6 @@ fn spawn_managed(
         events: raw_tx.clone(),
         next: Arc::new(AtomicU64::new(0)),
         _lifetime: lifetime_tx,
-        modes: Arc::clone(&params.modes),
         #[cfg(any(test, feature = "test-util"))]
         mirror: None,
     };
@@ -1031,10 +997,10 @@ fn spawn_managed(
                         workflow: params.defaults.workflow,
                         thinking: params.defaults.thinking.into(),
                     },
-                    initial_mode.clone(),
+                    AgentMode::Build,
                 )
                 .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
-                .with_mode_def(Some(params.modes.current(&initial_mode)));
+                .with_mode_def(Some(params.modes.current(&AgentMode::Build)));
                 let persist = one_shot.is_none();
                 let backend = HeadlessBackend {
                     params: AgentParams {
@@ -1195,7 +1161,6 @@ fn spawn_one_shot(
         workflow: params.input.workflow,
         thinking: Some(params.input.thinking.into()),
     };
-    let initial_mode = params.input.mode.clone();
     let interactive = spawn_managed(
         InteractiveParams {
             model: params.model,
@@ -1224,7 +1189,6 @@ fn spawn_one_shot(
         None,
         Some(binding),
         Some((admission, coordinator)),
-        initial_mode,
     );
     Ok(HeadlessHandle {
         manager: interactive.manager,
@@ -1264,9 +1228,9 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::TurnOutcome;
     use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
     use crate::tools::offload::{OffloadBackend, OffloadError};
+    use crate::{ModeRegistry, TurnOutcome};
     use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -1368,12 +1332,7 @@ pub(crate) mod tests {
     }
 
     fn first_input() -> AgentInput {
-        AgentInput::from_defaults(
-            "hello".into(),
-            AgentMode::Build,
-            Vec::new(),
-            SessionDefaults::default(),
-        )
+        AgentInput::from_defaults("hello".into(), Vec::new(), SessionDefaults::default())
     }
 
     /// Spawns a print session on {provider} and admits its first turn.
@@ -1410,7 +1369,7 @@ pub(crate) mod tests {
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(Path::new("/tmp")),
-            modes: Arc::default(),
+            modes: Arc::new(ModeRegistry::builtin()),
             session_options: Default::default(),
             state_dir: None,
         }
@@ -1942,7 +1901,6 @@ pub(crate) mod tests {
             let (bound, binding_seen) = flume::bounded(1);
             let mut params = test_params();
             params.config.max_concurrent_agent_turns = 1;
-            params.input.mode = AgentMode::Plan(PathBuf::from("/tmp/plan.md"));
             let handle = spawn_with_binding(
                 params,
                 Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
@@ -1950,10 +1908,7 @@ pub(crate) mod tests {
                     Box::pin(async move {
                         assert_eq!(manager.root_id().unwrap(), root.id());
                         assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
-                        assert_eq!(
-                            template.mode,
-                            AgentMode::Plan(PathBuf::from("/tmp/plan.md"))
-                        );
+                        assert_eq!(template.mode, AgentMode::Build);
                         assert_eq!(template.execution_agent_id, Some(root.id()));
                         assert_eq!(template.cwd, PathBuf::from("/tmp"));
                         assert!(template.managed_turn.is_none());
@@ -1969,7 +1924,6 @@ pub(crate) mod tests {
             let ticket = handle
                 .start_with_input(AgentInput::from_defaults(
                     DISPATCHED_INPUT.into(),
-                    AgentMode::Build,
                     Vec::new(),
                     SessionDefaults::default(),
                 ))

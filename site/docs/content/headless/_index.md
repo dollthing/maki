@@ -84,10 +84,9 @@ Inbound messages (`user`, `control_request`, `control_response`, `control_cancel
 
 SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
-Two caveats:
+One caveat: one-shot `--print` always starts a **new** session in **build** mode, does not save it, and keeps the model it started with. Plan mode, session resume and model changes need the SDK path (or the TUI).
 
-- One-shot `--print` always starts a **new** session in **build** mode, does not save it, and keeps the model it started with. Plan mode, session resume and model changes need the SDK path (or the TUI).
-- The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
+SDK `set_permission_mode` commits plan mode for `plan` and build mode for any other value, as durable session config, the same way `/mode` does in the TUI.
 
 ### Quick example
 

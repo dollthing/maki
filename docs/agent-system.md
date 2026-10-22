@@ -65,6 +65,8 @@ Managed actors own the committed `EffectiveAgentConfig`. Typed changes and admis
 
 Every frontend, the coordinator and Lua commit a config change through one `config_change::ConfigChangeTicket`. Reserving takes the durable mutation (for a root, the session option lease) and then the FIFO slot, both synchronously, so changes hold the lease in dispatch order. A change that meets a held lease or idle guard joins a per-actor wait queue and takes its slot once the holder lets go, so waiting changes keep dispatch order too; it fails only when the target closes or the change is rejected. A model in a patch is re-resolved against discovery when the actor materializes it, so a model prepared before discovery finished still gets the discovered metadata. Errors are a typed `ConfigChangeError`; `is_busy()` means an idle guard or the lease refused a change outside the ticket.
 
+Every mode name goes through one `modes::resolve`, against the registry the Lua host owns (`EventHandle::mode_registry`), and every frontend and Lua commit a mode with `ConfigChangeTicket::commit_mode`. `plan` keeps the current plan file or allocates one under the state directory. A mode is durable config committed once, like any other change: headless frontends admit turns without a mode of their own.
+
 An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints use the existing session format and project onto stored metadata without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
 
 ### Durable publication

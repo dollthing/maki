@@ -72,9 +72,9 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 
 | Mode | Effect |
 |------|--------|
-| `default` | Normal permission prompts |
+| `default` | Normal permission prompts, build mode |
 | `acceptEdits` | Accepted for Claude Code compatibility; currently same as `default` |
-| `plan` | Agent mode plan with plan file `./plan.md` under cwd |
+| `plan` | Plan mode, with the plan file in the state directory (`plans/<slug>.md`) like every other frontend |
 | `bypassPermissions` | Same as `--yolo` for the SDK path |
 
 If both `--yolo` and `--permission-mode` are set, the explicit mode wins. Unknown mode names warn and fall back to `default`.

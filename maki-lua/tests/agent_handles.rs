@@ -43,6 +43,7 @@ use maki_storage::checkpoint::{
     CheckpointRequest, CheckpointWriter,
 };
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::plans::PLANS_DIR;
 use maki_storage::sessions::HistorySnapshot;
 use serde_json::{Value, json};
 use std::{
@@ -1781,7 +1782,8 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 .effective_config()
                 .unwrap();
             if command == "/pr5_capture" {
-                assert!(matches!(config.mode, AgentMode::Plan(_)));
+                let plans = fixture._state_dir.path().join(PLANS_DIR);
+                assert!(config.mode.plan_path().unwrap().starts_with(plans));
             } else {
                 assert_eq!(config.mode, AgentMode::Build);
             }

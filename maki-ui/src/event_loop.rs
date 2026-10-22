@@ -644,9 +644,12 @@ fn dispatch_mode_commit(
     let storage = storage.clone();
     smol::spawn(async move {
         let result = match reservation {
-            Ok((target, reservation)) => {
-                commit_mode_change(reservation, target, &id, &storage, &modes).await
-            }
+            Ok((target, reservation)) => reservation
+                .commit_mode(&target, &modes, &id, &storage, async |_, _| {
+                    Ok(publication_claim())
+                })
+                .await
+                .map(|_| ()),
             Err(error) => Err(error),
         }
         .map_err(|error| error.to_string());
@@ -5237,43 +5240,6 @@ fn reserve_config_change(
     )
 }
 
-async fn commit_mode_change(
-    ticket: ConfigChangeTicket<'_>,
-    target: AgentRef,
-    id: &str,
-    storage: &StateDir,
-    modes: &maki_agent::ModeRegistry,
-) -> Result<(), ConfigChangeError> {
-    ticket
-        .commit(async |_, predecessor| {
-            let mut plan = predecessor
-                .mode
-                .plan_path()
-                .map(|path| crate::app::mode::PlanState::Drafting(path.to_path_buf()))
-                .unwrap_or_default();
-            if id == "plan" {
-                plan.allocate_path(storage);
-            }
-            let mode = match id {
-                "build" => maki_agent::AgentMode::Build,
-                "plan" => plan
-                    .path()
-                    .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
-                    .unwrap_or_default(),
-                name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
-            };
-            let mode_def = modes.current(&mode);
-            target.actor()?.validate_mode_change(&mode, &mode_def)?;
-            let change = ConfigChange::Mode {
-                mode,
-                mode_def: Some(mode_def),
-            };
-            Ok((publication_claim(), change))
-        })
-        .await
-        .map(|_| ())
-}
-
 /// Commits {patch} with {spec}'s model prepared, unless preparation outlives
 /// the session op timeout.
 async fn commit_model_patch(
@@ -5640,10 +5606,15 @@ mod tests {
                 kind,
                 SessionOpKind::ModeChanged { reply: Some(None) }
             ));
-            assert!(matches!(
-                actor.effective_config().unwrap().mode,
-                maki_agent::AgentMode::Plan(_)
-            ));
+            let config = actor.effective_config().unwrap();
+            let plan = config.mode.plan_path().unwrap();
+            assert!(plan.starts_with(temp_dir.path().join(maki_storage::plans::PLANS_DIR)));
+            assert_eq!(
+                config.mode_def,
+                EventHandle::disconnected_for_test()
+                    .mode_registry()
+                    .get(&maki_agent::ModeId::Plan)
+            );
             drop(temp_dir);
             release_runtime(runtime);
         });

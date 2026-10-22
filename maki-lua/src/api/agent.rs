@@ -3184,12 +3184,7 @@ mod tests {
             .unwrap();
         let backend = LuaActorBackend::new(Arc::clone(&state));
         let prepare = backend.admission_preparation().unwrap();
-        let input = AgentInput::from_defaults(
-            "queued".into(),
-            AgentMode::Build,
-            Vec::new(),
-            Default::default(),
-        );
+        let input = AgentInput::from_defaults("queued".into(), Vec::new(), Default::default());
         let admitted = prepare(&input, &input.mode, None);
         let params = state.params.get().unwrap();
         let config = EffectiveAgentConfig::new(
@@ -3250,12 +3245,7 @@ mod tests {
             AgentMode::Build,
         )
         .with_context(AgentContextSnapshot::new(directory.path().into()));
-        let input = AgentInput::from_defaults(
-            "queued".into(),
-            AgentMode::Build,
-            Vec::new(),
-            Default::default(),
-        );
+        let input = AgentInput::from_defaults("queued".into(), Vec::new(), Default::default());
         let prepare = LuaActorBackend::new(Arc::clone(&state))
             .admission_preparation()
             .unwrap();

@@ -1,16 +1,14 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{
     ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel,
 };
 use maki_agent::{
-    AgentInput, AgentMode, CurrentManagedTurn, ModeId, TranscriptRequest, TurnAdmissionOptions,
-    TurnId, TurnOrigin, TurnProvenance,
+    AgentInput, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId, TurnOrigin,
+    TurnProvenance,
 };
 use maki_lua_macro::{lua_class, lua_fn};
 use maki_storage::StateDir;
-use maki_storage::plans::new_plan_path;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, observe, retire_closed};
@@ -456,21 +454,13 @@ fn agent_mode(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Res
     Ok((Some(config.mode.id().key().to_string()), None))
 }
 
-/// Allocates a fresh plan file in the state directory, as the UI does.
-async fn prepare_plan_path(lua: &Lua) -> Result<PathBuf, String> {
-    let state_dir = lua
-        .app_data_ref::<StateDirOverride>()
-        .map(|dir| StateDir::from_path(dir.0.clone()));
-    smol::unblock(move || {
-        let dir = state_dir.map(Ok).unwrap_or_else(StateDir::resolve)?;
-        new_plan_path(&dir)
-    })
-    .await
-    .map_err(|error| error.to_string())
+fn state_dir(lua: &Lua) -> Result<StateDir, String> {
+    match lua.app_data_ref::<StateDirOverride>() {
+        Some(dir) => Ok(StateDir::from_path(dir.0.clone())),
+        None => StateDir::resolve().map_err(|error| error.to_string()),
+    }
 }
 
-// The build and plan names below are native modes that move into guest
-// plugins in PR 8A; until then set_mode keeps their special handling here.
 /// Switch mode through the actor configuration FIFO.
 /// @param ctx LuaCtx Invocation context.
 /// @param name string Registered mode name.
@@ -492,42 +482,28 @@ async fn agent_set_mode(
     {
         return Ok(err_pair(RESTRICTED_MODE_CHANGE));
     }
-    let definition = try_pair!(
-        template
-            .modes
-            .get_by_key(&name)
-            .ok_or_else(|| format!("unknown mode: {name}"))
-    );
-    try_pair!(validate_required_output_mode(
-        this.state
-            .as_ref()
-            .is_some_and(|state| state.structured.is_some()),
-        Some(&definition),
-    ));
-    let commit = orchestration::commit_config_change(
-        &*services,
-        &target,
-        async |publication, predecessor| {
-            let claim = ctx.agent_publication_claim(&lua, &target, &publication)?;
-            let mode = match name.as_str() {
-                "build" => AgentMode::Build,
-                "plan" => match predecessor.mode.plan_path() {
-                    Some(path) => AgentMode::Plan(path.to_path_buf()),
-                    None => AgentMode::Plan(prepare_plan_path(&lua).await?),
-                },
-                _ => AgentMode::Custom(ModeId::parse(&name)),
-            };
-            authorize(&lua, &ctx, &this)?;
-            drop(this);
-            drop(ctx);
-            let change = ConfigChange::Mode {
-                mode,
-                mode_def: Some(definition),
-            };
-            Ok((claim, change))
-        },
-    )
-    .await;
+    let structured = this
+        .state
+        .as_ref()
+        .is_some_and(|state| state.structured.is_some());
+    let state_dir = try_pair!(state_dir(&lua));
+    let ticket = try_pair!(orchestration::reserve_config_change(&*services, &target));
+    let commit = ticket
+        .commit_mode(
+            &target,
+            &template.modes,
+            &name,
+            &state_dir,
+            async |publication, definition| {
+                validate_required_output_mode(structured, Some(definition))?;
+                let claim = ctx.agent_publication_claim(&lua, &target, &publication)?;
+                authorize(&lua, &ctx, &this)?;
+                drop(this);
+                drop(ctx);
+                Ok(claim)
+            },
+        )
+        .await;
     let commit = try_pair!(commit);
     Ok((Some(commit.config.mode.id().key().to_string()), None))
 }

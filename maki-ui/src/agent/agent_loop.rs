@@ -989,14 +989,8 @@ mod tests {
             // turn after it is the one that allocates its own presentation.
             actor.observe_presentation(RUN_ID - 1);
             let mut app = crate::app::tests::actor_presentation_app(root.clone(), RUN_ID - 1);
-            let make_input = |text: &str| {
-                AgentInput::from_defaults(
-                    text.into(),
-                    AgentMode::Build,
-                    Vec::new(),
-                    Default::default(),
-                )
-            };
+            let make_input =
+                |text: &str| AgentInput::from_defaults(text.into(), Vec::new(), Default::default());
             if deferred {
                 actor.observe_presentation(RUN_ID - 2);
                 // The UI already drew this deferred submission, so admission
@@ -1305,7 +1299,6 @@ mod tests {
                 let make_input = || {
                     AgentInput::from_defaults(
                         "explicit root".into(),
-                        AgentMode::Build,
                         Vec::new(),
                         Default::default(),
                     )
@@ -1564,7 +1557,6 @@ mod tests {
                 let submission = |text: &str| {
                     let mut input = AgentInput::from_defaults(
                         text.into(),
-                        AgentMode::Build,
                         vec![image.clone()],
                         Default::default(),
                     );
@@ -1762,12 +1754,7 @@ mod tests {
                 assert!(serde_json::to_string(&request).unwrap().contains(INITIAL));
                 let joined = actor
                     .submit(
-                        AgentInput::from_defaults(
-                            STEERING.into(),
-                            AgentMode::Build,
-                            Vec::new(),
-                            Default::default(),
-                        ),
+                        AgentInput::from_defaults(STEERING.into(), Vec::new(), Default::default()),
                         None,
                         String::new(),
                         Default::default(),
@@ -2546,7 +2533,7 @@ mod tests {
                 request_rx.recv_async().await.unwrap();
                 const STEERING: &str = "steering during tool batch";
                 let steering = actor.submit(AgentInput::from_defaults(
-                    STEERING.into(), AgentMode::Build, Vec::new(), Default::default(),
+                    STEERING.into(), Vec::new(), Default::default(),
                 ), None, String::new(), Default::default()).unwrap();
                 assert_eq!(steering.turn_id(), parent.turn_id());
 
@@ -2834,7 +2821,6 @@ mod tests {
         );
         let mut input = AgentInput::from_defaults(
             "hello".into(),
-            AgentMode::Build,
             Vec::new(),
             maki_config::SessionDefaults::default(),
         );
@@ -3111,12 +3097,8 @@ mod tests {
                 inbox: None,
                 managed_turn: None,
             };
-            let mut successor_input = AgentInput::from_defaults(
-                input.message.clone(),
-                input.mode.clone(),
-                Vec::new(),
-                Default::default(),
-            );
+            let mut successor_input =
+                AgentInput::from_defaults(input.message.clone(), Vec::new(), Default::default());
             successor_input.prompt = input.prompt.clone();
             let mut history = History::new(Vec::new());
             let outcome = {

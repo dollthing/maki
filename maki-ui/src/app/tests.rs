@@ -485,12 +485,7 @@ fn running_root_app() -> (App, flume::Receiver<AgentInput>) {
     let run_id = actor.reserve_presentation(app.run_id);
     actor
         .submit(
-            AgentInput::from_defaults(
-                RUNNING_TURN_TEXT.into(),
-                AgentMode::Build,
-                Vec::new(),
-                Default::default(),
-            ),
+            AgentInput::from_defaults(RUNNING_TURN_TEXT.into(), Vec::new(), Default::default()),
             None,
             String::new(),
             maki_agent::actor::TurnAdmissionOptions {

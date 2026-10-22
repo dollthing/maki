@@ -487,12 +487,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     );
     state.operations.push_back(ActorOperation::Turn {
         id,
-        input: AgentInput::from_defaults(
-            String::new(),
-            AgentMode::Build,
-            Vec::new(),
-            Default::default(),
-        ),
+        input: AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
         event_sender: None,
         correlation: "child-results".into(),
         ticket,
@@ -641,12 +636,7 @@ mod tests {
             );
             let user = actor
                 .admit_turn(
-                    AgentInput::from_defaults(
-                        String::new(),
-                        crate::AgentMode::Build,
-                        Vec::new(),
-                        Default::default(),
-                    ),
+                    AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
                     None,
                     CORRELATION.into(),
                 )
@@ -676,12 +666,7 @@ mod tests {
             assert!(actor.latest_ticket().is_none());
             let user = actor
                 .admit_turn(
-                    AgentInput::from_defaults(
-                        String::new(),
-                        crate::AgentMode::Build,
-                        Vec::new(),
-                        Default::default(),
-                    ),
+                    AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
                     None,
                     CORRELATION.into(),
                 )
@@ -1099,12 +1084,7 @@ mod tests {
             );
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(
-                        INSTRUCTION.into(),
-                        crate::AgentMode::Build,
-                        Vec::new(),
-                        Default::default(),
-                    ),
+                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1174,12 +1154,7 @@ mod tests {
             );
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(
-                        INSTRUCTION.into(),
-                        crate::AgentMode::Build,
-                        Vec::new(),
-                        Default::default(),
-                    ),
+                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1255,12 +1230,7 @@ mod tests {
             };
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(
-                        INSTRUCTION.into(),
-                        crate::AgentMode::Build,
-                        Vec::new(),
-                        Default::default(),
-                    ),
+                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1272,7 +1242,6 @@ mod tests {
                     .submit(
                         AgentInput::from_defaults(
                             INSTRUCTION.into(),
-                            crate::AgentMode::Build,
                             Vec::new(),
                             Default::default()
                         ),

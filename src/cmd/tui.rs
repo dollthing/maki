@@ -405,7 +405,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.plugin_host.plugin_rules(),
             &stack.commands,
             stack.plugin_host.command_registry(),
-            stack.plugin_host.mode_registry(),
             trust.project_config.clone(),
         )
         .context("run print mode")?;

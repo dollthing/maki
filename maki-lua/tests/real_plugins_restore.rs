@@ -18,8 +18,8 @@ use maki_agent::session_coordinator::{
 use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
 use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{
-    ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, DoneReason, History, SessionMailbox, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, BackendResult, ControlWork,
+    DoneReason, History, SessionMailbox, TurnContext, TurnOutcome, WorkKind,
 };
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
@@ -1007,12 +1007,7 @@ fn exec_bash_real(
         .actor()
         .unwrap()
         .admit_turn(
-            AgentInput::from_defaults(
-                "run bash".into(),
-                AgentMode::Build,
-                Vec::new(),
-                Default::default(),
-            ),
+            AgentInput::from_defaults("run bash".into(), Vec::new(), Default::default()),
             None,
             "bash".into(),
         )

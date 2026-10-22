@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
-use maki_agent::{AgentConfig, ModeRegistry, PermissionsConfig};
+use maki_agent::{AgentConfig, PermissionsConfig};
 use maki_commands::CommandRegistry;
 use maki_config::{ModelPolicy, SessionDefaults, TrustConfig, project::TrustMode};
 use maki_providers::Timeouts;
@@ -23,7 +23,6 @@ pub struct AcpParams {
     pub initial_wd: PathBuf,
     pub storage: maki_storage::StateDir,
     pub prompt_slots: Arc<ResolvedSlots>,
-    pub modes: Arc<ModeRegistry>,
     pub yolo: bool,
     pub defaults: SessionDefaults,
     pub system_prompt_override: Option<String>,

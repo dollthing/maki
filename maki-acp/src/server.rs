@@ -27,7 +27,7 @@ use maki_agent::session_coordinator::SessionCoordinatorError;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandError, CommandFuture, CommandHost,
     CommandOutcome, HostRequest, HostResponse, InputDispatch, PresentedCommand, TargetHandle,
@@ -155,7 +155,6 @@ struct SessionState {
     orchestration: Option<Arc<AgentOrchestration>>,
     checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
-    current_mode: AgentMode,
     pending: PendingState,
     command_registry: maki_commands::CommandRegistry,
     command_target: TargetHandle,
@@ -209,7 +208,6 @@ struct InstallSession<'a> {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
-    modes: Arc<maki_agent::ModeRegistry>,
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
     elicitation: bool,
@@ -241,7 +239,6 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
-        modes: Arc::clone(&params.modes),
         session: None,
         elicitation: false,
         supports_boolean: false,
@@ -392,7 +389,7 @@ async fn handle_request(
             Ok(()) => return,
             Err(e) => Err(e),
         },
-        "session/set_mode" => handle_set_mode(srv, raw),
+        "session/set_mode" => handle_set_mode(srv, raw, params).await,
         "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
@@ -496,9 +493,11 @@ async fn new_session(
     )
     .await
     .map_err(session_registration_error)?;
-    let resp = methods::new_session_response(&session_id, &srv.modes).config_options(
-        methods::session_config_options(&snapshot, srv.supports_boolean),
-    );
+    let resp = methods::new_session_response(&session_id, &srv.lua_event_handle.mode_registry())
+        .config_options(methods::session_config_options(
+            &snapshot,
+            srv.supports_boolean,
+        ));
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -596,9 +595,10 @@ async fn load_session(
     for update in translate::replay_history(&replay_history, &session_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
-    let resp = methods::load_session_response(&srv.modes).config_options(
-        methods::session_config_options(&snapshot, srv.supports_boolean),
-    );
+    let resp =
+        methods::load_session_response(&srv.lua_event_handle.mode_registry()).config_options(
+            methods::session_config_options(&snapshot, srv.supports_boolean),
+        );
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -636,7 +636,7 @@ fn spawn_session_with_history(
         mcp_handle,
         initial_wd: cwd,
         session_id,
-        modes: Arc::clone(&params.modes),
+        modes: params.lua_event_handle.mode_registry(),
         initial_history: history,
         yolo,
         system_prompt_override: params.system_prompt_override.clone(),
@@ -972,7 +972,6 @@ async fn install_session_with_lock(
         orchestration: Some(orchestration),
         checkpoint: Some(checkpoint),
         mcp,
-        current_mode: AgentMode::Build,
         pending,
         command_registry,
         command_target,
@@ -1488,13 +1487,8 @@ async fn send_command_turn(
     let (cancel_trigger, cancel) = maki_agent::cancel::CancelToken::new();
     defaults.fast |= enabled(maki_agent::session_options::FAST_OPTION_ID);
     defaults.workflow |= enabled(maki_agent::session_options::WORKFLOW_OPTION_ID);
-    let mut input = agent_input(
-        turn.content.text.to_string(),
-        images,
-        session.current_mode.clone(),
-        defaults,
-        prompt,
-    );
+    let mut input = AgentInput::from_defaults(turn.content.text.to_string(), images, defaults);
+    input.prompt = prompt.map(Box::new);
     if session.pending.lock().unwrap().operation.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
@@ -1522,18 +1516,6 @@ async fn send_command_turn(
     Ok(())
 }
 
-fn agent_input(
-    message: String,
-    images: Vec<ImageSource>,
-    mode: AgentMode,
-    defaults: SessionDefaults,
-    prompt: Option<maki_agent::McpPromptRef>,
-) -> AgentInput {
-    let mut input = AgentInput::from_defaults(message, mode, images, defaults);
-    input.prompt = prompt.map(Box::new);
-    input
-}
-
 fn command_error(error: maki_commands::CommandError) -> AcpError {
     AcpError::new(-32602, error.to_string())
 }
@@ -1544,6 +1526,7 @@ fn config_error(error: ConfigChangeError) -> AcpError {
             AcpError::resource_not_found(Some(format!("session/{id}")))
         }
         _ if error.is_busy() => AcpError::new(-32600, error.to_string()),
+        ConfigChangeError::Mode(ModeError::Unknown(_)) => AcpError::new(-32602, error.to_string()),
         ConfigChangeError::Option(option)
         | ConfigChangeError::Coordinator(SessionCoordinatorError::Option(option))
             if matches!(
@@ -1662,16 +1645,30 @@ fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
     );
 }
 
-fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_mode(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
     validate_session(srv, req.session_id.0.as_ref())?;
     let mode_str = req.mode_id.0.to_string();
-    let new_mode = methods::mode_id_to_agent_mode(&mode_str, &srv.modes)
-        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
-
-    let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session.current_mode = new_mode;
-
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let orchestration = session.orchestration.as_ref().ok_or_else(no_session)?;
+    let root = session
+        .handle
+        .initialized_root()
+        .await
+        .map_err(|error| AcpError::new(-32603, error))?;
+    maki_lua::orchestration::set_mode(
+        &**orchestration,
+        &root,
+        &srv.lua_event_handle.mode_registry(),
+        &mode_str,
+        &params.storage,
+    )
+    .await
+    .map_err(config_error)?;
     let sid = SessionId::from(session.handle.session_id.to_string());
     session_update(
         &srv.out_tx,
@@ -2460,7 +2457,7 @@ mod tests {
                 append_system_prompt: None,
                 defaults: Default::default(),
                 model_policy: Arc::default(),
-                modes: Arc::default(),
+                modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/tmp")),
@@ -2650,7 +2647,6 @@ mod tests {
             initial_wd: cwd.clone(),
             storage: StateDir::from_path(cwd),
             prompt_slots: Arc::default(),
-            modes: Arc::default(),
             yolo: false,
             defaults: Default::default(),
             system_prompt_override: Some(String::new()),
@@ -2832,7 +2828,7 @@ mod tests {
                 mcp_handle: None,
                 initial_wd: PathBuf::from("/project"),
                 session_id: Some(SessionRef::from(session_id)),
-                modes: Arc::default(),
+                modes: Arc::new(maki_agent::ModeRegistry::builtin()),
                 initial_history: Vec::new(),
                 yolo: false,
                 system_prompt_override: Some(String::new()),
@@ -2905,7 +2901,6 @@ mod tests {
         );
         let server = Server {
             out_tx: out_tx.clone(),
-            modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             model_specs: Vec::new(),
             session: Some(SessionState {
                 option_projection: Some(Arc::new(OptionProjection {
@@ -2921,7 +2916,6 @@ mod tests {
                 orchestration: None,
                 checkpoint: None,
                 mcp: None,
-                current_mode: AgentMode::Build,
                 pending: Arc::new(Mutex::new(Pending {
                     permissions: HashMap::from([(ANSWERED_ID, ("toolu_1".to_string(), answer_tx))]),
                     ..Default::default()
@@ -2962,7 +2956,6 @@ mod tests {
             let mut srv = Server {
                 out_tx,
                 model_specs: vec![OFFLINE_SPEC.to_owned()],
-                modes: Arc::clone(&params.modes),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
@@ -3009,12 +3002,10 @@ mod tests {
             assert!(!error.is_empty());
             assert!(
                 input_tx
-                    .send(agent_input(
+                    .send(AgentInput::from_defaults(
                         String::new(),
                         Vec::new(),
-                        AgentMode::Build,
                         SessionDefaults::default(),
-                        None,
                     ))
                     .await
                     .is_err(),
@@ -3036,7 +3027,6 @@ mod tests {
             let mut srv = Server {
                 out_tx,
                 model_specs: vec![OFFLINE_SPEC.to_owned()],
-                modes: Arc::clone(&params.modes),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
@@ -3569,6 +3559,68 @@ mod tests {
         );
     }
 
+    const GHOST_MODE: &str = "ghost";
+    const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+
+    #[test_case("plan", false ; "plan_lands_in_the_state_dir")]
+    #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
+    fn set_mode_commits_through_the_shared_setter(mode: &str, invalid: bool) {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let params = test_params(
+                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                model_specs: Vec::new(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                defaults: SessionDefaults::default(),
+            };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let session = srv.session.as_ref().unwrap();
+            let session_id = session.handle.session_id.to_string();
+            let root = session.handle.initialized_root().await.unwrap();
+            let result = handle_set_mode(
+                &mut srv,
+                &serde_json::json!({ "params": { "sessionId": session_id, "modeId": mode } }),
+                &params,
+            )
+            .await;
+            assert_eq!(
+                result.as_ref().err().map(|error| error.code),
+                invalid.then(|| AcpError::invalid_params().code)
+            );
+            let config = root.effective_config().unwrap().unwrap();
+            if !invalid {
+                let plan = config.mode.plan_path().unwrap();
+                assert!(plan.starts_with(cwd.path().join(maki_storage::plans::PLANS_DIR)));
+                assert_eq!(
+                    config.mode_def,
+                    params
+                        .lua_event_handle
+                        .mode_registry()
+                        .get(&maki_agent::ModeId::Plan)
+                );
+            } else {
+                assert_eq!(config.mode, maki_agent::AgentMode::Build);
+            }
+            close_session(&mut srv).await;
+        });
+    }
+
     #[test]
     fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
         let (mut srv, answer_rx, _, input_rx) = server_awaiting_answer();
@@ -3595,7 +3647,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(config_error.code, AcpError::resource_not_found(None).code);
 
-        let mode_error = handle_set_mode(
+        let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), PathBuf::new());
+        let mode_error = smol::block_on(handle_set_mode(
             &mut srv,
             &serde_json::json!({
                 "params": {
@@ -3603,7 +3656,8 @@ mod tests {
                     "modeId": "build"
                 }
             }),
-        )
+            &params,
+        ))
         .unwrap_err();
         assert_eq!(mode_error.code, AcpError::resource_not_found(None).code);
 
@@ -3815,7 +3869,8 @@ mod tests {
     fn new_session_response_precedes_available_commands() {
         let (srv, _, out_rx, _) = server_awaiting_answer();
         let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
-        let response = methods::new_session_response(&session_id, &srv.modes);
+        let response =
+            methods::new_session_response(&session_id, &srv.lua_event_handle.mode_registry());
 
         respond_request(
             &srv,
@@ -5112,7 +5167,6 @@ mod tests {
                     initial_wd: PathBuf::from("/project"),
                     storage: StateDir::from_path(PathBuf::from("/tmp/maki-acp-test")),
                     prompt_slots: Arc::default(),
-                    modes: Arc::default(),
                     yolo: false,
                     defaults: SessionDefaults::default(),
                     system_prompt_override: Some(String::new()),
@@ -6277,7 +6331,6 @@ mod tests {
             let mut srv = Server {
                 out_tx,
                 model_specs: vec![OFFLINE_SPEC.to_owned()],
-                modes: Arc::clone(&params.modes),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,

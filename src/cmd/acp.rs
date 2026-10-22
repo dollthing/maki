@@ -77,7 +77,6 @@ pub fn run(
 
     let lua_event_handle = plugin_host.event_handle();
     let prompt_slots = lua_event_handle.collect_prompt_slots();
-    let modes = lua_event_handle.mode_registry();
     let yolo = config.permissions.yolo;
 
     let result = maki_acp::run(maki_acp::AcpParams {
@@ -88,7 +87,6 @@ pub fn run(
         initial_wd: cwd,
         storage,
         prompt_slots: Arc::new(prompt_slots),
-        modes,
         yolo,
         defaults: config.session_defaults,
         system_prompt_override,

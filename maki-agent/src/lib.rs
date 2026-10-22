@@ -196,15 +196,15 @@ impl AgentInput {
     /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
     /// about the toggles beyond what config says, so they all build their input
     /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    /// The mode is the actor's committed one, stamped at admission.
     pub fn from_defaults(
         message: String,
-        mode: AgentMode,
         images: Vec<ImageSource>,
         defaults: SessionDefaults,
     ) -> Self {
         Self {
             message,
-            mode,
+            mode: AgentMode::Build,
             images,
             preamble: Vec::new(),
             thinking: defaults.thinking.into(),

@@ -25,7 +25,7 @@ use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::tools::offload::OffloadCleanup;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
-    ModeRegistry, PermissionsConfig, TurnOutcome,
+    PermissionsConfig, TurnOutcome,
 };
 use maki_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
@@ -250,7 +250,7 @@ fn drive_print(
                 workflow: literal.workflow,
                 thinking: Some(literal.thinking.into()),
             };
-            command_attachments::agent_input(turn, literal.mode.clone(), defaults)?
+            command_attachments::agent_input(turn, defaults)?
         }
         InputDispatch::Dispatched(
             CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
@@ -360,7 +360,6 @@ fn run_and_settle<T>(
 fn print_initialization_input(literal: &AgentInput) -> AgentInput {
     AgentInput::from_defaults(
         String::new(),
-        literal.mode.clone(),
         Vec::new(),
         SessionDefaults {
             fast: literal.fast,
@@ -439,7 +438,6 @@ pub fn run(
     plugin_rules: Arc<PluginRuleStore>,
     commands: &[command::CustomCommand],
     command_registry: CommandRegistry,
-    modes: Arc<ModeRegistry>,
     project_config: ProjectConfig,
 ) -> Result<()> {
     let prompt = match prompt_arg {
@@ -452,7 +450,7 @@ pub fn run(
     };
 
     let images = load_images(&image_paths)?;
-    let literal = AgentInput::from_defaults(prompt, AgentMode::Build, images, defaults);
+    let literal = AgentInput::from_defaults(prompt, images, defaults);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
     let prompt_slots = lua_handle.collect_prompt_slots();
@@ -494,7 +492,7 @@ pub fn run(
                 append_system_prompt,
                 plugin_rules: Arc::clone(&plugin_rules),
                 project_config,
-                modes: Arc::clone(&modes),
+                modes: lua_handle.mode_registry(),
                 session_options: session_options.clone(),
                 state_dir: state_dir.clone(),
             },
@@ -1242,7 +1240,7 @@ mod tests {
                 model_policy: Arc::default(),
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(&cwd),
-                modes: Arc::default(),
+                modes: EventHandle::disconnected_for_test().mode_registry(),
                 session_options: Default::default(),
                 state_dir: None,
             },
@@ -1301,7 +1299,7 @@ mod tests {
                 model_policy: Arc::default(),
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(&cwd),
-                modes: Arc::default(),
+                modes: EventHandle::disconnected_for_test().mode_registry(),
                 session_options: Default::default(),
                 state_dir: Some(state.path().to_path_buf()),
             },
@@ -1468,7 +1466,7 @@ mod tests {
                 model_policy: Arc::default(),
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(&cwd),
-                modes: Arc::default(),
+                modes: EventHandle::disconnected_for_test().mode_registry(),
                 session_options: lua_handle.session_option_catalog(),
                 state_dir: Some(state_dir.path().to_path_buf()),
             },

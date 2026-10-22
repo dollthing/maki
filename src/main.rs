@@ -14,7 +14,7 @@ mod command_attachments {
 
     use color_eyre::Result;
     use color_eyre::eyre::eyre;
-    use maki_agent::{AgentInput, AgentMode, McpPromptRef};
+    use maki_agent::{AgentInput, McpPromptRef};
     use maki_commands::{AgentTurn, CommandAttachment};
     use maki_providers::{ImageMediaType, ImageSource};
 
@@ -47,12 +47,10 @@ mod command_attachments {
 
     pub(crate) fn agent_input(
         turn: AgentTurn,
-        mode: AgentMode,
         defaults: maki_config::SessionDefaults,
     ) -> Result<AgentInput> {
         let mut input = AgentInput::from_defaults(
             turn.content.text.to_string(),
-            mode,
             into_images(&turn.content.attachments)?,
             defaults,
         );

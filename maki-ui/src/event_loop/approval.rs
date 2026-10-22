@@ -192,12 +192,7 @@ fn implementation_turn(message: String, sender: Option<EventSender>) -> Prepared
 }
 
 fn build_input(message: String) -> AgentInput {
-    AgentInput::from_defaults(
-        message,
-        AgentMode::Build,
-        Vec::new(),
-        SessionDefaults::default(),
-    )
+    AgentInput::from_defaults(message, Vec::new(), SessionDefaults::default())
 }
 
 impl EventLoop<'_> {

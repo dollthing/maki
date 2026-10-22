@@ -3169,7 +3169,7 @@ mod tests {
             modes.current(&context.mode).tools.as_ref().unwrap(),
             &["write"]
         );
-        assert!(modes.restrict_write_to(&context.mode).is_some());
+        assert!(modes.current(&context.mode).restrict_write_to.is_some());
         assert_eq!(
             *advertised.lock().unwrap(),
             vec![serde_json::json!([{"name": "read"}]); 2]
@@ -3249,7 +3249,6 @@ mod tests {
         let modes = crate::ModeRegistry::builtin();
         let def = modes.current(&AgentMode::Build);
         assert!(def.tools.is_none(), "build inherits the default toolset");
-        assert_eq!(modes.restrict_write_to(&AgentMode::Build), None);
         assert_eq!(modes.current(&AgentMode::Build).id, crate::ModeId::Build);
     }
 }

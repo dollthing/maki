@@ -8,10 +8,13 @@ use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use maki_agent::headless::{InteractiveHandle, RootBinding};
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
-use maki_agent::session_coordinator::{ConfigMutation, ModelPreparer, SessionCoordinatorHandle};
-use maki_agent::{AgentRef, tools::ToolContext};
+use maki_agent::session_coordinator::{
+    ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
+};
+use maki_agent::{AgentRef, ModeRegistry, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
+use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use maki_storage::sessions::{HistorySnapshot, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
@@ -379,6 +382,16 @@ fn default_config_mutation(
     Ok(nonpersistent_config_mutation(publication))
 }
 
+/// Reserves {target}'s next slot in its config FIFO.
+pub fn reserve_config_change<'a>(
+    services: &'a (impl OrchestrationServices + ?Sized),
+    target: &'a AgentRef,
+) -> Result<ConfigChangeTicket<'a>, ConfigChangeError> {
+    ConfigChangeTicket::reserve(target, CheckpointPublication::default(), |publication| {
+        services.reserve_config_mutation(target, publication)
+    })
+}
+
 /// Commits one config change through {target}'s FIFO; see
 /// [`ConfigChangeTicket::commit`] for what `prepare` receives.
 pub async fn commit_config_change(
@@ -389,11 +402,24 @@ pub async fn commit_config_change(
         Arc<EffectiveAgentConfig>,
     ) -> Result<(CheckpointClaim, ConfigChange), ConfigChangeError>,
 ) -> Result<ConfigCommit, ConfigChangeError> {
-    ConfigChangeTicket::reserve(target, CheckpointPublication::default(), |publication| {
-        services.reserve_config_mutation(target, publication)
-    })?
-    .commit(prepare)
-    .await
+    reserve_config_change(services, target)?
+        .commit(prepare)
+        .await
+}
+
+/// Sets mode {key} on {target}; see [`ConfigChangeTicket::commit_mode`].
+pub async fn set_mode(
+    services: &(impl OrchestrationServices + ?Sized),
+    target: &AgentRef,
+    registry: &ModeRegistry,
+    key: &str,
+    state_dir: &StateDir,
+) -> Result<ConfigCommit, ConfigChangeError> {
+    reserve_config_change(services, target)?
+        .commit_mode(target, registry, key, state_dir, async |_, _| {
+            Ok(publication_claim())
+        })
+        .await
 }
 
 pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {

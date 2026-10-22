@@ -189,7 +189,6 @@ use maki_providers::{Message, TokenUsage};
 use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
-use crate::config_change::ConfigChangeQueue;
 use crate::tools::offload::OffloadStore;
 use crate::types::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, EventSender, TurnCancellationReason,
@@ -246,7 +245,7 @@ pub(crate) struct ActorInner {
     runtime_probes: Mutex<Vec<flume::Sender<ActorRuntimeProbe>>>,
     pub(crate) state: Mutex<ActorState>,
     pub(crate) policy_changed: Event,
-    pub(crate) config_changes: ConfigChangeQueue,
+    pub(crate) config_waiters: Mutex<VecDeque<Arc<()>>>,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
@@ -1364,7 +1363,7 @@ impl AgentActorHandle {
             runtime_probes: Mutex::new(Vec::new()),
             state: Mutex::new(ActorState::idle(initial_config)),
             policy_changed: Event::new(),
-            config_changes: ConfigChangeQueue::default(),
+            config_waiters: Mutex::default(),
             queue: Arc::new(ActorQueue::new()),
             outcomes: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
