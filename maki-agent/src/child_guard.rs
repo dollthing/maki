@@ -125,11 +125,10 @@ mod tests {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 
-    /// Asserts the process is gone by attempting to reap it. The guard's own
-    /// `Drop` may have won the race and reaped already, which reads as `ECHILD`
-    /// and proves the same thing. Both outcomes are terminal, so this needs no
-    /// polling or wall clock: `SIGKILL` to the process group cannot fail to
-    /// terminate a `sleep`.
+    /// Asserts the process was killed by attempting to reap it. The guard's own
+    /// `Drop` may have won the race and reaped already, which reads as `ECHILD`.
+    /// Otherwise the status must show `SIGKILL`: a `sleep` that outlived a guard
+    /// which failed to kill it would reap here with a normal exit.
     fn assert_reaped(pid: u32) {
         let mut status = 0;
         let reaped = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
@@ -140,7 +139,13 @@ mod tests {
                 Some(libc::ECHILD),
                 "process {pid} was neither reaped here nor already reaped by the guard"
             );
+            return;
         }
+        assert_eq!(reaped, pid as i32);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "process {pid} exited with status {status} instead of being killed"
+        );
     }
 
     #[test]

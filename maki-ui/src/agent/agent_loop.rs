@@ -900,6 +900,7 @@ mod tests {
     use std::any::Any;
     use std::collections::HashMap;
     use std::pin::pin;
+    use std::time::Duration;
 
     use futures_lite::future::poll_once;
     use maki_agent::actor::{ActorEvent, DeliveryStatus};
@@ -916,6 +917,9 @@ mod tests {
 
     use crate::app::tests::work_identity;
 
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
     /// Waits for the actor's own settlement publication and asserts it names
     /// the presentation that settled last. Settlement is the actor's, never
     /// re-derived from a frontend mirror.
@@ -923,7 +927,6 @@ mod tests {
         events: &flume::Receiver<maki_agent::actor::ActorEvent>,
         presentation: u64,
     ) -> maki_agent::ActorWorkIdentity {
-        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
         // Earlier settlements stay published, so skip past them rather than
@@ -1118,7 +1121,6 @@ mod tests {
             // takes the next presentation after any barrier's reservation.
             let mut explicit_presentation = None;
             let mut visible = Vec::new();
-            const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             loop {
                 let envelope = futures_lite::future::or(events.recv_async(), async {
                     smol::Timer::after(TEST_TIMEOUT).await;
@@ -1296,7 +1298,7 @@ mod tests {
             actor.close();
             assert!(
                 manager
-                    .shutdown(std::time::Duration::from_secs(1))
+                    .shutdown(SHUTDOWN_TIMEOUT)
                     .await
                     .timed_out
                     .is_empty()
@@ -1308,7 +1310,6 @@ mod tests {
     #[test_case(true; "undisplayed_deferred_root")]
     fn ui_cancel_targets_buffered_active_root_without_cancelling_future_turn(deferred: bool) {
         const FIRST_RUN: u64 = 7;
-        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const SHARED_CORRELATION: &str = "plugin-shared-correlation";
 
         smol::block_on(futures_lite::future::or(
@@ -1494,7 +1495,7 @@ mod tests {
                 actor.close();
                 assert!(
                     manager
-                        .shutdown(std::time::Duration::from_secs(1))
+                        .shutdown(SHUTDOWN_TIMEOUT)
                         .await
                         .timed_out
                         .is_empty()
@@ -1677,14 +1678,14 @@ mod tests {
                 actor.close();
                 assert!(
                     manager
-                        .shutdown(std::time::Duration::from_secs(1))
+                        .shutdown(SHUTDOWN_TIMEOUT)
                         .await
                         .timed_out
                         .is_empty()
                 );
             },
             async {
-                smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("production queue folding timed out");
             },
         ));
@@ -1745,7 +1746,6 @@ mod tests {
         const INITIAL: &str = "request before steering";
         const STEERING: &str = "accepted but omitted steering";
         const FAILURE: &str = "gated provider failure";
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         smol::block_on(futures_lite::future::or(
             async {
                 let (mut backend, mut input, events) = failing_backend();
@@ -1803,10 +1803,10 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(outcomes, [outcome]);
-                assert!(manager.shutdown(TIMEOUT).await.timed_out.is_empty());
+                assert!(manager.shutdown(TEST_TIMEOUT).await.timed_out.is_empty());
             },
             async {
-                smol::Timer::after(TIMEOUT).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("accepted steering failure did not settle");
             },
         ));
@@ -1865,7 +1865,6 @@ mod tests {
     #[test_case(false; "main_does_not_join")]
     #[test_case(true; "nonmain_joins")]
     fn completion_policy_main_vs_nonmain(child: bool) {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         smol::block_on(futures_lite::future::or(
             async {
                 let manager = maki_agent::AgentManagerHandle::new(maki_agent::AgentLimits {
@@ -1944,11 +1943,11 @@ mod tests {
                 assert!(serialized.contains(EXPLICIT_RESPONSE));
                 release.send(()).unwrap();
                 assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-                assert!(manager.shutdown(TIMEOUT).await.timed_out.is_empty());
+                assert!(manager.shutdown(TEST_TIMEOUT).await.timed_out.is_empty());
                 assert!(requests.try_recv().is_err());
             },
             async {
-                smol::Timer::after(TIMEOUT).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("main/non-main completion policy did not settle");
             },
         ));
@@ -2055,7 +2054,7 @@ mod tests {
             let submitted_run = app.run_id;
             loop {
                 let envelope = futures_lite::future::or(events.recv_async(), async {
-                    smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                    smol::Timer::after(TEST_TIMEOUT).await;
                     panic!("waiting for immediate response");
                 })
                 .await
@@ -2081,7 +2080,7 @@ mod tests {
                     }
                 },
                 async {
-                    smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                    smol::Timer::after(TEST_TIMEOUT).await;
                     panic!("waiting for actor settlement: actor={:?}", actor.snapshot());
                 },
             )
@@ -2100,7 +2099,7 @@ mod tests {
                         String::new(),
                         0,
                     )
-                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .recv_timeout(TEST_TIMEOUT)
                     .unwrap(),
                 Ok(())
             );
@@ -2115,7 +2114,7 @@ mod tests {
             actor.close();
             assert!(
                 manager
-                    .shutdown(std::time::Duration::from_secs(1))
+                    .shutdown(SHUTDOWN_TIMEOUT)
                     .await
                     .timed_out
                     .is_empty()
@@ -2313,7 +2312,7 @@ mod tests {
             );
             let outcome =
                 futures_lite::future::or(commands.dispatch_input(&target, COMMAND.into()), async {
-                    smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                    smol::Timer::after(TEST_TIMEOUT).await;
                     panic!("command-origin MCP spawn timed out");
                 })
                 .await;
@@ -2327,7 +2326,7 @@ mod tests {
                 "{outcome:?}"
             );
             let action = futures_lite::future::or(actions.recv_async(), async {
-                smol::Timer::after(std::time::Duration::from_secs(10)).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("command-origin MCP handler did not finish");
             })
             .await
@@ -2339,7 +2338,7 @@ mod tests {
             root.actor().unwrap().close();
             assert!(
                 manager
-                    .shutdown(std::time::Duration::from_secs(1))
+                    .shutdown(SHUTDOWN_TIMEOUT)
                     .await
                     .timed_out
                     .is_empty()
@@ -2433,7 +2432,6 @@ mod tests {
         smol::block_on(async {
             const RUN_ID: u64 = 7;
             const CHILD_INPUT: &str = "child work";
-            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             futures_lite::future::or(async {
                 let (mut backend, mut input, events) = failing_backend();
                 input.prompt = None;
@@ -2529,9 +2527,9 @@ mod tests {
                     app.handle_actor_event(event);
                 }
                 assert_eq!(consumed, 1);
-                manager.shutdown(TIMEOUT).await;
+                manager.shutdown(TEST_TIMEOUT).await;
             }, async {
-                smol::Timer::after(TIMEOUT).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("child completion did not reach the production TUI path");
             }).await;
         });
@@ -2541,7 +2539,6 @@ mod tests {
     #[test_case(true; "child")]
     fn shared_consumption_wrapper_and_request_order(child: bool) {
         smol::block_on(async {
-            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             futures_lite::future::or(async {
                 let (backend, mut input, _events) = failing_backend();
                 input.prompt = None;
@@ -2616,7 +2613,7 @@ mod tests {
 
                 assert!(matches!(parent.wait().await, TurnOutcome::Completed { .. }));
                 assert!(matches!(steering.wait().await, TurnOutcome::Completed { .. }));
-                manager.shutdown(TIMEOUT).await;
+                manager.shutdown(TEST_TIMEOUT).await;
                 assert!(request_rx.try_recv().is_err(), "parent made an extra provider request");
                 seen.extend(actor_events.try_iter());
                 let started: Vec<TurnId> = seen.iter().filter_map(|event| match event {
@@ -2633,7 +2630,7 @@ mod tests {
                 }).collect();
                 assert_eq!(executed, [parent.turn_id()]);
             }, async {
-                smol::Timer::after(TIMEOUT).await;
+                smol::Timer::after(TEST_TIMEOUT).await;
                 panic!("child completion did not reach the parent's follow-up request");
             }).await;
         });

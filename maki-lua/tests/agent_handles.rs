@@ -4112,8 +4112,8 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
     });
 }
 
-#[test_case::test_case(false; "invalid_report")]
-#[test_case::test_case(true; "missing_report")]
+#[test_case::test_case(true; "invalid_report")]
+#[test_case::test_case(false; "missing_report")]
 fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
     smol::block_on(async {
         let fixture = if invalid {

@@ -1739,12 +1739,20 @@ mod tests {
             if cancelled {
                 trigger.cancel();
             }
+            let compacted = if cancelled {
+                Ok(())
+            } else {
+                Err(SAVE_ERROR.into())
+            };
             let event = settle_manual_compaction(
-                Err(SAVE_ERROR.into()),
+                compacted,
                 &mut history,
                 previous.clone(),
                 &cancel,
-                |_| async { panic!("failed compaction must not persist") },
+                |_| async move {
+                    assert!(cancelled, "failed compaction must not persist");
+                    Err(SAVE_ERROR.into())
+                },
             )
             .await;
             assert_eq!(
