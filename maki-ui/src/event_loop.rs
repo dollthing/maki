@@ -1194,7 +1194,11 @@ impl SessionRuntime {
             |projected| projected.config.mode.clone(),
         );
         self.app.update_model(&commit.config.model);
-        if self.app.state.resolve_pending_fast(commit.config.fast) {
+        if self
+            .app
+            .state
+            .resolve_pending_fast(commit.config.fast, &commit.config.model)
+        {
             self.restore_pending_fast(commit.config.model.spec());
         }
         self.app.project_root_mode(&previous, &commit.config.mode);
@@ -1816,28 +1820,6 @@ fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, Prepare
             provider: Arc::clone(&current.provider) as Arc<dyn Provider>,
         },
     )
-}
-
-/// Brings each tab's displayed model in line with the slot that tab actually
-/// runs on. It takes only the sessions on purpose: reading the event loop's
-/// global slot here would rewrite -- and persist -- every session's model as
-/// the last one to change, while inference kept using the session's real
-/// provider.
-fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
-    let mut changed = false;
-    for rt in sessions {
-        let slot_model = rt.model_slot.load();
-        if rt.app.state.session.model != slot_model.model.spec()
-            || rt.app.state.model.context_window != slot_model.model.context_window
-            || rt.app.state.model.supports_fast_override != slot_model.model.supports_fast_override
-        {
-            let model = slot_model.model.clone();
-            drop(slot_model);
-            rt.app.update_model(&model);
-            changed = true;
-        }
-    }
-    changed
 }
 
 fn merge_batch(
@@ -2772,10 +2754,6 @@ impl<'t> EventLoop<'t> {
         }
 
         self.sync_model_values();
-
-        if sync_session_models(&mut self.sessions) {
-            dirty = Dirty::YES;
-        }
 
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
@@ -3739,7 +3717,7 @@ impl<'t> EventLoop<'t> {
             id: rt.id().to_string(),
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
-            model: app.state.model.spec(),
+            model: config.model.spec(),
             fast: config.fast,
             thinking: config.thinking.to_string(),
             mode: if app.root_mode() == crate::app::mode::Mode::Plan {
@@ -3755,7 +3733,7 @@ impl<'t> EventLoop<'t> {
             }),
             usage: app.state.token_usage,
             context_size: app.state.context_size,
-            context_window: app.state.model.context_window,
+            context_window: config.model.context_window,
             cost: app.state.cost,
         };
         let mut value = serde_json::to_value(snapshot).unwrap_or_default();
@@ -4359,11 +4337,7 @@ impl<'t> EventLoop<'t> {
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
                 Ok(()) => self.apply_model_change(idx, &spec),
-                Err(error) => {
-                    let model = self.sessions[idx].model_slot.load().model.clone();
-                    self.sessions[idx].app.update_model(&model);
-                    self.sessions[idx].app.flash(error);
-                }
+                Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::ProviderRefreshed => {
                 if let Err(error) = result {
@@ -6881,40 +6855,6 @@ mod tests {
         }
     }
 
-    /// Tabs hold their own models. A sync that read one shared slot would
-    /// rewrite every tab to the last model changed, and persist it, while each
-    /// agent kept inferring on the model its own slot holds.
-    #[test]
-    fn each_tab_follows_its_own_model_slot() {
-        let mut sessions = vec![
-            test_runtime(model_named("first")),
-            test_runtime(model_named("second")),
-        ];
-
-        // Repoint only the second tab's slot, as `/model` on that tab would.
-        sessions[1]
-            .model_slot
-            .install(model_named("changed"), Arc::new(StubProvider));
-
-        assert!(sync_session_models(&mut sessions));
-        assert_eq!(
-            sessions[0].app.state.session.model,
-            model_named("first").spec(),
-            "an untouched tab must keep its own model"
-        );
-        assert_eq!(
-            sessions[1].app.state.session.model,
-            model_named("changed").spec()
-        );
-        assert!(
-            !sync_session_models(&mut sessions),
-            "a settled set of tabs reports no change"
-        );
-
-        for rt in sessions {
-            let _ = smol::block_on(rt.coordinator.close());
-        }
-    }
     const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -7550,7 +7490,7 @@ mod tests {
             )
             .unwrap();
         runtime.activate_deferred();
-        session.model = runtime.app.state.model.spec();
+        session.model = runtime.app.root_config().model.spec();
         let outgoing = std::thread::spawn({
             let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
             move || store.put(OUTGOING)
@@ -8123,7 +8063,7 @@ mod tests {
         const RECOVERY_TEXT: &str = "retained after failure";
         const REWOUND_TEXT: &str = "rewound prompt";
         with_event_loop(|event_loop| {
-            let model = event_loop.sessions[0].app.state.model.clone();
+            let model = event_loop.sessions[0].app.root_config().model.clone();
             let mut session = AppSession::new(&model.spec(), &event_loop.session_cwd);
             session.push_message(Message::user(REWOUND_TEXT.into()));
             let prepared = event_loop
@@ -8226,7 +8166,7 @@ mod tests {
         let runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
         let installed = harness.ctx().model_slot.load();
 
-        assert_eq!(runtime.app.state.model.spec(), REPLACEMENT_MODEL);
+        assert_eq!(runtime.app.root_config().model.spec(), REPLACEMENT_MODEL);
         assert_eq!(installed.model.spec(), REPLACEMENT_MODEL);
         assert_ne!(installed.provider.identity(), previous_provider);
 
@@ -8431,7 +8371,7 @@ mod tests {
             &PermissionAnswer::AllowSession,
         );
         let mut replacement = if reset { harness.session() } else { session };
-        replacement.model = runtime.app.state.model.spec();
+        replacement.model = runtime.app.root_config().model.spec();
         replacement.meta.session_rules = vec![maki_storage::sessions::StoredRule {
             tool: "bash".into(),
             scope: Some("target".into()),
@@ -8823,7 +8763,7 @@ mod tests {
     #[test]
     fn failed_directory_persistence_does_not_publish_actor_context() {
         with_event_loop(|event_loop| {
-            let model = event_loop.sessions[0].app.state.model.clone();
+            let model = event_loop.sessions[0].app.root_config().model.clone();
             let session = AppSession::new(&model.spec(), &event_loop.session_cwd);
             let prepared = event_loop
                 .ctx
@@ -8879,14 +8819,14 @@ mod tests {
         const DRAFT: &str = "second prompt";
         with_event_loop(|event_loop| {
             let mut session = AppSession::new(
-                &event_loop.sessions[0].app.state.model.spec(),
+                &event_loop.sessions[0].app.root_config().model.spec(),
                 &event_loop.session_cwd,
             );
             session.replace_messages(vec![
                 Message::user(FIRST.into()),
                 Message::user(DRAFT.into()),
             ]);
-            let model = event_loop.sessions[0].app.state.model.clone();
+            let model = event_loop.sessions[0].app.root_config().model.clone();
             let prepared = event_loop
                 .ctx
                 .prepare_runtime_with_provider(
@@ -9381,7 +9321,7 @@ mod tests {
             )
             .unwrap();
             select_child_chat(event_loop, child, CHILD_CHAT);
-            let root_model = event_loop.sessions[0].app.state.model.spec();
+            let root_model = event_loop.sessions[0].app.root_config().model.spec();
             assert_ne!(root_model, CHILD_MODEL);
             event_loop.ctx.available_models.store(Some(Arc::new(vec![
                 root_model.clone(),
@@ -9427,7 +9367,7 @@ mod tests {
                 matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
                 if target.id() == child && spec == CHILD_MODEL)
             );
-            assert_eq!(app.state.model.spec(), root_model);
+            assert_eq!(app.root_config().model.spec(), root_model);
             assert_eq!(actor.effective_config().unwrap().model.spec(), CHILD_MODEL);
 
             app.active_chat = 1;
@@ -9923,7 +9863,7 @@ mod tests {
             .session_mut()
             .push_message(Message::user("must not save".into()));
         session.truncate_messages(1);
-        session.model = runtime.app.state.model.spec();
+        session.model = runtime.app.root_config().model.spec();
         let prepared = harness
             .ctx()
             .prepare_replacement_runtime(

@@ -3620,7 +3620,7 @@ fn model_arg_ambiguous_flashes() {
         MODEL_SPEC_GLM4.into(),
         LATE_MODEL_SPEC.into(),
     ])));
-    let before = app.state.model.spec();
+    let before = app.root_config().model.spec();
 
     let actions = app.execute_command(
         ParsedCommand {
@@ -3631,7 +3631,7 @@ fn model_arg_ambiguous_flashes() {
     );
     assert!(actions.is_empty());
     assert!(!app.model_picker.is_open());
-    assert_eq!(app.state.model.spec(), before);
+    assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
         "command failed: ambiguous model: glm"
@@ -3644,7 +3644,7 @@ fn model_arg_ambiguous_flashes() {
 fn model_arg_no_match_flashes() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
-    let before = app.state.model.spec();
+    let before = app.root_config().model.spec();
 
     let actions = app.execute_command(
         ParsedCommand {
@@ -3655,7 +3655,7 @@ fn model_arg_no_match_flashes() {
     );
     assert!(actions.is_empty());
     assert!(!app.model_picker.is_open());
-    assert_eq!(app.state.model.spec(), before);
+    assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
         "command failed: no model matches: xyz"
@@ -3683,7 +3683,7 @@ fn model_arg_matches_provider_section() {
 #[test]
 fn malformed_model_arg_flashes_invalid_model() {
     let (mut app, _models) = app_with_model_slot();
-    let before = app.state.model.spec();
+    let before = app.root_config().model.spec();
 
     let actions = app.execute_command(
         ParsedCommand {
@@ -3693,7 +3693,7 @@ fn malformed_model_arg_flashes_invalid_model() {
         0,
     );
     assert!(actions.is_empty());
-    assert_eq!(app.state.model.spec(), before);
+    assert_eq!(app.root_config().model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
         "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
@@ -4984,7 +4984,7 @@ fn apply_loaded_session_defers_queued_messages_until_flush() {
     session.meta.queued_messages = vec!["deferred".into()];
     session.push_message(Message::user("hello".into()));
 
-    let model = app.state.model.clone();
+    let model = app.root_config().model.clone();
     app.apply_loaded_session(session, &model);
 
     assert!(app.queue.is_empty());
@@ -4998,7 +4998,7 @@ fn loaded_session_restores_yolo() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.yolo = Some(true);
 
-    let model = app.state.model.clone();
+    let model = app.root_config().model.clone();
     app.apply_loaded_session(session, &model);
 
     assert!(app.permissions.is_yolo());
@@ -6976,7 +6976,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.plan_form.on_plan_ready();
-    let original = app.state.model.spec();
+    let original = app.root_config().model.spec();
     let persisted_model = maki_storage::model::read_model(&app.storage);
     let recents = maki_storage::model::read_recents(&app.storage);
     let prefs = serde_json::to_value(maki_storage::sessions::read_prefs(&app.storage)).unwrap();
@@ -6997,7 +6997,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
     assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
-    assert_eq!(app.state.model.spec(), original);
+    assert_eq!(app.root_config().model.spec(), original);
     assert_eq!(
         maki_storage::model::read_model(&app.storage),
         persisted_model
@@ -7135,7 +7135,7 @@ fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
 fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     let mut app = plan_app();
     app.plan_form
-        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+        .set_implementation_model("zai/glm-5".into(), &app.root_config().model.spec());
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     set_root_mode(&mut app, Mode::from_id(mode));
     assert_eq!(app.plan_form.implementation_model(), None);
@@ -7148,7 +7148,7 @@ fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
 fn model_picker_without_target_initializes_from_root(plan: bool) {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
     let models = install_model_slot(&mut app);
-    let root_model = app.state.model.spec();
+    let root_model = app.root_config().model.spec();
     models.store(Some(Arc::new(vec![
         MODEL_SPEC_GLM4.into(),
         root_model.clone(),
@@ -7181,7 +7181,7 @@ fn normal_model_picker_still_requests_model_change() {
 fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     let mut app = plan_app();
     app.plan_form
-        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+        .set_implementation_model("zai/glm-5".into(), &app.root_config().model.spec());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -8204,7 +8204,6 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                             spawn_input_child_with_mode(&mut app, TASK_ID, "matrix-agent", mode);
                         let config = target.effective_config().unwrap().unwrap();
                         commit_root_model(&app, config.model.clone());
-                        app.state.model = config.model.clone();
                         app.state.session_mut().model = config.model.spec();
                         if child {
                             bind_actor_target(&app, target);

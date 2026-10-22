@@ -762,7 +762,7 @@ impl App {
                 self.chats[self.active_chat]
                     .model_id
                     .clone()
-                    .unwrap_or_else(|| self.state.model.spec())
+                    .unwrap_or_else(|| self.root_config().model.spec())
             })
     }
 

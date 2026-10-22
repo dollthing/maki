@@ -451,9 +451,9 @@ impl App {
                     config.model.context_window
                 } else if self.focused_streaming() {
                     self.run_context_window
-                        .unwrap_or(self.state.model.context_window)
+                        .unwrap_or_else(|| self.root_config().model.context_window)
                 } else {
-                    self.state.model.context_window
+                    self.root_config().model.context_window
                 },
                 show_global: self.chats.len() > 1,
             },

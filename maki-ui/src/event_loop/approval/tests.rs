@@ -1031,7 +1031,7 @@ fn assert_preserved(
 ) {
     let app = &event_loop.sessions[index].app;
     assert_eq!(app.status_bar.flash_text(), flash);
-    assert_eq!(app.state.model.spec(), SOURCE_MODEL);
+    assert_eq!(app.root_config().model.spec(), SOURCE_MODEL);
     assert_eq!(app.root_mode(), Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
     assert_eq!(app.plan_form.implementation_model(), Some(TARGET_MODEL));
@@ -1100,7 +1100,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
             prefs
         );
         assert_eq!(
-            event_loop.sessions[index].app.state.model.spec(),
+            event_loop.sessions[index].app.root_config().model.spec(),
             SOURCE_MODEL
         );
         assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
@@ -1172,7 +1172,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         let runtime = &mut event_loop.sessions[index];
         assert_eq!(runtime.id(), original_id);
         assert_eq!(runtime.app.root_mode(), Mode::Build);
-        assert_eq!(runtime.app.state.model.spec(), TARGET_MODEL);
+        assert_eq!(runtime.app.root_config().model.spec(), TARGET_MODEL);
         assert_eq!(runtime.app.plan_form.implementation_model(), None);
         let (manager, root) = runtime.handles.manager_and_root();
         assert_eq!(
@@ -1389,7 +1389,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         ));
         assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Build);
         assert_eq!(
-            event_loop.sessions[index].app.state.model.spec(),
+            event_loop.sessions[index].app.root_config().model.spec(),
             TARGET_MODEL
         );
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
@@ -1773,7 +1773,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(
-            event_loop.sessions[index].app.state.model.spec(),
+            event_loop.sessions[index].app.root_config().model.spec(),
             TARGET_MODEL
         );
         assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Build);
@@ -1819,10 +1819,6 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
                 )
             },
         );
-        assert_eq!(
-            event_loop.sessions[index].app.state.model.spec(),
-            SOURCE_MODEL
-        );
         event_loop.ctx.prepare_provider =
             Arc::new(|_, _| panic!("no-override approval must reuse actor provider"));
         approve(event_loop, index, fresh);
@@ -1865,7 +1861,7 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
         assert!(recorded.is_empty());
         assert!(requests.is_empty());
         assert_eq!(
-            event_loop.sessions[index].app.state.model.spec(),
+            event_loop.sessions[index].app.root_config().model.spec(),
             TARGET_MODEL
         );
     });

@@ -44,12 +44,6 @@ impl ConfigSource {
 pub(crate) struct SessionState {
     /// Shared with the writer thread, so a checkpoint is just a refcount bump.
     pub session: Arc<AppSession>,
-    /// The model the UI currently shows and accounts against. Seeded before the
-    /// agent exists, then refined by model discovery, which is the only thing
-    /// that can move context window and fast support after the model is picked.
-    /// Mode, fast, workflow and thinking are not read off this: they follow the
-    /// agent's committed config.
-    pub model: Model,
     pub token_usage: TokenUsage,
     /// What the session has billed so far: the restored total plus every turn
     /// since. Kept running, because re-deriving it from the counters would
@@ -75,36 +69,7 @@ impl SessionState {
         storage: &StateDir,
         model_policy: &ModelPolicy,
     ) -> Self {
-        // A caller that resolved the session's own model hands in a value that
-        // has already been through the provider (and its `adjust_model`), so it
-        // is richer than anything a rebuild from the spec could produce. Only a
-        // saved model the caller did not resolve gets rebuilt and adjusted.
-        let model = if model_policy.allows(&session.model) && fallback_model.spec() == session.model
-        {
-            fallback_model.clone()
-        } else {
-            match model_policy
-                .allows(&session.model)
-                .then(|| Model::from_spec(&session.model))
-                .transpose()
-                .ok()
-                .flatten()
-            {
-                Some(mut model) => {
-                    // Apply the provider's per-model adjustments (e.g. ZAI's
-                    // glm-5.2 thinking support) so a resumed session matches one
-                    // started fresh.
-                    if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
-                        tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
-                    }
-                    model
-                }
-                None => {
-                    session.model = fallback_model.spec();
-                    fallback_model.clone()
-                }
-            }
-        };
+        let model = resumed_model(&mut session, fallback_model, model_policy);
 
         let mode = stored_mode(&session.meta.mode);
 
@@ -138,7 +103,6 @@ impl SessionState {
         Self {
             fast_pending,
             session: Arc::new(session),
-            model,
             token_usage,
             cost,
             context_size,
@@ -203,20 +167,58 @@ impl SessionState {
         }
     }
 
-    /// A model switch drops a pending fast wish; discovery answering for the
-    /// same model keeps it while the model can still honour it.
+    /// Records the root's committed model on the session. A model switch drops
+    /// a pending fast wish; discovery answering for the same model keeps it
+    /// while the model can still honour it.
     pub fn update_model(&mut self, model: &Model) {
+        let spec = model.spec();
         self.fast_pending &=
-            self.model.spec() == model.spec() && (model.fast_pending() || model.supports_fast());
-        self.session_mut().set_model(model.spec());
-        self.model = model.clone();
+            self.session.model == spec && (model.fast_pending() || model.supports_fast());
+        self.session_mut().set_model(spec);
     }
 
-    /// Whether a pending fast wish can now be committed. A committed fast
-    /// settles the wish.
-    pub fn resolve_pending_fast(&mut self, fast: bool) -> bool {
+    /// Whether a pending fast wish can now be committed on `model`. A
+    /// committed fast settles the wish.
+    pub fn resolve_pending_fast(&mut self, fast: bool, model: &Model) -> bool {
         self.fast_pending &= !fast;
-        self.fast_pending && self.model.supports_fast()
+        self.fast_pending && model.supports_fast()
+    }
+}
+
+/// The model a resumed session is accounted against (cost, a pending /fast).
+fn resumed_model(
+    session: &mut AppSession,
+    fallback_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Model {
+    // A caller that resolved the session's own model hands in a value that
+    // has already been through the provider (and its `adjust_model`), so it
+    // is richer than anything a rebuild from the spec could produce. Only a
+    // saved model the caller did not resolve gets rebuilt and adjusted.
+    if model_policy.allows(&session.model) && fallback_model.spec() == session.model {
+        fallback_model.clone()
+    } else {
+        match model_policy
+            .allows(&session.model)
+            .then(|| Model::from_spec(&session.model))
+            .transpose()
+            .ok()
+            .flatten()
+        {
+            Some(mut model) => {
+                // Apply the provider's per-model adjustments (e.g. ZAI's
+                // glm-5.2 thinking support) so a resumed session matches one
+                // started fresh.
+                if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
+                    tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
+                }
+                model
+            }
+            None => {
+                session.model = fallback_model.spec();
+                fallback_model.clone()
+            }
+        }
     }
 }
 
@@ -453,8 +455,8 @@ mod tests {
         model.supports_fast_override = Some(support);
         state.update_model(&model);
         assert_eq!(state.fast_pending, ready || support == FastSupport::Pending);
-        assert_eq!(state.resolve_pending_fast(false), ready);
-        assert!(!state.resolve_pending_fast(true));
+        assert_eq!(state.resolve_pending_fast(false, &model), ready);
+        assert!(!state.resolve_pending_fast(true, &model));
         assert!(!state.fast_pending);
     }
 
@@ -499,8 +501,6 @@ mod tests {
 
     #[test]
     fn disallowed_restored_model_uses_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
         let fallback = test_model();
         let mut session = make_plan_session(Some(StoredMode::Build), None);
         session.model = "openai/gpt-5".into();
@@ -510,10 +510,10 @@ mod tests {
         .unwrap();
         let policy = raw.into_config().unwrap().provider.model_policy;
 
-        let state = SessionState::from_session(session, &fallback, &storage, &policy);
+        let model = resumed_model(&mut session, &fallback, &policy);
 
-        assert_eq!(state.model.spec(), fallback.spec());
-        assert_eq!(state.session.model, fallback.spec());
+        assert_eq!(model.spec(), fallback.spec());
+        assert_eq!(session.model, fallback.spec());
     }
 
     #[test]
@@ -534,14 +534,13 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
         session.meta.thinking = Some(StoredThinking::Adaptive);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
         assert!(
-            state.model.supports_thinking(),
+            model.supports_thinking(),
             "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
         );
         assert_eq!(
-            resolve_thinking(&state.session, &state.model, &storage),
+            resolve_thinking(&session, &model, &storage),
             ThinkingConfig::Adaptive,
             "resumed thinking config should be preserved when the model supports it",
         );
@@ -565,11 +564,10 @@ mod tests {
     #[test]
     fn new_session_uses_pref_thinking_default() {
         let (_tmp, storage) = with_prefs(&prefs_high());
-        let session = AppSession::new("test-model", "/tmp");
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let mut session = AppSession::new("test-model", "/tmp");
+        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
         assert_eq!(
-            resolve_thinking(&state.session, &state.model, &storage),
+            resolve_thinking(&session, &model, &storage),
             ThinkingConfig::Effort(Effort::High)
         );
     }
@@ -579,10 +577,9 @@ mod tests {
         let (_tmp, storage) = with_prefs(&prefs_high());
         let mut session = AppSession::new("test-model", "/tmp");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
         assert_eq!(
-            resolve_thinking(&state.session, &state.model, &storage),
+            resolve_thinking(&session, &model, &storage),
             ThinkingConfig::Budget(4096)
         );
     }
@@ -594,10 +591,10 @@ mod tests {
             thinking_override: Some(ThinkingSupport::No),
             ..test_model()
         };
-        let session = AppSession::new("test-model", "/tmp");
-        let state = SessionState::from_session(session, &model, &storage, &ModelPolicy::default());
+        let mut session = AppSession::new("test-model", "/tmp");
+        let model = resumed_model(&mut session, &model, &ModelPolicy::default());
         assert_eq!(
-            resolve_thinking(&state.session, &state.model, &storage),
+            resolve_thinking(&session, &model, &storage),
             ThinkingConfig::Off
         );
     }
@@ -606,14 +603,10 @@ mod tests {
     fn new_session_without_pref_stays_off() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let state = SessionState::from_session(
-            AppSession::new("test-model", "/tmp"),
-            &test_model(),
-            &storage,
-            &ModelPolicy::default(),
-        );
+        let mut session = AppSession::new("test-model", "/tmp");
+        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
         assert_eq!(
-            resolve_thinking(&state.session, &state.model, &storage),
+            resolve_thinking(&session, &model, &storage),
             ThinkingConfig::Off
         );
     }
