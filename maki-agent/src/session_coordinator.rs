@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -35,6 +35,7 @@ static DIRECTORY: LazyLock<Mutex<HashMap<MakiId, DirectoryEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 const ACK_MISMATCH: &str = "checkpoint acknowledgement did not match request";
+const CHECKPOINT_CANCELLED: &str = "checkpoint cancelled";
 const PARTICIPANT_CLOSED_MESSAGE: &str =
     "session option participant closed before the catalog decision";
 
@@ -88,6 +89,10 @@ pub type ModelPreparer = Arc<dyn Fn(Model) -> ModelPreparationFuture + Send + Sy
 /// Applies the committed host snapshot synchronously. It must not fail, panic,
 /// acquire the actor lock, or enqueue work on that actor.
 pub type ConfigProjector = Arc<dyn Fn(&ConfigCommit) + Send + Sync>;
+pub type ConfigMutation = Box<
+    dyn FnOnce(Arc<EffectiveAgentConfig>, CheckpointClaim) -> Result<PreparedTransaction, String>
+        + Send,
+>;
 
 #[derive(Clone)]
 struct ActorBinding {
@@ -175,29 +180,94 @@ impl Drop for SessionTransactionReservation {
 }
 
 impl SessionTransactionReservation {
+    /// Fails before taking the option reservation, so a failed prepare still
+    /// cancels the publication when the reservation drops.
     pub fn prepare(
         mut self,
         config: Arc<EffectiveAgentConfig>,
         claim: CheckpointClaim,
         history_changed: bool,
     ) -> Result<PreparedTransaction, SessionCoordinatorError> {
-        let result = self.coordinator.prepare_reserved_transaction(
-            config,
-            self.publication.clone(),
-            claim,
-            history_changed,
-            self.reservation
-                .take()
-                .expect("transaction owns option reservation"),
+        let coordinator = &self.coordinator;
+        let binding = coordinator.actor_binding()?;
+        let candidate = actor_options(&coordinator.read, &config)?;
+        let options = SessionOptions::candidate_snapshot(&candidate);
+        let publish_read = coordinator.read.clone();
+        let session_id = coordinator.session_id;
+        let runtime_epoch = coordinator.generation;
+        let reservation = self
+            .reservation
+            .take()
+            .expect("transaction owns option reservation");
+        let registration = Arc::new(
             self.registration
                 .take()
                 .expect("transaction owns publication registration"),
         );
-        if result.is_err() {
-            self.publication.cancel();
-        }
-        result
+        let final_registration = Arc::clone(&registration);
+        Ok(PreparedTransaction {
+            publication: self.publication.clone(),
+            publish: Box::new(move |snapshot, publication| {
+                let registration = registration;
+                if !Arc::ptr_eq(&config, &snapshot.config) {
+                    return Box::pin(async {
+                        Err(
+                            "transaction configuration does not match prepared actor operation"
+                                .into(),
+                        )
+                    });
+                }
+                let history = history_changed.then_some(snapshot.history);
+                let (version, history_revision) =
+                    publish_read.next_version(options.version, history.is_some());
+                let checkpoint = publish_read.checkpoint.checkpoint_guarded(
+                    CheckpointRequest {
+                        session_id,
+                        version,
+                        snapshot: Arc::new(SessionCheckpoint {
+                            kind: SessionCheckpointKind::Config,
+                            history_revision,
+                            history,
+                            options,
+                            config: Some(CommittedConfigProjection {
+                                runtime: snapshot.commit.identity,
+                                generation: snapshot.commit.generation,
+                                runtime_epoch,
+                                config: snapshot.commit.config,
+                            }),
+                        }),
+                    },
+                    publication,
+                    claim,
+                );
+                Box::pin(async move {
+                    let _registration = registration;
+                    verify_ack(session_id, version, checkpoint)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            }),
+            finalize: Box::new(move |commit| {
+                let _registration = final_registration;
+                (binding.project_config)(commit);
+                reservation.commit(candidate);
+            }),
+        })
     }
+
+    pub fn into_config_mutation(self) -> ConfigMutation {
+        Box::new(move |config, claim| {
+            self.prepare(config, claim, false)
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+struct ActorChange {
+    binding: ActorBinding,
+    operation: PreparedOperationTicket,
+    reservation: SessionTransactionReservation,
+    predecessor: Arc<EffectiveAgentConfig>,
 }
 
 pub struct PreparedSessionCoordinator {
@@ -248,17 +318,15 @@ enum PluginOptionDecision {
 }
 
 enum Operation {
-    OptionReserved {
-        operation: Box<Operation>,
-        reservation: SessionOptionsReservation,
-    },
     SetOption {
         id: Arc<str>,
         value: Arc<str>,
+        reservation: SessionOptionsReservation,
         reply: flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>,
     },
     UpdateModelValues {
         specs: Vec<Arc<str>>,
+        reservation: SessionOptionsReservation,
         reply: flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>,
     },
     PreparePluginOptions {
@@ -271,6 +339,8 @@ enum Operation {
     Close {
         reply: flume::Sender<()>,
     },
+    #[cfg(test)]
+    Barrier(flume::Sender<()>),
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -286,7 +356,7 @@ pub fn publication_claim() -> CheckpointClaim {
         if publication.try_publish() {
             Ok(())
         } else {
-            Err(Arc::from("checkpoint cancelled"))
+            Err(Arc::from(CHECKPOINT_CANCELLED))
         }
     })
 }
@@ -648,82 +718,22 @@ impl SessionCoordinatorHandle {
         &self,
         publication: CheckpointPublication,
     ) -> Result<SessionTransactionReservation, SessionCoordinatorError> {
+        self.reserve_transaction_if_version(publication, None)
+    }
+
+    fn reserve_transaction_if_version(
+        &self,
+        publication: CheckpointPublication,
+        version: Option<u64>,
+    ) -> Result<SessionTransactionReservation, SessionCoordinatorError> {
         self.actor_binding()?;
-        let reservation = self.reserve_options(None)?;
+        let reservation = self.reserve_options(version)?;
         let registration = self.register_publication(&publication)?;
         Ok(SessionTransactionReservation {
             coordinator: self.clone(),
             publication,
             reservation: Some(reservation),
             registration: Some(registration),
-        })
-    }
-
-    fn prepare_reserved_transaction(
-        &self,
-        config: Arc<EffectiveAgentConfig>,
-        publication: CheckpointPublication,
-        claim: CheckpointClaim,
-        history_changed: bool,
-        reservation: SessionOptionsReservation,
-        registration: PublicationRegistration,
-    ) -> Result<PreparedTransaction, SessionCoordinatorError> {
-        let binding = self.actor_binding()?;
-        let candidate = actor_options(&self.read, &config)?;
-        let options = SessionOptions::candidate_snapshot(&candidate);
-        let read = self.read.clone();
-        let publish_read = read.clone();
-        let session_id = self.session_id;
-        let runtime_epoch = self.generation;
-        let registration = Arc::new(registration);
-        let final_registration = Arc::clone(&registration);
-        Ok(PreparedTransaction {
-            publication,
-            publish: Box::new(move |snapshot, publication| {
-                let registration = registration;
-                if !Arc::ptr_eq(&config, &snapshot.config) {
-                    return Box::pin(async {
-                        Err(
-                            "transaction configuration does not match prepared actor operation"
-                                .into(),
-                        )
-                    });
-                }
-                let history = history_changed.then_some(snapshot.history);
-                let (version, history_revision) =
-                    publish_read.next_version(options.version, history.is_some());
-                let checkpoint = publish_read.checkpoint.checkpoint_guarded(
-                    CheckpointRequest {
-                        session_id,
-                        version,
-                        snapshot: Arc::new(SessionCheckpoint {
-                            kind: SessionCheckpointKind::Config,
-                            history_revision,
-                            history,
-                            options,
-                            config: Some(CommittedConfigProjection {
-                                runtime: snapshot.commit.identity,
-                                generation: snapshot.commit.generation,
-                                runtime_epoch,
-                                config: snapshot.commit.config,
-                            }),
-                        }),
-                    },
-                    publication,
-                    claim,
-                );
-                Box::pin(async move {
-                    let _registration = registration;
-                    verify_ack(session_id, version, checkpoint)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-            }),
-            finalize: Box::new(move |commit| {
-                let _registration = final_registration;
-                (binding.project_config)(commit);
-                reservation.commit(candidate);
-            }),
         })
     }
 
@@ -749,25 +759,69 @@ impl SessionCoordinatorHandle {
         Ok(verify_ack(self.session_id, version, checkpoint).await?)
     }
 
+    async fn reserve_actor_change(
+        &self,
+        publication: CheckpointPublication,
+        version: Option<u64>,
+    ) -> Result<ActorChange, SessionCoordinatorError> {
+        let binding = self.actor_binding()?;
+        let reservation = self.reserve_transaction_if_version(publication, version)?;
+        let operation = binding
+            .agent
+            .actor()
+            .map_err(actor_error)?
+            .reserve_prepared_operation(None)
+            .map_err(actor_error)?;
+        operation
+            .register_publication(&reservation.publication)
+            .map_err(actor_error)?;
+        let predecessor = operation.wait_predecessor().await.map_err(actor_error)?;
+        Ok(ActorChange {
+            binding,
+            operation,
+            reservation,
+            predecessor,
+        })
+    }
+
     async fn commit_actor_change(
         &self,
-        operation: PreparedOperationTicket,
-        change: Option<ConfigChange>,
-        reservation: SessionTransactionReservation,
-        claim: Option<CheckpointClaim>,
+        change: ActorChange,
+        config_change: ConfigChange,
+        claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
-        operation.resolve(change).map_err(actor_error)?;
+        let ActorChange {
+            operation,
+            reservation,
+            ..
+        } = change;
+        operation
+            .resolve(Some(config_change))
+            .map_err(actor_error)?;
         operation.wait_ready().await.map_err(actor_error)?;
-        let transaction = reservation.prepare(
-            operation.ready_config().map_err(actor_error)?,
-            claim.unwrap_or_else(publication_claim),
-            false,
-        )?;
+        let transaction =
+            reservation.prepare(operation.ready_config().map_err(actor_error)?, claim, false)?;
         operation
             .commit_durable(transaction)
             .await
             .map_err(actor_error)?;
         Ok(self.read.options())
+    }
+
+    async fn commit_patch(
+        &self,
+        spec: Option<Arc<str>>,
+        mut patch: ConfigPatch,
+        version: Option<u64>,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
+        let change = self.reserve_actor_change(publication, version).await?;
+        if let Some(spec) = spec {
+            patch.model = Some(self.prepare_model(&change.binding, spec).await?);
+        }
+        self.commit_actor_change(change, ConfigChange::Patch(patch), claim)
+            .await
     }
 
     pub async fn set_option(
@@ -787,75 +841,56 @@ impl SessionCoordinatorHandle {
         self.ensure_live()?;
         let id = id.into();
         let value = value.into();
-        if matches!(
-            id.as_ref(),
-            MODEL_OPTION_ID | THINKING_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID
-        ) {
-            let binding = self.actor_binding()?;
-            let publication = CheckpointPublication::default();
-            let reserved = self.reserve_options(version)?;
-            let registration = self.register_publication(&publication)?;
-            let reservation = SessionTransactionReservation {
-                coordinator: self.clone(),
-                publication,
-                reservation: Some(reserved),
-                registration: Some(registration),
-            };
-            if id.as_ref() != MODEL_OPTION_ID {
+        let enabled = value.as_ref() == ENABLED_VALUE;
+        let (spec, patch) = match id.as_ref() {
+            MODEL_OPTION_ID => (Some(value), ConfigPatch::default()),
+            THINKING_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID => {
                 self.read.options.prepare_set(&id, &value)?;
+                let patch = match id.as_ref() {
+                    THINKING_OPTION_ID => ConfigPatch {
+                        thinking: Some(
+                            value
+                                .parse()
+                                .map_err(|_| SessionOptionError::InvalidValue { id, value })?,
+                        ),
+                        ..Default::default()
+                    },
+                    FAST_OPTION_ID => ConfigPatch {
+                        fast: Some(enabled),
+                        ..Default::default()
+                    },
+                    _ => ConfigPatch {
+                        workflow: Some(enabled),
+                        ..Default::default()
+                    },
+                };
+                (None, patch)
             }
-            let actor = binding.agent.actor().map_err(actor_error)?;
-            let operation = actor
-                .reserve_prepared_operation(None)
-                .map_err(actor_error)?;
-            operation
-                .register_publication(&reservation.publication)
-                .map_err(actor_error)?;
-            operation.wait_predecessor().await.map_err(actor_error)?;
-            let patch = match id.as_ref() {
-                MODEL_OPTION_ID => ConfigPatch {
-                    model: Some(self.prepare_model(&binding, value).await?),
-                    ..Default::default()
-                },
-                THINKING_OPTION_ID => ConfigPatch {
-                    thinking: Some(
-                        value
-                            .parse()
-                            .map_err(|_| SessionOptionError::InvalidValue { id, value })?,
-                    ),
-                    ..Default::default()
-                },
-                FAST_OPTION_ID => ConfigPatch {
-                    fast: Some(value.as_ref() == ENABLED_VALUE),
-                    ..Default::default()
-                },
-                WORKFLOW_OPTION_ID => ConfigPatch {
-                    workflow: Some(value.as_ref() == ENABLED_VALUE),
-                    ..Default::default()
-                },
-                _ => unreachable!(),
-            };
-            return self
-                .commit_actor_change(
-                    operation,
-                    Some(ConfigChange::Patch(patch)),
-                    reservation,
-                    None,
-                )
-                .await;
-        }
-        let reservation = self.reserve_options(version)?;
-        let (reply, response) = flume::bounded(1);
-        self.tx
-            .send(Operation::OptionReserved {
-                operation: Box::new(Operation::SetOption { id, value, reply }),
-                reservation,
-            })
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))
+            _ => {
+                let reservation = self.reserve_options(version)?;
+                let (reply, response) = flume::bounded(1);
+                self.tx
+                    .send(Operation::SetOption {
+                        id,
+                        value,
+                        reservation,
+                        reply,
+                    })
+                    .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+                return response
+                    .recv_async()
+                    .await
+                    .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)));
+            }
+        };
+        self.commit_patch(
+            spec,
+            patch,
+            version,
+            CheckpointPublication::default(),
+            publication_claim(),
+        )
+        .await
     }
 
     pub async fn toggle_boolean_option(
@@ -930,72 +965,29 @@ impl SessionCoordinatorHandle {
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
-        let binding = self.actor_binding()?;
-        let reservation = self.reserve_transaction(publication)?;
-        let actor = binding.agent.actor().map_err(actor_error)?;
-        let operation = actor
-            .reserve_prepared_operation(None)
-            .map_err(actor_error)?;
-        operation
-            .register_publication(&reservation.publication)
-            .map_err(actor_error)?;
-        operation.wait_predecessor().await.map_err(actor_error)?;
-        let model = match spec {
-            Some(spec) => Some(self.prepare_model(&binding, spec).await?),
-            None => None,
+        let patch = ConfigPatch {
+            fast,
+            thinking,
+            ..Default::default()
         };
-        self.commit_actor_change(
-            operation,
-            Some(ConfigChange::Patch(ConfigPatch {
-                model,
-                fast,
-                thinking,
-                ..Default::default()
-            })),
-            reservation,
-            Some(claim),
-        )
-        .await
+        self.commit_patch(spec, patch, None, publication, claim)
+            .await
     }
 
     pub async fn change_directory(
         &self,
         path: PathBuf,
     ) -> Result<PathBuf, SessionCoordinatorError> {
-        let binding = self.actor_binding()?;
-        let reservation = self.reserve_transaction(CheckpointPublication::default())?;
-        let actor = binding.agent.actor().map_err(actor_error)?;
-        let operation = actor
-            .reserve_prepared_operation(None)
-            .map_err(actor_error)?;
-        operation
-            .register_publication(&reservation.publication)
-            .map_err(actor_error)?;
-        let predecessor = operation.wait_predecessor().await.map_err(actor_error)?;
-        let path = if path.is_absolute() {
-            path
-        } else {
-            predecessor.context.cwd().join(path)
-        };
-        let canonical = smol::fs::canonicalize(path).await.map_err(|error| {
-            SessionCoordinatorError::DirectoryAdoption(Arc::from(error.to_string()))
-        })?;
-        if !smol::fs::metadata(&canonical)
+        let change = self
+            .reserve_actor_change(CheckpointPublication::default(), None)
+            .await?;
+        let canonical = canonical_directory(change.predecessor.context.cwd(), path)
             .await
-            .map_err(|error| {
-                SessionCoordinatorError::DirectoryAdoption(Arc::from(error.to_string()))
-            })?
-            .is_dir()
-        {
-            return Err(SessionCoordinatorError::DirectoryAdoption(Arc::from(
-                "working directory is not a directory",
-            )));
-        }
+            .map_err(SessionCoordinatorError::DirectoryAdoption)?;
         self.commit_actor_change(
-            operation,
-            Some(ConfigChange::WorkingDirectory(canonical.clone())),
-            reservation,
-            None,
+            change,
+            ConfigChange::WorkingDirectory(canonical.clone()),
+            publication_claim(),
         )
         .await?;
         Ok(canonical)
@@ -1009,9 +1001,10 @@ impl SessionCoordinatorHandle {
         let reservation = self.reserve_options(None)?;
         let (reply, response) = flume::bounded(1);
         self.tx
-            .send(Operation::OptionReserved {
-                operation: Box::new(Operation::UpdateModelValues { specs, reply }),
+            .send(Operation::UpdateModelValues {
+                specs,
                 reservation,
+                reply,
             })
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
         response
@@ -1226,9 +1219,6 @@ fn reject_operation(operation: Operation, session_id: MakiId, busy: bool) {
         SessionCoordinatorError::StaleSession(session_id)
     };
     match operation {
-        Operation::OptionReserved { operation, .. } => {
-            reject_operation(*operation, session_id, busy)
-        }
         Operation::SetOption { reply, .. } | Operation::UpdateModelValues { reply, .. } => {
             let _ = reply.send(Err(error));
         }
@@ -1236,6 +1226,10 @@ fn reject_operation(operation: Operation, session_id: MakiId, busy: bool) {
             let _ = prepared.send(Err(error));
         }
         Operation::Close { reply } => {
+            let _ = reply.send(());
+        }
+        #[cfg(test)]
+        Operation::Barrier(reply) => {
             let _ = reply.send(());
         }
     }
@@ -1261,18 +1255,14 @@ async fn handle_operation(
     operation: Operation,
     rx: &flume::Receiver<Operation>,
 ) -> ControlFlow<()> {
-    let (operation, reservation) = match operation {
-        Operation::OptionReserved {
-            operation,
-            reservation,
-        } => (*operation, Some(reservation)),
-        operation => (operation, None),
-    };
     match operation {
-        Operation::OptionReserved { .. } => unreachable!("nested option reservation"),
-        Operation::SetOption { id, value, reply } => {
+        Operation::SetOption {
+            id,
+            value,
+            reservation,
+            reply,
+        } => {
             let result = async {
-                let reservation = reservation.expect("option mutation is reserved");
                 let Some(candidate) = ctx.read.options.prepare_set(&id, &value)? else {
                     return Ok(ctx.read.options());
                 };
@@ -1283,12 +1273,12 @@ async fn handle_operation(
             .await;
             let _ = reply.send(result);
         }
-        Operation::UpdateModelValues { specs, reply } => {
-            let result = match reservation {
-                Some(reservation) => update_model_values(&ctx.read, reservation, specs).await,
-                None => Err(SessionCoordinatorError::SessionBusy(ctx.session_id)),
-            };
-            let _ = reply.send(result);
+        Operation::UpdateModelValues {
+            specs,
+            reservation,
+            reply,
+        } => {
+            let _ = reply.send(update_model_values(&ctx.read, reservation, specs).await);
         }
         Operation::PreparePluginOptions {
             plugin,
@@ -1396,6 +1386,10 @@ async fn handle_operation(
             ctx.catalog.unregister(ctx.session_id, ctx.generation);
             let _ = reply.send(());
             return ControlFlow::Break(());
+        }
+        #[cfg(test)]
+        Operation::Barrier(reply) => {
+            let _ = reply.send(());
         }
     }
     ControlFlow::Continue(())
@@ -1595,6 +1589,24 @@ fn unregister(session_id: MakiId, generation: u64) {
     }
 }
 
+/// Resolves `path` against `cwd` and requires an existing directory.
+pub async fn canonical_directory(cwd: &Path, path: PathBuf) -> Result<PathBuf, Arc<str>> {
+    let path = cwd.join(path);
+    smol::unblock(move || {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| Arc::from(error.to_string()))?;
+        if !canonical.is_dir() {
+            return Err(Arc::from(format!(
+                "{} is not a directory",
+                canonical.display()
+            )));
+        }
+        Ok(canonical)
+    })
+    .await
+}
+
 pub fn builtin_option_definitions(
     current_model: impl Into<Arc<str>>,
     model_specs: impl IntoIterator<Item = Arc<str>>,
@@ -1716,6 +1728,14 @@ mod tests {
     const OLD: &str = "ollama/old";
     const NEW: &str = "ollama/new";
     const FAILED: &str = "failed";
+
+    impl SessionCoordinatorHandle {
+        async fn barrier(&self) {
+            let (reply, response) = flume::bounded(1);
+            self.tx.send(Operation::Barrier(reply)).unwrap();
+            response.recv_async().await.unwrap();
+        }
+    }
 
     fn projection_config(workflow: bool) -> Arc<EffectiveAgentConfig> {
         let mut config = EffectiveAgentConfig::new(
@@ -2138,15 +2158,7 @@ mod tests {
                     closed.recv_async().await.unwrap();
                 } else {
                     drop(replace);
-                    let (reply, response) = flume::bounded(1);
-                    first
-                        .tx
-                        .send(Operation::UpdateModelValues {
-                            specs: Vec::new(),
-                            reply,
-                        })
-                        .unwrap();
-                    let _ = response.recv_async().await;
+                    first.barrier().await;
                     first
                         .set_option(YOLO_OPTION_ID, DISABLED_VALUE)
                         .await
@@ -2155,15 +2167,7 @@ mod tests {
                 assert_eq!(catalog.plugin_definitions("test"), previous_definitions);
                 assert_eq!(lock(&first_saved).last().unwrap().options, before_first);
                 drop(first.read.options.try_reserve(None).unwrap());
-                let (reply, response) = flume::bounded(1);
-                second
-                    .tx
-                    .send(Operation::UpdateModelValues {
-                        specs: Vec::new(),
-                        reply,
-                    })
-                    .unwrap();
-                let _ = response.recv_async().await;
+                second.barrier().await;
                 assert_eq!(lock(&second_saved).last().unwrap().options, before_second);
                 drop(second.read.options.try_reserve(None).unwrap());
                 second
@@ -2246,18 +2250,6 @@ mod tests {
                     ));
                 }
             }
-            let (queued, response) = flume::bounded(1);
-            first
-                .tx
-                .send(Operation::UpdateModelValues {
-                    specs: Vec::new(),
-                    reply: queued,
-                })
-                .unwrap();
-            assert!(matches!(
-                response.recv_async().await.unwrap(),
-                Err(SessionCoordinatorError::SessionBusy(id)) if id == ids[0]
-            ));
             assert_eq!(lock(&saved).len(), 2);
             assert!(replacement.cancel().await.is_none());
             reply

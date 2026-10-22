@@ -1,7 +1,7 @@
 use maki_agent::SessionMailbox;
 use maki_agent::session_coordinator::{
     SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
-    builtin_option_definitions,
+    SessionTransactionReservation, builtin_option_definitions,
 };
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
@@ -243,16 +243,11 @@ fn gated_config_mutations(
                 .map_err(|error| error.to_string())?;
             *slot = Some(handle);
         }
-        let reservation = slot
-            .as_ref()
+        slot.as_ref()
             .unwrap()
             .reserve_transaction(publication)
-            .map_err(|error| error.to_string())?;
-        Ok(Box::new(move |config, claim| {
-            reservation
-                .prepare(config, claim, false)
-                .map_err(|error| error.to_string())
-        }))
+            .map(SessionTransactionReservation::into_config_mutation)
+            .map_err(|error| error.to_string())
     })
 }
 

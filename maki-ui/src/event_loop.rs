@@ -26,10 +26,10 @@ use maki_agent::command::CustomCommand;
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::session_coordinator::SessionCheckpoint;
 use maki_agent::session_coordinator::{
-    PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
-    SessionCoordinatorParams, builtin_option_definitions,
+    PreparedSessionCoordinator, SessionCheckpoint, SessionCoordinatorError,
+    SessionCoordinatorHandle, SessionCoordinatorParams, SessionTransactionReservation,
+    builtin_option_definitions, canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
@@ -4773,15 +4773,9 @@ impl<'t> EventLoop<'t> {
                     .wait_predecessor()
                     .await
                     .map_err(|error| error.to_string())?;
-                let path = config.context.cwd().join(path);
-                let path = smol::unblock(move || {
-                    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-                    if !canonical.is_dir() {
-                        return Err(format!("{} is not a directory", canonical.display()));
-                    }
-                    Ok(canonical)
-                })
-                .await?;
+                let path = canonical_directory(config.context.cwd(), path)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 commit_config_change(ticket, ConfigChange::WorkingDirectory(path.clone())).await?;
                 if is_root {
                     *adopted.lock().unwrap_or_else(|error| error.into_inner()) = Some(path);
@@ -5286,14 +5280,10 @@ fn runtime_config_mutations(
         }
         target.validate_live().map_err(|error| error.to_string())?;
         if target.id() == root_id {
-            let reservation = coordinator
+            return coordinator
                 .reserve_transaction(publication)
-                .map_err(|error| error.to_string())?;
-            return Ok(Box::new(move |config, claim| {
-                reservation
-                    .prepare(config, claim, false)
-                    .map_err(|error| error.to_string())
-            }));
+                .map(SessionTransactionReservation::into_config_mutation)
+                .map_err(|error| error.to_string());
         }
         let key = orchestration
             .upgrade()
@@ -5353,14 +5343,10 @@ fn reserve_config_change(
         .parent_id
         .is_none()
     {
-        let reservation = coordinator
+        coordinator
             .reserve_transaction(publication.clone())
-            .map_err(|error| error.to_string())?;
-        Box::new(move |config, claim| {
-            reservation
-                .prepare(config, claim, false)
-                .map_err(|error| error.to_string())
-        })
+            .map_err(|error| error.to_string())?
+            .into_config_mutation()
     } else {
         services
             .ok_or_else(|| "durable agent configuration adapter is unavailable".to_owned())?
@@ -5424,15 +5410,6 @@ async fn commit_mode_change(
     )
     .await
     .map(|_| ())
-}
-
-fn publication_claim() -> maki_storage::checkpoint::CheckpointClaim {
-    Arc::new(|publication| {
-        publication
-            .try_publish()
-            .then_some(())
-            .ok_or_else(|| Arc::from(maki_agent::ActorError::PolicyCancelled.to_string()))
-    })
 }
 
 async fn commit_config_change(

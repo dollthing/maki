@@ -5,10 +5,11 @@ use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use arc_swap::ArcSwapOption;
 use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
+use maki_agent::session_coordinator::{ConfigMutation, SessionTransactionReservation};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
-use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
+use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::{HistorySnapshot, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
 use std::{
@@ -187,10 +188,7 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
-pub type ConfigMutationReservation = Box<
-    dyn FnOnce(Arc<EffectiveAgentConfig>, CheckpointClaim) -> Result<PreparedTransaction, String>
-        + Send,
->;
+pub type ConfigMutationReservation = ConfigMutation;
 
 pub type ConfigMutationReserver = Arc<
     dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutationReservation, String>
@@ -303,14 +301,10 @@ pub fn frontend_root(
             if target.id() != root_id {
                 return child_config(target, publication);
             }
-            let reservation = root_coordinator()?
+            root_coordinator()?
                 .reserve_transaction(publication)
-                .map_err(|error| error.to_string())?;
-            Ok(Box::new(move |config, claim| {
-                reservation
-                    .prepare(config, claim, false)
-                    .map_err(|error| error.to_string())
-            }))
+                .map(SessionTransactionReservation::into_config_mutation)
+                .map_err(|error| error.to_string())
         },
     ))
 }
