@@ -14,7 +14,7 @@ mod types;
 pub use manager_error::ManagerError;
 pub use types::{
     AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, CurrentManagedTurn, GraphLifecycle,
-    ManagedPromptWait, PromptAdmission, PromptWaitError, ShutdownReport, TurnPermitLease,
+    ManagedPromptWait, PromptWaitError, ShutdownReport, TurnPermitLease,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -154,13 +154,6 @@ struct TestGate {
     release: flume::Receiver<()>,
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-struct PromptAdmissionGate {
-    admitted: flume::Sender<TurnId>,
-    release: flume::Receiver<()>,
-}
-
 pub(crate) struct ManagerInner {
     generation: u64,
     limits: AgentLimits,
@@ -172,8 +165,6 @@ pub(crate) struct ManagerInner {
     reaped: Event,
     #[cfg(test)]
     commit_gate: Mutex<Option<TestGate>>,
-    #[cfg(test)]
-    prompt_admission_gate: Mutex<Option<PromptAdmissionGate>>,
     #[cfg(test)]
     prompt_wait_registration_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
@@ -214,8 +205,6 @@ impl AgentManagerHandle {
             reaped: Event::new(),
             #[cfg(test)]
             commit_gate: Mutex::new(None),
-            #[cfg(test)]
-            prompt_admission_gate: Mutex::new(None),
             #[cfg(test)]
             prompt_wait_registration_gate: Mutex::new(None),
             #[cfg(test)]
@@ -761,19 +750,6 @@ impl AgentManagerHandle {
         self.actor(child_id)
     }
 
-    fn register_prompt_wait(
-        &self,
-        current: &CurrentManagedTurn,
-        lease: &TurnPermitLease,
-        child_id: AgentId,
-        actor: &AgentActorHandle,
-        ticket: crate::TurnTicket,
-        timeout: Option<Duration>,
-    ) -> Result<ManagedPromptWait, ManagerError> {
-        self.register_turn_wait(current, lease, child_id, actor, ticket, timeout, true)
-    }
-
-    #[expect(clippy::too_many_arguments)]
     fn register_turn_wait(
         &self,
         current: &CurrentManagedTurn,
@@ -782,7 +758,6 @@ impl AgentManagerHandle {
         actor: &AgentActorHandle,
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
-        destructive: bool,
     ) -> Result<ManagedPromptWait, ManagerError> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
             return Err(ManagerError::WrongManager);
@@ -815,7 +790,6 @@ impl AgentManagerHandle {
             cancel: Mutex::new(Some(cancel)),
         });
         let watcher_wait = Arc::clone(&wait);
-        let manager = Arc::downgrade(&self.0);
         let suspension = PermitSuspensionGuard {
             lease: Arc::clone(&lease.inner),
             watcher_id,
@@ -839,12 +813,6 @@ impl AgentManagerHandle {
                     .await
                     .map_err(|_| PromptWaitError::Cancelled),
             };
-            if destructive
-                && outcome == Err(PromptWaitError::Timeout)
-                && let Some(manager) = manager.upgrade()
-            {
-                let _ = AgentManagerHandle(manager).close_subtree(child_id);
-            }
             drop(suspension);
             watcher_wait.complete(outcome);
             watcher_wait.mark_reapable();
@@ -1773,34 +1741,6 @@ impl AgentManagerHandle {
     #[cfg(test)]
     fn wait_at_prompt_wait_registration_gate(&self) {
         self.wait_at_test_gate(&self.0.prompt_wait_registration_gate);
-    }
-
-    #[cfg(test)]
-    fn set_prompt_admission_gate(
-        &self,
-        admitted: flume::Sender<TurnId>,
-        release: flume::Receiver<()>,
-    ) {
-        *self
-            .0
-            .prompt_admission_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            Some(PromptAdmissionGate { admitted, release });
-    }
-
-    #[cfg(test)]
-    fn wait_at_prompt_admission_gate(&self, turn_id: TurnId) {
-        let gate = self
-            .0
-            .prompt_admission_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(gate) = gate {
-            gate.admitted.send(turn_id).unwrap();
-            gate.release.recv().unwrap();
-        }
     }
 
     #[cfg(test)]

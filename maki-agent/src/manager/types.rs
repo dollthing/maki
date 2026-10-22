@@ -1,9 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{
-    ActorSnapshot, AgentActorHandle, AgentId, AgentInput, EventSender, TurnId, TurnTicket,
-};
+use crate::{ActorSnapshot, AgentActorHandle, AgentId, TurnId, TurnTicket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
@@ -234,12 +232,6 @@ pub(crate) struct ManagedTurnToken {
     pub(crate) nonce: u64,
 }
 
-pub struct PromptAdmission {
-    pub input: AgentInput,
-    pub event_sender: Option<EventSender>,
-    pub correlation: String,
-}
-
 #[derive(Clone)]
 pub struct TurnPermitLease {
     pub(crate) inner: Arc<super::LeaseInner>,
@@ -254,20 +246,6 @@ impl TurnPermitLease {
         self.inner.turn_id
     }
 
-    pub fn wait_for_descendant(
-        &self,
-        current: &CurrentManagedTurn,
-        child_id: AgentId,
-        actor: &AgentActorHandle,
-        ticket: TurnTicket,
-        timeout: Option<Duration>,
-    ) -> Result<ManagedPromptWait, super::ManagerError> {
-        current
-            .token
-            .manager
-            .register_prompt_wait(current, self, child_id, actor, ticket, timeout)
-    }
-
     pub fn observe_descendant(
         &self,
         current: &CurrentManagedTurn,
@@ -279,74 +257,7 @@ impl TurnPermitLease {
         current
             .token
             .manager
-            .register_turn_wait(current, self, child_id, actor, ticket, timeout, false)
-    }
-
-    pub fn admit_and_wait_for_descendant(
-        &self,
-        current: &CurrentManagedTurn,
-        child_id: AgentId,
-        actor: &AgentActorHandle,
-        admission: PromptAdmission,
-        timeout: Option<Duration>,
-    ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
-        self.admit_and_wait_for_descendant_with_options(
-            current,
-            child_id,
-            actor,
-            admission,
-            timeout,
-            crate::TurnAdmissionOptions::default(),
-        )
-    }
-
-    pub fn admit_and_wait_for_descendant_with_options(
-        &self,
-        current: &CurrentManagedTurn,
-        child_id: AgentId,
-        actor: &AgentActorHandle,
-        admission: PromptAdmission,
-        timeout: Option<Duration>,
-        options: crate::TurnAdmissionOptions,
-    ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
-        if !Arc::ptr_eq(&self.inner, &current.lease.inner) {
-            return Err(super::ManagerError::WrongManager);
-        }
-        let managed_actor = current
-            .token
-            .manager
-            .validated_descendant_actor(current, child_id)?;
-        if !managed_actor.same_actor(actor) {
-            return Err(super::ManagerError::ActorMismatch {
-                expected_id: child_id,
-                actual_id: actor.agent_id(),
-            });
-        }
-        let Ok(ticket) = managed_actor.admit_turn_with_options(
-            admission.input,
-            admission.event_sender,
-            admission.correlation,
-            options,
-        ) else {
-            return Ok(None);
-        };
-        let turn_id = ticket.turn_id();
-        #[cfg(test)]
-        current.token.manager.wait_at_prompt_admission_gate(turn_id);
-        match current.token.manager.register_prompt_wait(
-            current,
-            self,
-            child_id,
-            &managed_actor,
-            ticket,
-            timeout,
-        ) {
-            Ok(wait) => Ok(Some((turn_id, wait))),
-            Err(error) => {
-                let _ = managed_actor.cancel_turn(turn_id);
-                Err(error)
-            }
-        }
+            .register_turn_wait(current, self, child_id, actor, ticket, timeout)
     }
 }
 

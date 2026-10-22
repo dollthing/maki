@@ -3920,7 +3920,7 @@ fn descendant_preflight_rejects_before_suspension() {
 }
 
 #[test]
-fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
+fn unauthorized_descendant_wait_does_not_cancel_child_turn() {
     smol::block_on(async {
         let (manager, _, current, root_gate) = active_root(AgentLimits::default());
         let child_gate = Gate::new();
@@ -3939,14 +3939,14 @@ fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
         child_rx.recv_async().await.unwrap();
         let (wrong_manager, _, wrong_current, wrong_gate) = active_root(AgentLimits::default());
 
-        let Err(error) = wrong_current.lease().wait_for_descendant(
+        let Err(error) = wrong_current.lease().observe_descendant(
             &wrong_current,
             child.id(),
             &actor,
             ticket.clone(),
             None,
         ) else {
-            panic!("wrong manager accepted prompt wait");
+            panic!("wrong manager accepted descendant wait");
         };
         assert_eq!(error, ManagerError::UnknownAgent(child.id()));
         let mut pending = Box::pin(ticket.wait());
@@ -3971,7 +3971,7 @@ fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
 
 #[test_case(false; "parent_actor")]
 #[test_case(true; "foreign_manager_actor")]
-fn descendant_admission_rejects_mismatched_actor_without_suspending(foreign: bool) {
+fn descendant_wait_rejects_mismatched_actor_without_suspending(foreign: bool) {
     smol::block_on(async {
         const CORRELATION: &str = "child";
         let (manager, root, current, root_gate) = active_root(AgentLimits::default());
@@ -3991,19 +3991,12 @@ fn descendant_admission_rejects_mismatched_actor_without_suspending(foreign: boo
             .map_or(&root, |(_, root, _, _)| root)
             .actor()
             .unwrap();
+        let ticket = child_actor
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
         let error = current
             .lease()
-            .admit_and_wait_for_descendant(
-                &current,
-                child.id(),
-                &wrong_actor,
-                super::PromptAdmission {
-                    input: input(),
-                    event_sender: None,
-                    correlation: CORRELATION.into(),
-                },
-                None,
-            )
+            .observe_descendant(&current, child.id(), &wrong_actor, ticket.clone(), None)
             .err()
             .unwrap();
         assert_eq!(
@@ -4014,7 +4007,7 @@ fn descendant_admission_rejects_mismatched_actor_without_suspending(foreign: boo
             }
         );
         assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
-        assert_eq!(child_actor.snapshot().queued, 0);
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         root_gate.release(1);
         if let Some((_, _, _, gate)) = &foreign_root {
             gate.release(1);
@@ -4073,7 +4066,7 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
 
         let error = current
             .lease()
-            .wait_for_descendant(
+            .observe_descendant(
                 &current,
                 first.id(),
                 &first.actor().unwrap(),
@@ -4535,7 +4528,7 @@ fn parent_waiting_for_child_yields_permit() {
             .unwrap();
         let wait = current
             .lease()
-            .wait_for_descendant(&current, child.id(), &child.actor().unwrap(), ticket, None)
+            .observe_descendant(&current, child.id(), &child.actor().unwrap(), ticket, None)
             .unwrap();
 
         child_rx.recv_async().await.unwrap();
@@ -4584,7 +4577,7 @@ fn parent_cancellation_seals_descendant_wait_registration() {
     let child_id = child.id();
     let pending_ticket = child_ticket.clone();
     let registration = std::thread::spawn(move || {
-        lease.wait_for_descendant(&wait_current, child_id, &wait_actor, pending_ticket, None)
+        lease.observe_descendant(&wait_current, child_id, &wait_actor, pending_ticket, None)
     });
     registration_entered_rx.recv().unwrap();
 
@@ -4665,7 +4658,7 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
             .unwrap();
         let wait = current
             .lease()
-            .wait_for_descendant(
+            .observe_descendant(
                 &current,
                 child.id(),
                 &child.actor().unwrap(),
@@ -4731,78 +4724,6 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
 }
 
 #[test]
-fn authority_revoked_after_prompt_admission_cancels_only_that_ticket() {
-    let limits = AgentLimits {
-        max_concurrent_agent_turns: 1,
-        ..AgentLimits::default()
-    };
-    let (manager, _, current, root_gate) = active_root(limits);
-    let child_gate = Gate::new();
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            Box::new(TestBackend {
-                current: None,
-                cancel: None,
-                gate: Some(Arc::clone(&child_gate)),
-            }),
-        )
-        .unwrap();
-    let actor = child.actor().unwrap();
-    let surviving = actor.admit_turn(input(), None, "surviving".into()).unwrap();
-    let (admitted_tx, admitted_rx) = flume::bounded(1);
-    let (register_tx, register_rx) = flume::bounded(1);
-    manager.set_prompt_admission_gate(admitted_tx, register_rx);
-
-    let lease = current.lease();
-    let prompt_current = current.clone();
-    let prompt_actor = actor.clone();
-    let prompt_child_id = child.id();
-    let prompt = std::thread::spawn(move || {
-        lease.admit_and_wait_for_descendant(
-            &prompt_current,
-            prompt_child_id,
-            &prompt_actor,
-            super::PromptAdmission {
-                input: input(),
-                event_sender: None,
-                correlation: "cancelled".into(),
-            },
-            None,
-        )
-    });
-    let cancelled_id = admitted_rx.recv().unwrap();
-
-    root_gate.release(1);
-    while current.validate_descendant(child.id()).is_ok() {
-        std::thread::yield_now();
-    }
-    register_tx.send(()).unwrap();
-    assert!(matches!(
-        prompt.join().unwrap(),
-        Err(ManagerError::InactiveTurn { .. })
-    ));
-    assert!(matches!(
-        smol::block_on(actor.wait_outcome(cancelled_id)).unwrap(),
-        TurnOutcome::Cancelled {
-            reason: crate::TurnCancellationReason::User,
-            ..
-        }
-    ));
-    child_gate.release(1);
-    assert!(matches!(
-        smol::block_on(surviving.wait()),
-        TurnOutcome::Completed { .. }
-    ));
-
-    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
-    assert!(report.timed_out.is_empty());
-}
-
-#[test]
 fn two_child_waits_share_one_parent_suspension() {
     smol::block_on(async {
         let limits = AgentLimits {
@@ -4849,7 +4770,7 @@ fn two_child_waits_share_one_parent_suspension() {
             .unwrap();
         let first_wait = current
             .lease()
-            .wait_for_descendant(
+            .observe_descendant(
                 &current,
                 first.id(),
                 &first.actor().unwrap(),
@@ -4877,7 +4798,7 @@ fn two_child_waits_share_one_parent_suspension() {
             .unwrap();
         let second_wait = current
             .lease()
-            .wait_for_descendant(
+            .observe_descendant(
                 &current,
                 second.id(),
                 &second.actor().unwrap(),
