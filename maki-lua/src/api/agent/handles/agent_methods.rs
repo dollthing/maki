@@ -593,6 +593,10 @@ pub(crate) fn agent_defer_close(
     Ok((Some(true), None))
 }
 
+// Bundled task plugin internals, not public API. `_maki_session_id` reads the
+// task/UI identity. `_maki_task_owner` returns a host-stamped guard whose
+// `_maki_can_control` checks plugin generation, host and parent branch, and whose
+// `_maki_retired` reports a closed child. The guard authorizes no effect.
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
     methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
         authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
@@ -622,15 +626,6 @@ lua_class! {
     /// A nonowning agent handle. Garbage collection never closes its actor.
     /// Reads and effects require current invocation authority; identity is context-free.
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
-    /// Internal compatibility adapters are supported only for the bundled task plugin:
-    /// _maki_session_id() reads the existing task/UI identity without granting control;
-    /// _maki_task_owner() returns a host-stamped owner guard whose _maki_can_control()
-    /// checks the current invocation's plugin generation, host and permitted parent branch,
-    /// and whose _maki_retired() reports a managed child that has closed.
-    /// The guard cannot authorize effects, transfer control or revive expired authority.
-    /// Each effect still uses the public ctx-taking Agent or AgentTurn operation.
-    /// Third-party plugins should use id(), explicit references and public scoped operations;
-    /// these underscore-prefixed adapters are not a stable public API.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_latest_turn, agent_status, agent_mode, agent_model, agent_available_models,
         agent_transcript, agent_ref, agent_send, agent_submit, agent_enqueue, agent_prompt, agent_set_model,

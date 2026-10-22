@@ -43,7 +43,7 @@ default: prompt / allow / deny
 
 Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO. Mode tool selection and native write-target restrictions also apply before permission approval. A custom write-restricted mode can explicitly offer a third-party local tool. Native mutation tools must match the permitted normalized target, including after an input hook changes their arguments. MCP execution and deferred MCP search remain blocked in write-restricted modes. Approval and YOLO do not bypass these restrictions. `default` resolves per-tool first, then global. The built-in default is `"prompt"`.
 
-Mode restrictions do not provide a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and have no plan-path restriction. See [Modes](/docs/modes/#configuration-changes) for configuration ownership, admission snapshots, and asynchronous saving. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
+Mode restrictions do not provide a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and have no plan-path restriction. See [Modes](/docs/modes/#configuration-changes) for configuration ownership, admission snapshots, and saving. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
 
 ## Builtin Defaults
 
@@ -57,8 +57,6 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines`   | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task_spawn`   | `*`        | Subagent spawning always allowed      |
-
-Earlier task-keyed permission rules and saved allow entries must use `task_spawn`. See [task and Session migration](/docs/plugins/#migration-from-the-previous-task-and-session-apis) for the tool and configuration changes.
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 

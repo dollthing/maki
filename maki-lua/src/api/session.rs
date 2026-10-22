@@ -430,9 +430,9 @@ async fn options(
     Ok((Some(snapshot), None))
 }
 
-/// Sets one option explicitly for a live session. Managed model, thinking,
-/// fast, and workflow changes succeed at actor commit; saving is asynchronous.
-/// Other options retain their existing owner and persistence behavior.
+/// Sets one option explicitly for a live session. Model, thinking, fast, and
+/// workflow changes follow the agent configuration rules. Other options keep
+/// their owner's persistence behavior.
 /// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param id string Stable option id.
@@ -544,7 +544,6 @@ async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 /// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 /// the choice is also persisted as the global default for new sessions.
-/// The active session changes at actor commit and is saved asynchronously.
 /// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param opts table Required fields: mode (string) the thinking setting;

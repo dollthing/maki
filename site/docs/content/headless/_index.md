@@ -86,7 +86,7 @@ SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-m
 
 Two caveats:
 
-- One-shot `--print` always starts a **new** session in **build** mode. Plan mode and session resume need the SDK path (or the TUI).
+- One-shot `--print` always starts a **new** session in **build** mode, does not save it, and keeps the model it started with. Plan mode, session resume and model changes need the SDK path (or the TUI).
 - The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
 
 ### Quick example

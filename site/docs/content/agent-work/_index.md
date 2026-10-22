@@ -29,11 +29,13 @@ Reset and new-session operations remain session-wide. The Lua `maki.session.*` A
 
 UI cancellation stops the viewed agent's current work and removes its ordinary messages already pending when cancellation is accepted. Descendants, siblings, pending child reports, queued configuration and control operations, and later messages survive. If no work is active, cancellation clears only pending ordinary messages.
 
-Cancelling a managed turn through `ticket:cancel` also closes the child subtrees that turn delegated. UI cancellation does not close those children. Explicit close through `task_despawn` or `agent:close` permanently closes the selected agent and its descendants. Children created by trusted plugin handlers have independent ownership; unrelated turn cancellation does not close them.
+Cancelling a managed turn through `ticket:cancel` also closes the child subtrees that turn delegated. UI cancellation does not close those children. Explicit close through `task_despawn` or `agent:close` permanently closes the selected agent and its descendants. Children created by trusted plugin handlers have independent ownership; unrelated turn cancellation does not close them, but explicit close or revoking the plugin does.
 
 ## Child reports and completion
 
 The main agent may finish while its children run. A subagent waits for children that report to it before completing, subject to execution limits. This completion rule does not change how it accepts messages.
+
+A subagent spawned with an `output_schema` must end each turn with a valid structured report. Consuming new instructions invalidates earlier reports and captured results, so only a fresh report satisfies completion. Child observations do not invalidate reports.
 
 Child reports are internal observations, not user instructions. An active parent receives them after outstanding tool results and before its next eligible model request. Queued work can consume pending reports at that boundary. When no earlier queued work remains, an idle parent receives a bounded batch in a new turn, called a continuation. The runtime does not start a separate turn for every report in that batch.
 

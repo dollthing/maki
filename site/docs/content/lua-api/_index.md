@@ -110,7 +110,7 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
-| [`maki.model`](#maki-model) | Compatibility model access. |
+| [`maki.model`](#maki-model) | Focused-session model access. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
@@ -1627,15 +1627,6 @@ Requires an active managed turn or a trusted manager-backed parent.
 A nonowning agent handle. Garbage collection never closes its actor.
 Reads and effects require current invocation authority; identity is context-free.
 A held managed handle retains authorized closed-status reads, not mutation rights.
-Internal compatibility adapters are supported only for the bundled task plugin:
-_maki_session_id() reads the existing task/UI identity without granting control;
-_maki_task_owner() returns a host-stamped owner guard whose _maki_can_control()
-checks the current invocation's plugin generation, host and permitted parent branch,
-and whose _maki_retired() reports a managed child that has closed.
-The guard cannot authorize effects, transfer control or revive expired authority.
-Each effect still uses the public ctx-taking Agent or AgentTurn operation.
-Third-party plugins should use id(), explicit references and public scoped operations;
-these underscore-prefixed adapters are not a stable public API.
 
 ---
 
@@ -3934,8 +3925,7 @@ maki.api.mode.set({name})
 
 Enters a mode by name on the invocation's agent, or the focused agent when
 called outside an invocation. Fails when the mode is not defined. Success
-means the actor committed the mode for subsequent admissions, not that
-saving has finished.
+means the actor committed the mode for subsequent admissions.
 See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
@@ -3994,7 +3984,7 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-Compatibility model access. With a ctx, `get` reads that invocation's
+Focused-session model access. With a ctx, `get` reads that invocation's
 admitted model. Without a ctx, calls address the focused session and
 need an interactive UI; other hosts use the Agent API with an explicit
 ctx instead.
@@ -4055,10 +4045,9 @@ maki.model.set({opts})
 Switches the focused session's model, thinking level, or fast mode. Fields
 you leave out stay as they are, so this doubles as a thinking-only switch.
 Answers with the committed state, in the same shape `get` returns. Changes
-apply to subsequent admissions. UI actors save asynchronously after commit;
-SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
-print roots reject all patches. Delegated tool handlers cannot call it,
-because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
+apply to subsequent admissions; see
+[Configuration changes](/docs/modes/#configuration-changes). Delegated
+tool handlers cannot call it, because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
 for an explicit target.
 
 **Parameters:**
@@ -4508,9 +4497,9 @@ local snapshot, err = maki.session.options({ session = id })
 maki.session.set_option({id}, {value}, {opts?})
 ```
 
-Sets one option explicitly for a live session. Managed model, thinking,
-fast, and workflow changes succeed at actor commit; saving is asynchronous.
-Other options retain their existing owner and persistence behavior.
+Sets one option explicitly for a live session. Model, thinking, fast, and
+workflow changes follow the agent configuration rules. Other options keep
+their owner's persistence behavior.
 See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
@@ -4581,7 +4570,6 @@ Sets the focused session's thinking mode. `mode` accepts any value
 `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 the choice is also persisted as the global default for new sessions.
-The active session changes at actor commit and is saved asynchronously.
 See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**

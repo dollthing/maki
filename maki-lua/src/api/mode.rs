@@ -146,8 +146,7 @@ async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<
 
 /// Enters a mode by name on the invocation's agent, or the focused agent when
 /// called outside an invocation. Fails when the mode is not defined. Success
-/// means the actor committed the mode for subsequent admissions, not that
-/// saving has finished.
+/// means the actor committed the mode for subsequent admissions.
 /// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param name string Mode id ("build", "plan", or a custom name).

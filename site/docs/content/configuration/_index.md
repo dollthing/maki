@@ -116,7 +116,7 @@ Kinds registered by your own completion sources (via `maki.api.register_completi
 
 ### `ui.tool_output_lines`
 
-How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1. Earlier configurations must rename `task` to `task_spawn`; the old key is rejected. See [task and Session migration](/docs/plugins/#migration-from-the-previous-task-and-session-apis).
+How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
 
 | Field | Default |
 |-------|---------|

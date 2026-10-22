@@ -184,9 +184,7 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(
         out,
         "How many lines of output to show per tool in the UI. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}. \
-         Earlier configurations must rename `task` to `task_spawn`; the old key is rejected. \
-         See [task and Session migration](/docs/plugins/#migration-from-the-previous-task-and-session-apis).\n"
+         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default |").unwrap();

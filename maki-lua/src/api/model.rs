@@ -85,10 +85,9 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// Switches the focused session's model, thinking level, or fast mode. Fields
 /// you leave out stay as they are, so this doubles as a thinking-only switch.
 /// Answers with the committed state, in the same shape `get` returns. Changes
-/// apply to subsequent admissions. UI actors save asynchronously after commit;
-/// SDK and ACP roots retain checkpoint-before-commit rollback semantics. Fixed
-/// print roots reject all patches. Delegated tool handlers cannot call it,
-/// because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
+/// apply to subsequent admissions; see
+/// [Configuration changes](/docs/modes/#configuration-changes). Delegated
+/// tool handlers cannot call it, because it addresses no explicit agent. Prefer `Agent:set_model(ctx, patch)`
 /// for an explicit target.
 ///
 /// @param opts string|table A model spec, or a table with any of:
@@ -199,7 +198,7 @@ fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    /// Compatibility model access. With a ctx, `get` reads that invocation's
+    /// Focused-session model access. With a ctx, `get` reads that invocation's
     /// admitted model. Without a ctx, calls address the focused session and
     /// need an interactive UI; other hosts use the Agent API with an explicit
     /// ctx instead.

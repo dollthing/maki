@@ -44,13 +44,13 @@ After approval, the picked model becomes the session model and the agent starts 
 
 ## Configuration changes
 
-The model, thinking, fast, workflow, and mode settings belong to the session. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. Makima shows the new value as soon as it accepts the change. When you pick a model that does not support thinking or fast, those turn off.
+The model, thinking, fast, workflow, and mode settings belong to each agent, so changing the viewed subagent leaves the main agent alone. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. When you pick a model that does not support thinking or fast, those turn off.
 
 A change never touches a turn that has already started. The running turn finishes with the model, settings, mode, and tools it started with. A message you send while the agent works usually joins the running turn, but not after a change: then it waits for the running turn to finish and starts its own turn with the new settings. Messages that were already in the queue keep the settings they were queued with. The same is true when a plugin redefines a mode: running and queued turns keep the old definition.
 
-Makima saves the change with the session in the background, so you never wait on the disk. If saving fails, the change still applies, and a warning says the configuration was applied but not saved. Makima keeps retrying and tells you when the save recovers. If Makima crashes before the save lands, the session comes back with the older settings.
+Makima saves the change with the session before it applies it. If the save fails, nothing changes and you see an error. A change a plugin requested is also dropped when the plugin reloads or its call ends before the save starts. Once the save has started, the change always applies.
 
-All of this is how the TUI and Lua agent sessions work. Headless, print, and ACP runs set these options their own way. YOLO and plugin options sit outside it, and a YOLO change applies to permission checks right away.
+The TUI, SDK, ACP and Lua agent sessions all follow these rules. One-shot print runs do not save the session and reject model changes. YOLO and plugin options sit outside this, and a YOLO change applies to permission checks right away.
 
 ## What a mode is
 
