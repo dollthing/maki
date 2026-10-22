@@ -92,45 +92,6 @@ struct Pending {
 
 type PendingState = Arc<Mutex<Pending>>;
 
-/// A session's cross-process lock: the heartbeat thread that keeps it fresh
-/// and where to release it. Dropping stops the thread and releases the lock;
-/// the join in the drop guarantees no beat lands after the release, which
-/// also covers process shutdown after stdin EOF, where `close_session` never
-/// runs.
-struct SessionLock {
-    stop_tx: flume::Sender<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    publication_guard: Option<maki_storage::session_lock::SessionPublicationGuard>,
-}
-
-impl SessionLock {
-    /// Stop the heartbeat thread, wait until it cannot beat again, and release the lock.
-    fn shutdown(mut self) {
-        self.release();
-    }
-
-    fn publication_guard(&self) -> Option<maki_storage::session_lock::SessionPublicationGuard> {
-        self.publication_guard.clone()
-    }
-
-    fn release(&mut self) {
-        let _ = self.stop_tx.send(());
-        if self
-            .thread
-            .take()
-            .is_some_and(|thread| thread.join().is_err())
-        {
-            warn!("session lock heartbeat thread terminated abnormally");
-        }
-    }
-}
-
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 struct OptionProjection {
     out_tx: Sender<Value>,
     session_id: SessionId,
@@ -195,7 +156,7 @@ struct SessionState {
     command_projection_task: smol::Task<()>,
     option_projection: Option<Arc<OptionProjection>>,
     option_projection_task: smol::Task<()>,
-    lock: Option<SessionLock>,
+    lock: Option<session_lock::LockHeartbeat>,
 }
 
 struct SpawnSession {
@@ -850,45 +811,20 @@ async fn close_session(srv: &mut Server) {
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
-    if let Some(lock) = state.lock.take() {
-        lock.shutdown();
-    }
+    drop(state.lock.take());
 }
 
-fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String> {
-    let mut lease = session_lock::claim(&dir, &id)
+fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<session_lock::LockHeartbeat, String> {
+    let lease = session_lock::claim(&dir, &id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| session_lock::OPEN_ELSEWHERE_MSG.to_owned())?;
-    let publication_guard = lease.publication_guard();
-    let (stop_tx, stop_rx) = flume::bounded(1);
-    let thread = std::thread::spawn(move || {
-        loop {
-            if stop_rx
-                .recv_timeout(session_lock::HEARTBEAT_INTERVAL)
-                .is_ok()
-            {
-                return;
-            }
-            match lease.heartbeat() {
-                Ok(session_lock::LockBeat::Lost) => {
-                    warn!(session_id = %id, "session lock heartbeat lost ownership");
-                    if let Ok(coordinator) =
-                        maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(id)
-                    {
-                        coordinator.retire();
-                    }
-                    return;
-                }
-                Err(error) => warn!(session_id = %id, %error, "session lock heartbeat failed"),
-                Ok(session_lock::LockBeat::Claimed | session_lock::LockBeat::Held) => {}
-            }
+    Ok(session_lock::LockHeartbeat::spawn(lease, move || {
+        if let Ok(coordinator) =
+            maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(id)
+        {
+            coordinator.retire();
         }
-    });
-    Ok(SessionLock {
-        stop_tx,
-        thread: Some(thread),
-        publication_guard: Some(publication_guard),
-    })
+    }))
 }
 
 async fn rollback_install(
@@ -928,7 +864,7 @@ async fn install_session_with_lock(
     srv: &mut Server,
     params: &AcpParams,
     session: InstallSession<'_>,
-    lock_session: impl FnOnce(MakiId) -> Result<SessionLock, String>,
+    lock_session: impl FnOnce(MakiId) -> Result<session_lock::LockHeartbeat, String>,
 ) -> Result<maki_agent::session_options::SessionOptionsSnapshot, String> {
     let InstallSession {
         handle,
@@ -963,7 +899,7 @@ async fn install_session_with_lock(
         handle.session_id.id(),
         &current_model,
         &cwd.to_string_lossy(),
-        lock.publication_guard(),
+        Some(lock.publication_guard()),
     ) {
         Ok(checkpoint) => Arc::new(checkpoint),
         Err(error) => {
@@ -3051,27 +2987,6 @@ mod tests {
             defaults: SessionDefaults::default(),
         };
         (server, answer_rx, out_rx, input_rx)
-    }
-
-    #[test]
-    fn abnormal_heartbeat_thread_termination_releases_lock() {
-        let dir = TempDir::new().unwrap();
-        let id = MakiId::generate();
-        let lease = session_lock::claim(dir.path(), &id).unwrap().unwrap();
-        let (stop_tx, _) = flume::bounded(1);
-        let thread = std::thread::spawn(move || {
-            let _lease = lease;
-            panic!("heartbeat failed");
-        });
-        let lock = SessionLock {
-            stop_tx,
-            thread: Some(thread),
-            publication_guard: None,
-        };
-
-        drop(lock);
-
-        assert!(session_lock::claim(dir.path(), &id).unwrap().is_some());
     }
 
     #[test]

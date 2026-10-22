@@ -690,24 +690,6 @@ impl SdkCommands {
     }
 }
 
-/// Stops and joins the heartbeat thread, which owns and releases the session lock.
-struct LockGuard {
-    stop_tx: flume::Sender<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    id: MakiId,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = self.stop_tx.send(());
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            warn!(session_id = %self.id, "session lock heartbeat thread terminated abnormally");
-        }
-    }
-}
-
 fn sdk_root_binding() -> (headless::RootBinding, Receiver<TrustedTarget>) {
     let (ready, target) = flume::bounded(1);
     let binding: headless::RootBinding = Box::new(move |_, root, template| {
@@ -886,7 +868,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let sessions_dir = storage
         .ensure_subdir(SESSIONS_DIR)
         .context("create sessions dir")?;
-    let mut claimed_lock = session_lock::claim(&sessions_dir, &locked_id)
+    let claimed_lock = session_lock::claim(&sessions_dir, &locked_id)
         .context("claim session lock")?
         .ok_or_else(|| eyre!("session is open in another terminal; close it there first"))?;
     let publication_guard = claimed_lock.publication_guard();
@@ -961,34 +943,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_id: handle.session_id.clone(),
         out_tx,
     };
-    let (lock_stop_tx, lock_stop_rx) = flume::bounded(1);
     let lock_coordinator = coordinator.clone();
-    let lock_heartbeat = std::thread::spawn(move || {
-        loop {
-            if lock_stop_rx
-                .recv_timeout(session_lock::HEARTBEAT_INTERVAL)
-                .is_ok()
-            {
-                return;
-            }
-            match claimed_lock.heartbeat() {
-                Ok(session_lock::LockBeat::Lost) => {
-                    lock_coordinator.retire();
-                    warn!(session_id = %locked_id, "session lock heartbeat lost ownership");
-                    return;
-                }
-                Err(error) => {
-                    warn!(session_id = %locked_id, %error, "session lock heartbeat failed");
-                }
-                Ok(session_lock::LockBeat::Claimed | session_lock::LockBeat::Held) => {}
-            }
-        }
+    let lock_guard = session_lock::LockHeartbeat::spawn(claimed_lock, move || {
+        lock_coordinator.retire();
     });
-    let lock_guard = LockGuard {
-        stop_tx: lock_stop_tx,
-        thread: Some(lock_heartbeat),
-        id: locked_id,
-    };
     let tools: Vec<&str> = handle
         .tool_names
         .iter()

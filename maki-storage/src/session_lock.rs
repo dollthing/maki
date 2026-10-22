@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
@@ -316,6 +318,61 @@ fn open_lock_file(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+/// Beats a claimed lease on a background thread until dropped. Dropping stops
+/// and joins the thread, which owns the lease, so no beat lands after the
+/// release; that also covers process shutdown, where no close path runs.
+pub struct LockHeartbeat {
+    stop_tx: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+    publication_guard: SessionPublicationGuard,
+}
+
+impl LockHeartbeat {
+    /// Beats {lease} every `HEARTBEAT_INTERVAL`; {on_lost} runs once if
+    /// another process takes the lock over.
+    pub fn spawn(mut lease: ClaimedSessionLock, on_lost: impl FnOnce() + Send + 'static) -> Self {
+        let publication_guard = lease.publication_guard();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
+                match lease.heartbeat() {
+                    Ok(LockBeat::Lost) => {
+                        warn!(path = %lease.path.display(), "session lock heartbeat lost ownership");
+                        on_lost();
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(path = %lease.path.display(), %error, "session lock heartbeat failed")
+                    }
+                    Ok(LockBeat::Claimed | LockBeat::Held) => {}
+                }
+            }
+        });
+        Self {
+            stop_tx,
+            thread: Some(thread),
+            publication_guard,
+        }
+    }
+
+    pub fn publication_guard(&self) -> SessionPublicationGuard {
+        self.publication_guard.clone()
+    }
+}
+
+impl Drop for LockHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+        {
+            warn!(path = %self.publication_guard.path.display(), "session lock heartbeat thread terminated abnormally");
+        }
+    }
+}
+
 /// Outcome of a `heartbeat` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockBeat {
@@ -439,6 +496,35 @@ mod tests {
     use std::fs::File;
     use tempfile::tempdir;
     use test_case::test_case;
+
+    #[test]
+    fn abnormal_heartbeat_thread_termination_releases_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let publication_guard = lease.publication_guard();
+        let (stop_tx, _) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _lease = lease;
+            panic!("heartbeat failed");
+        });
+        drop(LockHeartbeat {
+            stop_tx,
+            thread: Some(thread),
+            publication_guard,
+        });
+        assert!(claim(dir.path(), &id).unwrap().is_some());
+    }
+
+    #[test]
+    fn dropping_heartbeat_releases_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let heartbeat = LockHeartbeat::spawn(claim(dir.path(), &id).unwrap().unwrap(), || {});
+        assert!(claim(dir.path(), &id).unwrap().is_none());
+        drop(heartbeat);
+        assert!(claim(dir.path(), &id).unwrap().is_some());
+    }
 
     const HERE: &str = "/here";
     const ELSEWHERE: &str = "/elsewhere";
