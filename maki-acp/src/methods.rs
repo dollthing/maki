@@ -13,8 +13,6 @@ use agent_client_protocol_schema::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const MODE_BUILD: &str = "build";
-
 pub const MODEL_CONFIG_ID: &str = "model";
 
 pub fn initialize_response() -> InitializeResponse {
@@ -52,12 +50,16 @@ pub fn mode_state(current: &str, modes: &ModeRegistry) -> SessionModeState {
     SessionModeState::new(SessionModeId::from(current.to_string()), list)
 }
 
-pub fn new_session_response(session_id: &str, modes: &ModeRegistry) -> NewSessionResponse {
-    NewSessionResponse::new(session_id.to_string()).modes(mode_state(MODE_BUILD, modes))
+pub fn new_session_response(
+    session_id: &str,
+    current_mode: &str,
+    modes: &ModeRegistry,
+) -> NewSessionResponse {
+    NewSessionResponse::new(session_id.to_string()).modes(mode_state(current_mode, modes))
 }
 
-pub fn load_session_response(modes: &ModeRegistry) -> LoadSessionResponse {
-    LoadSessionResponse::new().modes(mode_state(MODE_BUILD, modes))
+pub fn load_session_response(current_mode: &str, modes: &ModeRegistry) -> LoadSessionResponse {
+    LoadSessionResponse::new().modes(mode_state(current_mode, modes))
 }
 
 pub fn session_config_options(

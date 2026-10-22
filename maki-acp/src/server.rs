@@ -60,6 +60,7 @@ const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
 const SESSION_ENDED_MESSAGE: &str = "session ended";
+const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `maki auth login`, then send the prompt again.";
@@ -494,11 +495,13 @@ async fn new_session(
     )
     .await
     .map_err(session_registration_error)?;
-    let resp = methods::new_session_response(&session_id, &srv.lua_event_handle.mode_registry())
-        .config_options(methods::session_config_options(
-            &snapshot,
-            srv.supports_boolean,
-        ));
+    let mode = committed_mode(srv).await?;
+    let resp =
+        methods::new_session_response(&session_id, &mode, &srv.lua_event_handle.mode_registry())
+            .config_options(methods::session_config_options(
+                &snapshot,
+                srv.supports_boolean,
+            ));
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -596,10 +599,12 @@ async fn load_session(
     for update in translate::replay_history(&replay_history, &session_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
-    let resp =
-        methods::load_session_response(&srv.lua_event_handle.mode_registry()).config_options(
-            methods::session_config_options(&snapshot, srv.supports_boolean),
-        );
+    let mode = committed_mode(srv).await?;
+    let resp = methods::load_session_response(&mode, &srv.lua_event_handle.mode_registry())
+        .config_options(methods::session_config_options(
+            &snapshot,
+            srv.supports_boolean,
+        ));
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -2168,6 +2173,21 @@ fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate
 
 fn no_session() -> AcpError {
     AcpError::new(-32600, "no active session")
+}
+
+/// The mode the session's root committed, which is what a client must show.
+async fn committed_mode(srv: &Server) -> Result<String, AcpError> {
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let root = session
+        .handle
+        .initialized_root()
+        .await
+        .map_err(|error| AcpError::new(-32603, error))?;
+    let config = root
+        .effective_config()
+        .map_err(|error| AcpError::new(-32603, error.to_string()))?
+        .ok_or_else(|| AcpError::new(-32603, ROOT_CONFIG_UNAVAILABLE))?;
+    Ok(config.mode.id().key().to_owned())
 }
 
 fn session_registration_error(error: String) -> AcpError {
@@ -3909,8 +3929,11 @@ mod tests {
     fn new_session_response_precedes_available_commands() {
         let (srv, _, out_rx, _) = server_awaiting_answer();
         let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
-        let response =
-            methods::new_session_response(&session_id, &srv.lua_event_handle.mode_registry());
+        let response = methods::new_session_response(
+            &session_id,
+            maki_agent::ModeId::Build.key(),
+            &srv.lua_event_handle.mode_registry(),
+        );
 
         respond_request(
             &srv,
