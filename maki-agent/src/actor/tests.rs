@@ -1797,6 +1797,7 @@ fn failed_actor_is_reusable() {
 fn close_drains_queued_turns_and_cancels_active_with_closed_reason() {
     smol::block_on(async {
         let backend = CancellableBackend::new();
+        let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let t1 = handle
             .admit_turn(input("running"), None, "t1".into())
@@ -1813,7 +1814,7 @@ fn close_drains_queued_turns_and_cancels_active_with_closed_reason() {
             )
             .unwrap();
 
-        until(|| handle.snapshot().status != ActorStatus::Idle).await;
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
         handle.close();
 
         // Queued turns terminalize with the Closed reason and their tickets
@@ -2953,7 +2954,7 @@ fn reserved_policy_orders_admissions() {
             ))
             .unwrap();
         let a = handle.admit_turn(input("a"), None, "a".into()).unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| turn_popped(&handle)).await;
         let options = handle.reserve_prepared_operation(None).unwrap();
         let reservation = handle.reserve_prepared_operation(None).unwrap();
         let next = handle.clone();
@@ -3569,7 +3570,7 @@ fn remove_terminalizes_instead_of_stranding() {
         let t1 = handle
             .admit_turn(input("running"), None, "t1".into())
             .unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| turn_popped(&handle)).await;
         let t2 = handle
             .admit_turn(input("queued"), None, "t2".into())
             .unwrap();
@@ -3602,8 +3603,9 @@ fn remove_terminalizes_instead_of_stranding() {
     });
 }
 
-/// One of the running/queued turns reached the backend.
-fn backend_reached(handle: &AgentActorHandle) -> bool {
+/// The runner popped a turn. Its backend may not have entered yet, so a
+/// cancel issued now can settle the turn before it runs.
+fn turn_popped(handle: &AgentActorHandle) -> bool {
     handle.snapshot().status != ActorStatus::Idle
 }
 
@@ -3616,7 +3618,7 @@ fn targeted_cancel_matching_queued_correlation_and_reuse() {
         let t1 = handle
             .admit_turn(input("one"), None, "keep".into())
             .unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| turn_popped(&handle)).await;
         let t2 = handle
             .admit_turn(input("two"), None, "drop".into())
             .unwrap();
@@ -3788,7 +3790,7 @@ fn remove_turn_terminalizes_exact_queued_turn() {
         let t1 = handle
             .admit_turn(input("running"), None, "r1".into())
             .unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| turn_popped(&handle)).await;
 
         let t2 = handle
             .admit_turn(input("queued"), None, "r2".into())
@@ -3863,7 +3865,7 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         let running = handle
             .admit_turn(input("running"), None, "run-1".into())
             .unwrap();
-        until(|| backend_reached(&handle)).await;
+        until(|| turn_popped(&handle)).await;
         handle.push_compact(7, None).unwrap();
         handle.push_compact(8, None).unwrap();
         assert_eq!(handle.snapshot().queued, 2);

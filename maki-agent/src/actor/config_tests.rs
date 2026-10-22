@@ -46,7 +46,7 @@ fn admitted_prompt_dependencies_remain_pinned() {
         let active = actor
             .admit_turn(input("active"), None, "active".into())
             .unwrap();
-        super::until(|| super::backend_reached(&actor)).await;
+        super::until(|| super::turn_popped(&actor)).await;
         let queued = actor
             .admit_turn(input("queued"), None, "queued".into())
             .unwrap();
