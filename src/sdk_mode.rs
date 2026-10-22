@@ -1954,31 +1954,8 @@ mod tests {
     /// Commands over a session whose root never starts, for dispatch that
     /// never reaches the actor.
     fn sdk_commands(registry: CommandRegistry) -> SdkCommands {
-        let cwd = std::env::temp_dir();
         let handle = headless::spawn_interactive_with_binding(
-            InteractiveParams {
-                model: Model::from_spec(STARTUP_MODEL).unwrap(),
-                config: AgentConfig::default(),
-                permissions_config: PermissionsConfig::default(),
-                timeouts: Default::default(),
-                prompt_slots: Arc::default(),
-                excluded_tools: Vec::new(),
-                mcp_handle: None,
-                initial_wd: cwd.clone(),
-                session_id: None,
-                initial_history: Vec::new(),
-                yolo: false,
-                system_prompt_override: None,
-                append_system_prompt: None,
-                defaults: SessionDefaults::default(),
-                model_policy: Arc::default(),
-                modes: Arc::new(maki_agent::ModeRegistry::builtin()),
-                question_mode: QuestionMode::Headless,
-                plugin_rules: Arc::default(),
-                project_config: ProjectConfig::for_project(&cwd),
-                local_tools: Default::default(),
-                state_dir: None,
-            },
+            idle_params(),
             Box::new(|_, _| {
                 Box::pin(async {
                     Err(AgentError::Config {
@@ -1998,6 +1975,135 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    fn idle_params() -> InteractiveParams {
+        let cwd = std::env::temp_dir();
+        InteractiveParams {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Default::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: cwd.clone(),
+            session_id: None,
+            initial_history: Vec::new(),
+            yolo: false,
+            system_prompt_override: None,
+            append_system_prompt: None,
+            defaults: SessionDefaults::default(),
+            model_policy: Arc::default(),
+            modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            question_mode: QuestionMode::Headless,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(&cwd),
+            local_tools: Default::default(),
+            state_dir: None,
+        }
+    }
+
+    struct PendingProvider(Sender<()>);
+
+    impl Provider for PendingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send_async(()).await.unwrap();
+                std::future::pending().await
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// Like ACP, the end of input cancels the turn still running instead of
+    /// waiting for it, reports it once and lets the session end.
+    #[test]
+    fn input_end_cancels_in_flight_turn_and_exits() {
+        let (entered, entering) = flume::bounded(1);
+        let provider: Arc<dyn Provider> = Arc::new(PendingProvider(entered));
+        let handle = headless::spawn_interactive_with_binding(
+            idle_params(),
+            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            None,
+            None,
+        );
+        smol::block_on(handle.initialized_root()).unwrap();
+        let coordinator = unbound_coordinator(handle.session_id.id());
+        let shared = Arc::new(Mutex::new(Shared {
+            turn_start: Instant::now(),
+            pending: HashMap::new(),
+            turn_active: false,
+            active_cancel: None,
+        }));
+        let (out_tx, out_rx) = flume::unbounded();
+        let pump = EventPump {
+            writer: SdkWriter {
+                session_id: handle.session_id.clone(),
+                out_tx,
+            },
+            shared: Arc::clone(&shared),
+            read: coordinator.read(),
+            permissions: Arc::clone(&handle.permissions),
+            answer_tx: handle.answer_tx.clone(),
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            terminal_run_id: None,
+            observer: HeadlessObserver::new(
+                maki_lua::EventHandle::disconnected_for_test(),
+                handle.session_id.id(),
+            ),
+        }
+        .spawn(handle.event_rx.clone());
+        let input = prepare_sdk_turn(
+            &shared,
+            AgentInput::from_defaults(
+                SDK_ROOT_PROMPT.into(),
+                Vec::new(),
+                SessionDefaults::default(),
+            ),
+        )
+        .unwrap();
+        smol::block_on(handle.input_tx.send(input)).unwrap();
+        entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+
+        let InteractiveHandle { input_tx, task, .. } = handle;
+        drop(input_tx);
+        smol::block_on(futures_lite::future::or(
+            async {
+                task.await;
+                pump.await;
+            },
+            async {
+                smol::Timer::after(SDK_GATE_TIMEOUT).await;
+                panic!("{SDK_SETTLEMENT_TIMEOUT}");
+            },
+        ));
+        let results = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|message| message["type"] == "result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], true);
+        assert!(!shared.lock().unwrap().turn_active);
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     fn test_permissions() -> PermissionManager {
@@ -2628,7 +2734,15 @@ mod tests {
             notices.recv_timeout(SDK_GATE_TIMEOUT).unwrap(),
             SDK_COMMAND_DONE
         );
-        assert_eq!(handle.manager.snapshot().len(), 1);
+        assert_eq!(
+            handle
+                .manager
+                .snapshot()
+                .iter()
+                .filter(|node| node.graph_lifecycle == maki_agent::GraphLifecycle::Live)
+                .count(),
+            1
+        );
         assert!(matches!(
             commands.dispatch_input("/model not-a-model", &[]),
             InputDispatch::Dispatched(CommandOutcome::Failed(_))

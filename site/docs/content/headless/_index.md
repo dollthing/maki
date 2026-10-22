@@ -82,7 +82,7 @@ your orchestrator                     makima --print --input-format stream-json
         │  one JSON object per line       (stdout)    │
 ```
 
-Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. The initialization and control projections list the active slash commands. A `system/commands_update` event reports registry changes after plugin reloads or MCP updates. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
+Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. The initialization and control projections list the active slash commands. A `system/commands_update` event reports registry changes after plugin reloads or MCP updates. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way. When stdin closes, the session ends, as it does in ACP: a turn still running is cancelled and reported in one error `result`, so keep stdin open until the last `result` you need has arrived.
 
 SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
