@@ -28,8 +28,7 @@ use crate::agent_errors::{
     RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT,
 };
 use crate::api::agent::{
-    LuaTaskOwner, SessionProviderPreparer, TaskOwnerAuthority, build_session_provider,
-    validate_required_output_mode,
+    LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
 };
 use crate::api::env::StateDirOverride;
 use crate::api::util::convert::json_to_lua;
@@ -602,31 +601,20 @@ pub(crate) fn agent_defer_close(
     Ok((Some(true), None))
 }
 
-fn task_owner_authority(
-    lua: &Lua,
-    this: &LuaAgent,
-    ctx: &LuaCtx,
-) -> mlua::Result<TaskOwnerAuthority> {
-    authorize(lua, ctx, this).map_err(mlua::Error::runtime)?;
-    let plugin_identity =
-        || current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY));
-    let (plugin, generation) = plugin_identity()?;
-    Ok(TaskOwnerAuthority::Agent {
-        owner: plugin_authority(lua, plugin.clone()),
-        plugin,
-        generation,
-        target: this
-            .manager
-            .lookup(this.id)
-            .map_err(mlua::Error::external)?,
-    })
-}
-
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
     methods.add_method("_maki_task_owner", |lua, this, ctx: UserDataRef<LuaCtx>| {
+        authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
+        let (plugin, generation) =
+            current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
         Ok(LuaTaskOwner {
             owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
-            authority: task_owner_authority(lua, this, &ctx)?,
+            owner: plugin_authority(lua, plugin.clone()),
+            plugin,
+            generation,
+            target: this
+                .manager
+                .lookup(this.id)
+                .map_err(mlua::Error::external)?,
         })
     });
     methods.add_method("_maki_session_id", |_, this, ()| {

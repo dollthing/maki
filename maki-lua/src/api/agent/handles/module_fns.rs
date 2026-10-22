@@ -176,7 +176,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
         return Ok((None, error));
     };
     let id = session.agent_id;
-    let mut agent = try_pair!(lookup(session.control.agent.manager(), id, &lua));
+    let mut agent = try_pair!(lookup(session.agent.manager(), id, &lua));
     agent.state = Some(Arc::clone(&session.state));
     let actor = Arc::clone(&session.actor);
     let events = actor.subscribe_events();

@@ -71,27 +71,18 @@ struct LuaAgentTurn {
 #[derive(Clone, Default)]
 struct AgentOwners(Arc<Mutex<HashMap<AgentId, AgentOwner>>>);
 
-/// A spawned child's session handle. Dropping it closes the child and emits
-/// its ordered close notification, so the registry keeps it alive until the
-/// record is retired.
-trait SessionHold {}
-
-impl SessionHold for LuaSession {}
-
-#[cfg(test)]
-impl SessionHold for crate::api::agent::tests::BackendFixture {}
-
 struct AgentOwner {
     plugin: Option<Arc<str>>,
     actor: Weak<AgentActorHandle>,
     state: Weak<LuaActorState>,
-    /// Kept alive so that dropping the record closes the child.
-    hold: Option<Box<dyn SessionHold + Send + Sync>>,
+    /// Dropping the session closes the child and emits its ordered close
+    /// notification, so the record keeps it alive until it is retired.
+    hold: Option<LuaSession>,
 }
 
 impl AgentOwner {
     /// Take the hold so a caller can drop it outside the registry lock.
-    fn take_hold(&mut self) -> Option<Box<dyn SessionHold + Send + Sync>> {
+    fn take_hold(&mut self) -> Option<LuaSession> {
         self.hold.take()
     }
 }
@@ -107,26 +98,7 @@ impl AgentOwners {
             plugin,
             actor: Arc::downgrade(&session.actor),
             state: Arc::downgrade(&session.state),
-            hold: Some(Box::new(session)),
-        };
-        self.lock().insert(id, owner);
-    }
-
-    /// Record a spawned child whose session handle is not a `LuaSession`.
-    #[cfg(test)]
-    fn record(
-        &self,
-        id: AgentId,
-        actor: Weak<AgentActorHandle>,
-        state: Weak<LuaActorState>,
-        hold: Box<dyn SessionHold + Send + Sync>,
-        plugin: Option<Arc<str>>,
-    ) {
-        let owner = AgentOwner {
-            plugin,
-            actor,
-            state,
-            hold: Some(hold),
+            hold: Some(session),
         };
         self.lock().insert(id, owner);
     }
@@ -1161,38 +1133,44 @@ mod tests {
 
     #[test]
     fn plugin_revocation_closes_only_owned_children() {
-        const OWNER: &str = "agent-owner";
         const OTHER_OWNER: &str = "other-owner";
-        let provider = Arc::new(StreamOnceProvider::new_replies(Vec::new()));
-        let (actor, state, session, _) = session_with_provider(provider.clone(), None);
-        let (other_actor, other_state, other_session, _) = session_with_provider(provider, None);
-        let lua = Lua::new();
-        let owners = AgentOwners::default();
-        owners.record(
-            actor.agent_id(),
-            Arc::downgrade(&actor),
-            Arc::downgrade(&state),
-            Box::new(session),
-            Some(Arc::from(OWNER)),
-        );
-        owners.record(
-            other_actor.agent_id(),
-            Arc::downgrade(&other_actor),
-            Arc::downgrade(&other_state),
-            Box::new(other_session),
-            Some(Arc::from(OTHER_OWNER)),
-        );
-        lua.set_app_data(owners);
-        revoke_plugin(&lua, OWNER);
-        assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
-        assert_eq!(other_actor.snapshot().lifecycle, ActorLifecycle::Open);
-        assert_eq!(
-            lua.app_data_ref::<AgentOwners>().unwrap().lock().len(),
-            1,
-            "revocation drops only the revoked plugin's ownership record"
-        );
-        revoke_plugin(&lua, OWNER);
-        assert_eq!(other_actor.snapshot().lifecycle, ActorLifecycle::Open);
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let root = install_managed_root(&lua, &stub_ctx(&AgentMode::Build));
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            let spawn = |ctx: &str| {
+                lua.load(format!(
+                    "return assert(agent_api.spawn({ctx}, {{ inherit_provider = true, silent = true, tools = {{}} }}))"
+                ))
+                .eval_async::<AnyUserData>()
+            };
+            let owned = scope.scope_future(spawn("ctx")).await.unwrap();
+            let other_scope = plugin_scope(&lua, OTHER_OWNER);
+            let other_ctx =
+                LuaCtx::trusted_context(&lua, root.target.clone(), Arc::from(OTHER_OWNER));
+            lua.globals().set("other_ctx", other_ctx).unwrap();
+            let other = other_scope.scope_future(spawn("other_ctx")).await.unwrap();
+            let actor = |handle: &AnyUserData| {
+                let agent = handle.borrow::<LuaAgent>().unwrap();
+                agent.manager.lookup(agent.id).unwrap().actor().unwrap()
+            };
+            let (owned, other) = (actor(&owned), actor(&other));
+            revoke_plugin(&lua, PLUGIN);
+            assert_ne!(owned.snapshot().lifecycle, ActorLifecycle::Open);
+            assert_eq!(other.snapshot().lifecycle, ActorLifecycle::Open);
+            assert_eq!(
+                lua.app_data_ref::<AgentOwners>().unwrap().lock().len(),
+                1,
+                "revocation drops only the revoked plugin's ownership record"
+            );
+            revoke_plugin(&lua, PLUGIN);
+            assert_eq!(other.snapshot().lifecycle, ActorLifecycle::Open);
+            drop((scope, other_scope));
+            root.shutdown();
+        });
     }
 
     #[test]

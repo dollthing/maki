@@ -532,8 +532,6 @@ fn managed_child_approval_is_pinned(
         let info = maki_agent::SubagentInfo {
             agent_id: child_id,
             parent_agent_id: Some(root),
-            parent_is_root: true,
-            auto_deliver: true,
             parent_tool_use_id: child_key.clone(),
             name: CHILD_TOOL_NAME.into(),
             prompt: None,

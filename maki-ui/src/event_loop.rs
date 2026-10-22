@@ -6819,8 +6819,6 @@ mod tests {
                 subagent: Some(SubagentInfo {
                     agent_id: child,
                     parent_agent_id: Some(root),
-                    parent_is_root: true,
-                    auto_deliver: false,
                     parent_tool_use_id: history_key,
                     name: name.into(),
                     prompt: None,

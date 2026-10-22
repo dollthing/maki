@@ -813,8 +813,6 @@ mod tests {
             subagent: Some(SubagentInfo {
                 agent_id: child_id,
                 parent_agent_id: None,
-                parent_is_root: true,
-                auto_deliver: true,
                 parent_tool_use_id: String::new(),
                 name: String::new(),
                 prompt: None,

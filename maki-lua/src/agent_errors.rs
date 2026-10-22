@@ -5,8 +5,6 @@ pub const NO_PLUGIN_AUTHORITY: &str = "no active plugin authority";
 pub const NO_TASK_AUTHORITY: &str = "no active task authority";
 pub const MANAGED_AUTHORITY_INACTIVE: &str =
     "managed agent authority is not active in this invocation";
-pub const UNMANAGED_AUTHORITY_INACTIVE: &str =
-    "unmanaged agent authority is not active in this invocation";
 pub const OTHER_PLUGIN_GENERATION: &str = "agent belongs to another plugin generation";
 pub const FIXED_MODEL_ERROR: &str = "model changes are unavailable for this fixed root";
 pub const AGENT_CONFIG_UNAVAILABLE: &str = "agent configuration is unavailable";

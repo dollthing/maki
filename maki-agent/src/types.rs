@@ -1297,10 +1297,6 @@ pub struct SubagentInfo {
     pub agent_id: AgentId,
     #[serde(skip)]
     pub parent_agent_id: Option<AgentId>,
-    #[serde(skip)]
-    pub parent_is_root: bool,
-    #[serde(skip)]
-    pub auto_deliver: bool,
     pub parent_tool_use_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,

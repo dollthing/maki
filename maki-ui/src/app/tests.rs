@@ -785,8 +785,6 @@ fn subagent_info_for_agent(
     SubagentInfo {
         agent_id,
         parent_agent_id: None,
-        parent_is_root: true,
-        auto_deliver: true,
         parent_tool_use_id: parent_id.into(),
         name: name.into(),
         prompt: None,
@@ -7811,17 +7809,13 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     assert_eq!(app.chats[1].last_message_text(), "provider unavailable");
 }
 
-#[test_case(false, true ; "grandchild")]
-#[test_case(true, false ; "auto_delivery_disabled")]
-#[test_case(true, true ; "eligible_direct_child")]
-fn failed_subagent_is_presented_without_ui_delivery(parent_is_root: bool, auto_deliver: bool) {
+#[test]
+fn failed_subagent_is_presented_without_ui_delivery() {
     const FAILURE_MESSAGE: &str = "provider unavailable";
 
     let mut app = streaming_app();
     let (input_tx, _input_rx) = flume::unbounded();
-    let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
-    info.parent_is_root = parent_is_root;
-    info.auto_deliver = auto_deliver;
+    let info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
     let outcome = TurnOutcome::failed(
         info.agent_id,
         TurnId::generate(),
@@ -10808,7 +10802,6 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
         Some(input_tx),
     );
     grandchild.parent_agent_id = Some(parent_id);
-    grandchild.parent_is_root = false;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
             history_epoch: 0,

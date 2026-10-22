@@ -5008,8 +5008,6 @@ mod tests {
             subagent: Some(maki_agent::SubagentInfo {
                 agent_id: maki_agent::AgentId::generate(),
                 parent_agent_id: Some(maki_agent::AgentId::generate()),
-                parent_is_root: true,
-                auto_deliver: true,
                 parent_tool_use_id: "task-reusable".to_owned(),
                 name: "task".to_owned(),
                 prompt: Some("reuse actor".to_owned()),

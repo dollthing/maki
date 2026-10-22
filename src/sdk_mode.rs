@@ -3827,8 +3827,6 @@ mod tests {
             subagent: Some(maki_agent::SubagentInfo {
                 agent_id: maki_agent::AgentId::generate(),
                 parent_agent_id: None,
-                parent_is_root: true,
-                auto_deliver: true,
                 parent_tool_use_id: "task".into(),
                 name: "research".into(),
                 prompt: None,

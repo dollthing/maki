@@ -28,7 +28,7 @@ use maki_agent::actor::{
 use maki_agent::agent::{
     Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
 };
-use maki_agent::cancel::{CancelMap, CancelToken};
+use maki_agent::cancel::CancelMap;
 use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::offload::OffloadStore;
@@ -40,10 +40,10 @@ use maki_agent::tools::{
     TurnToolBindings,
 };
 use maki_agent::{
-    Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
-    AgentRunParams, CancelTrigger, CurrentManagedTurn, Envelope, EventSender, History,
-    HistorySnapshot, McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo,
-    ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRef,
+    AgentRunParams, CurrentManagedTurn, Envelope, EventSender, History, HistorySnapshot,
+    McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
+    TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_fn, lua_table};
@@ -139,14 +139,12 @@ struct LuaActorState {
     mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
-    child_cancel: CancelToken,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
     ui_id: String,
     parent_event_tx: EventSender,
     cancel: SubagentCancel,
     parent_agent_id: Option<AgentId>,
-    parent_is_root: bool,
     auto_deliver: bool,
     silent: bool,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
@@ -171,13 +169,6 @@ impl LuaActorState {
                     .expect("session parameters must be initialized before admission")
                     .agent_id,
                 parent_agent_id: self.parent_agent_id,
-                parent_is_root: self.parent_is_root,
-                auto_deliver: self.auto_deliver
-                    && self
-                        .template
-                        .get()
-                        .is_some_and(|template| template.managed_turn.is_none())
-                    && self.parent_agent_id.is_none(),
                 parent_tool_use_id: self.ui_id.clone(),
                 name: self.name.clone(),
                 prompt: Some(first_message.to_owned()),
@@ -689,11 +680,7 @@ async fn relay_session_events(
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     live_sink: Option<flume::Sender<ToolLive>>,
     silent: bool,
-    relay_gate: Option<flume::Receiver<()>>,
 ) {
-    if let Some(gate) = relay_gate {
-        let _ = gate.recv_async().await;
-    }
     let mut cost = None;
     while let Ok(mut envelope) = sub_rx.recv_async().await {
         if silent {
@@ -1131,7 +1118,6 @@ struct SessionParent {
     trusted: Option<TrustedContext>,
     managed_turn: Option<CurrentManagedTurn>,
     agent_id: Option<AgentId>,
-    is_root: bool,
 }
 
 impl SessionParent {
@@ -1154,16 +1140,11 @@ impl SessionParent {
             .as_ref()
             .map(|current| current.agent_id())
             .or_else(|| trusted.as_ref().map(|trusted| trusted.target.id()));
-        let is_root = managed_turn
-            .as_ref()
-            .and_then(|current| current.node_snapshot().ok())
-            .is_some_and(|node| node.parent_id.is_none());
         Ok(Self {
             context,
             trusted,
             managed_turn,
             agent_id,
-            is_root,
         })
     }
 
@@ -1686,8 +1667,7 @@ fn spawn_session_actor(
     state: &Arc<LuaActorState>,
     initial_config: EffectiveAgentConfig,
     params: impl FnOnce(AgentId) -> AgentParams,
-    child_trigger: CancelTrigger,
-) -> Result<(AgentActorHandle, SessionControl), String> {
+) -> Result<(AgentActorHandle, AgentRef), String> {
     let backend = || -> Box<dyn ActorBackend> {
         let mut backend = LuaActorBackend::new(Arc::clone(state));
         backend.offload = parent.context.offload.clone();
@@ -1725,37 +1705,7 @@ fn spawn_session_actor(
         let _ = child.close_subtree();
         return Err(error.to_string());
     }
-    Ok((
-        actor,
-        SessionControl {
-            agent: child,
-            _child_trigger: child_trigger,
-        },
-    ))
-}
-
-/// `task_despawn` and global cancellation fire the shared child token.
-/// Permanent closure aborts running turns and terminalizes queued turns;
-/// managed sessions close their subtree. A normal close stops the relay first,
-/// through the returned sender.
-fn spawn_close_relay(control: &SessionControl, state: &Arc<LuaActorState>) -> flume::Sender<()> {
-    let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
-    let managed_agent = control.agent.clone();
-    let child_cancel = state.child_cancel.clone();
-    let close_state = Arc::clone(state);
-    smol::spawn(async move {
-        select(
-            Box::pin(async move { child_cancel.cancelled().await }),
-            Box::pin(async move {
-                let _ = relay_stop_rx.recv_async().await;
-            }),
-        )
-        .await;
-        close_state.notify_closed_direct();
-        let _ = managed_agent.close_subtree();
-    })
-    .detach();
-    relay_stop_tx
+    Ok((actor, child))
 }
 
 fn register_session(
@@ -1767,7 +1717,7 @@ fn register_session(
     if let Some(service) = crate::orchestration::services(lua)
         && let Err(error) = service.register_child_target(
             crate::orchestration::TrustedTarget {
-                target: sess.control.agent.clone(),
+                target: sess.agent.clone(),
                 template: child_template,
             },
             sess.state.ui_id.clone(),
@@ -1830,22 +1780,11 @@ async fn build_session(
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth. The fallback key gets its own id:
-    // it keys `subagent_cancels`, so sharing the session id would make two
-    // subagents running at once collide.
     let ui_id = parent
         .context
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    // The subagent's permanent close is independent of the parent run's cancel:
-    // it is triggered only through the shared `subagent_cancels` map
-    // (`task_despawn` and global cancellation). Deriving it from `parent.context.cancel`
-    // (the run's token, which the UI fires at normal run end by dropping the
-    // run's CancelTrigger) would close every in-flight subagent as soon as the
-    // spawning run finishes.
-    let (child_trigger, child_cancel) = CancelToken::new();
     let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
     let cancel = SubagentCancel::new({
         let cancel_actor = Arc::clone(&cancel_actor);
@@ -1873,14 +1812,12 @@ async fn build_session(
             .filter(|_| options.mcp)
             .map(McpSession::fresh),
         chip_event_tx: EventSender::with_identity(sub_tx, parent.context.event_tx.identity()),
-        child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
         ui_id,
         parent_event_tx: parent.context.event_tx.clone(),
         cancel,
         parent_agent_id: parent.agent_id,
-        parent_is_root: parent.is_root,
         auto_deliver: options.auto_deliver,
         silent: options.silent,
         subagent_info: Arc::clone(&subagent_info),
@@ -1893,7 +1830,7 @@ async fn build_session(
         close_notified: std::sync::atomic::AtomicBool::new(false),
         relay_snapshot: Mutex::default(),
     });
-    let (actor, control) = try_pair!(spawn_session_actor(
+    let (actor, agent) = try_pair!(spawn_session_actor(
         &lua,
         &parent,
         &state,
@@ -1905,7 +1842,6 @@ async fn build_session(
             child.provider,
             &options
         ),
-        child_trigger,
     ));
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
@@ -1921,19 +1857,16 @@ async fn build_session(
         subagent_info,
         parent.context.live_sink.clone(),
         options.silent,
-        None,
     ))
     .detach();
 
     *cancel_actor.lock().unwrap() = Some(actor.clone());
-    let relay_stop_tx = spawn_close_relay(&control, &state);
 
     let sess = LuaSession {
         agent_id: actor.agent_id(),
         actor: Arc::new(actor),
         state,
-        control,
-        relay_stop_tx,
+        agent,
     };
     let session = try_pair!(register_session(&lua, sess, child_template));
     if let (Some(description), Some(trusted)) = (options.show, &parent.trusted) {
@@ -2121,24 +2054,17 @@ pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
     handles::close_plugin_agents(lua, plugin);
 }
 
-struct SessionControl {
-    agent: maki_agent::AgentRef,
-    _child_trigger: CancelTrigger,
-}
-
 struct LuaSession {
     agent_id: AgentId,
     actor: Arc<AgentActorHandle>,
     state: Arc<LuaActorState>,
-    control: SessionControl,
-    relay_stop_tx: flume::Sender<()>,
+    agent: AgentRef,
 }
 
 impl LuaSession {
     fn close_controlled(&self) {
         self.state.notify_closed_ordered();
-        let _ = self.relay_stop_tx.try_send(());
-        let _ = self.control.agent.close_subtree();
+        let _ = self.agent.close_subtree();
     }
 }
 
@@ -2160,18 +2086,12 @@ impl Drop for LuaSession {
     }
 }
 
-enum TaskOwnerAuthority {
-    Agent {
-        plugin: Arc<str>,
-        generation: u64,
-        owner: Arc<crate::orchestration::PluginAuthority>,
-        target: maki_agent::AgentRef,
-    },
-}
-
 struct LuaTaskOwner {
     owner_id: Option<AgentId>,
-    authority: TaskOwnerAuthority,
+    plugin: Arc<str>,
+    generation: u64,
+    owner: Arc<crate::orchestration::PluginAuthority>,
+    target: AgentRef,
 }
 
 impl mlua::UserData for LuaTaskOwner {
@@ -2179,51 +2099,34 @@ impl mlua::UserData for LuaTaskOwner {
         // A managed task whose child has closed, for instance because its owner
         // was closed, can be dropped without anyone's authority.
         methods.add_method("_maki_retired", |_, this, ()| {
-            Ok(matches!(
-                &this.authority,
-                TaskOwnerAuthority::Agent { target, .. } if target.validate_live().is_err()
-            ))
+            Ok(this.target.validate_live().is_err())
         });
         methods.add_method("_maki_can_control", |lua, this, ()| {
-            match &this.authority {
-                TaskOwnerAuthority::Agent {
-                    plugin,
-                    generation,
-                    owner,
-                    target,
-                } => {
-                    if InvocationGuard::capture(lua).is_err()
-                        || !crate::orchestration::holds_plugin_grant(
-                            lua,
-                            plugin,
-                            *generation,
-                            owner,
-                        )
-                    {
-                        return Ok(false);
-                    }
-                    let Some(current) = crate::runtime::current_managed_turn(lua) else {
-                        return Ok(false);
-                    };
-                    if !current.manager().same_manager(&target.manager())
-                        || current.validate_active().is_err()
-                        || (current.agent_id() != target.id()
-                            && current.validate_descendant(target.id()).is_err())
-                    {
-                        return Ok(false);
-                    }
-                }
+            if InvocationGuard::capture(lua).is_err()
+                || !crate::orchestration::holds_plugin_grant(
+                    lua,
+                    &this.plugin,
+                    this.generation,
+                    &this.owner,
+                )
+            {
+                return Ok(false);
             }
-            let Some(owner_id) = this.owner_id else {
-                return Ok(true);
-            };
             let Some(current) = crate::runtime::current_managed_turn(lua) else {
                 return Ok(false);
             };
-            if current.agent_id() == owner_id {
-                return Ok(current.validate_active().is_ok());
+            if !current.manager().same_manager(&this.target.manager())
+                || current.validate_active().is_err()
+                || (current.agent_id() != this.target.id()
+                    && current.validate_descendant(this.target.id()).is_err())
+            {
+                return Ok(false);
             }
-            Ok(current.validate_descendant(owner_id).is_ok())
+            Ok(match this.owner_id {
+                None => true,
+                Some(owner_id) if owner_id == current.agent_id() => true,
+                Some(owner_id) => current.validate_descendant(owner_id).is_ok(),
+            })
         });
     }
 }
@@ -2500,14 +2403,11 @@ mod tests {
     pub(super) struct BackendFixture {
         pub(super) actor: Arc<AgentActorHandle>,
         pub(super) state: Arc<LuaActorState>,
-        relay_stop_tx: flume::Sender<()>,
-        _child_trigger: CancelTrigger,
     }
 
     impl BackendFixture {
         pub(super) fn close_controlled(&self) {
             self.state.notify_closed_ordered();
-            let _ = self.relay_stop_tx.try_send(());
             self.actor.close();
         }
     }
@@ -2624,9 +2524,7 @@ mod tests {
             None => (parent_raw_tx.clone(), None),
         };
         let (answer_tx, answer_rx) = flume::unbounded();
-        let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
         let ui_id = "task-1".to_owned();
-        let (child_trigger, child_cancel) = CancelToken::new();
         let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
         let params = AgentParams {
             agent_id,
@@ -2664,7 +2562,6 @@ mod tests {
             mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx),
-            child_cancel,
             answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
             answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
@@ -2681,7 +2578,6 @@ mod tests {
             ),
             cancel: SubagentCancel::new(|| {}),
             parent_agent_id: None,
-            parent_is_root: false,
             auto_deliver: true,
             silent: false,
             subagent_info: Arc::new(OnceLock::new()),
@@ -2695,7 +2591,7 @@ mod tests {
             relay_snapshot: Mutex::default(),
         });
         if let Some((sub_rx, gate)) = relay {
-            smol::spawn(relay_session_events(
+            let relay = relay_session_events(
                 sub_rx,
                 EventSender::with_identity(
                     parent_raw_tx.clone(),
@@ -2711,8 +2607,11 @@ mod tests {
                 Arc::clone(&state.subagent_info),
                 None,
                 false,
-                Some(gate),
-            ))
+            );
+            smol::spawn(async move {
+                let _ = gate.recv_async().await;
+                relay.await;
+            })
             .detach();
         }
         let (actor, task) = AgentActorHandle::spawn(
@@ -2726,8 +2625,6 @@ mod tests {
         let sess = BackendFixture {
             actor: Arc::clone(&actor),
             state: Arc::clone(&state),
-            relay_stop_tx,
-            _child_trigger: child_trigger,
         };
         (actor, state, sess, parent_rx)
     }
@@ -3543,8 +3440,6 @@ mod tests {
             .set(SubagentInfo {
                 agent_id: AgentId::generate(),
                 parent_agent_id: None,
-                parent_is_root: true,
-                auto_deliver: true,
                 parent_tool_use_id: PARENT_ID.into(),
                 name: "research".into(),
                 prompt: None,
@@ -3578,7 +3473,6 @@ mod tests {
             subagent_info,
             Some(live_tx),
             false,
-            None,
         ));
 
         let live = live_rx
@@ -3617,8 +3511,6 @@ mod tests {
             .set(SubagentInfo {
                 agent_id: AgentId::generate(),
                 parent_agent_id: None,
-                parent_is_root: true,
-                auto_deliver: true,
                 parent_tool_use_id: "parent".into(),
                 name: "parent".into(),
                 prompt: None,
@@ -3632,8 +3524,6 @@ mod tests {
         let grandchild_info = SubagentInfo {
             agent_id: grandchild_id,
             parent_agent_id: parent_info.get().map(|info| info.agent_id),
-            parent_is_root: false,
-            auto_deliver: true,
             parent_tool_use_id: "grandchild".into(),
             name: "grandchild".into(),
             prompt: None,
@@ -3661,7 +3551,6 @@ mod tests {
             parent_info,
             None,
             false,
-            None,
         ));
 
         let forwarded = parent_rx.recv().unwrap();

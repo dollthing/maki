@@ -2188,7 +2188,6 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             .expect("managed child history envelope");
         let child = envelope.subagent.unwrap();
         assert_eq!(child.parent_agent_id, Some(root.id()));
-        assert!(child.parent_is_root);
         wait_for_runner_finished(&manager, child.agent_id).await;
         let root_node = root.snapshot().unwrap();
         assert_eq!(root_node.graph_lifecycle, GraphLifecycle::Live);
