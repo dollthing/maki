@@ -12,7 +12,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, BoxFuture, Provider};
-use maki_providers::{RequestOptions, Timeouts};
+use maki_providers::{RequestOptions, Timeouts, TokenUsage};
 use maki_storage::checkpoint::accept_all;
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -39,8 +39,8 @@ use crate::{
     ActorBackend, Agent, AgentConfig, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle,
     AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult, ControlWork,
     EffectiveAgentConfig, Envelope, EventSender, McpHandle, McpSession, PermissionsConfig,
-    RunLedger, RunSettings, SessionMailbox, ToolOutputLines, TurnContext, TurnId, TurnTicket,
-    WorkKind,
+    RunLedger, RunSettings, SessionMailbox, ToolOutputLines, TurnContext, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome, TurnTicket, WorkKind,
 };
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -651,10 +651,18 @@ impl ActorBackend for HeadlessBackend {
                 Ok(config) => config,
                 Err(error) => {
                     warn!(%turn_id, %error, "headless turn setup failed");
-                    return BackendResult::SetupFailed {
-                        agent_id: context.agent_id,
+                    return BackendResult::EnteredRun(TurnOutcome::failed(
+                        context.agent_id,
                         turn_id,
-                    };
+                        TokenUsage::default(),
+                        0,
+                        TurnFailure {
+                            kind: TurnFailureKind::Internal,
+                            diagnostic: error.clone(),
+                            user_message: error,
+                            retryable: true,
+                        },
+                    ));
                 }
             };
             let instructions = context
@@ -1268,10 +1276,9 @@ pub(crate) fn spawn_command_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TurnOutcome;
     use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
     use crate::tools::offload::{OffloadBackend, OffloadError};
-    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
+    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
