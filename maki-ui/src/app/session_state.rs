@@ -414,7 +414,9 @@ mod tests {
             input: FAST_INPUT_RATE,
             output: test_pricing().output,
         });
-        let state = resumed(session, &model);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let state = SessionState::from_session(session, &model, &storage, &ModelPolicy::default());
         assert_eq!(state.fast_pending, pending);
         assert_eq!(
             state.cost,
@@ -424,6 +426,14 @@ mod tests {
                 LIST_PRICE
             })
         );
+        let seeded = state.starting_config(
+            maki_agent::tools::cli_tool_ctx().provider,
+            &model,
+            tmp.path().to_path_buf(),
+            &ModeRegistry::builtin(),
+            &storage,
+        );
+        assert_eq!(seeded.fast, fast_rates);
     }
 
     #[test_case(FastSupport::Supported, false, true ; "discovery_answers_supported")]

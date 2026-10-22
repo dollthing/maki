@@ -2975,7 +2975,7 @@ fn no_op_policy_update_keeps_generation() {
 }
 
 #[test]
-fn reserved_policy_orders_admissions() {
+fn reserved_policy_orders_admissions_and_failed_updates() {
     smol::block_on(async {
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
@@ -3025,6 +3025,23 @@ fn reserved_policy_orders_admissions() {
             ]
         );
 
+        let failed = handle.reserve_prepared_operation(None).unwrap();
+        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
+        assert!(matches!(
+            failed
+                .commit_when_ready(Some(super::ConfigChange::Patch(super::ConfigPatch {
+                    thinking: Some(maki_providers::ThinkingConfig::Off),
+                    toggle_thinking: true,
+                    ..Default::default()
+                })))
+                .await,
+            Err(ActorError::InvalidConfig(_))
+        ));
+        c.wait().await;
+        assert_eq!(
+            state.policies.lock().unwrap()[2],
+            ("c".into(), Some(true), 2)
+        );
         handle.close();
         task.await;
     });

@@ -46,6 +46,7 @@ use crate::{
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_CLOSED: &str = "session ended before initialization";
 const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
+const OPERATION_CANCELLED: &str = "operation cancelled";
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -209,7 +210,7 @@ impl PendingControl {
     fn cancel(&mut self) {
         match self.control.take() {
             Some(InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply)) => {
-                let _ = reply.send(Err("operation cancelled".into()));
+                let _ = reply.send(Err(OPERATION_CANCELLED.into()));
             }
             Some(InteractiveControl::ManualCompaction { output, .. }) => {
                 let _ = output.send(ManualCompactionEvent::Cancelled);
@@ -1721,6 +1722,43 @@ mod tests {
             bounded(received.recv_async()).await.unwrap();
             release.send_async(()).await.unwrap();
             bounded(ticket.wait()).await;
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(InteractiveControl::Compact ; "compact")]
+    #[test_case(InteractiveControl::Reset ; "reset")]
+    fn control_dropped_on_close_replies_cancelled(
+        control: fn(flume::Sender<Result<(), String>>) -> InteractiveControl,
+    ) {
+        smol::block_on(async {
+            let (seen, received) = flume::bounded(1);
+            let (release, released) = flume::bounded::<()>(1);
+            let checkpoint: Checkpoint = Arc::new(
+                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    let seen = seen.clone();
+                    let released = released.clone();
+                    Box::pin(async move {
+                        let _ = seen.send_async(()).await;
+                        let _ = released.recv_async().await;
+                        Ok(CheckpointAck::for_request(&request))
+                    }) as CheckpointFuture
+                },
+            );
+            let (provider, _) = recording();
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
+            let root = handle.initialized_root().await.unwrap();
+            let _turn = handle.input_tx.admit(test_params().input).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            let (reply, replies) = flume::bounded(1);
+            handle.control_tx.send(control(reply)).await.unwrap();
+            root.actor().unwrap().close();
+            assert_eq!(
+                bounded(replies.recv_async()).await.unwrap(),
+                Err(OPERATION_CANCELLED.to_owned())
+            );
+            drop(release);
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
         });
