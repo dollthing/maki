@@ -2107,9 +2107,117 @@ mod tests {
         assert_eq!(stored_child(ORPHAN_CHILD), None);
     }
 
-    #[test_case(false; "published_config_keeps_pending_history")]
-    #[test_case(true; "rejected_config_keeps_pending_history")]
-    fn pending_history_then_guarded_config_keeps_truthful_acks(reject: bool) {
+    #[test_case(true, false, false; "history_then_config")]
+    #[test_case(false, false, false; "config_then_history")]
+    #[test_case(true, true, false; "queued_history_then_config")]
+    #[test_case(false, true, false; "queued_config_then_history")]
+    #[test_case(true, false, true; "rejected_config_keeps_history")]
+    fn staged_child_config_and_history_keep_each_other(
+        history_first: bool,
+        queued: bool,
+        reject: bool,
+    ) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
+        session.set_subagents(vec![StoredSubagent {
+            tool_use_id: TOOL_ID.into(),
+            name: TOOL_ID.into(),
+            model: Some(MODEL.into()),
+            thinking: Some(StoredThinking::Adaptive),
+            fast: false,
+        }]);
+        let id = session.id;
+        writer.seed(Arc::new(session.clone()));
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.write(&session).unwrap();
+        let destination = || HistoryDestination::Child(TOOL_ID.into());
+        let edited = HistorySnapshot::new(vec![
+            Message::user(BASE_MSG.into()),
+            Message::user(COORDINATOR_MSG.into()),
+        ]);
+        let history_model = if history_first {
+            NEXT_MODEL
+        } else {
+            FAILED_MODEL
+        };
+        let config_claim: CheckpointClaim = if reject {
+            Arc::new(|_| Err(Arc::from(CHECKPOINT_CANCELLED)))
+        } else {
+            publication_claim()
+        };
+        let mut replies = Vec::new();
+        for history in [history_first, !history_first] {
+            let (staged_history, model, claim) = if history {
+                (
+                    Some((destination(), edited.clone())),
+                    history_model,
+                    publication_claim(),
+                )
+            } else {
+                (None, FAILED_MODEL, Arc::clone(&config_claim))
+            };
+            let reply = enqueue_staged_checkpoint(
+                &writer.pending,
+                &writer.wake,
+                StagedSessionCheckpoint {
+                    session_id: id,
+                    checkpoint: None,
+                    selected_config: Some((
+                        destination(),
+                        config_projection(model, CWD, 1, 1).config,
+                    )),
+                    history: staged_history,
+                    publication: CheckpointPublication::default(),
+                    claim,
+                    guard: lease.publication_guard(),
+                },
+            )
+            .unwrap();
+            if !queued {
+                disk.flush(&writer.pending);
+            }
+            replies.push((history, reply));
+        }
+        disk.flush(&writer.pending);
+        for (history, reply) in replies {
+            assert_eq!(reply.recv().unwrap().is_err(), reject && !history);
+        }
+        let expected_model =
+            maki_providers::Model::from_spec(if reject { NEXT_MODEL } else { FAILED_MODEL })
+                .unwrap()
+                .id;
+        let stored = AppSession::load(id, &dir).unwrap();
+        for saved in [&stored, writer.latest_snapshot(id).unwrap().as_ref()] {
+            assert_eq!(message_texts(saved), [BASE_MSG]);
+            let child: Vec<_> = saved.subagent_messages()[TOOL_ID]
+                .iter()
+                .map(|message| message.user_text().unwrap())
+                .collect();
+            assert_eq!(child, [BASE_MSG, COORDINATOR_MSG]);
+            assert_eq!(
+                saved.subagents()[0].model.as_deref(),
+                Some(expected_model.as_str())
+            );
+        }
+    }
+
+    #[test_case(0, false; "published_config_keeps_pending_history")]
+    #[test_case(0, true; "rejected_config_keeps_pending_history")]
+    #[test_case(1, false; "transient_failure_preserves_pending_history")]
+    #[test_case(CHECKPOINT_RETRY_BACKOFFS.len() + 1, false; "exhausted_history_is_not_promoted")]
+    fn pending_history_then_guarded_config_keeps_truthful_acks(failures: usize, reject: bool) {
         let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
@@ -2156,14 +2264,37 @@ mod tests {
             logs: HashMap::new(),
             failing: HashSet::new(),
         };
+        let sessions_path = dir.path().join(SESSIONS_DIR);
+        let saved_path = dir.path().join(TITLE);
+        if failures > 0 {
+            std::fs::rename(&sessions_path, &saved_path).unwrap();
+            block_sessions_dir(&dir);
+        }
+        for _ in 0..failures {
+            if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
+                save.retry_at = None;
+            }
+            disk.flush(&writer.pending);
+        }
+        if failures > 0 {
+            std::fs::remove_file(&sessions_path).unwrap();
+            std::fs::rename(&saved_path, &sessions_path).unwrap();
+        }
+        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
+            save.retry_at = None;
+        }
         disk.flush(&writer.pending);
-        assert!(smol::block_on(history_ack).is_ok());
-        assert_eq!(smol::block_on(config_ack).is_err(), reject);
-        let expected_model = if reject { MODEL } else { FAILED_MODEL };
-        let reopened = AppSession::load(id, &dir).unwrap();
+        let exhausted = failures > CHECKPOINT_RETRY_BACKOFFS.len();
+        assert_eq!(smol::block_on(history_ack).is_ok(), !exhausted);
+        let published = smol::block_on(config_ack).is_ok();
+        assert_eq!(published, !reject && failures == 0);
+        let expected_model = if published { FAILED_MODEL } else { MODEL };
+        let expected_text = if exhausted { BASE_MSG } else { COORDINATOR_MSG };
+        let reopened = AppSession::load(id, &dir).ok();
+        assert_eq!(reopened.is_none(), exhausted);
         let latest = writer.latest_snapshot(id).unwrap();
-        for saved in [&reopened, latest.as_ref()] {
-            assert_eq!(message_texts(saved), [COORDINATOR_MSG]);
+        for saved in reopened.iter().chain([latest.as_ref()]) {
+            assert_eq!(message_texts(saved), [expected_text]);
             assert_eq!(saved.model, expected_model);
         }
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
