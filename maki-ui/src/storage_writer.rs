@@ -36,6 +36,8 @@ pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
 const CHECKPOINT_CANCELLED: &str = "session checkpoint cancelled";
+const CONFIG_REQUIRES_CLAIM: &str = "configuration checkpoints require a publication claim";
+const SNAPSHOT_UNAVAILABLE: &str = "session snapshot is unavailable";
 const SELECTED_CONFIG_DESTINATION: &str =
     "selected config requires its child checkpoint destination";
 const SELECTED_CONFIG_MISSING: &str = "selected child config requires existing stored metadata";
@@ -160,7 +162,6 @@ impl RequiredHistory {
 
 struct CheckpointWaiter {
     version: CheckpointVersion,
-    config_version: Option<(u64, u64)>,
     histories: Vec<RequiredHistory>,
     reply: flume::Sender<Result<CheckpointAck, CheckpointError>>,
 }
@@ -262,6 +263,18 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
     fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
         let session_id = request.session_id;
         let version = request.version;
+        let fail = |message: &str| -> CheckpointFuture {
+            let message = Arc::from(message);
+            Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message,
+                })
+            })
+        };
+        if request.snapshot.kind == SessionCheckpointKind::Config {
+            return fail(CONFIG_REQUIRES_CLAIM);
+        }
         let mut state = lock(&self.pending);
         if state.closed {
             return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
@@ -269,122 +282,53 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         if let Err(message) =
             validate_checkpoint_history(&request.snapshot, request.snapshot.history.is_some())
         {
-            return Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id,
-                    message: Arc::from(message),
-                })
-            });
+            return fail(message);
         }
-        let config_version = (request.snapshot.kind == SessionCheckpointKind::Config)
-            .then_some(request.snapshot.config.as_ref())
-            .flatten()
-            .map(|config| (config.runtime_epoch, config.generation));
-        if request.snapshot.kind != SessionCheckpointKind::Options
-            && let Some(history) = &request.snapshot.history
-            && let Some(revision) = request.snapshot.history_revision
-        {
-            let incoming = (history.epoch, revision);
-            if history_version(&state, session_id, &HistoryDestination::Main)
+        let history = request
+            .snapshot
+            .history
+            .as_ref()
+            .filter(|_| request.snapshot.kind != SessionCheckpointKind::Options);
+        let incoming = history
+            .zip(request.snapshot.history_revision)
+            .map(|(history, revision)| (history.epoch, revision));
+        if incoming.is_some_and(|incoming| {
+            history_version(&state, session_id, &HistoryDestination::Main)
                 .is_some_and(|current| incoming < current)
-            {
-                return Box::pin(async move {
-                    Err(CheckpointError::Save {
-                        session_id,
-                        message: Arc::from(CHECKPOINT_REPLACED),
-                    })
-                });
-            }
-        }
-        if config_version.is_some_and(|incoming| {
-            state
-                .config_versions
-                .get(&session_id)
-                .is_some_and(|current| incoming < *current)
         }) {
-            return Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id,
-                    message: Arc::from("configuration checkpoint superseded by a newer generation"),
-                })
-            });
+            return fail(CHECKPOINT_REPLACED);
         }
-        let has_provisional = state.coordinator_pending.contains_key(&session_id);
-        let (base, mut history_base) =
-            if let Some(pending) = state.coordinator_pending.get(&session_id) {
-                (Arc::clone(&pending.session), pending.history_base)
-            } else if let Some(latest) = state.latest.get(&session_id) {
-                (
-                    Arc::clone(latest),
-                    state.coordinator_history_bases.get(&session_id).copied(),
-                )
-            } else {
-                return Box::pin(async move {
-                    Err(CheckpointError::Save {
-                        session_id,
-                        message: Arc::from("session snapshot is unavailable"),
-                    })
-                });
-            };
-        if history_base.is_none()
-            && request.snapshot.kind != SessionCheckpointKind::Options
-            && request.snapshot.history.is_some()
+        let (base, history_base) = if let Some(pending) = state.coordinator_pending.get(&session_id)
         {
-            history_base = Some(base.history_identity());
-        }
-        if request.snapshot.kind != SessionCheckpointKind::Options
-            && let Some(history) = &request.snapshot.history
-            && let Some(revision) = request.snapshot.history_revision
-        {
-            set_history_version(
-                &mut state,
-                session_id,
-                &HistoryDestination::Main,
-                (history.epoch, revision),
-            );
+            (Arc::clone(&pending.session), pending.history_base)
+        } else if let Some(latest) = state.latest.get(&session_id) {
+            (
+                Arc::clone(latest),
+                state.coordinator_history_bases.get(&session_id).copied(),
+            )
+        } else {
+            return fail(SNAPSHOT_UNAVAILABLE);
+        };
+        let history_base =
+            history_base.or_else(|| history.is_some().then(|| base.history_identity()));
+        if let Some(incoming) = incoming {
+            set_history_version(&mut state, session_id, &HistoryDestination::Main, incoming);
         }
         let live_ids = state.live_children.get(&session_id).map(Vec::as_slice);
         let merged = Arc::new(merge_checkpoint(&base, &request.snapshot, live_ids));
         let generation = next_generation(&mut state);
         state.latest_generations.insert(session_id, generation);
-        if let Some(config_version) = config_version {
-            state.config_versions.insert(session_id, config_version);
-            let authoritative = state
-                .latest
-                .get(&session_id)
-                .map(|latest| {
-                    Arc::new(merge_checkpoint(
-                        latest,
-                        &request.snapshot,
-                        state.live_children.get(&session_id).map(Vec::as_slice),
-                    ))
-                })
-                .unwrap_or_else(|| Arc::clone(&merged));
-            state.latest.insert(session_id, authoritative);
-            if !has_provisional && let Some(history_base) = history_base {
-                state
-                    .coordinator_history_bases
-                    .insert(session_id, history_base);
-            }
-        }
-        let provisional = config_version.is_none() || has_provisional;
-        if provisional {
-            state.coordinator_pending.insert(
-                session_id,
-                CoordinatorPending {
-                    generation,
-                    session: Arc::clone(&merged),
-                    history_base,
-                },
-            );
-        }
+        state.coordinator_pending.insert(
+            session_id,
+            CoordinatorPending {
+                generation,
+                session: Arc::clone(&merged),
+                history_base,
+            },
+        );
         let (reply, response) = flume::bounded(1);
-        let retained_config_version = state.config_versions.get(&session_id).copied();
-        let histories = request
-            .snapshot
-            .history
-            .as_ref()
-            .filter(|_| request.snapshot.kind != SessionCheckpointKind::Options)
+        let config_version = state.config_versions.get(&session_id).copied();
+        let histories = history
             .map(|history| {
                 RequiredHistory::Root(history.clone(), request.snapshot.history_revision)
             })
@@ -396,13 +340,12 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                 session: merged,
                 waiters: vec![CheckpointWaiter {
                     version,
-                    config_version,
                     histories,
                     reply,
                 }],
                 generation,
-                coordinator_generation: provisional.then_some(generation),
-                config_version: retained_config_version,
+                coordinator_generation: Some(generation),
+                config_version,
                 coordinator_history_base: history_base,
                 retry_attempt: 0,
                 retry_at: None,
@@ -682,7 +625,6 @@ impl StorageWriter {
                 config_version,
                 waiters: vec![CheckpointWaiter {
                     version,
-                    config_version: None,
                     histories,
                     reply,
                 }],
@@ -1337,10 +1279,7 @@ fn acknowledge_waiters(
     retain_history_waiters(id, session, &mut waiters);
     let state = lock(pending);
     for waiter in waiters {
-        if waiter
-            .config_version
-            .is_some_and(|version| state.config_versions.get(&id) != Some(&version))
-            || waiter.histories.iter().any(|history| {
+        if waiter.histories.iter().any(|history| {
                 matches!(history, RequiredHistory::Root(snapshot, Some(revision))
                     if history_version(&state, id, &HistoryDestination::Main).is_some_and(|current| (snapshot.epoch, *revision) < current))
             })
@@ -1873,6 +1812,34 @@ mod tests {
         }
     }
 
+    /// Claims the session lock and returns the writer production binds to it.
+    fn guarded_writer(
+        writer: &StorageWriter,
+        dir: &StateDir,
+        id: MakiId,
+    ) -> (
+        session_lock::ClaimedSessionLock,
+        Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+    ) {
+        let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let checkpoint = writer
+            .coordinator_checkpoint_guarded(lease.publication_guard(), HistoryDestination::Main);
+        (lease, checkpoint)
+    }
+
+    fn publish_config(
+        checkpoint: &Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+        request: CheckpointRequest<SessionCheckpoint>,
+    ) -> CheckpointFuture {
+        checkpoint.checkpoint_guarded(
+            request,
+            CheckpointPublication::default(),
+            maki_agent::session_coordinator::publication_claim(),
+        )
+    }
+
     fn manual_writer() -> (StorageWriter, flume::Receiver<()>) {
         let (wake, wake_rx) = flume::unbounded();
         let (_, done_rx) = flume::bounded(1);
@@ -2305,79 +2272,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn committed_config_survives_failure_and_retries_with_lease_history() {
+    #[test_case(false; "published_config_keeps_pending_history")]
+    #[test_case(true; "rejected_config_keeps_pending_history")]
+    fn pending_history_then_guarded_config_keeps_truthful_acks(reject: bool) {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
-        let (writer, _wake_rx) = manual_writer();
-        let mut session = AppSession::new(MODEL, CWD);
-        session.push_message(Message::user(BASE_MSG.into()));
-        let id = session.id;
-        writer.seed(Arc::new(session.clone()));
-        let checkpoint = writer
-            .coordinator_checkpoint()
-            .checkpoint(CheckpointRequest {
-                session_id: id,
-                version: CheckpointVersion {
-                    revision: 1,
-                    epoch: 1,
-                },
-                snapshot: Arc::new(config_checkpoint(1, 1)),
-            });
-        let (warn_tx, warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
-        for _ in 0..=CHECKPOINT_RETRY_BACKOFFS.len() {
-            if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-                save.retry_at = None;
-            }
-            disk.flush(&writer.pending);
-        }
-        assert!(smol::block_on(checkpoint).is_err());
-        assert_eq!(writer.latest_snapshot(id).unwrap().model, FAILED_MODEL);
-        let warning = warn_rx.try_recv().unwrap();
-        assert!(warning.contains("Configuration applied but not saved (runtime 1, generation 1)"));
-        assert!(warn_rx.try_recv().is_err());
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
-        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-            save.retry_at = None;
-        }
-        disk.flush(&writer.pending);
-        let recovered = AppSession::load(id, &dir).unwrap();
-        assert_eq!(recovered.model, FAILED_MODEL);
-        assert_eq!(message_texts(&recovered), [BASE_MSG]);
-        session.push_message(Message::user(COORDINATOR_MSG.into()));
-        writer.send(Arc::new(session));
-        disk.flush(&writer.pending);
-        let stored = AppSession::load(id, &dir).unwrap();
-        assert_eq!(stored.model, FAILED_MODEL);
-        assert_eq!(stored.meta.mode, Some(StoredMode::Plan));
-        assert_eq!(stored.meta.plan_path.as_deref(), Some(CWD));
-        assert!(stored.meta.fast);
-        assert!(stored.meta.workflow);
-        assert_eq!(message_texts(&stored), [BASE_MSG, COORDINATOR_MSG]);
-        assert_eq!(warn_rx.try_recv().unwrap(), SAVE_RECOVERED);
-        assert!(!disk.failing.contains(&id));
-    }
-
-    #[test_case(0; "success_preserves_pending_history")]
-    #[test_case(1; "transient_failure_preserves_pending_history")]
-    #[test_case(CHECKPOINT_RETRY_BACKOFFS.len() + 1; "exhausted_history_is_not_promoted")]
-    fn pending_history_then_config_keeps_truthful_history_ack(failures: usize) {
-        let (_tmp, dir) = state_dir();
-        if failures > 0 {
-            block_sessions_dir(&dir);
-        }
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
         session.push_message(Message::user(BASE_MSG.into()));
         let id = session.id;
         writer.seed(Arc::new(session));
-        let checkpoint = writer.coordinator_checkpoint();
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
         let mut history = config_checkpoint(1, 1);
         history.config = None;
         history.kind = SessionCheckpointKind::History;
@@ -2393,23 +2297,23 @@ mod tests {
             },
             snapshot: Arc::new(history),
         });
-        let config_ack = checkpoint.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: 2,
-                epoch: 1,
+        let claim: CheckpointClaim = if reject {
+            Arc::new(|_| Err(Arc::from(CHECKPOINT_CANCELLED)))
+        } else {
+            maki_agent::session_coordinator::publication_claim()
+        };
+        let config_ack = checkpoint.checkpoint_guarded(
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 2,
+                    epoch: 1,
+                },
+                snapshot: Arc::new(config_checkpoint(1, 1)),
             },
-            snapshot: Arc::new(config_checkpoint(1, 1)),
-        });
-        {
-            let state = lock(&writer.pending);
-            assert_eq!(message_texts(&state.latest[&id]), [BASE_MSG]);
-            assert_eq!(state.latest[&id].model, FAILED_MODEL);
-            let Entry::Save(save) = &state.entries[&id] else {
-                unreachable!()
-            };
-            assert_eq!(message_texts(&save.session), [COORDINATOR_MSG]);
-        }
+            CheckpointPublication::default(),
+            claim,
+        );
         let (warn_tx, _warn_rx) = flume::unbounded();
         let mut disk = Writer {
             dir: dir.clone(),
@@ -2417,41 +2321,22 @@ mod tests {
             logs: HashMap::new(),
             failing: HashSet::new(),
         };
-        for _ in 0..failures {
-            if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-                save.retry_at = None;
-            }
-            disk.flush(&writer.pending);
-            assert_eq!(
-                message_texts(&writer.latest_snapshot(id).unwrap()),
-                [BASE_MSG]
-            );
-        }
-        if failures > 0 {
-            std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
-        }
-        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-            save.retry_at = None;
-        }
         disk.flush(&writer.pending);
-        let exhausted = failures > CHECKPOINT_RETRY_BACKOFFS.len();
-        assert_eq!(smol::block_on(history_ack).is_err(), exhausted);
-        assert_eq!(smol::block_on(config_ack).is_err(), exhausted);
-        let expected = if exhausted { BASE_MSG } else { COORDINATOR_MSG };
+        assert!(smol::block_on(history_ack).is_ok());
+        assert_eq!(smol::block_on(config_ack).is_err(), reject);
+        let expected_model = if reject { MODEL } else { FAILED_MODEL };
         let reopened = AppSession::load(id, &dir).unwrap();
-        assert_eq!(message_texts(&reopened), [expected]);
-        assert_eq!(
-            message_texts(&writer.latest_snapshot(id).unwrap()),
-            [expected]
-        );
-        assert_eq!(reopened.model, FAILED_MODEL);
-        assert_eq!(reopened.meta.mode, Some(StoredMode::Plan));
+        let latest = writer.latest_snapshot(id).unwrap();
+        for saved in [&reopened, latest.as_ref()] {
+            assert_eq!(message_texts(saved), [COORDINATOR_MSG]);
+            assert_eq!(saved.model, expected_model);
+        }
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
     }
 
     #[test_case(false, false; "before_first_config_projection")]
     #[test_case(true, false; "after_config_projection")]
-    #[test_case(true, true; "replacement_history_invalidates_waiter")]
+    #[test_case(true, true; "replacement_history_publishes_after_waiter")]
     fn in_flight_history_retry_handles_config_advancement(
         initial_config: bool,
         replace_history: bool,
@@ -2463,7 +2348,7 @@ mod tests {
         let id = session.id;
         writer.seed(Arc::new(session));
         writer.bind_config_runtime(id, 1);
-        let checkpoint = writer.coordinator_checkpoint();
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
         let (warn_tx, _warn_rx) = flume::unbounded();
         let mut disk = Writer {
             dir: dir.clone(),
@@ -2472,14 +2357,17 @@ mod tests {
             failing: HashSet::new(),
         };
         if initial_config {
-            let ack = checkpoint.checkpoint(CheckpointRequest {
-                session_id: id,
-                version: CheckpointVersion {
-                    revision: 1,
-                    epoch: 1,
+            let ack = publish_config(
+                &checkpoint,
+                CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(config_checkpoint(1, 1)),
                 },
-                snapshot: Arc::new(config_checkpoint(1, 1)),
-            });
+            );
             disk.flush(&writer.pending);
             assert!(smol::block_on(ack).is_ok());
         }
@@ -2506,27 +2394,23 @@ mod tests {
             config.history_revision = Some(3);
             config.history = Some(HistorySnapshot::new(vec![Message::user(BASE_MSG.into())]));
         }
-        let config_ack = checkpoint.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: 3,
-                epoch: 1,
+        let config_ack = publish_config(
+            &checkpoint,
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 3,
+                    epoch: 1,
+                },
+                snapshot: Arc::new(config),
             },
-            snapshot: Arc::new(config),
-        });
+        );
         assert!(requeue_save(&writer.pending, id, in_flight).is_ok());
         if !replace_history {
             assert!(smol::block_on(futures_lite::future::poll_once(&mut history_ack)).is_none());
         }
         disk.flush(&writer.pending);
-        if replace_history {
-            let Err(CheckpointError::Save { message, .. }) = smol::block_on(history_ack) else {
-                panic!("replaced history must fail its checkpoint")
-            };
-            assert_eq!(message.as_ref(), CHECKPOINT_REPLACED);
-        } else {
-            assert!(smol::block_on(history_ack).is_ok());
-        }
+        assert!(smol::block_on(history_ack).is_ok());
         assert!(smol::block_on(config_ack).is_ok());
         let expected = if replace_history {
             BASE_MSG
@@ -2544,93 +2428,29 @@ mod tests {
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
     }
 
-    #[test]
-    fn provisional_checkpoint_failure_keeps_committed_config_retry() {
-        let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
-        let (writer, _wake_rx) = manual_writer();
-        let mut session = AppSession::new(MODEL, CWD);
-        session.push_message(Message::user(BASE_MSG.into()));
-        let id = session.id;
-        writer.seed(Arc::new(session));
-        let checkpoint = writer.coordinator_checkpoint();
-        let committed = checkpoint.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: 1,
-                epoch: 1,
-            },
-            snapshot: Arc::new(config_checkpoint(1, 1)),
-        });
-        let mut provisional = config_checkpoint(1, 1);
-        provisional.config = None;
-        provisional.kind = SessionCheckpointKind::History;
-        provisional.history_revision = Some(1);
-        provisional.history = Some(HistorySnapshot::new(vec![Message::user(
-            REWOUND_MSG.into(),
-        )]));
-        let candidate = checkpoint.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: 2,
-                epoch: 1,
-            },
-            snapshot: Arc::new(provisional),
-        });
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
-        for _ in 0..=CHECKPOINT_RETRY_BACKOFFS.len() {
-            if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-                save.retry_at = None;
-            }
-            disk.flush(&writer.pending);
-        }
-        assert!(smol::block_on(committed).is_err());
-        assert!(smol::block_on(candidate).is_err());
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
-        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
-            save.retry_at = None;
-        }
-        disk.flush(&writer.pending);
-        let stored = AppSession::load(id, &dir).unwrap();
-        assert_eq!(stored.model, FAILED_MODEL);
-        assert_eq!(message_texts(&stored), [BASE_MSG]);
-    }
-
     #[test_case(false; "older_config_save")]
     #[test_case(true; "older_untagged_save")]
     fn stale_save_does_not_publish_or_clear_latest_config_warning(untagged: bool) {
         const FAILURE: &str = "test disk failure";
-        const WARNING: &str = "Configuration applied but not saved (runtime 2, generation 1)";
+        const WARNING: &str = "Configuration applied but not saved (runtime 2, generation 0)";
         let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
-        let session = AppSession::new(MODEL, CWD);
+        let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
-        writer.seed(Arc::new(session));
-        let checkpoint = writer.coordinator_checkpoint();
+        writer.seed(Arc::clone(&session));
         let enqueue = |epoch| {
-            checkpoint.checkpoint(CheckpointRequest {
-                session_id: id,
-                version: CheckpointVersion { revision: 1, epoch },
-                snapshot: Arc::new(config_checkpoint(epoch, 1)),
-            })
+            writer.bind_config_runtime(id, epoch);
+            writer.send(Arc::clone(&session));
+            let Entry::Save(save) = lock(&writer.pending).entries.remove(&id).unwrap() else {
+                unreachable!()
+            };
+            save
         };
-        let _old_ack = enqueue(1);
-        let Entry::Save(mut old) = lock(&writer.pending).entries.remove(&id).unwrap() else {
-            unreachable!()
-        };
+        let mut old = enqueue(1);
         if untagged {
             old.config_version = None;
         }
-        let _latest_ack = enqueue(2);
-        let Entry::Save(latest) = lock(&writer.pending).entries.remove(&id).unwrap() else {
-            unreachable!()
-        };
+        let latest = enqueue(2);
         let (warn_tx, warn_rx) = flume::unbounded();
         let mut disk = Writer {
             dir,
@@ -2667,7 +2487,7 @@ mod tests {
         let id = session.id;
         writer.seed(Arc::new(session));
         writer.bind_config_runtime(id, 1);
-        let checkpoint = writer.coordinator_checkpoint();
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
         let mut history = config_checkpoint(1, 1);
         history.config = None;
         history.kind = SessionCheckpointKind::History;
@@ -2693,14 +2513,17 @@ mod tests {
         };
         writer.bind_config_runtime(id, 2);
         let config_ack = newer_config.then(|| {
-            checkpoint.checkpoint(CheckpointRequest {
-                session_id: id,
-                version: CheckpointVersion {
-                    revision: 2,
-                    epoch: 2,
+            publish_config(
+                &checkpoint,
+                CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 2,
+                        epoch: 2,
+                    },
+                    snapshot: Arc::new(config_checkpoint(2, 1)),
                 },
-                snapshot: Arc::new(config_checkpoint(2, 1)),
-            })
+            )
         });
         if let Some(save) = old_save {
             assert!(requeue_save(&writer.pending, id, save).is_ok());
@@ -2714,7 +2537,7 @@ mod tests {
             let Entry::Save(save) = &state.entries[&id] else {
                 unreachable!()
             };
-            assert_eq!(save.waiters.len(), usize::from(newer_config));
+            assert!(save.waiters.is_empty());
             assert_eq!(message_texts(&save.session), [BASE_MSG]);
         }
         let (warn_tx, _warn_rx) = flume::unbounded();
@@ -2738,60 +2561,38 @@ mod tests {
 
     #[test]
     fn registered_runtime_rejects_old_config_before_first_new_projection() {
+        let (_tmp, dir) = state_dir();
         let (writer, _wake_rx) = manual_writer();
         let session = AppSession::new(MODEL, CWD);
         let id = session.id;
         writer.seed(Arc::new(session));
-        let checkpoint = writer.coordinator_checkpoint();
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
         let enqueue = || {
-            checkpoint.checkpoint(CheckpointRequest {
-                session_id: id,
-                version: CheckpointVersion {
-                    revision: 1,
-                    epoch: 1,
+            publish_config(
+                &checkpoint,
+                CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(config_checkpoint(1, 1)),
                 },
-                snapshot: Arc::new(config_checkpoint(1, 1)),
-            })
+            )
         };
         let old_ack = enqueue();
         writer.bind_config_runtime(id, 2);
         assert!(smol::block_on(enqueue()).is_err());
-        let Entry::Save(save) = lock(&writer.pending).entries.remove(&id).unwrap() else {
-            unreachable!()
-        };
-        acknowledge_waiters(&writer.pending, &save.session, save.waiters);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        Writer {
+            dir,
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        }
+        .flush(&writer.pending);
         assert!(smol::block_on(old_ack).is_err());
         assert_eq!(lock(&writer.pending).config_versions[&id], (2, 0));
-    }
-
-    #[test]
-    fn config_runtime_replacement_rejects_old_enqueue_and_ack() {
-        let (writer, _wake_rx) = manual_writer();
-        let session = AppSession::new(MODEL, CWD);
-        let id = session.id;
-        writer.seed(Arc::new(session));
-        let enqueue = |epoch, generation| {
-            writer
-                .coordinator_checkpoint()
-                .checkpoint(CheckpointRequest {
-                    session_id: id,
-                    version: CheckpointVersion {
-                        revision: generation,
-                        epoch,
-                    },
-                    snapshot: Arc::new(config_checkpoint(epoch, generation)),
-                })
-        };
-        let old_ack = enqueue(1, 10);
-        let new_ack = enqueue(2, 1);
-        assert!(smol::block_on(enqueue(1, 11)).is_err());
-        let Entry::Save(save) = lock(&writer.pending).entries.remove(&id).unwrap() else {
-            unreachable!()
-        };
-        acknowledge_waiters(&writer.pending, &save.session, save.waiters);
-        assert!(smol::block_on(old_ack).is_err());
-        assert!(smol::block_on(new_ack).is_ok());
-        assert_eq!(lock(&writer.pending).config_versions[&id], (2, 1));
     }
 
     fn state_dir() -> (TempDir, StateDir) {
@@ -2998,7 +2799,7 @@ mod tests {
         session.push_message(Message::user(BASE_MSG.into()));
         let id = session.id;
         writer.seed(Arc::new(session.clone()));
-        let checkpoint = writer.coordinator_checkpoint();
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
         let mut history = config_checkpoint(1, 1);
         history.config = None;
         history.kind = SessionCheckpointKind::History;
@@ -3027,14 +2828,19 @@ mod tests {
             .unwrap()
             .current_value = Arc::from(ENABLED_VALUE);
         let expected_model = if versioned { FAILED_MODEL } else { MODEL };
-        let metadata_ack = checkpoint.checkpoint(CheckpointRequest {
+        let metadata = CheckpointRequest {
             session_id: id,
             version: CheckpointVersion {
                 revision: 2,
                 epoch: 1,
             },
             snapshot: Arc::new(metadata),
-        });
+        };
+        let metadata_ack = if versioned {
+            publish_config(&checkpoint, metadata)
+        } else {
+            checkpoint.checkpoint(metadata)
+        };
         let (warn_tx, _warn_rx) = flume::unbounded();
         let mut disk = Writer {
             dir: dir.clone(),
@@ -3046,7 +2852,7 @@ mod tests {
         commit_save(&writer.pending, id, &in_flight);
         acknowledge_waiters(&writer.pending, &in_flight.session, in_flight.waiters);
         assert!(smol::block_on(history_ack).is_ok());
-        assert_eq!(writer.latest_snapshot(id).unwrap().model, expected_model);
+        assert_eq!(writer.latest_snapshot(id).unwrap().model, MODEL);
         disk.flush(&writer.pending);
         assert!(smol::block_on(metadata_ack).is_ok());
         assert_eq!(AppSession::load(id, &dir).unwrap().model, expected_model);
@@ -3180,7 +2986,6 @@ mod tests {
             session: Arc::new(old),
             waiters: vec![CheckpointWaiter {
                 version: old_version,
-                config_version: None,
                 histories: required_histories(&newer),
                 reply: old_reply,
             }],
@@ -3198,7 +3003,6 @@ mod tests {
                 session: Arc::new(newer),
                 waiters: vec![CheckpointWaiter {
                     version: newer_version,
-                    config_version: None,
                     histories: newer_histories,
                     reply: newer_reply,
                 }],
@@ -3324,7 +3128,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        kind: SessionCheckpointKind::Config,
+                        kind: SessionCheckpointKind::History,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(Vec::new())),
                         options,
@@ -3378,7 +3182,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        kind: SessionCheckpointKind::Config,
+                        kind: SessionCheckpointKind::History,
                         history_revision: Some(1),
                         history: Some(HistorySnapshot::new(Vec::new())),
                         options,
@@ -4067,9 +3871,10 @@ mod tests {
                 revision: 1,
                 epoch: 1,
             };
-            let checkpoint = writer.coordinator_checkpoint();
-            let ack = checkpoint
-                .checkpoint(CheckpointRequest {
+            let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
+            let ack = publish_config(
+                &checkpoint,
+                CheckpointRequest {
                     session_id: id,
                     version,
                     snapshot: Arc::new(SessionCheckpoint {
@@ -4079,9 +3884,10 @@ mod tests {
                         options,
                         config: Some(config_projection(NEXT_MODEL, NEXT_CWD, 1, 1)),
                     }),
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
 
             assert_eq!(ack.version, version);
             let persisted = AppSession::load(id, &dir).unwrap();
@@ -4297,7 +4103,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        kind: SessionCheckpointKind::Config,
+                        kind: SessionCheckpointKind::Options,
                         history_revision: None,
                         history: None,
                         options,
