@@ -3,20 +3,12 @@
 //! The provider records `RequestOptions.thinking`, including the agent layer's
 //! clamp to Off for models that do not support thinking.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::actor::EffectiveAgentConfig;
-use maki_agent::agent::RunSettings;
 use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{
-    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, BackendResult, ControlWork, History,
-    TurnContext, WorkKind,
-};
+use maki_agent::{ActorBackend, AgentLimits, AgentManagerHandle};
 use maki_lua::PluginHost;
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::{Effort, Model, ThinkingConfig};
 use serde_json::{Value, json};
 
@@ -46,71 +38,23 @@ maki.api.register_command({
 })
 "#;
 
-struct IdleRoot;
-
-impl ActorBackend for IdleRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(std::future::pending())
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 fn load_thinking_host(ctx: &mut ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("thinking_policy", PROBE_SRC).unwrap();
-    let policy = EffectiveAgentConfig::new(
-        RunSettings {
-            provider: Arc::clone(&ctx.provider),
-            model: (*ctx.model).clone(),
-            fast: ctx.opts.fast,
-            workflow: ctx.workflow,
-            thinking: ctx.opts.thinking,
-        },
-        ctx.mode.clone(),
-    );
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let root = manager
-        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(IdleRoot) as Box<dyn ActorBackend>)
-        })
+        .create_root_with_config(
+            Some(common::effective_config(ctx)),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+        )
         .unwrap();
     ctx.execution_agent_id = Some(root.id());
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);
-    host.event_handle().install_orchestration_services(Arc::new(
-        AgentOrchestration::bind_fixed_root(
-            Arc::default(),
-            TrustedTarget {
-                target: root,
-                template,
-            },
-        ),
-    ));
-    host.wait_for_worker_barrier_for_test();
+    common::install_fixed_root(&host, root, template);
     (reg, host)
 }
 

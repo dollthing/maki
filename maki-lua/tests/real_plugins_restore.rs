@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+use maki_agent::actor::AgentContextSnapshot;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
 use maki_agent::session_coordinator::{
@@ -19,8 +19,7 @@ use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
 use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{
     ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, DoneReason, History, RunSettings, SessionMailbox, TurnContext, TurnOutcome,
-    WorkKind,
+    ControlWork, DoneReason, History, SessionMailbox, TurnContext, TurnOutcome, WorkKind,
 };
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
@@ -981,17 +980,8 @@ fn exec_bash_real(
         ctx.mcp.as_ref(),
     ));
     ctx = common::with_request_tools(reg, &ctx);
-    let policy = EffectiveAgentConfig::new(
-        RunSettings {
-            provider: Arc::clone(&ctx.provider),
-            model: (*ctx.model).clone(),
-            fast: ctx.opts.fast,
-            workflow: ctx.workflow,
-            thinking: ctx.opts.thinking,
-        },
-        ctx.mode.clone(),
-    )
-    .with_context(AgentContextSnapshot::new(ctx.cwd.clone()));
+    let policy =
+        common::effective_config(&ctx).with_context(AgentContextSnapshot::new(ctx.cwd.clone()));
     let manager = AgentManagerHandle::new(Default::default()).unwrap();
     let (completed_tx, completed) = flume::bounded(1);
     let template = ctx.clone();

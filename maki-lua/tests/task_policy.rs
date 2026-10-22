@@ -2,26 +2,16 @@
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
-use maki_agent::actor::EffectiveAgentConfig;
-use maki_agent::agent::RunSettings;
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
 };
-use maki_agent::{
-    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, CurrentManagedTurn, History, ModeDef, ModeId, ToolOutput, TurnCancellationReason,
-    TurnContext, TurnOutcome, WorkKind,
-};
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_agent::{AgentLimits, AgentMode, ModeDef, ModeId, ToolOutput};
 use maki_lua::{PluginHost, agent_errors::OUTPUT_SCHEMA_NOT_OBJECT};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -999,51 +989,6 @@ maki.api.register_tool({
 })
 "#;
 
-struct FixtureRoot {
-    turn: flume::Sender<CurrentManagedTurn>,
-    cancel: CancelToken,
-}
-
-impl ActorBackend for FixtureRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        ctx: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
-            self.cancel.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                ctx.agent_id,
-                ctx.turn_id.unwrap(),
-                TokenUsage::default(),
-                0,
-                TurnCancellationReason::User,
-            ))
-        })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 fn load_real_driver_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
     load_real_driver_host_with_capacity(ctx, AgentLimits::default().max_concurrent_agent_turns)
 }
@@ -1071,31 +1016,6 @@ fn load_real_driver_host_with_prelude(
         serde_json::Map::new(),
     )
     .unwrap();
-    let policy = EffectiveAgentConfig::new(
-        RunSettings {
-            provider: Arc::clone(&ctx.provider),
-            model: (*ctx.model).clone(),
-            fast: ctx.opts.fast,
-            workflow: ctx.workflow,
-            thinking: ctx.opts.thinking,
-        },
-        ctx.mode.clone(),
-    )
-    .with_mode_def(ctx.mode_def.as_deref().cloned());
-    let manager = AgentManagerHandle::new(AgentLimits {
-        max_concurrent_agent_turns,
-        ..AgentLimits::default()
-    })
-    .unwrap();
-    let (turn_tx, turn_rx) = flume::bounded(1);
-    let root = manager
-        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(FixtureRoot {
-                turn: turn_tx,
-                cancel: ctx.cancel.clone(),
-            }) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
     let mut ctx = ctx.clone();
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
@@ -1103,37 +1023,17 @@ fn load_real_driver_host_with_prelude(
         &ctx.local_tools,
         ctx.mcp.as_ref(),
     ));
-    ctx.execution_agent_id = Some(root.id());
-    root.actor()
-        .unwrap()
-        .admit_turn(
-            AgentInput {
-                message: TASK_PROMPT.into(),
-                mode: ctx.mode.clone(),
-                images: Vec::new(),
-                preamble: Vec::new(),
-                thinking: ctx.opts.thinking,
-                fast: ctx.opts.fast,
-                workflow: ctx.workflow,
-                prompt: None,
-                cancel: None,
-            },
-            None,
-            "task-policy-fixture".into(),
-        )
-        .unwrap();
-    ctx.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
-    let template = common::with_request_tools(&reg, &ctx);
-    host.event_handle().install_orchestration_services(Arc::new(
-        AgentOrchestration::bind_fixed_root(
-            Arc::default(),
-            TrustedTarget {
-                target: root,
-                template,
-            },
-        ),
-    ));
-    host.wait_for_worker_barrier_for_test();
+    let config = common::effective_config(&ctx).with_mode_def(ctx.mode_def.as_deref().cloned());
+    common::bind_parked_root(
+        &host,
+        &reg,
+        &mut ctx,
+        config,
+        AgentLimits {
+            max_concurrent_agent_turns,
+            ..AgentLimits::default()
+        },
+    );
     (reg, host, ctx)
 }
 

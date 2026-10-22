@@ -7,8 +7,6 @@
 //!    the reply back to the main agent (SubagentHistory must be emitted, not
 //!    only on explicit close).
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,10 +14,7 @@ use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolContext;
 use maki_agent::tools::ToolRegistry;
-use maki_agent::{
-    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
-    ControlWork, History, TurnContext, WorkKind,
-};
+use maki_agent::{AgentEvent, AgentLimits, AgentManagerHandle, AgentRef};
 use maki_commands::CommandInvocation;
 use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
 use maki_lua::{EventHandle, PluginHost};
@@ -138,38 +133,6 @@ impl OrchestrationServices for ProbeServices {
     }
 }
 
-struct IdleRoot;
-
-impl ActorBackend for IdleRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(std::future::pending())
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 fn load_probe_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -183,7 +146,7 @@ fn load_probe_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     .unwrap();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let root = manager
-        .create_root(Vec::new(), None, Box::new(IdleRoot))
+        .create_root(Vec::new(), None, Box::new(common::IdleRoot))
         .unwrap();
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);

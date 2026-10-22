@@ -12,14 +12,23 @@
 #![allow(dead_code)]
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use maki_agent::actor::EffectiveAgentConfig;
+use maki_agent::agent::RunSettings;
 use maki_agent::cancel::{CancelMap, CancelToken, CancelTrigger};
 use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, RequestTools, ToolContext, ToolRegistry};
-use maki_agent::{AgentMode, Envelope, EventSender, ToolOutput};
+use maki_agent::{
+    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
+    ControlWork, CurrentManagedTurn, Envelope, EventSender, History, ToolOutput,
+    TurnCancellationReason, TurnContext, TurnOutcome, WorkKind,
+};
+use maki_lua::PluginHost;
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -29,6 +38,7 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const PARKED_ROOT_PROMPT: &str = "parked root turn";
 
 pub async fn bounded<T>(future: impl Future<Output = T>) -> T {
     futures_lite::future::race(future, async {
@@ -231,4 +241,154 @@ pub fn exec_tool(
 ) -> Result<Value, String> {
     let out = exec_tool_text(reg, ctx, name, input)?;
     serde_json::from_str(&out).map_err(|e| format!("invalid json {out:?}: {e}"))
+}
+
+/// The effective config a root built from {ctx} starts with.
+pub fn effective_config(ctx: &ToolContext) -> EffectiveAgentConfig {
+    EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&ctx.provider),
+            model: (*ctx.model).clone(),
+            fast: ctx.opts.fast,
+            workflow: ctx.workflow,
+            thinking: ctx.opts.thinking,
+        },
+        ctx.mode.clone(),
+    )
+}
+
+/// A root whose turns never finish.
+pub struct IdleRoot;
+
+impl ActorBackend for IdleRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+/// A root that hands out its managed turn and parks it until {cancel} fires.
+struct ParkedRoot {
+    turn: flume::Sender<CurrentManagedTurn>,
+    cancel: CancelToken,
+}
+
+impl ActorBackend for ParkedRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        ctx: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
+            self.cancel.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                ctx.agent_id,
+                ctx.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
+                TurnCancellationReason::User,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+/// Installs a fixed root on {host} running {config}, parked inside one managed
+/// turn until `ctx.cancel` fires, and points {ctx} at that turn.
+pub fn bind_parked_root(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    ctx: &mut ToolContext,
+    config: EffectiveAgentConfig,
+    limits: AgentLimits,
+) {
+    let manager = AgentManagerHandle::new(limits).unwrap();
+    let (turn_tx, turn_rx) = flume::bounded(1);
+    let cancel = ctx.cancel.clone();
+    let root = manager
+        .create_root_with_config(Some(config), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(ParkedRoot {
+                turn: turn_tx,
+                cancel,
+            }) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    ctx.execution_agent_id = Some(root.id());
+    root.actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput {
+                message: PARKED_ROOT_PROMPT.into(),
+                mode: ctx.mode.clone(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: ctx.opts.thinking,
+                fast: ctx.opts.fast,
+                workflow: ctx.workflow,
+                prompt: None,
+                cancel: None,
+            },
+            None,
+            PARKED_ROOT_PROMPT.into(),
+        )
+        .unwrap();
+    ctx.managed_turn = Some(smol::block_on(bounded(turn_rx.recv_async())).unwrap());
+    install_fixed_root(host, root, with_request_tools(reg, ctx));
+}
+
+/// Installs {root} as {host}'s fixed orchestration root.
+pub fn install_fixed_root(host: &PluginHost, root: AgentRef, template: ToolContext) {
+    host.event_handle().install_orchestration_services(Arc::new(
+        AgentOrchestration::bind_fixed_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root,
+                template,
+            },
+        ),
+    ));
+    host.wait_for_worker_barrier_for_test();
 }

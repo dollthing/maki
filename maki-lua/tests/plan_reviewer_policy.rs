@@ -8,22 +8,11 @@
 //! The plan-mode UI flow on a fail verdict is UI behavior, intentionally not
 //! tested here.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use maki_agent::actor::EffectiveAgentConfig;
-use maki_agent::agent::RunSettings;
-use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{ToolContext, ToolRegistry};
-use maki_agent::{
-    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, CurrentManagedTurn, History, TurnCancellationReason, TurnContext, TurnOutcome,
-    WorkKind,
-};
+use maki_agent::{AgentLimits, AgentMode};
 use maki_lua::PluginHost;
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
-use maki_providers::TokenUsage;
 use serde_json::{Value, json};
 
 mod common;
@@ -95,104 +84,10 @@ fn load_reviewer_host(real_tools: bool) -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
-struct FixtureRoot {
-    turn: flume::Sender<CurrentManagedTurn>,
-    cancel: CancelToken,
-}
-
-impl ActorBackend for FixtureRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        ctx: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
-            self.cancel.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                ctx.agent_id,
-                ctx.turn_id.unwrap(),
-                TokenUsage::default(),
-                0,
-                TurnCancellationReason::User,
-            ))
-        })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: &'a mut History,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 fn bind_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, mode: AgentMode) {
     ctx.mode = mode;
-    let policy = EffectiveAgentConfig::new(
-        RunSettings {
-            provider: Arc::clone(&ctx.provider),
-            model: (*ctx.model).clone(),
-            fast: ctx.opts.fast,
-            workflow: ctx.workflow,
-            thinking: ctx.opts.thinking,
-        },
-        ctx.mode.clone(),
-    );
-    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let (turn_tx, turn_rx) = flume::bounded(1);
-    let root = manager
-        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(FixtureRoot {
-                turn: turn_tx,
-                cancel: ctx.cancel.clone(),
-            }) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
-    ctx.execution_agent_id = Some(root.id());
-    root.actor()
-        .unwrap()
-        .admit_turn(
-            AgentInput {
-                message: "review fixture".into(),
-                mode: ctx.mode.clone(),
-                images: Vec::new(),
-                preamble: Vec::new(),
-                thinking: ctx.opts.thinking,
-                fast: ctx.opts.fast,
-                workflow: ctx.workflow,
-                prompt: None,
-                cancel: None,
-            },
-            None,
-            "plan-reviewer-policy-fixture".into(),
-        )
-        .unwrap();
-    ctx.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
-    let template = common::with_request_tools(reg, ctx);
-    host.event_handle().install_orchestration_services(Arc::new(
-        AgentOrchestration::bind_fixed_root(
-            Arc::default(),
-            TrustedTarget {
-                target: root,
-                template,
-            },
-        ),
-    ));
-    host.wait_for_worker_barrier_for_test();
+    let config = common::effective_config(ctx);
+    common::bind_parked_root(host, reg, ctx, config, AgentLimits::default());
 }
 
 fn reviewer_input(description: &str) -> Value {
