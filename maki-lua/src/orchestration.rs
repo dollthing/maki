@@ -21,7 +21,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tracing::warn;
 
 mod targets;
 pub use targets::AgentOrchestration;
@@ -263,17 +262,10 @@ pub fn child_persistence(
         })();
         let checkpoint = Arc::clone(&checkpoint);
         Box::pin(async move {
-            let result = match child {
-                Ok(child) => checkpoint
-                    .checkpoint_child(child, history)
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                warn!(%error, "{label} child history was not checkpointed");
-            }
-            Ok(())
+            checkpoint
+                .checkpoint_child(child?, history)
+                .await
+                .map_err(|error| error.to_string())
         })
     });
 

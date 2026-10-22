@@ -504,7 +504,7 @@ impl ActorBackend for LuaActorBackend {
                     .with_completion_check(Arc::new(move || check.completion_check()))
                     .with_completion_exhausted(Arc::new(move || exhausted.completion_exhausted()));
             }
-            let outcome = agent.run(turn_id, input).await;
+            let mut outcome = agent.run(turn_id, input).await;
             drop(agent);
 
             if let Some(structured) = &state.structured {
@@ -528,9 +528,38 @@ impl ActorBackend for LuaActorBackend {
                     Err(error) => Err(error.to_string()),
                 };
                 if let Err(error) = result {
-                    let _ = state.chip_event_tx.send(AgentEvent::ControlError {
-                        message: format!("failed to checkpoint completed turn: {error}"),
-                    });
+                    warn!(%error, %turn_id, "child history was not checkpointed");
+                    if let TurnOutcome::Completed {
+                        agent_id,
+                        turn_id,
+                        usage,
+                        num_turns,
+                        cost,
+                        list_cost,
+                        context_size,
+                        context_window,
+                        ..
+                    } = outcome
+                    {
+                        outcome = TurnOutcome::Failed {
+                            agent_id,
+                            turn_id,
+                            usage,
+                            num_turns,
+                            failure: TurnFailure {
+                                kind: TurnFailureKind::Internal,
+                                user_message: format!(
+                                    "failed to checkpoint completed turn: {error}"
+                                ),
+                                diagnostic: error,
+                                retryable: true,
+                            },
+                            cost,
+                            list_cost,
+                            context_size,
+                            context_window,
+                        };
+                    }
                 }
             }
             state.relay_history(history);

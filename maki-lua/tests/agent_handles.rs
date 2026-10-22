@@ -27,7 +27,8 @@ use maki_lua::{
     },
     orchestration::{
         AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver,
-        OrchestrationServices, TrustedTarget, TurnCompletion, nonpersistent_config_mutation,
+        OrchestrationServices, TrustedTarget, TurnCompletion, TurnCompletionFuture,
+        nonpersistent_config_mutation,
     },
     test_support::InMemoryFs,
 };
@@ -263,6 +264,7 @@ struct RegisteredOrchestrationTargets {
     selected: AtomicUsize,
     models: Result<Vec<String>, String>,
     config_mutations: Option<ConfigMutationReserver>,
+    completion: Option<TurnCompletion>,
 }
 
 impl RegisteredOrchestrationTargets {
@@ -272,6 +274,7 @@ impl RegisteredOrchestrationTargets {
             selected: AtomicUsize::new(0),
             models: Err(MODEL_CATALOG_UNAVAILABLE.into()),
             config_mutations: None,
+            completion: None,
         }
     }
 }
@@ -329,6 +332,17 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
         match &self.config_mutations {
             Some(reserve) => reserve(target, publication),
             None => Ok(nonpersistent_config_mutation(publication)),
+        }
+    }
+
+    fn complete_turn(
+        &self,
+        target: &maki_agent::AgentRef,
+        history: HistorySnapshot<Message>,
+    ) -> TurnCompletionFuture {
+        match &self.completion {
+            Some(completion) => completion(target, history),
+            None => Box::pin(async { Ok(()) }),
         }
     }
 
@@ -548,6 +562,7 @@ struct FixtureOptions {
     schema_inheritance: bool,
     plugin_source: String,
     config_mutations: Option<ConfigMutationReserver>,
+    completion: Option<TurnCompletion>,
     invocation_cancel: Option<CancelToken>,
 }
 
@@ -631,6 +646,7 @@ impl Fixture {
             schema_inheritance,
             plugin_source,
             config_mutations,
+            completion,
             invocation_cancel,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
@@ -829,6 +845,7 @@ impl Fixture {
             template,
         }]);
         services.config_mutations = config_mutations;
+        services.completion = completion;
         host.event_handle()
             .install_orchestration_services(Arc::new(services));
         host.wait_for_worker_barrier_for_test();
@@ -950,6 +967,38 @@ fn orchestration_completion_awaits_host_callback_and_returns_checkpoint_error() 
             bounded(task, "completion checkpoint acknowledgement").await,
             Err(CHECKPOINT_ERROR.into())
         );
+        fixture.finish().await;
+    });
+}
+
+#[test]
+fn child_checkpoint_failure_fails_the_child_result() {
+    const CHECKPOINT_ERROR: &str = "child checkpoint unavailable";
+    smol::block_on(async {
+        let completion: TurnCompletion =
+            Arc::new(|_, _| Box::pin(async { Err(CHECKPOINT_ERROR.into()) }));
+        let fixture = Fixture::start_with_options(
+            "pr5_child_checkpoint_failure",
+            FixtureOptions {
+                completion: Some(completion),
+                ..Default::default()
+            },
+            &format!(
+                r#"
+            local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
+            local result = assert(child:prompt(ctx, "persist me"))
+            assert(result.status == "failed", result.status)
+            assert(result.error:find("{CHECKPOINT_ERROR}", 1, true), result.error)
+            assert(child:close(ctx))
+        "#
+            ),
+        );
+        fixture
+            .request()
+            .await
+            .reply
+            .send(common::canned_reply(FIRST_REPLY))
+            .unwrap();
         fixture.finish().await;
     });
 }
