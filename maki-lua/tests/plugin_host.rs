@@ -421,23 +421,12 @@ fn handler_reads_the_calling_session() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
 
-    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
-        .parse()
-        .expect("valid session id");
+    let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.session_id = Some(session.clone());
 
     let out = exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap();
-    assert_eq!(
-        out,
-        format!("id:{}", session.id()),
-        "lua sees the canonical form, so it compares equal to maki.session.current()"
-    );
-    assert_ne!(
-        out,
-        format!("id:{}", session.as_str()),
-        "the verbatim form would not match ids from maki.session.live()"
-    );
+    assert_eq!(out, format!("id:{}", session.id()));
 }
 
 #[test]
@@ -6201,7 +6190,7 @@ fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionR
     };
     let rows = match (expected, req) {
         (SessionRequest::Live, SessionRequest::Live) => json!([{
-            "id": "00000000-0000-4000-8000-000000000001",
+            "id": "1111114bZ6BZRUqUqZep",
             "title": PICKER_OTHER_TITLE,
             "status": "idle",
             "focused": true,
@@ -6210,7 +6199,7 @@ fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionR
             "message_count": 2,
         }]),
         (SessionRequest::List, SessionRequest::List) => json!([{
-            "id": "00000000-0000-4000-8000-000000000002",
+            "id": "1111114bZ6BZRUqUqZeq",
             "title": PICKER_MATCH_TITLE,
             "status": "idle",
             "focused": false,

@@ -772,8 +772,8 @@ mod tests {
     use maki_storage::sessions::SessionSummary;
     use std::collections::BTreeSet;
 
-    const SESSION_ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
-    const SESSION_ID_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+    const SESSION_ID_A: &str = "BWBeN28Vb7cMEx7Ym8AUzs";
+    const SESSION_ID_B: &str = "BWBeN28Vb7cMEx7Ym8AUzt";
 
     fn summary(id: &str, title: &str, updated_at: u64, cwd: &str) -> SessionSummary {
         SessionSummary {

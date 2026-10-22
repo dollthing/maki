@@ -503,6 +503,25 @@ mod tests {
         }
     }
 
+    fn stored_value(session: &StoredSession) -> serde_json::Value {
+        serde_json::json!({
+            "id": session.id,
+            "title": session.title,
+            "cwd": session.cwd,
+            "model": session.model,
+            "messages": session.messages(),
+            "token_usage": session.token_usage,
+            "tool_outputs": session.tool_outputs(),
+            "subagent_messages": session.subagent_messages(),
+            "subagents": session.subagents(),
+            "posts": session.posts(),
+            "usage_by_model": session.usage_by_model(),
+            "meta": session.meta,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        })
+    }
+
     fn child_session(id: MakiId) -> StoredSession {
         let mut session = StoredSession::new(MODEL, CWD);
         session.id = id;
@@ -685,8 +704,8 @@ mod tests {
                 upsert_child(&mut metadata_only, configured_child.clone());
                 metadata_only.updated_at = retained.session.updated_at;
                 assert_eq!(
-                    serde_json::to_value(StoredSession::load(id, &dir).unwrap()).unwrap(),
-                    serde_json::to_value(metadata_only).unwrap()
+                    stored_value(&StoredSession::load(id, &dir).unwrap()),
+                    stored_value(&metadata_only)
                 );
             }
             let (completed, sibling) = {

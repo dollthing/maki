@@ -935,8 +935,8 @@ mod tests {
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
     const LOCAL_TOOL_NAME: &str = "sess_tool";
-    /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
-    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+    /// Arbitrary ids are rejected: `SessionRef` parses base58 only.
+    const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
