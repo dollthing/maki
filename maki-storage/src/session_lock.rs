@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
+use tracing::warn;
 
 use crate::id::MakiId;
 
@@ -229,7 +230,9 @@ impl SessionPublicationGuard {
             return Ok(None);
         }
         let result = publish();
-        file.unlock()?;
+        if let Err(error) = file.unlock() {
+            warn!(path = %self.path.display(), %error, "session lock unlock failed after publication; closing the file releases it");
+        }
         Ok(Some(result))
     }
 }
