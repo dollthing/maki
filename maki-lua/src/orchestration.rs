@@ -6,7 +6,9 @@ use arc_swap::ArcSwapOption;
 use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
-use maki_agent::headless::{InteractiveHandle, RootBinding};
+use maki_agent::headless::{
+    InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding,
+};
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
 use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
@@ -216,11 +218,33 @@ pub type CommandRunner =
 pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
 
 /// A runner for a frontend that hands no outcome back to a frontend loop:
-/// commands run on {target} and only `Completed` counts as done.
-pub fn detached_command_runner(registry: CommandRegistry, target: TargetHandle) -> CommandRunner {
+/// commands run on {target}, compaction is queued on the root through
+/// {control}, feedback has nowhere to show, and the outcomes that still need
+/// a frontend loop are errors.
+pub fn detached_command_runner(
+    registry: CommandRegistry,
+    target: TargetHandle,
+    control: InteractiveControlSender,
+) -> CommandRunner {
     Arc::new(move |cmdline, _, _| {
         let dispatch = registry.dispatch_input(&target, CommandContent::from(cmdline.as_str()));
-        Box::pin(async move { detached_outcome(&cmdline, dispatch.await) })
+        let control = control.clone();
+        Box::pin(async move {
+            match dispatch.await {
+                InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(_)) => Ok(()),
+                InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
+                    let (output, _) = flume::unbounded();
+                    control
+                        .send(InteractiveControl::ManualCompaction {
+                            instructions,
+                            output,
+                            cancel: CancelToken::none(),
+                        })
+                        .await
+                }
+                result => detached_outcome(&cmdline, result),
+            }
+        })
     })
 }
 

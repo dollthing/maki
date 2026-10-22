@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::iter;
@@ -29,8 +28,8 @@ use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
-    AgentTurn, CommandAttachment, CommandContent, CommandError, CommandFuture, CommandHost,
-    CommandOutcome, HostRequest, HostResponse, InputDispatch, PresentedCommand, TargetHandle,
+    AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
+    TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -177,21 +176,6 @@ struct SpawnSession {
     defaults: SessionDefaults,
     project_config: ProjectConfig,
     permissions: PermissionsConfig,
-}
-
-struct AcpCommandHost {
-    host: maki_agent::command::SessionCommandHost,
-    root: TrustedTarget,
-}
-
-impl CommandHost for AcpCommandHost {
-    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        Some(Arc::new(self.root.clone()))
-    }
-
-    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
-        self.host.request(request)
-    }
 }
 
 struct InstallSession<'a> {
@@ -940,26 +924,24 @@ async fn install_session_with_lock(
         observer,
     );
     let command_registry = params.command_registry.clone();
-    let portable_capabilities = maki_agent::command::portable_capabilities();
     let command_target = command_registry.bind_target_with_presentation(
-        portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
-            maki_commands::TargetCapability::SessionReplacement,
-        )),
-        portable_capabilities,
-        Arc::new(AcpCommandHost {
-            host: maki_agent::command::SessionCommandHost::new(
+        maki_agent::command::session_capabilities(),
+        maki_agent::command::portable_capabilities(),
+        Arc::new(
+            maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
             )
-            .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
-            root: trusted_root.clone(),
-        }),
+            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
+            .with_admission_context(trusted_root.clone()),
+        ),
     );
     orchestration.bind_commands(
         &trusted_root.target,
         maki_lua::orchestration::detached_command_runner(
             command_registry.clone(),
             command_target.clone(),
+            handle.control_tx.clone(),
         ),
     );
     let session_id = SessionId::from(handle.session_id.to_string());
@@ -2741,12 +2723,9 @@ mod tests {
         coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
     ) -> TargetHandle {
         {
-            let portable_capabilities = maki_agent::command::portable_capabilities();
             registry.bind_target_with_presentation(
-                portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
-                    maki_commands::TargetCapability::SessionReplacement,
-                )),
-                portable_capabilities,
+                maki_agent::command::session_capabilities(),
+                maki_agent::command::portable_capabilities(),
                 Arc::new(
                     maki_agent::command::SessionCommandHost::new(control_tx, coordinator)
                         .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
@@ -2944,12 +2923,9 @@ mod tests {
             )
             .unwrap();
         let command_registry = test_registry(&[]);
-        let portable_capabilities = maki_agent::command::portable_capabilities();
         let command_target = command_registry.bind_target_with_presentation(
-            portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
-                maki_commands::TargetCapability::SessionReplacement,
-            )),
-            portable_capabilities,
+            maki_agent::command::session_capabilities(),
+            maki_agent::command::portable_capabilities(),
             Arc::new(
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),

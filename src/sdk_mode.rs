@@ -7,36 +7,35 @@
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than makima's base58
 //! `MakiId` canonical form.
 
-use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::cancel::{CancelToken, CancelTrigger};
-use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
+use maki_agent::command::{
+    CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
+};
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
+use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
     ToolOutput, TurnOutcome,
 };
-use maki_commands::{
-    AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
-    CommandOutcome, CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
-    TargetCapability, TargetHandle,
-};
+use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_lua::orchestration::AgentOrchestration;
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -52,7 +51,7 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::command_attachments;
 
-const MISSING_MODEL_OPTION: &str = "missing model option";
+const TURN_ALREADY_ACTIVE: &str = "a turn is already active";
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
@@ -522,7 +521,6 @@ pub struct SdkParams {
 }
 
 struct Shared {
-    model: Model,
     bypass_permissions: bool,
     turn_start: Instant,
     pending: HashMap<String, (String, Sender<String>)>,
@@ -530,108 +528,9 @@ struct Shared {
     active_cancel: Option<CancelTrigger>,
 }
 
-struct CommandDriverParams {
-    route_rx: Receiver<CommandRoute>,
-    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
-    shared: Arc<Mutex<Shared>>,
-}
-
-enum CommandRoute {
-    Selection {
-        selection: maki_commands::ModelSelection,
-        response: Sender<Result<HostResponse, CommandError>>,
-    },
-    Model {
-        argument: String,
-        response: Sender<Result<HostResponse, CommandError>>,
-    },
-}
-
-async fn route_model(
-    tx: &Sender<CommandRoute>,
-    argument: String,
-) -> Result<HostResponse, CommandError> {
-    let (response, response_rx) = flume::bounded(1);
-    tx.send(CommandRoute::Model { argument, response })
-        .map_err(|_| CommandError::StaleTarget)?;
-    response_rx
-        .recv_async()
-        .await
-        .map_err(|_| CommandError::StaleTarget)?
-}
-
-struct SdkCommandHost {
-    tx: Sender<CommandRoute>,
-    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
-    root: Option<TrustedTarget>,
-}
-
-impl CommandHost for SdkCommandHost {
-    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.root
-            .as_ref()
-            .map(|root| Arc::new(root.clone()) as Arc<dyn Any + Send + Sync>)
-    }
-
-    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let tx = self.tx.clone();
-        let model_specs = Arc::clone(&self.model_specs);
-        Box::pin(async move {
-            match request {
-                HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => Ok(
-                    HostResponse::Context(maki_commands::HostContextResponse::Values(
-                        model_specs.read().unwrap().clone(),
-                    )),
-                ),
-                HostRequest::Context(_) => Ok(HostResponse::Context(
-                    maki_commands::HostContextResponse::Unavailable,
-                )),
-                HostRequest::Builtin(BuiltinOperation::SelectModel(selection)) => {
-                    let (response, response_rx) = flume::bounded(1);
-                    tx.send(CommandRoute::Selection {
-                        selection,
-                        response,
-                    })
-                    .map_err(|_| CommandError::StaleTarget)?;
-                    response_rx
-                        .recv_async()
-                        .await
-                        .map_err(|_| CommandError::StaleTarget)?
-                }
-                HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
-                    route_model(&tx, spec.to_string()).await
-                }
-                HostRequest::Builtin(BuiltinOperation::QuickQuestion {
-                    question,
-                    attachments,
-                }) => Ok(HostResponse::AgentTurn(AgentTurn {
-                    content: CommandContent {
-                        text: question,
-                        attachments,
-                    },
-                    prompt: None,
-                })),
-                HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
-                    "unsupported command operation: {operation:?}"
-                )))),
-            }
-        })
-    }
-}
-
-fn sdk_capabilities() -> TargetCapabilities {
-    TargetCapabilities::from_slice(&[
-        TargetCapability::AgentTurns,
-        TargetCapability::ModelSelection,
-    ])
-}
-
 struct SdkCommands {
     registry: CommandRegistry,
     target: TargetHandle,
-    route_tx: Sender<CommandRoute>,
-    route_rx: Receiver<CommandRoute>,
-    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
     _standard_commands: StandardCommands,
 }
 
@@ -639,27 +538,14 @@ impl SdkCommands {
     fn new(
         registry: CommandRegistry,
         custom: &[CustomCommand],
-        model_specs: Arc<[Arc<str>]>,
-        root: Option<TrustedTarget>,
+        host: SessionCommandHost,
     ) -> Result<Self> {
-        let (route_tx, route_rx) = flume::unbounded();
-        let model_specs = Arc::new(RwLock::new(model_specs));
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
-        let target = registry.bind_target(
-            sdk_capabilities(),
-            Arc::new(SdkCommandHost {
-                tx: route_tx.clone(),
-                model_specs: Arc::clone(&model_specs),
-                root,
-            }),
-        );
+        let target = registry.bind_target(session_capabilities(), Arc::new(host));
         Ok(Self {
             target,
             registry,
-            route_tx,
-            route_rx,
-            model_specs,
             _standard_commands: standard_commands,
         })
     }
@@ -749,11 +635,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     let session_id = restored.id;
     let initial_history = restored.history;
 
-    let model_specs = available_model_specs(&model_policy)
-        .into_iter()
-        .map(Arc::from)
-        .collect::<Vec<_>>()
-        .into();
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) =
             mcp::start_with_commands(&cwd, project_config.clone(), command_registry.clone()).await;
@@ -848,8 +729,8 @@ pub fn run(params: SdkParams) -> Result<()> {
     let sdk_commands = SdkCommands::new(
         command_registry,
         &commands,
-        model_specs,
-        Some(trusted_root.clone()),
+        SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
+            .with_admission_context(trusted_root.clone()),
     )?;
     let root = trusted_root.target.clone();
     let orchestration = maki_lua::orchestration::durable_frontend(
@@ -864,6 +745,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         maki_lua::orchestration::detached_command_runner(
             sdk_commands.registry.clone(),
             sdk_commands.target.clone(),
+            handle.control_tx.clone(),
         ),
     );
     lua_handle.install_orchestration_services(orchestration.clone());
@@ -920,7 +802,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     );
 
     let shared = Arc::new(Mutex::new(Shared {
-        model: startup_model.clone(),
         bypass_permissions: yolo,
         turn_start: Instant::now(),
         pending: HashMap::new(),
@@ -934,6 +815,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let pump = EventPump {
         writer: writer.clone(),
         shared: Arc::clone(&shared),
+        read: coordinator.read(),
         answer_tx: handle.answer_tx.clone(),
         include_partial_messages: cli.include_partial_messages,
         synth: StreamSynth::new(),
@@ -945,11 +827,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         observer,
     }
     .spawn(handle.event_rx.clone());
-    let command_driver = spawn_command_driver(CommandDriverParams {
-        route_rx: sdk_commands.route_rx.clone(),
-        coordinator: coordinator.clone(),
-        shared: Arc::clone(&shared),
-    });
     let permission_watcher = watch_permission_option(
         coordinator.read(),
         Arc::clone(&handle.permissions),
@@ -959,7 +836,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         Arc::clone(&model_policy),
         coordinator.clone(),
         Arc::clone(&orchestration),
-        Arc::clone(&sdk_commands.model_specs),
     );
 
     let input_result = (|| -> Result<()> {
@@ -1016,21 +892,26 @@ pub fn run(params: SdkParams) -> Result<()> {
                             };
                             emit_command_result(&writer, &shared, false, result)?
                         }
-                        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(_)) => {
-                            emit_command_result(
-                                &writer,
-                                &shared,
-                                true,
-                                "isolated turns are unavailable in SDK mode".into(),
-                            )?
+                        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
+                            let images =
+                                command_attachments::into_images(&turn.content.attachments)?;
+                            let control = handle.control_tx.clone();
+                            spawn_sdk_operation(&writer, &shared, move |cancel| async move {
+                                control
+                                    .ask_isolated(turn.content.text.to_string(), images, cancel)
+                                    .await
+                            })?
                         }
-                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(_)) => {
-                            emit_command_result(
-                                &writer,
-                                &shared,
-                                true,
-                                "manual compaction is unavailable in SDK mode".into(),
-                            )?
+                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(
+                            instructions,
+                        )) => {
+                            let control = handle.control_tx.clone();
+                            spawn_sdk_operation(&writer, &shared, move |cancel| async move {
+                                control
+                                    .compact(instructions, cancel)
+                                    .await
+                                    .map(|()| String::new())
+                            })?
                         }
                         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
                             emit_command_result(&writer, &shared, true, error.to_string())?
@@ -1116,7 +997,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     drop(sdk_commands);
     smol::block_on(stop_sdk_tasks(
         projection_watcher,
-        command_driver,
         permission_watcher,
         model_discovery,
     ));
@@ -1189,12 +1069,10 @@ fn watch_command_projection(
 
 async fn stop_sdk_tasks(
     projection_watcher: smol::Task<()>,
-    command_driver: smol::Task<()>,
     permission_watcher: smol::Task<()>,
     model_discovery: smol::Task<()>,
 ) {
     projection_watcher.cancel().await;
-    command_driver.cancel().await;
     permission_watcher.cancel().await;
     model_discovery.cancel().await;
 }
@@ -1203,27 +1081,23 @@ fn watch_model_discovery(
     policy: Arc<ModelPolicy>,
     coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
     orchestration: Arc<AgentOrchestration>,
-    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
 ) -> smol::Task<()> {
     smol::spawn(async move {
+        let mut specs: Vec<Arc<str>> = available_model_specs(&policy)
+            .into_iter()
+            .map(Arc::from)
+            .collect();
         fetch_all_models(&policy, |batch| {
             if let Some(refresh) = orchestration.refresh_discovered_models() {
                 smol::spawn(refresh).detach();
             }
-            let mut specs = model_specs
-                .read()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
             specs.extend(batch.models.into_iter().map(Arc::from));
             specs.sort_unstable();
             specs.dedup();
-            let specs: Arc<[Arc<str>]> = specs.into();
-            *model_specs.write().unwrap() = Arc::clone(&specs);
+            let specs = specs.clone();
             let coordinator = coordinator.clone();
             smol::spawn(async move {
-                if let Err(error) = coordinator.update_model_values(specs.to_vec()).await {
+                if let Err(error) = coordinator.update_model_values(specs).await {
                     warn!(%error, "failed to publish discovered SDK models");
                 }
             })
@@ -1243,9 +1117,6 @@ fn watch_permission_option(
         loop {
             let snapshot = subscription.changed().await;
             apply_permission_option(&snapshot, &permissions, &shared);
-            if let Err(error) = project_sdk_model(&snapshot, &shared) {
-                warn!(%error, "failed to project committed SDK model");
-            }
         }
     })
 }
@@ -1310,64 +1181,35 @@ fn set_permission_mode(
     })
 }
 
-fn project_sdk_model(
-    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
-    shared: &Mutex<Shared>,
-) -> Result<(), CommandError> {
-    let spec = snapshot
-        .options
-        .iter()
-        .find(|option| {
-            option.definition.id.as_ref() == maki_agent::session_options::MODEL_OPTION_ID
-        })
-        .map(|option| option.current_value.as_ref())
-        .ok_or_else(|| CommandError::Producer(Arc::from(MISSING_MODEL_OPTION)))?;
-    let model = Model::from_spec(spec)
-        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-    shared
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .model = model;
-    Ok(())
-}
-
-fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
+/// Runs {operation} as the SDK's active work, so an interrupt cancels it,
+/// and reports its text as the result.
+fn spawn_sdk_operation<F>(
+    writer: &SdkWriter,
+    shared: &Arc<Mutex<Shared>>,
+    operation: impl FnOnce(CancelToken) -> F + Send + 'static,
+) -> Result<()>
+where
+    F: Future<Output = Result<String, String>> + Send + 'static,
+{
+    let cancel = match begin_sdk_work(shared) {
+        Ok(cancel) => cancel,
+        Err(error) => return emit_command_result(writer, shared, true, error.into()),
+    };
+    let writer = writer.clone();
+    let shared = Arc::clone(shared);
     smol::spawn(async move {
-        let CommandDriverParams {
-            route_rx,
-            coordinator,
-            shared,
-        } = params;
-        while let Ok(route) = route_rx.recv_async().await {
-            match route {
-                CommandRoute::Selection {
-                    selection,
-                    response,
-                } => {
-                    let result = coordinator
-                        .set_model(selection.spec, selection.fast, selection.thinking)
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))
-                        .and_then(|snapshot| {
-                            project_sdk_model(&snapshot, &shared)?;
-                            Ok(HostResponse::Completed)
-                        });
-                    let _ = response.send(result);
-                }
-                CommandRoute::Model { argument, response } => {
-                    let result = coordinator
-                        .set_option(maki_agent::session_options::MODEL_OPTION_ID, argument)
-                        .await
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))
-                        .and_then(|snapshot| {
-                            project_sdk_model(&snapshot, &shared)?;
-                            Ok(HostResponse::Completed)
-                        });
-                    let _ = response.send(result);
-                }
-            }
+        let result = operation(cancel).await;
+        end_sdk_work(&shared);
+        let (is_error, text) = match result {
+            Ok(text) => (false, text),
+            Err(error) => (true, error),
+        };
+        if let Err(error) = emit_command_result(&writer, &shared, is_error, text) {
+            warn!(%error, "failed to report SDK command result");
         }
     })
+    .detach();
+    Ok(())
 }
 
 fn emit_command_result(
@@ -1580,15 +1422,25 @@ fn prepare_sdk_turn(
     shared: &Mutex<Shared>,
     mut input: AgentInput,
 ) -> Result<AgentInput, &'static str> {
+    input.cancel = Some(begin_sdk_work(shared)?);
+    Ok(input)
+}
+
+fn begin_sdk_work(shared: &Mutex<Shared>) -> Result<CancelToken, &'static str> {
     let mut shared = shared.lock().unwrap();
     if shared.turn_active {
-        return Err("a turn is already active");
+        return Err(TURN_ALREADY_ACTIVE);
     }
     let (trigger, cancel) = CancelToken::new();
     shared.turn_active = true;
     shared.active_cancel = Some(trigger);
-    input.cancel = Some(cancel);
-    Ok(input)
+    Ok(cancel)
+}
+
+fn end_sdk_work(shared: &Mutex<Shared>) {
+    let mut shared = shared.lock().unwrap();
+    shared.turn_active = false;
+    shared.active_cancel.take();
 }
 
 fn handle_control_request(
@@ -1653,17 +1505,12 @@ fn handle_control_request(
             }
         }
         InboundControlRequestType::SetModel => {
-            let current_model = shared.lock().unwrap().model.clone();
+            let current_model = coordinator.read().model().unwrap_or_default();
             match resolve_set_model(cr.request.extra.get("model"), &current_model) {
-                Some(spec) => match smol::block_on(route_model(&commands.route_tx, spec)) {
-                    Ok(HostResponse::Completed) => {
-                        writer.emit_control_response(&cr.request_id, ok, None)
-                    }
-                    Ok(_) => writer.emit_control_response(
-                        &cr.request_id,
-                        None,
-                        Some("model change returned an unexpected response".into()),
-                    ),
+                Some(spec) => match smol::block_on(
+                    coordinator.set_option(maki_agent::session_options::MODEL_OPTION_ID, spec),
+                ) {
+                    Ok(_) => writer.emit_control_response(&cr.request_id, ok, None),
                     Err(error) => {
                         writer.emit_control_response(&cr.request_id, None, Some(error.to_string()))
                     }
@@ -1682,9 +1529,9 @@ fn handle_control_request(
 }
 
 /// The spec a `set_model` request names; the coordinator validates it.
-fn resolve_set_model(model_val: Option<&Value>, current_model: &Model) -> Option<String> {
+fn resolve_set_model(model_val: Option<&Value>, current_model: &str) -> Option<String> {
     match model_val? {
-        Value::Null => Some(current_model.spec()),
+        Value::Null => Some(current_model.to_owned()),
         Value::String(model_str) => Some(resolve_model_spec(model_str)),
         _ => None,
     }
@@ -1715,6 +1562,7 @@ fn decode_permission_response(data: &Value) -> PermissionAnswer {
 struct EventPump {
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
+    read: SessionReadHandle,
     answer_tx: Sender<String>,
     include_partial_messages: bool,
     synth: StreamSynth,
@@ -1745,7 +1593,11 @@ impl EventPump {
     }
 
     fn model_id(&self) -> String {
-        self.shared.lock().unwrap().model.id.clone()
+        self.read
+            .model()
+            .and_then(|spec| Model::from_spec(&spec).ok())
+            .map(|model| model.id)
+            .unwrap_or_default()
     }
 
     fn emit_stream(&self, events: Vec<Value>) -> Result<()> {
@@ -2021,6 +1873,7 @@ mod tests {
     use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
     use maki_agent::tools::ToolRegistry;
     use maki_agent::{AgentError, AgentRef, ModelSource, PreparedModel};
+    use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
@@ -2044,6 +1897,7 @@ mod tests {
 
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
     const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const UNSTARTED_ROOT: &str = "root never starts";
     const TARGET_MODEL: &str = "openai/gpt-5";
     const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
 
@@ -2133,7 +1987,7 @@ mod tests {
                         "command attachment changed before dispatch",
                     )));
                 }
-                Ok(CommandOutcome::AgentTurn(AgentTurn {
+                Ok(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
                     content: CommandContent {
                         text: Arc::from("inspected"),
                         attachments: Arc::from([maki_commands::CommandAttachment {
@@ -2157,12 +2011,76 @@ mod tests {
         }
     }
 
+    /// Commands over a session whose root never starts, for dispatch that
+    /// never reaches the actor.
     fn sdk_commands(registry: CommandRegistry) -> SdkCommands {
+        let cwd = std::env::temp_dir();
+        let handle = headless::spawn_interactive_with_binding(
+            InteractiveParams {
+                model: Model::from_spec(STARTUP_MODEL).unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                prompt_slots: Arc::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                session_id: None,
+                initial_history: Vec::new(),
+                yolo: false,
+                system_prompt_override: None,
+                append_system_prompt: None,
+                defaults: SessionDefaults::default(),
+                model_policy: Arc::default(),
+                modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+                question_mode: QuestionMode::Headless,
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                local_tools: Default::default(),
+                state_dir: None,
+            },
+            Box::new(|_, _| {
+                Box::pin(async {
+                    Err(AgentError::Config {
+                        message: UNSTARTED_ROOT.into(),
+                    })
+                })
+            }),
+            None,
+            None,
+        );
         SdkCommands::new(
             registry,
             &[],
-            Arc::from([Arc::from("openai/gpt-5"), Arc::from("anthropic/claude")]),
-            None,
+            SessionCommandHost::new(
+                handle.control_tx.clone(),
+                unbound_coordinator(handle.session_id.id()),
+            ),
+        )
+        .unwrap()
+    }
+
+    /// A coordinator on {STARTUP_MODEL} with no actor bound to it.
+    fn unbound_coordinator(
+        session_id: MakiId,
+    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+        maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    STARTUP_MODEL,
+                    [Arc::from(STARTUP_MODEL)],
+                    false,
+                    false,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                persisted_options: Default::default(),
+                model_policy: Arc::default(),
+                checkpoint: maki_storage::checkpoint::ClaimingWriter::accept_all(),
+                mailbox: maki_agent::SessionMailbox::new(session_id),
+            },
         )
         .unwrap()
     }
@@ -2276,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_commands_projection_includes_shared_producers_and_supported_model_only() {
+    fn sdk_commands_projection_includes_shared_producers_and_session_builtins() {
         let registry = CommandRegistry::new();
         let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         plugin
@@ -2291,16 +2209,28 @@ mod tests {
 
         assert_eq!(
             commands.slash_commands(),
-            ["lua", "mcp:prompt", "model", "btw"]
+            [
+                "lua",
+                "mcp:prompt",
+                "compact",
+                "new",
+                "clear",
+                "model",
+                "cd",
+                "btw",
+                "yolo",
+                "fast",
+                "workflow"
+            ]
         );
         assert!(matches!(
             commands.dispatch_input("/mcp:prompt", &[]),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
-        let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
+        let InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) =
             commands.dispatch_input("/btw explain this", &[])
         else {
-            panic!("quick question did not return an agent turn");
+            panic!("quick question did not return an isolated turn");
         };
         assert_eq!(turn.content.text.as_ref(), "explain this");
         assert!(matches!(
@@ -2315,93 +2245,9 @@ mod tests {
         assert_eq!(projection[0]["argumentHint"], "<arg>");
     }
 
-    #[test_case("/model gpt-5", "openai/gpt-5"; "shorthand")]
-    #[test_case("/model openai/gpt-5", "openai/gpt-5"; "qualified")]
-    fn sdk_model_command_routes_qualified_spec(input: &str, expected: &str) {
-        let commands = sdk_commands(CommandRegistry::new());
-        let registry = commands.registry.clone();
-        let target = commands.target.clone();
-        let content = CommandContent::from(input);
-        let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
-
-        let CommandRoute::Model { argument, response } = commands.route_rx.recv().unwrap() else {
-            panic!("expected model route");
-        };
-        assert_eq!(argument, expected);
-        response.send(Ok(HostResponse::Completed)).unwrap();
-        assert!(matches!(
-            smol::block_on(dispatch),
-            InputDispatch::Dispatched(CommandOutcome::Completed)
-        ));
-    }
-
-    #[test_case(
-        "/model gpt-5 thinking=high fast=true",
-        maki_commands::ModelSelection {
-            spec: Some(Arc::from(TARGET_MODEL)),
-            thinking: Some(maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High)),
-            fast: Some(true),
-        };
-        "spec_thinking_and_fast"
-    )]
-    #[test_case(
-        "/model thinking=off fast=false",
-        maki_commands::ModelSelection {
-            spec: None,
-            thinking: Some(maki_providers::ThinkingConfig::Off),
-            fast: Some(false),
-        };
-        "options_only"
-    )]
-    fn sdk_structured_model_command_routes_partial_selection(
-        input: &str,
-        expected: maki_commands::ModelSelection,
-    ) {
-        let commands = sdk_commands(CommandRegistry::new());
-        let registry = commands.registry.clone();
-        let target = commands.target.clone();
-        let content = CommandContent::from(input);
-        let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
-        let CommandRoute::Selection {
-            selection,
-            response,
-        } = commands.route_rx.recv().unwrap()
-        else {
-            panic!("expected structured model route");
-        };
-        assert_eq!(selection, expected);
-        response.send(Ok(HostResponse::Completed)).unwrap();
-        assert!(matches!(
-            smol::block_on(dispatch),
-            InputDispatch::Dispatched(CommandOutcome::Completed)
-        ));
-    }
-
-    #[test]
-    fn missing_committed_model_is_a_projection_error() {
-        let shared = Mutex::new(Shared {
-            model: Model::from_spec(STARTUP_MODEL).unwrap(),
-            bypass_permissions: false,
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        });
-        let snapshot = maki_agent::session_options::SessionOptionsSnapshot {
-            version: 1,
-            options: Arc::from([]),
-        };
-        assert_eq!(
-            project_sdk_model(&snapshot, &shared).unwrap_err(),
-            CommandError::Producer(Arc::from(MISSING_MODEL_OPTION))
-        );
-        assert_eq!(shared.lock().unwrap().model.spec(), STARTUP_MODEL);
-    }
-
     #[test]
     fn sdk_turn_cancellation_is_operation_scoped() {
         let shared = Mutex::new(Shared {
-            model: Model::from_spec(STARTUP_MODEL).unwrap(),
             bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
@@ -2740,7 +2586,6 @@ mod tests {
         )
         .unwrap();
         let shared = Arc::new(Mutex::new(Shared {
-            model: Model::from_spec(STARTUP_MODEL).unwrap(),
             bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
@@ -2823,8 +2668,8 @@ mod tests {
         let commands = SdkCommands::new(
             host.command_registry(),
             &[],
-            Arc::from([Arc::from(STARTUP_MODEL)]),
-            Some(trusted_root),
+            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
+                .with_admission_context(trusted_root),
         )
         .unwrap();
         host.wait_for_worker_barrier_for_test();
@@ -2837,21 +2682,18 @@ mod tests {
             SDK_COMMAND_DONE
         );
         assert_eq!(handle.manager.snapshot().len(), 1);
-        let (route_tx, route_rx) = flume::unbounded();
-        let driver = spawn_command_driver(CommandDriverParams {
-            route_rx,
-            coordinator: coordinator.clone(),
-            shared: Arc::clone(&shared),
-        });
-
-        let result = smol::block_on(route_model(&route_tx, "not-a-model".into()));
-        assert!(matches!(result, Err(CommandError::Producer(_))));
+        assert!(matches!(
+            commands.dispatch_input("/model not-a-model", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Failed(_))
+        ));
         assert_eq!(coordinator.read().model().unwrap().as_ref(), STARTUP_MODEL);
-        assert_eq!(shared.lock().unwrap().model.spec(), STARTUP_MODEL);
         assert!(checkpointed.lock().unwrap().is_empty());
 
-        let result = smol::block_on(route_model(&route_tx, TARGET_MODEL.into()));
-        assert!(matches!(result, Ok(HostResponse::Completed)), "{result:?}");
+        let result = commands.dispatch_input(&format!("/model {TARGET_MODEL}"), &[]);
+        assert!(
+            matches!(result, InputDispatch::Dispatched(CommandOutcome::Completed)),
+            "{result:?}"
+        );
         assert_eq!(coordinator.read().model().unwrap().as_ref(), TARGET_MODEL);
         assert_eq!(
             coordinator.read().options().options[0]
@@ -2859,7 +2701,6 @@ mod tests {
                 .as_ref(),
             TARGET_MODEL
         );
-        assert_eq!(shared.lock().unwrap().model.spec(), TARGET_MODEL);
         assert_eq!(
             checkpointed.lock().unwrap()[0]
                 .config
@@ -2891,6 +2732,7 @@ mod tests {
                 out_tx,
             },
             shared: Arc::clone(&shared),
+            read: coordinator.read(),
             answer_tx: handle.answer_tx.clone(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
@@ -3109,7 +2951,6 @@ mod tests {
         assert!(requests.iter().all(|(model, options)| model == TARGET_MODEL
             && options.thinking == thinking
             && !options.fast));
-        smol::block_on(driver.cancel());
         smol::block_on(coordinator.close()).unwrap();
     }
 
@@ -3161,7 +3002,6 @@ mod tests {
         );
         permissions.set_yolo(true);
         let shared = Mutex::new(Shared {
-            model: Model::from_spec(STARTUP_MODEL).unwrap(),
             bypass_permissions: true,
             turn_start: Instant::now(),
             pending: HashMap::new(),
@@ -3242,7 +3082,6 @@ mod tests {
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
                 if message.as_ref() == maki_agent::command::NONINTERACTIVE_MODEL_USAGE
         ));
-        assert!(commands.route_rx.is_empty());
     }
 
     #[test]
@@ -3617,7 +3456,6 @@ mod tests {
     fn subagent_outcome_does_not_retire_sdk_turn() {
         let (out_tx, out_rx) = flume::unbounded();
         let shared = Arc::new(Mutex::new(Shared {
-            model: Model::from_spec(STARTUP_MODEL).unwrap(),
             bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
@@ -3643,6 +3481,7 @@ mod tests {
                 out_tx,
             },
             shared: Arc::clone(&shared),
+            read: unbound_coordinator(MakiId::generate()).read(),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
             synth: StreamSynth::new(),
@@ -3715,13 +3554,13 @@ mod tests {
                 out_tx,
             },
             shared: Arc::new(Mutex::new(Shared {
-                model: Model::from_spec(STARTUP_MODEL).unwrap(),
                 bypass_permissions: false,
                 turn_start: Instant::now(),
                 pending: HashMap::new(),
                 turn_active: false,
                 active_cancel: None,
             })),
+            read: unbound_coordinator(MakiId::generate()).read(),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
             synth: StreamSynth::new(),
@@ -3914,9 +3753,9 @@ mod tests {
 
     #[test]
     fn resolve_set_model_null_keeps_current_model() {
-        let current = Model::from_spec("openai/gpt-5").unwrap();
-        let result = resolve_set_model(Some(&Value::Null), &current).unwrap();
-        assert_eq!(result, current.spec());
+        let current = "openai/gpt-5";
+        let result = resolve_set_model(Some(&Value::Null), current).unwrap();
+        assert_eq!(result, current);
     }
 
     #[test]

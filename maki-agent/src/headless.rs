@@ -18,6 +18,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel};
+use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
@@ -231,6 +232,58 @@ impl InteractiveControlSender {
             .detach();
         }
         Ok(())
+    }
+
+    /// Compacts the root's history and waits for it to settle.
+    pub async fn compact(
+        &self,
+        instructions: Option<String>,
+        cancel: CancelToken,
+    ) -> Result<(), String> {
+        let (output, events) = flume::unbounded();
+        self.send(InteractiveControl::ManualCompaction {
+            instructions,
+            output,
+            cancel,
+        })
+        .await?;
+        loop {
+            match events.recv_async().await {
+                Ok(ManualCompactionEvent::Started) => {}
+                Ok(event) => return compaction_result(event),
+                Err(_) => return Err(OPERATION_CANCELLED.into()),
+            }
+        }
+    }
+
+    /// Asks {question} beside the root's history, leaving it unchanged, and
+    /// returns the answer.
+    pub async fn ask_isolated(
+        &self,
+        question: String,
+        images: Vec<maki_providers::ImageSource>,
+        cancel: CancelToken,
+    ) -> Result<String, String> {
+        let (output, events) = flume::unbounded();
+        self.send(InteractiveControl::IsolatedTurn {
+            question,
+            images,
+            output,
+            cancel,
+        })
+        .await?;
+        let mut answer = String::new();
+        loop {
+            match events.recv_async().await {
+                Ok(IsolatedTurnEvent::TextDelta(text)) => answer.push_str(&text),
+                Ok(IsolatedTurnEvent::ThinkingDelta(_)) => {}
+                Ok(IsolatedTurnEvent::Done) => return Ok(answer),
+                Ok(IsolatedTurnEvent::Error(error)) => return Err(error),
+                Ok(IsolatedTurnEvent::Cancelled) | Err(_) => {
+                    return Err(OPERATION_CANCELLED.into());
+                }
+            }
+        }
     }
 }
 

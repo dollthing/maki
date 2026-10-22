@@ -1133,11 +1133,13 @@ fn register_command(
 ///
 /// Outside a command handler the command runs on the frontend's own command
 /// target for the keymap's pinned agent, or the focused agent. Inside another
-/// command's handler, and on frontends that run commands only from their
-/// input, there is no frontend loop waiting on the result, so a command that
-/// needs one to run it -- a model turn, a custom Markdown command,
-/// `/compact`, `/btw` -- reports an error instead of pretending it ran. Call
-/// it from a TUI keybinding or an autocmd if you need those.
+/// command's handler there is no frontend loop waiting on the result, so a
+/// command that needs one to run it -- a model turn, a custom Markdown
+/// command, `/compact`, `/btw` -- reports an error instead of pretending it
+/// ran. Print, SDK and ACP have no such loop either: there `/compact` is
+/// queued on the agent and `/cd` succeeds, but a model turn or `/btw` still
+/// reports an error. Call it from a TUI keybinding or an autocmd if you need
+/// those.
 ///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
 /// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.

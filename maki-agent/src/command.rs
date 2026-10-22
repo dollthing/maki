@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -43,10 +44,19 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
+/// What a [`SessionCommandHost`] can run: the portable set plus replacing
+/// the session's history.
+pub fn session_capabilities() -> TargetCapabilities {
+    portable_capabilities().union(TargetCapabilities::from_capability(
+        TargetCapability::SessionReplacement,
+    ))
+}
+
 pub struct SessionCommandHost {
     control_tx: InteractiveControlSender,
     coordinator: SessionCoordinatorHandle,
     reset_session_guidance: Option<Arc<str>>,
+    admission: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl SessionCommandHost {
@@ -58,7 +68,15 @@ impl SessionCommandHost {
             control_tx: control_tx.into(),
             coordinator,
             reset_session_guidance: None,
+            admission: None,
         }
+    }
+
+    /// Pins every command this host runs to {admission}, such as the root it
+    /// serves.
+    pub fn with_admission_context(mut self, admission: impl Any + Send + Sync) -> Self {
+        self.admission = Some(Arc::new(admission));
+        self
     }
 
     pub fn with_reset_session_guidance(mut self, guidance: impl Into<Arc<str>>) -> Self {
@@ -99,6 +117,10 @@ impl SessionCommandHost {
 }
 
 impl maki_commands::CommandHost for SessionCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.admission.clone()
+    }
+
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
         let read = self.coordinator.read();
         let operation = match request {
