@@ -1,7 +1,9 @@
 //! The one sequence every agent config change commits through.
 
-use std::future::Future;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use event_listener::Event;
 
 use maki_config::ModelPolicy;
 use maki_providers::Model;
@@ -17,7 +19,7 @@ use crate::session_coordinator::{
     publication_claim,
 };
 use crate::session_options::{MODEL_OPTION_ID, SessionOptionError};
-use crate::{ActorError, AgentRef, ManagerError};
+use crate::{ActorError, AgentActorHandle, AgentRef, ManagerError};
 
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ConfigChangeError {
@@ -59,15 +61,9 @@ impl ConfigChangeError {
         )
     }
 
-    /// Waits until the holder that refused this change as busy lets go of
-    /// {target}. Returns at once for any other error.
-    pub async fn wait_released(&self, target: &AgentRef) {
+    async fn wait_released(&self, actor: &AgentActorHandle) {
         match self {
-            Self::Actor(ActorError::Busy) => {
-                if let Ok(actor) = target.actor() {
-                    actor.wait_unguarded().await;
-                }
-            }
+            Self::Actor(ActorError::Busy) => actor.wait_unguarded().await,
             Self::Coordinator(SessionCoordinatorError::SessionBusy(id)) => {
                 if let Ok(coordinator) = SessionCoordinatorHandle::resolve(*id) {
                     coordinator.read().wait_unreserved().await;
@@ -78,42 +74,142 @@ impl ConfigChangeError {
     }
 }
 
-/// A reserved slot in an agent's config FIFO. Reserving takes the durable
-/// mutation and then the actor operation synchronously, so changes hold the
-/// session lease in the order they were dispatched and a refused reservation
-/// leaves nothing queued.
-pub struct ConfigChangeTicket {
-    mutation: ConfigMutation,
-    operation: PreparedOperationTicket,
-    publication: CheckpointPublication,
+type MutationReserver<'a> =
+    Box<dyn FnMut(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError> + Send + 'a>;
+
+/// Changes that met a busy target, in dispatch order. Only the head retries,
+/// so a later change never overtakes an earlier waiting one.
+#[derive(Default)]
+pub(crate) struct ConfigChangeQueue {
+    waiting: Mutex<VecDeque<Arc<()>>>,
+    advanced: Event,
 }
 
-impl ConfigChangeTicket {
+impl ConfigChangeQueue {
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Arc<()>>> {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+struct QueuedChange {
+    actor: AgentActorHandle,
+    place: Arc<()>,
+}
+
+impl QueuedChange {
+    fn enqueue(actor: AgentActorHandle) -> Self {
+        let place = Arc::new(());
+        actor
+            .inner
+            .config_changes
+            .lock()
+            .push_back(Arc::clone(&place));
+        Self { actor, place }
+    }
+
+    async fn wait_turn(&self) {
+        let queue = &self.actor.inner.config_changes;
+        loop {
+            let listener = queue.advanced.listen();
+            if queue
+                .lock()
+                .front()
+                .is_some_and(|head| Arc::ptr_eq(head, &self.place))
+            {
+                return;
+            }
+            listener.await;
+        }
+    }
+}
+
+impl Drop for QueuedChange {
+    fn drop(&mut self) {
+        let queue = &self.actor.inner.config_changes;
+        queue
+            .lock()
+            .retain(|place| !Arc::ptr_eq(place, &self.place));
+        queue.advanced.notify(usize::MAX);
+    }
+}
+
+enum Slot<'a> {
+    Reserved {
+        mutation: ConfigMutation,
+        operation: PreparedOperationTicket,
+    },
+    Queued {
+        place: QueuedChange,
+        reserve: MutationReserver<'a>,
+    },
+}
+
+/// A slot in an agent's config FIFO. Reserving takes the durable mutation and
+/// then the actor operation synchronously, so changes hold the session lease
+/// in dispatch order. A change that meets a held lease or idle guard queues
+/// and takes its slot once the holder lets go; it fails only if the target
+/// closes or the change is rejected.
+pub struct ConfigChangeTicket<'a> {
+    publication: CheckpointPublication,
+    slot: Slot<'a>,
+}
+
+impl<'a> ConfigChangeTicket<'a> {
     pub fn reserve(
         target: &AgentRef,
-        publication: CheckpointPublication,
-        mutation: impl FnOnce(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>,
+        mut publication: CheckpointPublication,
+        mut reserve: impl FnMut(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>
+        + Send
+        + 'a,
     ) -> Result<Self, ConfigChangeError> {
         target.validate_live()?;
-        let mutation = mutation(publication.clone())?;
-        let operation = target.actor()?.reserve_prepared_operation(None)?;
-        operation.register_publication(&publication)?;
+        let actor = target.actor()?;
+        let queued = !actor.inner.config_changes.lock().is_empty();
+        if !queued {
+            match try_reserve(&actor, &publication, &mut reserve) {
+                Ok(slot) => return Ok(Self { publication, slot }),
+                Err(error) if error.is_busy() => publication = CheckpointPublication::default(),
+                Err(error) => return Err(error),
+            }
+        }
         Ok(Self {
-            mutation,
-            operation,
             publication,
+            slot: Slot::Queued {
+                place: QueuedChange::enqueue(actor),
+                reserve: Box::new(reserve),
+            },
         })
     }
 
-    pub fn wait_predecessor(
-        &self,
-    ) -> impl Future<Output = Result<Arc<EffectiveAgentConfig>, ConfigChangeError>> + Send + '_
-    {
-        let operation = &self.operation;
-        async move { Ok(operation.wait_predecessor().await?) }
+    async fn reserved(&mut self) -> Result<&PreparedOperationTicket, ConfigChangeError> {
+        if let Slot::Queued { place, reserve } = &mut self.slot {
+            place.wait_turn().await;
+            let reserved = loop {
+                match try_reserve(&place.actor, &self.publication, reserve) {
+                    Err(error) if error.is_busy() => {
+                        self.publication = CheckpointPublication::default();
+                        error.wait_released(&place.actor).await;
+                    }
+                    result => break result?,
+                }
+            };
+            self.slot = reserved;
+        }
+        match &self.slot {
+            Slot::Reserved { operation, .. } => Ok(operation),
+            Slot::Queued { .. } => unreachable!("a queued change is reserved above"),
+        }
     }
 
-    /// Cancelling it before the claim rolls the change back.
+    pub async fn wait_predecessor(
+        &mut self,
+    ) -> Result<Arc<EffectiveAgentConfig>, ConfigChangeError> {
+        Ok(self.reserved().await?.wait_predecessor().await?)
+    }
+
+    /// Cancelling it before the claim rolls the change back. A refused
+    /// attempt cancels its publication, so a change that queued publishes
+    /// through a fresh one, taken here once it is reserved.
     pub fn publication(&self) -> CheckpointPublication {
         self.publication.clone()
     }
@@ -121,18 +217,25 @@ impl ConfigChangeTicket {
     /// Once the predecessor settles, `prepare` derives the change from its
     /// config and returns the claim the durable publication must pass.
     pub async fn commit(
-        self,
+        mut self,
         prepare: impl AsyncFnOnce(
             CheckpointPublication,
             Arc<EffectiveAgentConfig>,
         ) -> Result<(CheckpointClaim, ConfigChange), ConfigChangeError>,
     ) -> Result<ConfigCommit, ConfigChangeError> {
-        let predecessor = self.operation.wait_predecessor().await?;
+        let predecessor = self.wait_predecessor().await?;
+        let Slot::Reserved {
+            mutation,
+            operation,
+        } = self.slot
+        else {
+            unreachable!("waiting for the predecessor reserves the change")
+        };
         let (claim, change) = prepare(self.publication, predecessor).await?;
-        self.operation.resolve(Some(change))?;
-        self.operation.wait_ready().await?;
-        let transaction = (self.mutation)(self.operation.ready_config()?, claim)?;
-        Ok(self.operation.commit_durable(transaction).await?.config)
+        operation.resolve(Some(change))?;
+        operation.wait_ready().await?;
+        let transaction = mutation(operation.ready_config()?, claim)?;
+        Ok(operation.commit_durable(transaction).await?.config)
     }
 
     /// Commits a change fixed at dispatch under the default claim.
@@ -143,6 +246,20 @@ impl ConfigChangeTicket {
         self.commit(async |_, _| Ok((publication_claim(), change)))
             .await
     }
+}
+
+fn try_reserve<'a>(
+    actor: &AgentActorHandle,
+    publication: &CheckpointPublication,
+    reserve: &mut dyn FnMut(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>,
+) -> Result<Slot<'a>, ConfigChangeError> {
+    let mutation = reserve(publication.clone())?;
+    let operation = actor.reserve_prepared_operation(None)?;
+    operation.register_publication(publication)?;
+    Ok(Slot::Reserved {
+        mutation,
+        operation,
+    })
 }
 
 /// Resolves {spec} under {policy} and prepares its provider.

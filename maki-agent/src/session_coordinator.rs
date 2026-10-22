@@ -702,13 +702,14 @@ impl SessionCoordinatorHandle {
         &self,
         publication: CheckpointPublication,
         version: Option<u64>,
-    ) -> Result<(ActorBinding, ConfigChangeTicket), ConfigChangeError> {
+    ) -> Result<(ActorBinding, ConfigChangeTicket<'_>), ConfigChangeError> {
         let binding = self.actor_binding()?;
-        let ticket = ConfigChangeTicket::reserve(&binding.agent, publication, |publication| {
-            Ok(self
-                .reserve_transaction_if_version(publication, version)?
-                .into_config_mutation())
-        })?;
+        let ticket =
+            ConfigChangeTicket::reserve(&binding.agent, publication, move |publication| {
+                Ok(self
+                    .reserve_transaction_if_version(publication, version)?
+                    .into_config_mutation())
+            })?;
         Ok((binding, ticket))
     }
 
@@ -2111,7 +2112,9 @@ mod tests {
                     ));
                 }
                 assert!(
-                    matches!(first.set_model(None, Some(false), None).await, Err(ConfigChangeError::Coordinator(SessionCoordinatorError::SessionBusy(busy))) if busy == ids[0])
+                    futures_lite::future::poll_once(first.set_model(None, Some(false), None))
+                        .await
+                        .is_none()
                 );
                 if close {
                     let (rollback_tx, rollback_rx) = flume::bounded(1);
@@ -2890,6 +2893,52 @@ mod tests {
                     .unwrap(),
             );
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case::test_case(true; "idle_guard")]
+    #[test_case::test_case(false; "session_lease")]
+    fn queued_model_changes_wait_for_the_holder_and_apply_in_order(idle_guard: bool) {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(false)))
+                    .unwrap();
+            let installed = Arc::new(Mutex::new(Vec::new()));
+            let agent = bind(&coordinator, Arc::clone(&installed));
+            let guard = idle_guard.then(|| agent.actor().unwrap().prepare_idle().unwrap());
+            let lease = (!idle_guard).then(|| {
+                coordinator
+                    .reserve_transaction(CheckpointPublication::default())
+                    .unwrap()
+            });
+            let mut first = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut second = Box::pin(coordinator.set_model(Some(Arc::from(OLD)), None, None));
+            assert!(futures_lite::future::poll_once(&mut first).await.is_none());
+            assert!(futures_lite::future::poll_once(&mut second).await.is_none());
+            drop((guard, lease));
+            let (first, second) = futures_lite::future::zip(first, second).await;
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(lock(&installed).as_slice(), &[NEW, OLD]);
+            assert_eq!(coordinator.read().model().unwrap().as_ref(), OLD);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_model_change_fails_when_the_target_closes() {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(false)))
+                    .unwrap();
+            let installed = Arc::new(Mutex::new(Vec::new()));
+            let agent = bind(&coordinator, Arc::clone(&installed));
+            let _guard = agent.actor().unwrap().prepare_idle().unwrap();
+            let mut change = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            assert!(futures_lite::future::poll_once(&mut change).await.is_none());
+            agent.close_subtree().unwrap();
+            assert!(change.await.is_err());
+            assert!(lock(&installed).is_empty());
         });
     }
 

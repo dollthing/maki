@@ -54,10 +54,6 @@ fn same_agent(left: &AgentRef, right: &AgentRef) -> bool {
     left.same_manager(right) && left.id() == right.id()
 }
 
-fn rediscovery(target: &AgentRef) -> Option<ConfigChange> {
-    ConfigChange::rediscovered(&*target.effective_config().ok()??)
-}
-
 impl AgentOrchestration {
     pub fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self {
@@ -121,8 +117,7 @@ impl AgentOrchestration {
     }
 
     /// Commits a metadata refresh for every live agent whose model resolves
-    /// differently now that discovery has run. An agent refused as busy is
-    /// retried once its holder lets go. `None` when no agent needs one.
+    /// differently now that discovery has run. `None` when none does.
     pub fn refresh_discovered_models(self: &Arc<Self>) -> Option<BoxFuture<'static, ()>> {
         let roots = self
             .lock()
@@ -130,27 +125,23 @@ impl AgentOrchestration {
             .iter()
             .map(|entry| entry.target.target.clone())
             .collect::<Vec<_>>();
-        let targets = roots
+        let refreshes = roots
             .iter()
             .flat_map(|root| root.manager().list())
-            .filter(|target| rediscovery(target).is_some())
+            .filter_map(|target| {
+                let config = target.effective_config().ok()??;
+                Some((target, ConfigChange::rediscovered(&config)?))
+            })
             .collect::<Vec<_>>();
-        if targets.is_empty() {
+        if refreshes.is_empty() {
             return None;
         }
         let services = Arc::clone(self);
         Some(Box::pin(async move {
-            for target in targets {
-                while let Some(change) = rediscovery(&target) {
-                    let fixed = async |_, _| Ok((publication_claim(), change));
-                    match commit_config_change(&*services, &target, fixed).await {
-                        Err(error) if error.is_busy() => error.wait_released(&target).await,
-                        Err(error) => {
-                            warn!(agent = %target.id(), %error, "failed to refresh discovered model");
-                            break;
-                        }
-                        Ok(_) => break,
-                    }
+            for (target, change) in refreshes {
+                let fixed = async |_, _| Ok((publication_claim(), change));
+                if let Err(error) = commit_config_change(&*services, &target, fixed).await {
+                    warn!(agent = %target.id(), %error, "failed to refresh discovered model");
                 }
             }
         }))

@@ -630,7 +630,7 @@ fn dispatch_mode_commit(
     target: Result<AgentRef, String>,
     storage: &StateDir,
     modes: Arc<maki_agent::ModeRegistry>,
-    services: Option<&dyn OrchestrationServices>,
+    services: Option<Arc<AgentOrchestration>>,
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
     reply: ModeReply,
@@ -1191,7 +1191,7 @@ impl SessionRuntime {
     /// moved the root off `spec` or turned fast on.
     fn restore_pending_fast(&mut self, spec: String) {
         let (manager, root) = self.handles.manager_and_root();
-        let reservation = match manager
+        let mut reservation = match manager
             .lookup(root)
             .map_err(ConfigChangeError::from)
             .and_then(|target| reserve_config_change(&target, &self.coordinator, None))
@@ -3496,7 +3496,7 @@ impl<'t> EventLoop<'t> {
         self.dispatch_mode(
             idx,
             Ok(target),
-            Some(&*self.orchestration),
+            Some(Arc::clone(&self.orchestration)),
             id,
             ModeReply::Committed(reply),
         );
@@ -3529,7 +3529,7 @@ impl<'t> EventLoop<'t> {
         &self,
         idx: usize,
         target: Result<AgentRef, String>,
-        services: Option<&dyn OrchestrationServices>,
+        services: Option<Arc<AgentOrchestration>>,
         id: String,
         reply: ModeReply,
     ) {
@@ -4136,7 +4136,7 @@ impl<'t> EventLoop<'t> {
             Action::ChangeMode(mode) => self.dispatch_mode(
                 idx,
                 selected_agent(&self.sessions[idx]).ok_or_else(|| CLOSED_TARGET_ERR.to_owned()),
-                Some(&*self.orchestration),
+                Some(Arc::clone(&self.orchestration)),
                 mode,
                 ModeReply::None,
             ),
@@ -4643,7 +4643,7 @@ impl<'t> EventLoop<'t> {
         let ticket = reserve_config_change(
             target,
             &self.sessions[idx].coordinator,
-            Some(&*self.orchestration),
+            Some(Arc::clone(&self.orchestration)),
         )
         .map_err(|error| error.to_string())?;
         let session = self.sessions[idx].id();
@@ -4684,7 +4684,7 @@ impl<'t> EventLoop<'t> {
         let ticket = reserve_config_change(
             target,
             &self.sessions[idx].coordinator,
-            Some(&*self.orchestration),
+            Some(Arc::clone(&self.orchestration)),
         )
         .map_err(|error| error.to_string())?;
         let root = self.sessions[idx].handles.manager_and_root().1;
@@ -4829,7 +4829,7 @@ impl<'t> EventLoop<'t> {
                 reserve_config_change(
                     &target,
                     &self.sessions[idx].coordinator,
-                    Some(&*self.orchestration),
+                    Some(Arc::clone(&self.orchestration)),
                 )
             });
         let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
@@ -4914,7 +4914,7 @@ impl<'t> EventLoop<'t> {
                             replacement,
                         })
                     },
-                    smol::Timer::after(SESSION_OP_TIMEOUT),
+                    async { smol::Timer::after(SESSION_OP_TIMEOUT).await },
                 )
                 .await
                 .map(|_| ()),
@@ -5215,22 +5215,30 @@ fn runtime_config_mutations(
 fn reserve_config_change(
     target: &AgentRef,
     coordinator: &SessionCoordinatorHandle,
-    services: Option<&dyn OrchestrationServices>,
-) -> Result<ConfigChangeTicket, ConfigChangeError> {
-    ConfigChangeTicket::reserve(target, CheckpointPublication::default(), |publication| {
-        if target.snapshot()?.parent_id.is_none() {
-            return Ok(coordinator
-                .reserve_transaction(publication)?
-                .into_config_mutation());
-        }
-        services
-            .ok_or(DURABLE_CONFIG_UNAVAILABLE)?
-            .reserve_config_mutation(target, publication)
-    })
+    services: Option<Arc<AgentOrchestration>>,
+) -> Result<ConfigChangeTicket<'static>, ConfigChangeError> {
+    let root = target.snapshot()?.parent_id.is_none();
+    let coordinator = coordinator.clone();
+    let child = target.clone();
+    ConfigChangeTicket::reserve(
+        target,
+        CheckpointPublication::default(),
+        move |publication| {
+            if root {
+                return Ok(coordinator
+                    .reserve_transaction(publication)?
+                    .into_config_mutation());
+            }
+            services
+                .as_deref()
+                .ok_or(DURABLE_CONFIG_UNAVAILABLE)?
+                .reserve_config_mutation(&child, publication)
+        },
+    )
 }
 
 async fn commit_mode_change(
-    ticket: ConfigChangeTicket,
+    ticket: ConfigChangeTicket<'_>,
     target: AgentRef,
     id: &str,
     storage: &StateDir,
@@ -5269,7 +5277,7 @@ async fn commit_mode_change(
 /// Commits {patch} with {spec}'s model prepared, unless preparation outlives
 /// the session op timeout.
 async fn commit_model_patch(
-    ticket: ConfigChangeTicket,
+    ticket: ConfigChangeTicket<'_>,
     patch: ConfigPatch,
     spec: Option<&str>,
     policy: &ModelPolicy,
@@ -5280,16 +5288,20 @@ async fn commit_model_patch(
             prepare_patch(patch, spec, policy, prepare).await?,
         ))
     };
-    prepare_config_change(ticket, change, smol::Timer::after(SESSION_OP_TIMEOUT)).await
+    prepare_config_change(ticket, change, async {
+        smol::Timer::after(SESSION_OP_TIMEOUT).await
+    })
+    .await
 }
 
 /// Commits the change `prepare` yields once the predecessor settles, unless
-/// `expiry` fires before the publication is claimed.
+/// `expiry`, first polled then, fires before the publication is claimed.
 async fn prepare_config_change<T>(
-    ticket: ConfigChangeTicket,
+    mut ticket: ConfigChangeTicket<'_>,
     prepare: impl Future<Output = Result<ConfigChange, ConfigChangeError>>,
     expiry: impl Future<Output = T>,
 ) -> Result<ConfigCommit, ConfigChangeError> {
+    ticket.wait_predecessor().await?;
     let publication = ticket.publication();
     let operation = ticket.commit(async |_, _| Ok((publication_claim(), prepare.await?)));
     futures_lite::pin!(operation);
@@ -5557,7 +5569,7 @@ mod tests {
     }
 
     #[test_case(false ; "workflow_host_command_commits_on_the_pinned_actor")]
-    #[test_case(true ; "workflow_host_command_is_busy_during_a_held_idle_guard")]
+    #[test_case(true ; "workflow_host_command_waits_for_a_held_idle_guard")]
     fn workflow_host_command_on_the_pinned_actor(held: bool) {
         with_event_loop(|event_loop| {
             let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
@@ -5577,18 +5589,11 @@ mod tests {
                 })),
                 reply,
             });
-            let response = response.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
             if held {
-                assert!(matches!(
-                    response,
-                    Err(CommandError::Producer(message))
-                        if *message == *maki_agent::ActorError::Busy.to_string()
-                ));
-                drop(guard);
                 assert!(commits.is_empty());
-                assert!(!actor.effective_config().unwrap().workflow);
-                return;
             }
+            drop(guard);
+            let response = response.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
             assert_eq!(response.unwrap(), HostResponse::Completed);
             loop {
                 let commit = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
@@ -6443,7 +6448,7 @@ mod tests {
 
     #[test_case(true ; "idle_guard")]
     #[test_case(false ; "session_lease")]
-    fn busy_discovery_refresh_retries_once_released(idle_guard: bool) {
+    fn busy_discovery_refresh_applies_once_released(idle_guard: bool) {
         let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
         with_event_loop_runtime(
             |harness| {
