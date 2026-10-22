@@ -679,13 +679,7 @@ fn spawn_session_with_history(
     let (ready, root_target) = flume::bounded(1);
     let handle = headless::spawn_interactive_with_binding(
         interactive,
-        Box::new(|mut model, timeouts| {
-            Box::pin(async move {
-                let provider =
-                    maki_providers::provider::from_model_async(&mut model, timeouts).await?;
-                Ok((model, Arc::from(provider)))
-            })
-        }),
+        headless::default_preparation(),
         snapshot,
         Some(Box::new(move |_, target, template| {
             Box::pin(async move {

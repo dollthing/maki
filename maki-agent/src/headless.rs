@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -107,7 +107,7 @@ pub struct HeadlessHandle {
     pub cwd: String,
     pub task: smol::Task<()>,
     pub offload_cleanup: Option<OffloadCleanup>,
-    first_input: StdMutex<Option<AgentInput>>,
+    started: AtomicBool,
     input_tx: InteractiveInputSender,
     admitted: flume::Sender<TurnTicket>,
 }
@@ -117,22 +117,11 @@ impl HeadlessHandle {
         self.root.get().await
     }
 
-    pub async fn start(&self) -> Result<TurnTicket, String> {
-        self.start_input(None).await
-    }
-
     pub async fn start_with_input(&self, input: AgentInput) -> Result<TurnTicket, String> {
-        self.start_input(Some(input)).await
-    }
-
-    async fn start_input(&self, input: Option<AgentInput>) -> Result<TurnTicket, String> {
-        let initial = self
-            .first_input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .ok_or_else(|| "print turn already started".to_owned())?;
-        let ticket = self.input_tx.admit(input.unwrap_or(initial)).await?;
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Err("print turn already started".to_owned());
+        }
+        let ticket = self.input_tx.admit(input).await?;
         self.admitted
             .send(ticket.clone())
             .map_err(|_| "print session ended".to_owned())?;
@@ -427,7 +416,7 @@ pub type ProviderPreparation = Box<
         + Send,
 >;
 
-fn default_preparation() -> ProviderPreparation {
+pub fn default_preparation() -> ProviderPreparation {
     Box::new(|mut model, timeouts| {
         Box::pin(async move {
             let provider = provider::from_model_async(&mut model, timeouts).await?;
@@ -936,11 +925,7 @@ fn spawn_managed(
     prepare: ProviderPreparation,
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
-    mut one_shot: Option<(
-        Option<AgentInput>,
-        Receiver<TurnTicket>,
-        SessionCoordinatorHandle,
-    )>,
+    one_shot: Option<(Receiver<TurnTicket>, SessionCoordinatorHandle)>,
     initial_mode: AgentMode,
 ) -> InteractiveHandle {
     let session_ref = params
@@ -1017,8 +1002,6 @@ fn spawn_managed(
         let permissions = Arc::clone(&permissions);
         let mailbox = mailbox.clone();
         let session_ref = session_ref.clone();
-        let admission_events = raw_tx.clone();
-        let modes = Arc::clone(&params.modes);
         async move {
             let _lifetime = lifetime;
             let initialized = async {
@@ -1107,33 +1090,8 @@ fn spawn_managed(
             .await;
             match initialized {
                 Ok(reference) => {
-                    if let Some((input, admitted, _)) = &mut one_shot {
-                        let ticket = if let Some(input) = input.take() {
-                            let result = match reference.actor() {
-                                Ok(actor) => {
-                                    admit_input(
-                                        &actor,
-                                        &modes,
-                                        input,
-                                        EventSender::new(admission_events),
-                                        "run:0".into(),
-                                    )
-                                    .await
-                                }
-                                Err(error) => Err(error.to_string()),
-                            };
-                            match result {
-                                Ok(ticket) => Some(ticket),
-                                Err(message) => {
-                                    let _ = EventSender::new(raw_tx.clone())
-                                        .send(AgentEvent::ControlError { message });
-                                    None
-                                }
-                            }
-                        } else {
-                            admitted.recv_async().await.ok()
-                        };
-                        if let Some(ticket) = ticket {
+                    if let Some((admitted, _)) = &one_shot {
+                        if let Ok(ticket) = admitted.recv_async().await {
                             ticket.wait().await;
                         }
                     } else {
@@ -1160,7 +1118,7 @@ fn spawn_managed(
             if let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
             }
-            if let Some((_, _, coordinator)) = one_shot {
+            if let Some((_, coordinator)) = one_shot {
                 let _ = coordinator.close().await;
             }
             drain_offload(cleanup.as_ref()).await;
@@ -1185,55 +1143,19 @@ fn spawn_managed(
     }
 }
 
-pub fn spawn(
-    params: HeadlessParams,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_with_session_id(params, MakiId::generate())
-}
-
-fn spawn_with_session_id(
-    params: HeadlessParams,
-    session_id: MakiId,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, session_id, None)
-}
-
-pub fn spawn_with_provider(
-    params: HeadlessParams,
-    provider: Arc<dyn Provider>,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, MakiId::generate(), Some(Ok(provider)))
-}
-
 pub fn spawn_with_binding(
     params: HeadlessParams,
     prepare: ProviderPreparation,
     binding: RootBinding,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_one_shot(params, MakiId::generate(), prepare, Some(binding), false)
-}
-
-fn spawn_initialized(
-    params: HeadlessParams,
-    session_id: MakiId,
-    provider: Option<Result<Arc<dyn Provider>, crate::AgentError>>,
-) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    let prepare = match provider {
-        Some(provider) => Box::new(move |model, _| {
-            Box::pin(async move { provider.map(|provider| (model, provider)) })
-                as BoxFuture<'static, _>
-        }) as ProviderPreparation,
-        None => default_preparation(),
-    };
-    spawn_one_shot(params, session_id, prepare, None, true)
+    spawn_one_shot(params, MakiId::generate(), prepare, binding)
 }
 
 fn spawn_one_shot(
     params: HeadlessParams,
     session_id: MakiId,
     prepare: ProviderPreparation,
-    binding: Option<RootBinding>,
-    auto_start: bool,
+    binding: RootBinding,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let spec = params.model.spec();
     let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
@@ -1260,13 +1182,7 @@ fn spawn_one_shot(
         workflow: params.input.workflow,
         thinking: Some(params.input.thinking.into()),
     };
-    let input = params.input;
-    let initial_mode = input.mode.clone();
-    let (initial_input, first_input) = if auto_start {
-        (Some(input), None)
-    } else {
-        (None, Some(input))
-    };
+    let initial_mode = params.input.mode.clone();
     let interactive = spawn_managed(
         InteractiveParams {
             model: params.model,
@@ -1293,8 +1209,8 @@ fn spawn_one_shot(
         },
         prepare,
         None,
-        binding,
-        Some((initial_input, admission, coordinator)),
+        Some(binding),
+        Some((admission, coordinator)),
         initial_mode,
     );
     Ok(HeadlessHandle {
@@ -1306,7 +1222,7 @@ fn spawn_one_shot(
         cwd,
         task: interactive.task,
         offload_cleanup: interactive.offload_cleanup,
-        first_input: StdMutex::new(first_input),
+        started: AtomicBool::new(false),
         input_tx: interactive.input_tx,
         admitted,
     })
@@ -1446,18 +1362,40 @@ mod tests {
         }
     }
 
+    fn first_input() -> AgentInput {
+        AgentInput::from_defaults(
+            "hello".into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults::default(),
+        )
+    }
+
+    /// Spawns a print session on {provider} and admits its first turn.
+    fn spawn_started(
+        params: HeadlessParams,
+        session_id: MakiId,
+        provider: Result<Arc<dyn Provider>, crate::AgentError>,
+    ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+        let handle = spawn_one_shot(
+            params,
+            session_id,
+            Box::new(move |model, _| {
+                Box::pin(async move { provider.map(|provider| (model, provider)) })
+            }),
+            Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+        )?;
+        let _ = smol::block_on(handle.start_with_input(first_input()));
+        Ok(handle)
+    }
+
     fn test_params() -> HeadlessParams {
         HeadlessParams {
             model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
-            input: AgentInput::from_defaults(
-                "hello".into(),
-                AgentMode::Build,
-                Vec::new(),
-                SessionDefaults::default(),
-            ),
+            input: first_input(),
             prompt_slots: ResolvedSlots::default(),
             excluded_tools: Vec::new(),
             mcp_handle: None,
@@ -1945,9 +1883,8 @@ mod tests {
         });
     }
 
-    #[test_case(false; "initial_input")]
-    #[test_case(true; "dispatched_input")]
-    fn print_binding_precedes_first_admission(replace_input: bool) {
+    #[test]
+    fn print_binding_precedes_first_admission() {
         const DISPATCHED_INPUT: &str = "expanded command prompt";
         smol::block_on(async {
             let (provider, received) = recording();
@@ -1978,20 +1915,16 @@ mod tests {
             let root = handle.initialized_root().await.unwrap();
             assert_eq!(binding_seen.recv_async().await.unwrap(), root.id());
             assert!(received.is_empty());
-            let ticket = if replace_input {
-                handle
-                    .start_with_input(AgentInput::from_defaults(
-                        DISPATCHED_INPUT.into(),
-                        AgentMode::Build,
-                        Vec::new(),
-                        SessionDefaults::default(),
-                    ))
-                    .await
-                    .unwrap()
-            } else {
-                handle.start().await.unwrap()
-            };
-            assert!(handle.start().await.is_err());
+            let ticket = handle
+                .start_with_input(AgentInput::from_defaults(
+                    DISPATCHED_INPUT.into(),
+                    AgentMode::Build,
+                    Vec::new(),
+                    SessionDefaults::default(),
+                ))
+                .await
+                .unwrap();
+            assert!(handle.start_with_input(first_input()).await.is_err());
             assert!(matches!(
                 bounded(ticket.wait()).await,
                 TurnOutcome::Completed { .. }
@@ -2006,14 +1939,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(
-                inputs,
-                [if replace_input {
-                    DISPATCHED_INPUT
-                } else {
-                    "hello"
-                }]
-            );
+            assert_eq!(inputs, [DISPATCHED_INPUT]);
             assert!(
                 !handle
                     .manager
@@ -2032,13 +1958,14 @@ mod tests {
         params.state_dir = Some(state.path().to_path_buf());
         let (entered, received) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
-        let handle = spawn_with_provider(
+        let handle = spawn_started(
             params,
-            Arc::new(GatedHeadlessProvider {
+            MakiId::generate(),
+            Ok(Arc::new(GatedHeadlessProvider {
                 entered,
                 release: released,
                 exit,
-            }),
+            })),
         )
         .unwrap();
         received.recv_timeout(GATE_TIMEOUT).unwrap();
@@ -2119,12 +2046,12 @@ mod tests {
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
         let mut params = test_params();
         params.state_dir = Some(state.path().to_path_buf());
-        let handle = spawn_initialized(
+        let handle = spawn_started(
             params,
             session_id,
-            Some(Err(crate::AgentError::Config {
+            Err(crate::AgentError::Config {
                 message: HEADLESS_PROVIDER_ERROR.into(),
-            })),
+            }),
         )
         .unwrap();
         let mut saw_error = false;
@@ -2152,13 +2079,14 @@ mod tests {
     fn spawn_registers_a_resolvable_coordinator() {
         let (entered, received) = flume::bounded(1);
         let (_release, release) = flume::bounded(1);
-        let handle = spawn_with_provider(
+        let handle = spawn_started(
             test_params(),
-            Arc::new(GatedHeadlessProvider {
+            MakiId::generate(),
+            Ok(Arc::new(GatedHeadlessProvider {
                 entered,
                 release,
                 exit: ProviderExit::Pending,
-            }),
+            })),
         )
         .unwrap();
         received.recv_timeout(GATE_TIMEOUT).unwrap();
@@ -2174,7 +2102,7 @@ mod tests {
     fn spawn_stops_when_coordinator_registration_fails() {
         let session_id = MakiId::generate();
         let existing = coordinator(session_id, checkpoint());
-        let error = match spawn_with_session_id(test_params(), session_id) {
+        let error = match spawn_started(test_params(), session_id, Ok(recording().0)) {
             Ok(_) => panic!("duplicate registration succeeded"),
             Err(error) => error,
         };

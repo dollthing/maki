@@ -498,13 +498,7 @@ pub fn run(
                 session_options: session_options.clone(),
                 state_dir: state_dir.clone(),
             },
-            Box::new(|mut model, timeouts| {
-                Box::pin(async move {
-                    let provider =
-                        maki_providers::provider::from_model_async(&mut model, timeouts).await?;
-                    Ok((model, Arc::from(provider)))
-                })
-            }),
+            maki_agent::headless::default_preparation(),
             binding,
         )
         .map_err(|error| eyre!("register print session coordinator: {error}"))?;
@@ -983,6 +977,22 @@ mod tests {
         "session_id",
     ];
 
+    /// Spawns a print session on {provider} and admits {params}' input.
+    fn spawn_started(
+        params: HeadlessParams,
+        provider: Arc<dyn maki_providers::provider::Provider>,
+    ) -> maki_agent::headless::HeadlessHandle {
+        let message = params.input.message.clone();
+        let handle = maki_agent::headless::spawn_with_binding(
+            params,
+            Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
+            Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+        )
+        .unwrap();
+        smol::block_on(handle.start_with_input(input(&message))).unwrap();
+        handle
+    }
+
     fn input(message: &str) -> AgentInput {
         AgentInput {
             message: message.into(),
@@ -1216,7 +1226,7 @@ mod tests {
         let (polled, polling) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         let cwd = std::env::temp_dir();
-        let handle = maki_agent::headless::spawn_with_provider(
+        let handle = spawn_started(
             HeadlessParams {
                 model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
                 config: AgentConfig::default(),
@@ -1241,8 +1251,7 @@ mod tests {
                 polled,
                 release: gate,
             }),
-        )
-        .unwrap();
+        );
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
         let manager = handle.manager.clone();
         let session_id = handle.session_id.id();
@@ -1276,7 +1285,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let cwd = std::env::temp_dir();
         let (requests, received) = flume::bounded(0);
-        let handle = maki_agent::headless::spawn_with_provider(
+        let handle = spawn_started(
             HeadlessParams {
                 model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
                 config: AgentConfig::default(),
@@ -1300,8 +1309,7 @@ mod tests {
                 requests,
                 nested: None,
             }),
-        )
-        .unwrap();
+        );
         let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), "output").unwrap();

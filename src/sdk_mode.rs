@@ -843,12 +843,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     let startup_model = model.clone();
     let models = available_model_specs(&model_policy);
     let (binding, root_target) = sdk_root_binding();
-    let prepare: headless::ProviderPreparation = Box::new(|mut model, timeouts| {
-        Box::pin(async move {
-            let provider = maki_providers::provider::from_model_async(&mut model, timeouts).await?;
-            Ok((model, Arc::from(provider)))
-        })
-    });
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
             model,
@@ -873,7 +867,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             local_tools: Default::default(),
             state_dir: Some(storage.path().to_path_buf()),
         },
-        prepare,
+        headless::default_preparation(),
         Some(initial_history),
         Some(binding),
     );
