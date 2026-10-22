@@ -131,7 +131,7 @@ The actor orders submissions with configuration, working-directory changes, cont
 - `run_control`: execute a standalone control with no turn identity.
 - `run_compact`: compact history with no turn identity.
 
-A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. `Reported(outcome)` is the same, except the backend has already reported the terminal to its frontend (for example after a failed terminal checkpoint), so the actor sends no event. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`; the actor synthesizes and delivers the sole failed outcome.
+A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal checkpoint turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
 
 The `AgentInput` is moved exactly once from queue to backend. It is intentionally not cloned to paper over ownership or lifetime problems.
 

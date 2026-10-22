@@ -520,36 +520,8 @@ impl ActorBackend for LuaActorBackend {
                 };
                 if let Err(error) = result {
                     warn!(%error, %turn_id, "child history was not checkpointed");
-                    if let TurnOutcome::Completed {
-                        agent_id,
-                        turn_id,
-                        usage,
-                        num_turns,
-                        cost,
-                        list_cost,
-                        context_size,
-                        context_window,
-                        ..
-                    } = outcome
-                    {
-                        outcome = TurnOutcome::Failed {
-                            agent_id,
-                            turn_id,
-                            usage,
-                            num_turns,
-                            failure: TurnFailure {
-                                kind: TurnFailureKind::Internal,
-                                user_message: format!(
-                                    "failed to checkpoint completed turn: {error}"
-                                ),
-                                diagnostic: error,
-                                retryable: true,
-                            },
-                            cost,
-                            list_cost,
-                            context_size,
-                            context_window,
-                        };
+                    if matches!(outcome, TurnOutcome::Completed { .. }) {
+                        outcome = outcome.checkpoint_failed(error);
                     }
                 }
             }

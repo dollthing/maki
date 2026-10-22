@@ -1156,10 +1156,7 @@ mod tests {
                 Box::pin(async move {
                     self.0.send(context.managed_turn.unwrap()).unwrap();
                     self.1.recv_async().await.unwrap();
-                    BackendResult::SetupFailed {
-                        agent_id: context.agent_id,
-                        turn_id: context.turn_id.unwrap(),
-                    }
+                    BackendResult::SetupFailed(None)
                 })
             }
             fn run_control<'a>(

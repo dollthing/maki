@@ -36,7 +36,8 @@ use crate::tools::{
     ToolSource,
 };
 use crate::types::{
-    AgentId, DoneReason, Envelope, EventSender, TurnCancellationReason, TurnId, TurnOutcome,
+    AgentId, DoneReason, Envelope, EventSender, TurnCancellationReason, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome,
 };
 use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
 use std::borrow::Cow;
@@ -44,6 +45,7 @@ use std::borrow::Cow;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
 const BILLED_RESPONSE: &str = "billed response";
+const SETUP_ERROR: &str = "configuration unavailable";
 const BILLED_COST: f64 = 0.007;
 const BILLED_LIST_COST: f64 = 0.009;
 
@@ -168,10 +170,7 @@ impl ScriptedBackend {
 
     fn failing_setup() -> Self {
         let backend = Self::new();
-        *backend.outcomes.lock().unwrap() = vec![BackendResult::SetupFailed {
-            agent_id: AgentId::generate(),
-            turn_id: crate::types::TurnId::generate(),
-        }];
+        *backend.outcomes.lock().unwrap() = vec![BackendResult::SetupFailed(None)];
         backend
     }
 
@@ -501,6 +500,41 @@ fn synthetic_settlement_has_unavailable_history_boundary(close: bool) {
             actor.transcript(request),
             Err(ActorError::UnavailableTurnHistory(_))
         ));
+    });
+}
+
+#[test_case::test_case(None ; "generic_failure")]
+#[test_case::test_case(Some(SETUP_ERROR) ; "backend_failure")]
+fn setup_failure_settles_without_turn_history(error: Option<&str>) {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        *backend.outcomes.lock().unwrap() =
+            vec![BackendResult::SetupFailed(error.map(|error| TurnFailure {
+                kind: TurnFailureKind::Internal,
+                diagnostic: error.into(),
+                user_message: error.into(),
+                retryable: true,
+            }))];
+        let (actor, task) = spawn(backend);
+        let ticket = actor
+            .admit_turn(input("setup"), None, "setup".into())
+            .unwrap();
+        let TurnOutcome::Failed { failure, .. } = ticket.wait().await else {
+            panic!("setup failure must settle as Failed");
+        };
+        if let Some(error) = error {
+            assert_eq!(failure.user_message, error);
+        }
+        let request = super::TranscriptRequest {
+            through_turn: Some(ticket.turn_id()),
+            last_messages: 10,
+            max_bytes: 1024,
+        };
+        assert!(
+            matches!(actor.transcript(request), Err(ActorError::UnavailableTurnHistory(id)) if id == ticket.turn_id())
+        );
+        actor.close();
+        task.await;
     });
 }
 

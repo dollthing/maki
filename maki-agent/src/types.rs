@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use strum::Display;
 
 pub const NO_FILES_FOUND: &str = "No files found";
+const CHECKPOINT_FAILED_PREFIX: &str = "failed to checkpoint completed turn";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -820,6 +821,27 @@ impl TurnOutcome {
             list_cost: None,
             context_size: 0,
             context_window: 0,
+        }
+    }
+
+    /// The turn's outcome once its history could not be checkpointed: a
+    /// failure that keeps what the turn used and cost.
+    pub fn checkpoint_failed(&self, error: String) -> Self {
+        Self::Failed {
+            agent_id: self.agent_id(),
+            turn_id: self.turn_id(),
+            usage: self.usage(),
+            num_turns: self.num_turns(),
+            failure: TurnFailure {
+                kind: TurnFailureKind::Internal,
+                user_message: format!("{CHECKPOINT_FAILED_PREFIX}: {error}"),
+                diagnostic: error,
+                retryable: true,
+            },
+            cost: self.cost(),
+            list_cost: self.list_cost(),
+            context_size: self.context_size(),
+            context_window: self.context_window(),
         }
     }
 

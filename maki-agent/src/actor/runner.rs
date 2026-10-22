@@ -462,32 +462,22 @@ impl Runner {
             (None, None) => backend.await,
             _ => unreachable!("managed guard and context are created together"),
         };
-        let history_ready = matches!(
-            &result,
-            BackendResult::EnteredRun(_) | BackendResult::Reported(_)
-        );
-        let (outcome, deliver) = match result {
-            BackendResult::EnteredRun(outcome) => (outcome, true),
-            BackendResult::Reported(outcome) => {
-                admission.ticket.output().take_terminal_sender();
-                (outcome, false)
-            }
+        let history_ready = matches!(&result, BackendResult::EnteredRun(_));
+        let outcome = match result {
+            BackendResult::EnteredRun(outcome) => outcome,
             // A setup failure never entered a run: synthesize one Failed
             // outcome and attempt its single delivery.
-            BackendResult::SetupFailed { .. } => (
-                TurnOutcome::failed(
-                    agent_id,
-                    turn_id,
-                    TokenUsage::default(),
-                    0,
-                    crate::types::TurnFailure {
-                        kind: crate::types::TurnFailureKind::Internal,
-                        diagnostic: "actor setup failed".to_string(),
-                        user_message: "The agent could not start this turn.".to_string(),
-                        retryable: true,
-                    },
-                ),
-                true,
+            BackendResult::SetupFailed(failure) => TurnOutcome::failed(
+                agent_id,
+                turn_id,
+                TokenUsage::default(),
+                0,
+                failure.unwrap_or_else(|| crate::types::TurnFailure {
+                    kind: crate::types::TurnFailureKind::Internal,
+                    diagnostic: "actor setup failed".to_string(),
+                    user_message: "The agent could not start this turn.".to_string(),
+                    retryable: true,
+                }),
             ),
             other => {
                 warn!(%turn_id, ?other, "turn backend returned non-turn result");
@@ -495,7 +485,7 @@ impl Runner {
                 return;
             }
         };
-        settle_and_finalize_turn(&self.inner, &admission, outcome, deliver, history_ready);
+        settle_and_finalize_turn(&self.inner, &admission, outcome, true, history_ready);
         self.wake.wake();
     }
 

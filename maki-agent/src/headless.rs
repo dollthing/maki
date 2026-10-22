@@ -12,7 +12,7 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, BoxFuture, Provider};
-use maki_providers::{RequestOptions, Timeouts, TokenUsage};
+use maki_providers::{RequestOptions, Timeouts};
 use maki_storage::checkpoint::accept_all;
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
@@ -40,7 +40,7 @@ use crate::{
     AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult, ControlWork,
     EffectiveAgentConfig, Envelope, EventSender, McpHandle, McpSession, PermissionsConfig,
     RunLedger, RunSettings, SessionMailbox, ToolOutputLines, TurnContext, TurnFailure,
-    TurnFailureKind, TurnId, TurnOutcome, TurnTicket, WorkKind,
+    TurnFailureKind, TurnId, TurnTicket, WorkKind,
 };
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -651,18 +651,12 @@ impl ActorBackend for HeadlessBackend {
                 Ok(config) => config,
                 Err(error) => {
                     warn!(%turn_id, %error, "headless turn setup failed");
-                    return BackendResult::EnteredRun(TurnOutcome::failed(
-                        context.agent_id,
-                        turn_id,
-                        TokenUsage::default(),
-                        0,
-                        TurnFailure {
-                            kind: TurnFailureKind::Internal,
-                            diagnostic: error.clone(),
-                            user_message: error,
-                            retryable: true,
-                        },
-                    ));
+                    return BackendResult::SetupFailed(Some(TurnFailure {
+                        kind: TurnFailureKind::Internal,
+                        diagnostic: error.clone(),
+                        user_message: error,
+                        retryable: true,
+                    }));
                 }
             };
             let instructions = context
@@ -707,15 +701,10 @@ impl ActorBackend for HeadlessBackend {
                 },
             )
             .await;
-            match persisted {
-                Ok(()) => BackendResult::EnteredRun(outcome),
-                Err(error) => {
-                    let _ = event_tx.send(AgentEvent::ControlError {
-                        message: format!("failed to checkpoint completed turn: {error}"),
-                    });
-                    BackendResult::Reported(outcome)
-                }
-            }
+            BackendResult::EnteredRun(match persisted {
+                Ok(()) => outcome,
+                Err(error) => outcome.checkpoint_failed(error),
+            })
         })
     }
 
@@ -1276,9 +1265,10 @@ pub(crate) fn spawn_command_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TurnOutcome;
     use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
     use crate::tools::offload::{OffloadBackend, OffloadError};
-    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse};
+    use maki_providers::{ContentBlock, Role, StopReason, StreamResponse, TokenUsage};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
@@ -1601,9 +1591,9 @@ mod tests {
         });
     }
 
-    #[test_case(false, SAVE_ERROR ; "checkpoint_failure_replaces_the_outcome_with_one_error")]
-    #[test_case(true, TERMINAL_CHECKPOINT_TIMEOUT ; "hung_checkpoint_times_out_into_one_error")]
-    fn checkpoint_failure_after_terminal_is_forwarded_to_frontend(hang: bool, expected: &str) {
+    #[test_case(false, SAVE_ERROR ; "checkpoint_failure_fails_the_turn_once")]
+    #[test_case(true, TERMINAL_CHECKPOINT_TIMEOUT ; "hung_checkpoint_times_out_into_one_failure")]
+    fn checkpoint_failure_fails_the_turn_with_its_usage(hang: bool, expected: &str) {
         smol::block_on(async {
             let checkpoint: Checkpoint = Arc::new(
                 move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
@@ -1633,10 +1623,12 @@ mod tests {
                 Some(binding),
             );
             let ticket = handle.input_tx.admit(test_params().input).await.unwrap();
-            assert!(matches!(
-                bounded(ticket.wait()).await,
-                TurnOutcome::Completed { .. }
-            ));
+            let settled = bounded(ticket.wait()).await;
+            assert!(
+                matches!(&settled, TurnOutcome::Failed { failure, num_turns, .. }
+                    if failure.user_message.contains(expected) && *num_turns > 0),
+                "{settled:?}"
+            );
             let terminals: Vec<_> = handle
                 .event_rx
                 .try_iter()
@@ -1650,8 +1642,7 @@ mod tests {
             assert!(
                 matches!(
                     terminals.as_slice(),
-                    [Envelope { event: AgentEvent::ControlError { message }, .. }]
-                        if message.contains(expected)
+                    [Envelope { event: AgentEvent::TurnOutcome(outcome), .. }] if *outcome == settled
                 ),
                 "{terminals:?}"
             );

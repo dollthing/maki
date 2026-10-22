@@ -513,10 +513,7 @@ impl ActorBackend for LuaInvocationBackend {
                 }
             }
             if result.is_err() {
-                return BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id: context.turn_id.unwrap(),
-                };
+                return BackendResult::SetupFailed(None);
             }
             BackendResult::EnteredRun(TurnOutcome::completed(
                 context.agent_id,

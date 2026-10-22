@@ -719,18 +719,12 @@ impl ActorBackend for TuiActorBackend {
             }
             let result = if matches!(&work, WorkKind::Control | WorkKind::Compact) {
                 warn!(?work, "unexpected work kind in TUI run_turn");
-                BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id,
-                }
+                BackendResult::SetupFailed(None)
             } else if let Err(_) | Ok(false) = context.cancel.race(self.initialize()).await {
                 if context.cancel.is_cancelled() {
                     BackendResult::EnteredRun(self.cancel_setup(&context, turn_id, work_identity))
                 } else {
-                    BackendResult::SetupFailed {
-                        agent_id: context.agent_id,
-                        turn_id,
-                    }
+                    BackendResult::SetupFailed(None)
                 }
             } else {
                 info!(
@@ -744,13 +738,10 @@ impl ActorBackend for TuiActorBackend {
                     .await
                 {
                     Some(outcome) => BackendResult::EnteredRun(outcome),
-                    None => BackendResult::SetupFailed {
-                        agent_id: context.agent_id,
-                        turn_id,
-                    },
+                    None => BackendResult::SetupFailed(None),
                 }
             };
-            if matches!(result, BackendResult::SetupFailed { .. }) {
+            if matches!(result, BackendResult::SetupFailed(_)) {
                 if let Some(inbox) = &context.inbox {
                     inbox.close();
                 }

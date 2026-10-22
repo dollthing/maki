@@ -505,10 +505,7 @@ impl ActorBackend for LuaToolBackend {
             let result = invocation.execute(&self.context).await.output.map(|_| ());
             let _ = self.completed.send(result.clone());
             if result.is_err() {
-                return BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id: context.turn_id.unwrap(),
-                };
+                return BackendResult::SetupFailed(None);
             }
             BackendResult::EnteredRun(TurnOutcome::completed(
                 context.agent_id,
@@ -589,10 +586,7 @@ impl ActorBackend for NestedTaskBackend {
             let _ = self.completed.send(result.clone());
             self.release.recv_async().await.unwrap();
             if result.is_err() {
-                return BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id: context.turn_id.unwrap(),
-                };
+                return BackendResult::SetupFailed(None);
             }
             BackendResult::EnteredRun(TurnOutcome::completed(
                 context.agent_id,

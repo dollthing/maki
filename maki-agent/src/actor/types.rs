@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::tools::offload::OffloadStore;
-use crate::types::{ActorWorkIdentity, AgentId, TurnId, TurnOutcome};
+use crate::types::{ActorWorkIdentity, AgentId, TurnFailure, TurnId, TurnOutcome};
 use crate::{AgentMode, InterruptSource, RunSettings};
 
 #[derive(Clone)]
@@ -127,16 +127,10 @@ pub struct TurnContext {
 pub enum BackendResult {
     /// The backend entered the run and produced a real outcome.
     EnteredRun(TurnOutcome),
-    /// The run entered, but the backend already reported its terminal to the
-    /// frontend (a failed terminal checkpoint). The ticket settles with this
-    /// outcome and no `TurnOutcome` event is sent.
-    Reported(TurnOutcome),
     /// Setup failed before the run entered; the actor synthesizes one
-    /// `TurnOutcome::Failed` for the admission and delivers it once.
-    SetupFailed {
-        agent_id: AgentId,
-        turn_id: TurnId,
-    },
+    /// `TurnOutcome::Failed` for the admission, carrying the backend's
+    /// failure when it has a specific one, and delivers it once.
+    SetupFailed(Option<TurnFailure>),
     ControlDone,
     ControlFailed,
     CompactDone,
