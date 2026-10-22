@@ -477,17 +477,18 @@ impl PreparedOperation {
     }
 
     fn config_commit(&self, inner: &ActorInner, state: &ActorState) -> ConfigCommit {
-        let candidate = &self.ready.as_ref().unwrap().0;
+        let candidate =
+            config::with_discovery(state.policy.as_deref(), &self.ready.as_ref().unwrap().0);
         let current = state
             .policy
             .as_ref()
-            .filter(|current| config::equivalent(current, candidate));
+            .filter(|current| config::equivalent(current, &candidate));
         ConfigCommit {
             identity: Arc::clone(&inner.identity),
             generation: state
                 .policy_generation
                 .wrapping_add(u64::from(current.is_none())),
-            config: current.map_or_else(|| Arc::clone(candidate), Arc::clone),
+            config: current.map_or(candidate, Arc::clone),
         }
     }
 

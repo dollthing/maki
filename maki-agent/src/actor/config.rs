@@ -105,6 +105,29 @@ pub fn rediscovered_model(provider: &dyn Provider, model: &Model) -> Option<Mode
     (!same_model(&refined, model)).then_some(refined)
 }
 
+/// {candidate} as it commits over {current}: a model it switched to takes
+/// what discovery knows by now, so discovery that lands after the change
+/// materialized is not lost.
+pub(super) fn with_discovery(
+    current: Option<&EffectiveAgentConfig>,
+    candidate: &Arc<EffectiveAgentConfig>,
+) -> Arc<EffectiveAgentConfig> {
+    let switched = current.is_none_or(|current| {
+        !Arc::ptr_eq(&current.provider, &candidate.provider)
+            || current.model.spec() != candidate.model.spec()
+    });
+    let Some(model) = switched
+        .then(|| model_registry::discovered(&candidate.model.provider, &candidate.model.id))
+        .flatten()
+        .and_then(|_| rediscovered_model(&*candidate.provider, &candidate.model))
+    else {
+        return Arc::clone(candidate);
+    };
+    let mut config = (**candidate).clone();
+    config.settings.model = model;
+    Arc::new(config)
+}
+
 impl ConfigChange {
     /// A metadata-only refresh: the provider stays, so a concurrent model
     /// switch makes the compare-and-swap a no-op.
@@ -137,15 +160,7 @@ impl ConfigChange {
                 config.context = current.context.change_directory(cwd);
                 return Ok(config);
             }
-            Self::Patch(mut patch) => {
-                if let Some(model) = &mut patch.model
-                    && model_registry::discovered(&model.model.provider, &model.model.id).is_some()
-                    && let Some(refined) = rediscovered_model(&*model.provider, &model.model)
-                {
-                    model.model = refined;
-                }
-                patch
-            }
+            Self::Patch(patch) => patch,
             Self::PatchAndMode {
                 patch,
                 mode,

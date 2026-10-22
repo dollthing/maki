@@ -1567,7 +1567,7 @@ fn cancelled_preparation_does_not_block_successors() {
 }
 
 #[test]
-fn patched_model_takes_discovery_that_lands_before_commit() {
+fn patched_model_takes_discovery_that_lands_after_it_materialized() {
     smol::block_on(async {
         let (actor, task) = spawn(ScriptedBackend::new());
         let config = EffectiveAgentConfig::new(policy(false), AgentMode::Build);
@@ -1577,6 +1577,20 @@ fn patched_model_takes_discovery_that_lands_before_commit() {
             Model::from_spec(&format!("{DISCOVERY_PROVIDER}/{COLD_PATCH_MODEL_ID}")).unwrap();
         assert_ne!(cold.context_window, DISCOVERED_WINDOW);
         let change = actor.reserve_prepared_operation(None).unwrap();
+        change
+            .resolve(Some(ConfigChange::Patch(ConfigPatch {
+                model: Some(crate::PreparedModel {
+                    provider,
+                    model: cold,
+                }),
+                ..Default::default()
+            })))
+            .unwrap();
+        change.wait_ready().await.unwrap();
+        assert_ne!(
+            change.ready_config().unwrap().model.context_window,
+            DISCOVERED_WINDOW
+        );
         model_registry::set_known_models(
             DISCOVERY_PROVIDER,
             vec![ModelInfo {
@@ -1584,18 +1598,12 @@ fn patched_model_takes_discovery_that_lands_before_commit() {
                 ..ModelInfo::id_only(COLD_PATCH_MODEL_ID.into())
             }],
         );
-        let committed = change
-            .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
-                model: Some(crate::PreparedModel {
-                    provider,
-                    model: cold,
-                }),
-                ..Default::default()
-            })))
-            .await
-            .unwrap()
-            .config;
+        let committed = change.commit().unwrap().config;
         assert_eq!(committed.config.model.context_window, DISCOVERED_WINDOW);
+        assert_eq!(
+            actor.effective_config().unwrap().model.context_window,
+            DISCOVERED_WINDOW
+        );
         actor.close();
         task.await;
     });
