@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::VariantArray;
 use thiserror::Error;
-use tracing::warn;
 
 pub const PROJECT_DIR: &str = ".makima";
 const PERMISSIONS_FILE: &str = "permissions.toml";
@@ -342,12 +341,32 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
+    #[error("cannot load permissions from {}: {reason}", path.display())]
+    PermissionsFile { path: PathBuf, reason: String },
+    #[error(
+        "invalid permissions in {}: {}: {reason}",
+        path.display(),
+        rule_location(section, key)
+    )]
+    PermissionRule {
+        path: PathBuf,
+        section: String,
+        key: String,
+        reason: String,
+    },
     #[error("invalid config: trust.paths contains invalid glob pattern `{pattern}`: {source}")]
     InvalidTrustPattern {
         pattern: String,
         #[source]
         source: globset::Error,
     },
+}
+
+fn rule_location(section: &str, key: &str) -> String {
+    match section {
+        "" => key.to_owned(),
+        section => format!("[{section}] {key}"),
+    }
 }
 
 fn check(
@@ -835,75 +854,188 @@ impl PermissionsFileConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for PermissionsFileConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let table = toml::Table::deserialize(deserializer)?;
-        let default = table
-            .get("default")
-            .and_then(|v| DefaultEffect::deserialize(v.clone()).ok());
+/// Where in a permissions file a rule failed to parse, and why.
+#[derive(Debug)]
+struct RuleError {
+    section: String,
+    key: String,
+    reason: String,
+}
 
-        let mut tools = HashMap::new();
-        let mut mcp_rules = Vec::new();
-        let mut mcp_defaults = HashMap::new();
-
-        for (k, v) in table.iter() {
-            if k.is_empty() || k == "default" {
-                continue;
-            }
-            if k == "mcp" {
-                // TOML [mcp.server] creates nested table: mcp → {server → {...}}
-                if let Some(mcp_table) = v.as_table() {
-                    for (server_name, server_value) in mcp_table {
-                        if let Some(server_table) = server_value.as_table() {
-                            parse_mcp_server_table(
-                                server_name,
-                                server_table,
-                                &mut mcp_rules,
-                                &mut mcp_defaults,
-                            );
-                        } else {
-                            tracing::warn!(
-                                server = server_name.as_str(),
-                                "[mcp.{server_name}] is not a table — skipping"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
-                }
-            } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
-                if k.contains('.') {
-                    tracing::warn!(
-                        key = k.as_str(),
-                        "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
-                    );
-                } else {
-                    tools.insert(k.clone(), tp);
-                }
-            }
+impl RuleError {
+    fn new(section: &str, key: &str, reason: impl Into<String>) -> Self {
+        Self {
+            section: section.into(),
+            key: key.into(),
+            reason: reason.into(),
         }
-
-        Ok(Self {
-            default,
-            tools,
-            mcp_rules,
-            mcp_defaults,
-        })
     }
 }
 
-#[derive(Deserialize)]
+fn expected(what: &str, got: &toml::Value) -> String {
+    format!("expected {what}, got {}", got.type_str())
+}
+
+impl PermissionsFileConfig {
+    fn parse(table: &toml::Table) -> Result<Self, RuleError> {
+        let mut config = Self::default();
+        for (key, value) in table {
+            match key.as_str() {
+                "default" => {
+                    config.default = Some(
+                        default_effect(value).map_err(|reason| RuleError::new("", key, reason))?,
+                    );
+                }
+                "mcp" => {
+                    let servers = value.as_table().ok_or_else(|| {
+                        RuleError::new("", key, expected("a table of MCP servers", value))
+                    })?;
+                    for (server, value) in servers {
+                        config.parse_mcp_server(server, value)?;
+                    }
+                }
+                tool => {
+                    config
+                        .tools
+                        .insert(tool.to_owned(), ToolPermissions::parse(tool, value)?);
+                }
+            }
+        }
+        Ok(config)
+    }
+
+    fn parse_mcp_server(&mut self, server: &str, value: &toml::Value) -> Result<(), RuleError> {
+        let section = format!("mcp.{server}");
+        let table = value
+            .as_table()
+            .ok_or_else(|| RuleError::new("mcp", server, expected("a table", value)))?;
+        if !is_valid_server_name(server) {
+            return Err(RuleError::new(
+                "mcp",
+                server,
+                "invalid server name; use only alphanumeric characters and hyphens",
+            ));
+        }
+        for (key, value) in table {
+            let effect = match key.as_str() {
+                "allow" => Effect::Allow,
+                "deny" => Effect::Deny,
+                "default" => {
+                    let effect = default_effect(value)
+                        .map_err(|reason| RuleError::new(&section, key, reason))?;
+                    self.mcp_defaults.insert(
+                        ToolKey::McpServer {
+                            server: server.into(),
+                        },
+                        effect,
+                    );
+                    continue;
+                }
+                _ if value.is_table() => {
+                    return Err(RuleError::new(
+                        &section,
+                        key,
+                        "server names cannot contain dots",
+                    ));
+                }
+                _ => return Err(RuleError::new(&section, key, "unknown key")),
+            };
+            let tools = string_list(value, "an array of tool names")
+                .map_err(|reason| RuleError::new(&section, key, reason))?;
+            for tool in tools {
+                let key_error = |reason: String| RuleError::new(&section, key, reason);
+                let tool = match tool.as_str() {
+                    "*" => ToolKey::McpServer {
+                        server: server.into(),
+                    },
+                    tool => ToolKey::parse(&format!("{server}.{tool}"))
+                        .map_err(|error| key_error(error.to_string()))?,
+                };
+                self.mcp_rules.push(PermissionRule {
+                    tool,
+                    scope: None,
+                    effect,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_effect(value: &toml::Value) -> Result<DefaultEffect, String> {
+    value
+        .clone()
+        .try_into()
+        .map_err(|_| format!("expected \"allow\", \"deny\" or \"prompt\", got {value}"))
+}
+
+fn string_list(value: &toml::Value, what: &str) -> Result<Vec<String>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| expected(what, value))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| expected(what, item))
+        })
+        .collect()
+}
+
+#[derive(Default)]
 struct ToolPermissions {
     allow: Option<ScopeSet>,
     deny: Option<ScopeSet>,
     default: Option<DefaultEffect>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
+impl ToolPermissions {
+    fn parse(tool: &str, value: &toml::Value) -> Result<Self, RuleError> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| RuleError::new("", tool, expected("a table", value)))?;
+        if tool.is_empty() || tool.contains('.') {
+            return Err(RuleError::new(
+                "",
+                tool,
+                "invalid tool name; MCP servers go under [mcp.<server>]",
+            ));
+        }
+        let mut permissions = Self::default();
+        for (key, value) in table {
+            let error = |reason: String| RuleError::new(tool, key, reason);
+            match key.as_str() {
+                "allow" => permissions.allow = Some(ScopeSet::parse(value).map_err(error)?),
+                "deny" => permissions.deny = Some(ScopeSet::parse(value).map_err(error)?),
+                "default" if tool == "*" => {
+                    return Err(error("use the top-level `default` instead".into()));
+                }
+                "default" => permissions.default = Some(default_effect(value).map_err(error)?),
+                _ if value.is_table() => {
+                    return Err(error(
+                        "nested table; MCP servers go under [mcp.<server>]".into(),
+                    ));
+                }
+                _ => return Err(error("unknown key".into())),
+            }
+        }
+        Ok(permissions)
+    }
+}
+
 enum ScopeSet {
     All(bool),
     Scopes(Vec<String>),
+}
+
+impl ScopeSet {
+    fn parse(value: &toml::Value) -> Result<Self, String> {
+        const EXPECTED: &str = "a boolean or an array of scope patterns";
+        match value {
+            toml::Value::Boolean(all) => Ok(Self::All(*all)),
+            _ => string_list(value, EXPECTED).map(Self::Scopes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1858,32 +1990,6 @@ pub fn is_valid_server_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-fn push_mcp_tool_rule(
-    rules: &mut Vec<PermissionRule>,
-    server_name: &str,
-    tool_name: &str,
-    effect: Effect,
-) {
-    let qualified = format!("{server_name}.{tool_name}");
-    match ToolKey::parse(&qualified) {
-        Ok(key) => {
-            rules.push(PermissionRule {
-                tool: key,
-                scope: None,
-                effect,
-            });
-        }
-        Err(e) => {
-            tracing::warn!(
-                server = server_name,
-                tool = tool_name,
-                error = %e,
-                "skipping invalid MCP tool name"
-            );
-        }
-    }
-}
-
 fn child_table<'a>(
     table: &'a mut toml_edit::Table,
     key: &str,
@@ -1912,120 +2018,6 @@ fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(
     Ok(())
 }
 
-fn parse_mcp_server_table(
-    server_name: &str,
-    table: &toml::Table,
-    rules: &mut Vec<PermissionRule>,
-    mcp_defaults: &mut HashMap<ToolKey, DefaultEffect>,
-) {
-    if !is_valid_server_name(server_name) {
-        tracing::warn!(
-            server = server_name,
-            "skipping [mcp.{server_name}] — invalid server name; \
-             must contain only alphanumeric characters and hyphens"
-        );
-        return;
-    }
-
-    for (key, value) in table {
-        match key.as_str() {
-            "allow" | "deny" => {
-                let effect = if key == "allow" {
-                    Effect::Allow
-                } else {
-                    Effect::Deny
-                };
-                match value {
-                    toml::Value::Array(arr) => {
-                        for item in arr {
-                            if let Some(tool_name) = item.as_str() {
-                                if tool_name == "*" {
-                                    // `allow = ["*"]` / `deny = ["*"]` means server-wide.
-                                    // Create an McpServer rule so deny-wins logic applies:
-                                    // McpServer deny blocks all tools on the server.
-                                    // No allow can override a deny — any deny wins.
-                                    rules.push(PermissionRule {
-                                        tool: ToolKey::McpServer {
-                                            server: server_name.into(),
-                                        },
-                                        scope: None,
-                                        effect,
-                                    });
-                                    continue;
-                                }
-                                push_mcp_tool_rule(rules, server_name, tool_name, effect);
-                            }
-                        }
-                    }
-                    toml::Value::String(s) => {
-                        let tool_name = s.as_str();
-                        if tool_name == "*" {
-                            // Treat `allow = "*"` the same as `allow = ["*"]` —
-                            // create a hard McpServer rule, not a default.
-                            rules.push(PermissionRule {
-                                tool: ToolKey::McpServer {
-                                    server: server_name.into(),
-                                },
-                                scope: None,
-                                effect,
-                            });
-                        } else {
-                            tracing::info!(
-                                server = server_name,
-                                tool = tool_name,
-                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"] — \
-                                 consider using array syntax"
-                            );
-                            push_mcp_tool_rule(rules, server_name, tool_name, effect);
-                        }
-                    }
-                    other => {
-                        tracing::warn!(
-                            server = server_name,
-                            key = key.as_str(),
-                            value = ?other,
-                            "unexpected value for [mcp.{server_name}].{key} — \
-                             expected array of tool names or default = \"allow\"/\"deny\""
-                        );
-                    }
-                }
-            }
-            "default" => {
-                if let Ok(d) = value.clone().try_into::<DefaultEffect>() {
-                    mcp_defaults.insert(
-                        ToolKey::McpServer {
-                            server: server_name.into(),
-                        },
-                        d,
-                    );
-                } else {
-                    tracing::warn!(
-                        server = server_name,
-                        value = ?value,
-                        "invalid [mcp.{server_name}].default value — expected \"allow\", \"deny\", or \"prompt\""
-                    );
-                }
-            }
-            other => {
-                if value.is_table() {
-                    tracing::warn!(
-                        server = server_name,
-                        key = other,
-                        "unknown key [mcp.{server_name}.{other}] — server names cannot \
-                         contain dots; use [mcp.{other}] instead if this is a server name"
-                    );
-                } else {
-                    tracing::warn!(
-                        server = server_name,
-                        key = other,
-                        "unknown key in [mcp.{server_name}] — ignored"
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn build_permissions(
     global: PermissionsFileConfig,
     project: PermissionsFileConfig,
@@ -2040,16 +2032,7 @@ fn build_permissions(
     let mut tool_defaults = HashMap::new();
     for (tool, perms) in &global.tools {
         if let Some(d) = perms.default {
-            let key = ToolKey::native(tool);
-            if matches!(key, ToolKey::Wildcard) {
-                tracing::warn!(
-                    tool = tool,
-                    "ignoring [\"*\"].default — use the top-level `default` field instead \
-                     for global fallback behavior"
-                );
-            } else {
-                tool_defaults.insert(key, d);
-            }
+            tool_defaults.insert(ToolKey::native(tool), d);
         }
     }
     for (key, d) in &global.mcp_defaults {
@@ -2059,15 +2042,7 @@ fn build_permissions(
         if let Some(d) = perms.default
             && d != DefaultEffect::Allow
         {
-            let key = ToolKey::native(tool);
-            if matches!(key, ToolKey::Wildcard) {
-                tracing::warn!(
-                    tool = tool,
-                    "ignoring project [\"*\"].default — use the top-level `default` field instead"
-                );
-            } else {
-                tool_defaults.insert(key, d);
-            }
+            tool_defaults.insert(ToolKey::native(tool), d);
         }
     }
     for (key, d) in &project.mcp_defaults {
@@ -2139,40 +2114,53 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
     }
 }
 
-pub fn load_permissions(project_config: &ProjectConfig) -> PermissionsConfig {
+/// Fails on any permission rule that does not parse, so a typo can never
+/// silently drop a deny.
+pub fn load_permissions(project_config: &ProjectConfig) -> Result<PermissionsConfig, ConfigError> {
     load_permissions_inner(global_config_dir().as_deref(), project_config)
 }
 
 fn load_permissions_inner(
     global_dir: Option<&Path>,
     project_config: &ProjectConfig,
-) -> PermissionsConfig {
-    let global_perms = global_dir
-        .and_then(|dir| read_permissions_file(&dir.join(PERMISSIONS_FILE)))
-        .unwrap_or_default();
+) -> Result<PermissionsConfig, ConfigError> {
+    let global_perms = match global_dir {
+        Some(dir) => read_permissions_file(&dir.join(PERMISSIONS_FILE))?,
+        None => PermissionsFileConfig::default(),
+    };
 
     // The one deliberate exception to the gate: read at any trust level so a
     // repository can narrow the agent inside it, then stripped down to its deny
     // scopes when nobody vouched for the folder.
     let mut project_perms =
-        read_permissions_file(&project_config.project_file(GatedFile::Permissions))
-            .unwrap_or_default();
+        read_permissions_file(&project_config.project_file(GatedFile::Permissions))?;
     if !project_config.is_trusted() {
         project_perms.restrict_to_deny_scopes();
     }
 
-    build_permissions(global_perms, project_perms)
+    Ok(build_permissions(global_perms, project_perms))
 }
 
-fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
-    let content = fs::read_to_string(path).ok()?;
-    match toml::from_str(&content) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse permissions");
-            None
+fn read_permissions_file(path: &Path) -> Result<PermissionsFileConfig, ConfigError> {
+    let file_error = |reason: String| ConfigError::PermissionsFile {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PermissionsFileConfig::default());
         }
-    }
+        Err(error) => return Err(file_error(error.to_string())),
+    };
+    let table: toml::Table =
+        toml::from_str(&content).map_err(|error| file_error(error.to_string()))?;
+    PermissionsFileConfig::parse(&table).map_err(|error| ConfigError::PermissionRule {
+        path: path.to_path_buf(),
+        section: error.section,
+        key: error.key,
+        reason: error.reason,
+    })
 }
 
 pub fn global_config_dir() -> Option<PathBuf> {
@@ -2767,7 +2755,8 @@ mod tests {
              [bash]\nallow = [\n    \"cargo *\",\n]\ndeny = [\n    \"rm -rf *\",\n]\n",
         );
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
@@ -2795,7 +2784,8 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert_eq!(perms.rules.len(), 4);
 
@@ -2827,7 +2817,8 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"allow\"\n").unwrap();
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Prompt);
     }
 
@@ -2887,7 +2878,8 @@ mod tests {
     fn no_permissions_file_returns_defaults() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Prompt);
         assert!(perms.rules.is_empty());
     }
@@ -2901,7 +2893,8 @@ mod tests {
             "[bash]\nallow = [\"git *\"]\ndeny = [\"rm *\"]\n",
         );
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.rules[0].effect, Effect::Deny);
         assert_eq!(perms.rules[1].effect, Effect::Allow);
     }
@@ -2912,7 +2905,8 @@ mod tests {
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "default = \"deny\"\n");
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -2925,7 +2919,8 @@ mod tests {
             "default = \"deny\"\n\n[bash]\ndefault = \"allow\"\nallow = [\"cargo *\"]\n",
         );
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
@@ -2946,7 +2941,8 @@ mod tests {
         )
         .unwrap();
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
@@ -2961,7 +2957,8 @@ mod tests {
         fs::create_dir_all(&maki_dir).unwrap();
         fs::write(maki_dir.join("permissions.toml"), "default = \"deny\"\n").unwrap();
 
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.default, DefaultEffect::Deny);
     }
 
@@ -3464,7 +3461,8 @@ mod tests {
             dir.path(),
             "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
         );
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.rules.len(), 2);
         assert!(perms.rules.iter().any(|r| r.tool
             == ToolKey::McpTool {
@@ -3485,7 +3483,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(perms.rules.len(), 1);
         assert_eq!(
             perms.rules[0].tool,
@@ -3498,15 +3497,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_mcp_dotted_tool_name_rejected() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
-        assert_eq!(perms.rules.len(), 0, "dotted tool name should be rejected");
-    }
-
-    #[test]
     fn permissions_mcp_default_allow() {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
@@ -3514,7 +3504,8 @@ mod tests {
             dir.path(),
             "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
         );
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -3532,7 +3523,8 @@ mod tests {
             dir.path(),
             "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
         );
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::McpServer {
                 server: "exa".into()
@@ -3550,14 +3542,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_tool_key_sections_ignored() {
+    #[test_case("default = \"maybe\"\n", "", "default" ; "invalid_top_level_default")]
+    #[test_case("mcp = 1\n", "", "mcp" ; "mcp_not_a_table")]
+    #[test_case("[mcp]\ngithub = 1\n", "mcp", "github" ; "mcp_server_not_a_table")]
+    #[test_case("[mcp.bad_name]\ndeny = [\"x\"]\n", "mcp", "bad_name" ; "invalid_server_name")]
+    #[test_case("[mcp.github]\ndeny = true\n", "mcp.github", "deny" ; "mcp_boolean_deny")]
+    #[test_case("[mcp.github]\nallow = false\n", "mcp.github", "allow" ; "mcp_boolean_allow")]
+    #[test_case("[mcp.github]\ndeny = \"admin\"\n", "mcp.github", "deny" ; "mcp_string_deny")]
+    #[test_case("[mcp.github]\ndeny = [1]\n", "mcp.github", "deny" ; "mcp_non_string_tool")]
+    #[test_case("[mcp.github]\ndeny = [\"web.search\"]\n", "mcp.github", "deny" ; "mcp_dotted_tool_name")]
+    #[test_case("[mcp.github]\ndefault = \"sometimes\"\n", "mcp.github", "default" ; "mcp_invalid_default")]
+    #[test_case("[mcp.github]\ndeyn = [\"x\"]\n", "mcp.github", "deyn" ; "mcp_unknown_key")]
+    #[test_case("[mcp.github.admin]\n", "mcp.github", "admin" ; "mcp_dotted_server_name")]
+    #[test_case("bash = 1\n", "", "bash" ; "tool_not_a_table")]
+    #[test_case("[\"\"]\ndeny = [\"x\"]\n", "", "" ; "empty_tool_name")]
+    #[test_case("[\"a.b\"]\ndeny = [\"x\"]\n", "", "a.b" ; "dotted_tool_name")]
+    #[test_case("[bash]\ndeny = \"rm *\"\n", "bash", "deny" ; "tool_string_deny")]
+    #[test_case("[bash]\ndeny = [1]\n", "bash", "deny" ; "tool_non_string_scope")]
+    #[test_case("[bash]\ndefault = \"sometimes\"\n", "bash", "default" ; "tool_invalid_default")]
+    #[test_case("[bash]\ndeyn = [\"rm *\"]\n", "bash", "deyn" ; "tool_unknown_key")]
+    #[test_case("[bash.extra]\n", "bash", "extra" ; "tool_nested_table")]
+    #[test_case("[\"*\"]\ndefault = \"deny\"\n", "*", "default" ; "wildcard_tool_default")]
+    fn invalid_permission_rule_fails_loading(content: &str, section: &str, key: &str) {
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
-        let perms = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()));
-        assert!(perms.rules.is_empty());
-        assert!(perms.tool_defaults.is_empty());
+        write_global_permissions(dir.path(), content);
+        let error = load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path()))
+            .err()
+            .unwrap();
+        let path = global.join(PERMISSIONS_FILE);
+        assert!(
+            matches!(&error, ConfigError::PermissionRule { path: p, section: s, key: k, .. }
+                if *p == path && s == section && k == key),
+            "{error}"
+        );
+    }
+
+    #[test_case(true ; "trusted_project")]
+    #[test_case(false ; "untrusted_project")]
+    fn invalid_project_permission_rule_fails_loading(trusted: bool) {
+        let dir = TempDir::new().unwrap();
+        let maki_dir = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&maki_dir).unwrap();
+        fs::write(
+            maki_dir.join(PERMISSIONS_FILE),
+            "[mcp.github]\ndeny = true\n",
+        )
+        .unwrap();
+        let project = if trusted {
+            ProjectConfig::for_project(dir.path())
+        } else {
+            ProjectConfig::discover(dir.path())
+        };
+        assert!(matches!(
+            load_permissions_inner(None, &project),
+            Err(ConfigError::PermissionRule { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_permissions_file_fails_loading() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[bash\n");
+        assert!(matches!(
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())),
+            Err(ConfigError::PermissionsFile { .. })
+        ));
     }
 
     const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";

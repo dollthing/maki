@@ -54,7 +54,7 @@ pub fn run(
         .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(&trust.project_config);
+    config.permissions = load_permissions(&trust.project_config)?;
 
     if yolo || config.always_yolo {
         config.permissions.yolo = true;

@@ -33,7 +33,10 @@ use maki_commands::{
     CommandOutcome, HostRequest, HostResponse, InputDispatch, PresentedCommand, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
+use maki_config::{
+    MAX_SERVER_NAME_LEN, ModelPolicy, PermissionsConfig, ProjectConfig, SessionDefaults,
+    TrustConfig,
+};
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -172,6 +175,7 @@ struct SpawnSession {
     yolo: bool,
     defaults: SessionDefaults,
     project_config: ProjectConfig,
+    permissions: PermissionsConfig,
 }
 
 struct AcpCommandHost {
@@ -408,6 +412,11 @@ fn respond_request(
     }
 }
 
+fn load_permissions(project_config: &ProjectConfig) -> Result<PermissionsConfig, AcpError> {
+    maki_config::load_permissions(project_config)
+        .map_err(|error| AcpError::new(-32603, error.to_string()))
+}
+
 fn trusted_project_config(
     cwd: &Path,
     storage: &StateDir,
@@ -449,6 +458,7 @@ async fn new_session(
         params.trust_mode,
         &params.trust_policy,
     );
+    let permissions = load_permissions(&project_config)?;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
     let (handle, root_target) = spawn_session(
         params,
@@ -462,6 +472,7 @@ async fn new_session(
             yolo: params.yolo,
             defaults: params.defaults,
             project_config,
+            permissions,
         },
     );
     let session_id = handle.session_id.to_string();
@@ -511,6 +522,7 @@ async fn load_session(
         params.trust_mode,
         &params.trust_policy,
     );
+    let permissions = load_permissions(&project_config)?;
     let mcp = start_mcp(
         &session_cwd,
         &req.mcp_servers,
@@ -553,6 +565,7 @@ async fn load_session(
                 d
             },
             project_config,
+            permissions,
         },
         Some(history_snapshot),
     );
@@ -611,12 +624,12 @@ fn spawn_session_with_history(
         yolo,
         defaults,
         project_config,
+        permissions,
     } = session;
-    let permissions_config = maki_config::load_permissions(&project_config);
     let interactive = InteractiveParams {
         model,
         config: params.config.clone(),
-        permissions_config,
+        permissions_config: permissions,
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
         excluded_tools: Vec::new(),
@@ -2968,6 +2981,7 @@ mod tests {
                     yolo: false,
                     defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(cwd.path()),
+                    permissions: PermissionsConfig::default(),
                 },
             );
             let input_tx = handle.input_tx.clone();
@@ -3044,6 +3058,7 @@ mod tests {
                     yolo: false,
                     defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(cwd.path()),
+                    permissions: PermissionsConfig::default(),
                 },
             );
             let error = install_session_with_lock(
@@ -5119,6 +5134,7 @@ mod tests {
                     yolo: false,
                     defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(Path::new("/project")),
+                    permissions: PermissionsConfig::default(),
                 },
             );
             let provider_ready = smol::future::or(

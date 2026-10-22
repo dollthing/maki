@@ -618,7 +618,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(&trust.project_config);
+    config.permissions = load_permissions(&trust.project_config)?;
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;

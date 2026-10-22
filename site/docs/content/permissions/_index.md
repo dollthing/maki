@@ -102,7 +102,9 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names, with `["*"]` for every tool on the server. Booleans are rejected there; use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) accept `allow = true` to cover the whole tool.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take an array of tool names, with `["*"]` for every tool on the server. Use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) take an array of scope patterns, or `allow = true` to cover the whole tool.
+
+A rule that does not parse stops maki from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, tool names that are not valid, and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Maki never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
 
 ### The `default` key
 

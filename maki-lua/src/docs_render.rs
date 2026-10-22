@@ -45,7 +45,8 @@ The rules:
   warning at load time.
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
-- Invalid TOML: everything denied, with a warning in the log.
+- Invalid TOML, an unknown key under `[permissions]` or a value that is not
+  a boolean: everything denied, with a warning in the log.
 "#;
     let keys: Vec<&'static str> = Permission::ALL.iter().map(|p| p.manifest_key()).collect();
     let anchor = if anchored {
