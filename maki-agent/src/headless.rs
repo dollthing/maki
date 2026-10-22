@@ -19,13 +19,15 @@ use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::actor::{AdmissionPreparation, AgentContextSnapshot, ConfigChange, PreparedTurn};
+use crate::actor::{
+    AdmissionPreparation, AgentContextSnapshot, ConfigChange, PreparedModel, PreparedTurn,
+};
 use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{
-    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
+    ModelPreparer, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
 };
 use crate::template;
@@ -421,6 +423,21 @@ pub fn default_preparation() -> ProviderPreparation {
         Box::pin(async move {
             let provider = provider::from_model_async(&mut model, timeouts).await?;
             Ok((model, Arc::from(provider)))
+        })
+    })
+}
+
+/// Prepares the provider for a model a session coordinator commits.
+pub fn default_model_preparer(timeouts: Timeouts) -> ModelPreparer {
+    Arc::new(move |mut model| {
+        Box::pin(async move {
+            let provider = provider::from_model_async(&mut model, timeouts)
+                .await
+                .map_err(|error| Arc::from(error.user_message()))?;
+            Ok(PreparedModel {
+                model,
+                provider: Arc::from(provider),
+            })
         })
     })
 }

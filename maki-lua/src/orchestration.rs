@@ -5,7 +5,11 @@ use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use arc_swap::ArcSwapOption;
 use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
-use maki_agent::session_coordinator::{ConfigMutation, SessionTransactionReservation};
+use maki_agent::headless::{InteractiveHandle, RootBinding};
+use maki_agent::session_checkpoint::SessionLogCheckpoint;
+use maki_agent::session_coordinator::{
+    ConfigMutation, ModelPreparer, SessionCoordinatorHandle, SessionTransactionReservation,
+};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
@@ -206,7 +210,7 @@ pub type TurnCompletion =
 pub fn child_persistence(
     label: &'static str,
     services: Weak<AgentOrchestration>,
-    checkpoint: Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>,
+    checkpoint: Arc<SessionLogCheckpoint>,
 ) -> (ConfigMutationReserver, TurnCompletion) {
     let destination = move |target: &AgentRef| -> Result<(String, String), String> {
         let services = services
@@ -279,32 +283,84 @@ pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) 
     }
 }
 
-/// The orchestration a non-UI frontend binds to its root graph. The root's own
-/// config commits go through `root`, which resolves the coordinator; children
-/// go through `child_config`. `root` is a resolver rather than a handle because
-/// ACP publishes its root before the coordinator is registered while SDK holds
-/// one from the start.
+/// A root binding that hands the bound root and its template to the frontend.
+pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
+    let (ready, root) = flume::bounded(1);
+    let binding: RootBinding = Box::new(move |_, target, template| {
+        Box::pin(async move {
+            ready
+                .send(TrustedTarget { target, template })
+                .map_err(|error| error.to_string())
+        })
+    });
+    (binding, root)
+}
+
+/// Binds a headless frontend's root actor to {coordinator}, so committed
+/// config installs the model and cwd on {handle}, and returns the root that
+/// {root_binding} delivered.
+pub async fn bind_frontend_root(
+    handle: &InteractiveHandle,
+    coordinator: &SessionCoordinatorHandle,
+    root_binding: &flume::Receiver<TrustedTarget>,
+    prepare_model: ModelPreparer,
+) -> Result<TrustedTarget, String> {
+    let root = handle.initialized_root().await?;
+    let model = handle.model.clone();
+    let permissions = Arc::clone(&handle.permissions);
+    coordinator
+        .bind_actor(
+            root,
+            prepare_model,
+            Arc::new(move |commit| {
+                model.install(
+                    Arc::clone(&commit.config.provider),
+                    commit.config.model.clone(),
+                );
+                permissions.set_cwd(commit.config.context.cwd().to_path_buf());
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    root_binding
+        .recv_async()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The orchestration a non-UI frontend binds to its root graph: the root's
+/// config commits through {coordinator} and its children persist to
+/// {checkpoint}. `label` names the frontend in the closed-graph error.
+pub fn durable_frontend(
+    label: &'static str,
+    models: Vec<String>,
+    root: TrustedTarget,
+    coordinator: SessionCoordinatorHandle,
+    checkpoint: Arc<SessionLogCheckpoint>,
+) -> Arc<AgentOrchestration> {
+    Arc::new_cyclic(|services| {
+        let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
+        frontend_root(models, root, child_config, coordinator).with_completion(completion)
+    })
+}
+
+/// The root half of [`durable_frontend`]: root config goes through
+/// {coordinator}, children through {child_config}.
 pub fn frontend_root(
-    models: Arc<ArcSwapOption<Vec<String>>>,
+    models: Vec<String>,
     target: TrustedTarget,
     child_config: ConfigMutationReserver,
-    root_coordinator: impl Fn() -> Result<
-        maki_agent::session_coordinator::SessionCoordinatorHandle,
-        String,
-    > + Send
-    + Sync
-    + 'static,
+    coordinator: SessionCoordinatorHandle,
 ) -> AgentOrchestration {
     let root_id = target.target.id();
     let root = target.target.clone();
-    let services = AgentOrchestration::new(models);
+    let services = AgentOrchestration::new(Arc::new(ArcSwapOption::from_pointee(models)));
     services.register_root(
         target,
         Some(Arc::new(move |target, publication| {
             if target.id() != root_id {
                 return child_config(target, publication);
             }
-            root_coordinator()?
+            coordinator
                 .reserve_transaction(publication)
                 .map(SessionTransactionReservation::into_config_mutation)
                 .map_err(|error| error.to_string())
@@ -312,6 +368,23 @@ pub fn frontend_root(
     );
     services.select(Some(root));
     services
+}
+
+/// Children apply config changes without persistence; a root needs a durable
+/// adapter.
+fn default_config_mutation(
+    target: &AgentRef,
+    publication: CheckpointPublication,
+) -> Result<ConfigMutationReservation, String> {
+    if target
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .parent_id
+        .is_none()
+    {
+        return Err("durable root configuration adapter is unavailable".into());
+    }
+    Ok(nonpersistent_config_mutation(publication))
 }
 
 /// Commits one config change through {target}'s FIFO. Once the predecessor has
@@ -356,23 +429,6 @@ pub async fn commit_config_change(
         .await
         .map(|commit| commit.config)
         .map_err(|error| error.to_string())
-}
-
-/// Children apply config changes without persistence; a root needs a durable
-/// adapter.
-fn default_config_mutation(
-    target: &AgentRef,
-    publication: CheckpointPublication,
-) -> Result<ConfigMutationReservation, String> {
-    if target
-        .snapshot()
-        .map_err(|error| error.to_string())?
-        .parent_id
-        .is_none()
-    {
-        return Err("durable root configuration adapter is unavailable".into());
-    }
-    Ok(nonpersistent_config_mutation(publication))
 }
 
 pub fn nonpersistent_config_mutation(

@@ -35,7 +35,7 @@ use maki_commands::{
     TargetCapability, TargetHandle,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -690,56 +690,6 @@ impl SdkCommands {
     }
 }
 
-fn sdk_root_binding() -> (headless::RootBinding, Receiver<TrustedTarget>) {
-    let (ready, target) = flume::bounded(1);
-    let binding: headless::RootBinding = Box::new(move |_, root, template| {
-        Box::pin(async move {
-            ready
-                .send(TrustedTarget {
-                    target: root,
-                    template,
-                })
-                .map_err(|error| error.to_string())
-        })
-    });
-    (binding, target)
-}
-
-fn sdk_orchestration(
-    models: Vec<String>,
-    root: TrustedTarget,
-    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
-    child_config: ConfigMutationReserver,
-) -> AgentOrchestration {
-    let models = Arc::new(Some(Arc::new(models)).into());
-    maki_lua::orchestration::frontend_root(models, root, child_config, move || {
-        Ok(coordinator.clone())
-    })
-}
-
-fn bind_sdk_actor(
-    coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
-    handle: &InteractiveHandle,
-    root: maki_agent::AgentRef,
-    prepare_model: maki_agent::session_coordinator::ModelPreparer,
-) -> Result<(), maki_agent::session_coordinator::SessionCoordinatorError> {
-    coordinator.bind_actor(
-        root,
-        prepare_model,
-        Arc::new({
-            let shared = handle.model.clone();
-            let permissions = Arc::clone(&handle.permissions);
-            move |commit| {
-                shared.install(
-                    Arc::clone(&commit.config.settings.provider),
-                    commit.config.settings.model.clone(),
-                );
-                permissions.set_cwd(commit.config.context.cwd().to_path_buf());
-            }
-        }),
-    )
-}
-
 pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
@@ -824,7 +774,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let startup_model = model.clone();
     let models = available_model_specs(&model_policy);
-    let (binding, root_target) = sdk_root_binding();
+    let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
             model,
@@ -853,7 +803,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         Some(initial_history),
         Some(binding),
     );
-    let root = smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
+    smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
         startup_model.spec(),
         available_model_specs(&model_policy)
@@ -894,39 +844,26 @@ pub fn run(params: SdkParams) -> Result<()> {
         },
     )
     .map_err(|error| eyre!("register session coordinator: {error}"))?;
-    bind_sdk_actor(
-        &coordinator,
+    let trusted_root = smol::block_on(maki_lua::orchestration::bind_frontend_root(
         &handle,
-        root.clone(),
-        Arc::new(move |mut model| {
-            Box::pin(async move {
-                let provider = maki_providers::provider::from_model_async(&mut model, timeouts)
-                    .await
-                    .map_err(|error| Arc::from(error.user_message()))?;
-                Ok(maki_agent::PreparedModel {
-                    model,
-                    provider: Arc::from(provider),
-                })
-            })
-        }),
-    )
+        &coordinator,
+        &root_target,
+        headless::default_model_preparer(timeouts),
+    ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
-    let trusted_root = root_target.recv().map_err(|error| eyre!(error))?;
     let sdk_commands = SdkCommands::new(
         command_registry,
         &commands,
         model_specs,
         Some(trusted_root.clone()),
     )?;
-    let orchestration = Arc::new_cyclic(|weak| {
-        let persistence = maki_lua::orchestration::child_persistence(
-            "SDK",
-            weak.clone(),
-            Arc::clone(&checkpoint),
-        );
-        sdk_orchestration(models, trusted_root, coordinator.clone(), persistence.0)
-            .with_completion(persistence.1)
-    });
+    let orchestration = maki_lua::orchestration::durable_frontend(
+        "SDK",
+        models,
+        trusted_root,
+        coordinator.clone(),
+        Arc::clone(&checkpoint),
+    );
     lua_handle.install_orchestration_services(orchestration.clone());
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -2752,7 +2689,7 @@ mod tests {
             &ModelPolicy::default(),
             &mut defaults,
         );
-        let (binding, root_target) = sdk_root_binding();
+        let (binding, root_target) = maki_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
                 model,
@@ -2840,10 +2777,10 @@ mod tests {
             turn_active: false,
             active_cancel: None,
         }));
-        bind_sdk_actor(
-            &coordinator,
+        let trusted_root = smol::block_on(maki_lua::orchestration::bind_frontend_root(
             &handle,
-            agent.clone(),
+            &coordinator,
+            &root_target,
             Arc::new({
                 let provider = Arc::clone(&provider);
                 move |model| {
@@ -2851,7 +2788,7 @@ mod tests {
                     Box::pin(async move { Ok(PreparedModel { model, provider }) })
                 }
             }),
-        )
+        ))
         .unwrap();
         assert_eq!(
             agent.effective_config().unwrap().unwrap().settings.thinking,
@@ -2874,7 +2811,6 @@ mod tests {
         let (child_completing, child_completion_gate) = flume::bounded(1);
         let (child_completion_release, child_completion_resume) = flume::bounded(1);
         let root_id = agent.id();
-        let trusted_root = root_target.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
         let child_storage = StateDir::from_path(state_dir.path().to_path_buf());
         let child_checkpoint = Arc::new(
             maki_agent::session_checkpoint::SessionLogCheckpoint::open(
@@ -2893,11 +2829,11 @@ mod tests {
                 Arc::clone(&child_checkpoint),
             );
             let persist = persistence.1;
-            sdk_orchestration(
+            maki_lua::orchestration::frontend_root(
                 vec![STARTUP_MODEL.into(), TARGET_MODEL.into()],
                 trusted_root.clone(),
-                coordinator.clone(),
                 persistence.0,
+                coordinator.clone(),
             ).with_completion(Arc::new(move |target, history| {
             let save = persist(target, history.clone());
             let is_child = target.manager().node(target.id()).unwrap().parent_id == Some(root_id);

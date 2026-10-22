@@ -17,7 +17,6 @@ use agent_client_protocol_schema::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
-use arc_swap::ArcSwapOption;
 use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
@@ -32,7 +31,7 @@ use maki_commands::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
-use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
+use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -637,65 +636,14 @@ fn spawn_session_with_history(
         local_tools: Default::default(),
         state_dir: Some(params.storage.path().to_path_buf()),
     };
-    let (ready, root_target) = flume::bounded(1);
+    let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         interactive,
         headless::default_preparation(),
         snapshot,
-        Some(Box::new(move |_, target, template| {
-            Box::pin(async move {
-                ready
-                    .send(TrustedTarget { target, template })
-                    .map_err(|error| error.to_string())
-            })
-        })),
+        Some(binding),
     );
     (handle, root_target)
-}
-
-#[cfg(test)]
-use maki_lua::orchestration::TurnCompletion;
-
-#[cfg(test)]
-fn orchestration_binding_with_completion(
-    event_handle: maki_lua::EventHandle,
-    models: Arc<ArcSwapOption<Vec<String>>>,
-    completion: TurnCompletion,
-) -> headless::RootBinding {
-    Box::new(move |_, target, template| {
-        Box::pin(async move {
-            let session_id = template
-                .session_id
-                .as_ref()
-                .ok_or("ACP root session is unavailable")?
-                .id();
-            let services = acp_orchestration(
-                models,
-                TrustedTarget { target, template },
-                session_id,
-                Arc::new(|_, publication| {
-                    Ok(maki_lua::orchestration::nonpersistent_config_mutation(
-                        publication,
-                    ))
-                }),
-            )
-            .with_completion(completion);
-            event_handle.install_orchestration_services(Arc::new(services));
-            Ok(())
-        })
-    })
-}
-
-fn acp_orchestration(
-    models: Arc<ArcSwapOption<Vec<String>>>,
-    root: TrustedTarget,
-    session_id: MakiId,
-    child_config: ConfigMutationReserver,
-) -> AgentOrchestration {
-    maki_lua::orchestration::frontend_root(models, root, child_config, move || {
-        maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
-            .map_err(|error| error.to_string())
-    })
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we
@@ -926,67 +874,27 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
-    let root = match handle.initialized_root().await {
+    let trusted_root = match maki_lua::orchestration::bind_frontend_root(
+        &handle,
+        &coordinator,
+        &root_target,
+        headless::default_model_preparer(params.timeouts),
+    )
+    .await
+    {
         Ok(root) => root,
         Err(error) => {
             rollback_install(handle, mcp, Some(coordinator)).await;
             return Err(error);
         }
     };
-    if let Err(error) = coordinator.bind_actor(
-        root.clone(),
-        Arc::new({
-            let timeouts = params.timeouts;
-            move |mut model| {
-                Box::pin(async move {
-                    let provider = maki_providers::provider::from_model_async(&mut model, timeouts)
-                        .await
-                        .map_err(|error| Arc::from(error.user_message()))?;
-                    Ok(maki_agent::actor::PreparedModel {
-                        provider: Arc::from(provider),
-                        model,
-                    })
-                })
-            }
-        }),
-        Arc::new({
-            let model = handle.model.clone();
-            let permissions = Arc::clone(&handle.permissions);
-            move |commit| {
-                model.install(
-                    Arc::clone(&commit.config.provider),
-                    commit.config.model.clone(),
-                );
-                permissions.set_cwd(commit.config.context.cwd().to_path_buf());
-            }
-        }),
-    ) {
-        rollback_install(handle, mcp, Some(coordinator)).await;
-        return Err(error.to_string());
-    }
-    let trusted_root = match root_target.recv_async().await {
-        Ok(root) => root,
-        Err(error) => {
-            rollback_install(handle, mcp, Some(coordinator)).await;
-            return Err(error.to_string());
-        }
-    };
-    let orchestration = Arc::new_cyclic(|weak| {
-        let persistence = maki_lua::orchestration::child_persistence(
-            "ACP",
-            weak.clone(),
-            Arc::clone(&checkpoint),
-        );
-        acp_orchestration(
-            Arc::new(ArcSwapOption::from_pointee(available_model_specs(
-                &params.model_policy,
-            ))),
-            trusted_root.clone(),
-            handle.session_id.id(),
-            persistence.0,
-        )
-        .with_completion(persistence.1)
-    });
+    let orchestration = maki_lua::orchestration::durable_frontend(
+        "ACP",
+        available_model_specs(&params.model_policy),
+        trusted_root.clone(),
+        coordinator.clone(),
+        Arc::clone(&checkpoint),
+    );
     params
         .lua_event_handle
         .install_orchestration_services(orchestration.clone());
@@ -2271,6 +2179,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use maki_commands::TargetCapabilities;
+    use maki_lua::orchestration::TurnCompletion;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
@@ -2464,6 +2373,7 @@ mod tests {
         maki_lua::PluginHost,
         Receiver<(&'static str, String, bool)>,
         Receiver<String>,
+        TempDir,
     ) {
         let (requests, received) = flume::unbounded();
         let provider: Arc<dyn maki_providers::provider::Provider> =
@@ -2524,11 +2434,7 @@ mod tests {
         );
         let initial = Arc::clone(&provider);
         let (root_answers_tx, root_answers_rx) = flume::bounded(1);
-        let binding = orchestration_binding_with_completion(
-            host.event_handle(),
-            Arc::new(ArcSwapOption::from_pointee(vec![FAST_SPEC.into()])),
-            completion.unwrap_or_else(|| Arc::new(|_, _| Box::pin(async { Ok(()) }))),
-        );
+        let (binding, root_target) = maki_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
                 model: Model::from_spec(FAST_SPEC).unwrap(),
@@ -2575,28 +2481,55 @@ mod tests {
                 })
             })),
         );
-        let root = handle.initialized_root().await.unwrap();
         let replacement = Arc::clone(&provider);
-        coordinator
-            .bind_actor(
-                root.clone(),
-                Arc::new(move |model| {
-                    let provider = Arc::clone(&replacement);
-                    Box::pin(
-                        async move { Ok(maki_agent::actor::PreparedModel { provider, model }) },
-                    )
-                }),
-                Arc::new({
-                    let shared = handle.model.clone();
-                    move |commit| {
-                        shared.install(
-                            Arc::clone(&commit.config.provider),
-                            commit.config.model.clone(),
-                        );
-                    }
-                }),
+        let root = maki_lua::orchestration::bind_frontend_root(
+            &handle,
+            &coordinator,
+            &root_target,
+            Arc::new(move |model| {
+                let provider = Arc::clone(&replacement);
+                Box::pin(async move { Ok(maki_agent::actor::PreparedModel { provider, model }) })
+            }),
+        )
+        .await
+        .unwrap();
+        let state = TempDir::new().unwrap();
+        let child_checkpoint = Arc::new(
+            maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+                StateDir::from_path(state.path().to_path_buf()),
+                id.id(),
+                FAST_SPEC,
+                "/tmp",
+                None,
             )
-            .unwrap();
+            .unwrap(),
+        );
+        let services = Arc::new_cyclic(|services| {
+            let (child_config, persist) = maki_lua::orchestration::child_persistence(
+                "ACP",
+                services.clone(),
+                child_checkpoint,
+            );
+            let completion: TurnCompletion = match completion {
+                Some(gate) => Arc::new(move |target, history| {
+                    let gate = gate(target, history.clone());
+                    let persist = persist(target, history);
+                    Box::pin(async move {
+                        gate.await?;
+                        persist.await
+                    })
+                }),
+                None => persist,
+            };
+            maki_lua::orchestration::frontend_root(
+                vec![FAST_SPEC.into()],
+                root,
+                child_config,
+                coordinator.clone(),
+            )
+            .with_completion(completion)
+        });
+        host.event_handle().install_orchestration_services(services);
         let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
         previous.task.cancel().await;
@@ -2624,7 +2557,7 @@ mod tests {
             None,
         );
         srv.lua_event_handle = host.event_handle();
-        (host, received, root_answers)
+        (host, received, root_answers, state)
     }
 
     async fn prompt_terminal(out: &Receiver<Value>, id: i64) -> Value {
@@ -4642,7 +4575,7 @@ mod tests {
         let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (_host, received, root_answer_rx) =
+            let (_host, received, root_answer_rx, _state) =
                 managed_test_session(&mut srv, true, true, None, successful_checkpoint()).await;
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             handle_prompt(
@@ -5339,7 +5272,7 @@ mod tests {
                     Ok(())
                 })
             });
-            let (_host, received, _) =
+            let (_host, received, _, _state) =
                 managed_test_session(&mut srv, nested, false, Some(completion), checkpoint).await;
             let session = srv.session.as_ref().unwrap();
             let session_id = session.handle.session_id.to_string();
