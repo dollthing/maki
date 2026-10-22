@@ -25,7 +25,7 @@ use maki_agent::command::{
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
@@ -521,7 +521,6 @@ pub struct SdkParams {
 }
 
 struct Shared {
-    bypass_permissions: bool,
     turn_start: Instant,
     pending: HashMap<String, (String, Sender<String>)>,
     turn_active: bool,
@@ -802,7 +801,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     );
 
     let shared = Arc::new(Mutex::new(Shared {
-        bypass_permissions: yolo,
         turn_start: Instant::now(),
         pending: HashMap::new(),
         turn_active: false,
@@ -816,6 +814,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         writer: writer.clone(),
         shared: Arc::clone(&shared),
         read: coordinator.read(),
+        permissions: Arc::clone(&handle.permissions),
         answer_tx: handle.answer_tx.clone(),
         include_partial_messages: cli.include_partial_messages,
         synth: StreamSynth::new(),
@@ -827,11 +826,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         observer,
     }
     .spawn(handle.event_rx.clone());
-    let permission_watcher = watch_permission_option(
-        coordinator.read(),
-        Arc::clone(&handle.permissions),
-        Arc::clone(&shared),
-    );
     let model_discovery = watch_model_discovery(
         Arc::clone(&model_policy),
         coordinator.clone(),
@@ -948,7 +942,6 @@ pub fn run(params: SdkParams) -> Result<()> {
                         &cr,
                         ControlRequestContext {
                             writer: &writer,
-                            handle: &handle,
                             coordinator: &coordinator,
                             shared: &shared,
                             commands: &sdk_commands,
@@ -995,11 +988,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     })();
 
     drop(sdk_commands);
-    smol::block_on(stop_sdk_tasks(
-        projection_watcher,
-        permission_watcher,
-        model_discovery,
-    ));
+    smol::block_on(stop_sdk_tasks(projection_watcher, model_discovery));
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
@@ -1067,13 +1056,8 @@ fn watch_command_projection(
     })
 }
 
-async fn stop_sdk_tasks(
-    projection_watcher: smol::Task<()>,
-    permission_watcher: smol::Task<()>,
-    model_discovery: smol::Task<()>,
-) {
+async fn stop_sdk_tasks(projection_watcher: smol::Task<()>, model_discovery: smol::Task<()>) {
     projection_watcher.cancel().await;
-    permission_watcher.cancel().await;
     model_discovery.cancel().await;
 }
 
@@ -1107,35 +1091,6 @@ fn watch_model_discovery(
     })
 }
 
-fn watch_permission_option(
-    read: maki_agent::session_coordinator::SessionReadHandle,
-    permissions: Arc<maki_agent::permissions::PermissionManager>,
-    shared: Arc<Mutex<Shared>>,
-) -> smol::Task<()> {
-    smol::spawn(async move {
-        let mut subscription = read.subscribe();
-        loop {
-            let snapshot = subscription.changed().await;
-            apply_permission_option(&snapshot, &permissions, &shared);
-        }
-    })
-}
-
-fn apply_permission_option(
-    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
-    permissions: &maki_agent::permissions::PermissionManager,
-    shared: &Mutex<Shared>,
-) {
-    let Some(option) = snapshot.options.iter().find(|option| {
-        option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
-    }) else {
-        return;
-    };
-    let enabled = option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
-    permissions.set_yolo(enabled);
-    shared.lock().unwrap().bypass_permissions = enabled;
-}
-
 fn restored_permission_mode(
     restored: bool,
     persisted_yolo: Option<bool>,
@@ -1162,8 +1117,6 @@ fn restored_permission_mode(
 fn set_permission_mode(
     mode: PermissionMode,
     coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
-    permissions: &maki_agent::permissions::PermissionManager,
-    shared: &Mutex<Shared>,
     set_mode: &ModeSetter<'_>,
 ) -> Result<(), ConfigChangeError> {
     let value = if mode == PermissionMode::BypassPermissions {
@@ -1171,9 +1124,7 @@ fn set_permission_mode(
     } else {
         maki_agent::session_options::DISABLED_VALUE
     };
-    let snapshot =
-        smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
-    apply_permission_option(&snapshot, permissions, shared);
+    smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
     set_mode(if mode == PermissionMode::Plan {
         ModeId::Plan.key()
     } else {
@@ -1409,7 +1360,6 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
 
 struct ControlRequestContext<'a> {
     writer: &'a SdkWriter,
-    handle: &'a InteractiveHandle,
     coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
     shared: &'a Mutex<Shared>,
     commands: &'a SdkCommands,
@@ -1449,7 +1399,6 @@ fn handle_control_request(
 ) -> Result<()> {
     let ControlRequestContext {
         writer,
-        handle,
         coordinator,
         shared,
         commands,
@@ -1478,22 +1427,12 @@ fn handle_control_request(
         InboundControlRequestType::SetPermissionMode => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
-                Some(mode) => {
-                    match set_permission_mode(
-                        mode,
-                        coordinator,
-                        &handle.permissions,
-                        shared,
-                        set_mode,
-                    ) {
-                        Ok(()) => writer.emit_control_response(&cr.request_id, ok, None),
-                        Err(error) => writer.emit_control_response(
-                            &cr.request_id,
-                            None,
-                            Some(error.to_string()),
-                        ),
+                Some(mode) => match set_permission_mode(mode, coordinator, set_mode) {
+                    Ok(()) => writer.emit_control_response(&cr.request_id, ok, None),
+                    Err(error) => {
+                        writer.emit_control_response(&cr.request_id, None, Some(error.to_string()))
                     }
-                }
+                },
                 None => writer.emit_control_response(
                     &cr.request_id,
                     None,
@@ -1563,6 +1502,7 @@ struct EventPump {
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
     read: SessionReadHandle,
+    permissions: Arc<PermissionManager>,
     answer_tx: Sender<String>,
     include_partial_messages: bool,
     synth: StreamSynth,
@@ -1762,7 +1702,7 @@ impl EventPump {
                 } else {
                     self.answer_tx.clone()
                 };
-                if self.shared.lock().unwrap().bypass_permissions {
+                if self.permissions.is_yolo() {
                     let _ = answer_tx
                         .send(TaggedAnswer::new(id, PermissionAnswer::AllowSession).encode());
                     return Ok(());
@@ -2060,6 +2000,15 @@ mod tests {
         .unwrap()
     }
 
+    fn test_permissions() -> PermissionManager {
+        PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/project"),
+            ProjectConfig::for_project(std::path::Path::new("/project")),
+            Arc::default(),
+        )
+    }
+
     /// A coordinator on {STARTUP_MODEL} with no actor bound to it.
     fn unbound_coordinator(
         session_id: MakiId,
@@ -2248,7 +2197,6 @@ mod tests {
     #[test]
     fn sdk_turn_cancellation_is_operation_scoped() {
         let shared = Mutex::new(Shared {
-            bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
             turn_active: false,
@@ -2586,7 +2534,6 @@ mod tests {
         )
         .unwrap();
         let shared = Arc::new(Mutex::new(Shared {
-            bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
             turn_active: false,
@@ -2733,6 +2680,7 @@ mod tests {
             },
             shared: Arc::clone(&shared),
             read: coordinator.read(),
+            permissions: Arc::clone(&handle.permissions),
             answer_tx: handle.answer_tx.clone(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
@@ -2994,30 +2942,19 @@ mod tests {
             },
         )
         .unwrap();
-        let permissions = maki_agent::permissions::PermissionManager::new(
-            PermissionsConfig::default(),
-            PathBuf::from("/project"),
-            ProjectConfig::for_project(std::path::Path::new("/project")),
-            Arc::default(),
-        );
+        let permissions = Arc::new(test_permissions());
         permissions.set_yolo(true);
-        let shared = Mutex::new(Shared {
-            bypass_permissions: true,
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        });
+        maki_lua::orchestration::project_yolo(&coordinator, Arc::clone(&permissions));
+        assert!(permissions.is_yolo());
 
         let committed = StdMutex::new(Vec::new());
         let set_mode = |key: &str| {
             committed.lock().unwrap().push(key.to_owned());
             Ok(())
         };
-        set_permission_mode(mode, &coordinator, &permissions, &shared, &set_mode).unwrap();
+        set_permission_mode(mode, &coordinator, &set_mode).unwrap();
 
         assert!(!permissions.is_yolo());
-        assert!(!shared.lock().unwrap().bypass_permissions);
         let expected = if mode == PermissionMode::Plan {
             ModeId::Plan.key()
         } else {
@@ -3456,7 +3393,6 @@ mod tests {
     fn subagent_outcome_does_not_retire_sdk_turn() {
         let (out_tx, out_rx) = flume::unbounded();
         let shared = Arc::new(Mutex::new(Shared {
-            bypass_permissions: false,
             turn_start: Instant::now(),
             pending: HashMap::new(),
             turn_active: false,
@@ -3482,6 +3418,7 @@ mod tests {
             },
             shared: Arc::clone(&shared),
             read: unbound_coordinator(MakiId::generate()).read(),
+            permissions: Arc::new(test_permissions()),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
             synth: StreamSynth::new(),
@@ -3554,13 +3491,13 @@ mod tests {
                 out_tx,
             },
             shared: Arc::new(Mutex::new(Shared {
-                bypass_permissions: false,
                 turn_start: Instant::now(),
                 pending: HashMap::new(),
                 turn_active: false,
                 active_cancel: None,
             })),
             read: unbound_coordinator(MakiId::generate()).read(),
+            permissions: Arc::new(test_permissions()),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,
             synth: StreamSynth::new(),

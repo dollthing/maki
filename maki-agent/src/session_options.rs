@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use event_listener::{Event, EventListener};
 use maki_providers::ThinkingConfig;
@@ -76,6 +76,15 @@ pub struct SessionOptionsSnapshot {
     pub options: Arc<[SessionOptionState]>,
 }
 
+impl SessionOptionsSnapshot {
+    /// Whether boolean option {id} is on; an absent option is off.
+    pub fn enabled(&self, id: &str) -> bool {
+        self.options.iter().any(|option| {
+            option.definition.id.as_ref() == id && option.current_value.as_ref() == ENABLED_VALUE
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SessionOptionError {
     #[error("session options are reserved by another mutation")]
@@ -132,9 +141,12 @@ impl Deref for OptionsState {
     }
 }
 
+type OptionsProjector = Box<dyn Fn(&SessionOptionsSnapshot) + Send + Sync>;
+
 pub struct SessionOptions {
     state: Mutex<OptionsState>,
     changed: Event,
+    projector: OnceLock<OptionsProjector>,
 }
 
 pub(crate) struct SessionOptionsReservation {
@@ -149,7 +161,7 @@ impl SessionOptionsReservation {
         state.committed = candidate.state;
         let snapshot = snapshot(&state);
         drop(state);
-        self.options.changed.notify(usize::MAX);
+        self.options.published(&snapshot);
         snapshot
     }
 }
@@ -207,6 +219,21 @@ impl SessionOptionDefinition {
 }
 
 impl SessionOptions {
+    /// Applies {project} to the current snapshot and then to every committed
+    /// one, synchronously and before subscribers wake. One projector per
+    /// store; a second is ignored.
+    pub fn project(&self, project: impl Fn(&SessionOptionsSnapshot) + Send + Sync + 'static) {
+        project(&self.snapshot());
+        let _ = self.projector.set(Box::new(project));
+    }
+
+    fn published(&self, snapshot: &SessionOptionsSnapshot) {
+        if let Some(project) = self.projector.get() {
+            project(snapshot);
+        }
+        self.changed.notify(usize::MAX);
+    }
+
     pub fn new(
         definitions: Vec<SessionOptionDefinition>,
         persisted: &BTreeMap<String, String>,
@@ -237,6 +264,7 @@ impl SessionOptions {
                 reserved: false,
             }),
             changed: Event::new(),
+            projector: OnceLock::new(),
         }))
     }
 
@@ -479,8 +507,8 @@ impl SessionOptions {
             snapshots.push(snapshot(guard));
         }
         drop(guards);
-        for options in changed {
-            options.changed.notify(usize::MAX);
+        for (options, snapshot) in changed.iter().zip(&snapshots) {
+            options.published(snapshot);
         }
         Ok(snapshots)
     }
@@ -536,7 +564,7 @@ impl SessionOptions {
         }
         drop(guards);
         for options in changed {
-            options.changed.notify(usize::MAX);
+            options.published(&options.snapshot());
         }
         true
     }

@@ -1530,6 +1530,13 @@ mod tests {
             assert_eq!(manager.limits().max_concurrent_agent_turns, 1);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("saved.txt"), "output").unwrap();
+            for yolo in [false, true] {
+                assert!(matches!(
+                    smol::block_on(registry.dispatch_input(target, "/yolo".into())),
+                    InputDispatch::Dispatched(CommandOutcome::Completed)
+                ));
+                assert_eq!(handle.permissions.is_yolo(), yolo);
+            }
             host.event_handle().run_command(
                 Arc::from(PRINT_RUNNER),
                 Arc::from(format!("/{PRINT_RUNNER}").as_str()),

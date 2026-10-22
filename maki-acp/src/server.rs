@@ -103,7 +103,6 @@ struct OptionProjection {
     out_tx: Sender<Value>,
     session_id: SessionId,
     read: maki_agent::session_coordinator::SessionReadHandle,
-    permissions: Arc<maki_agent::permissions::PermissionManager>,
     supports_boolean: bool,
     emitted_version: Mutex<u64>,
 }
@@ -122,17 +121,6 @@ impl OptionProjection {
         if snapshot.version <= *emitted_version {
             return;
         }
-        self.permissions.set_yolo(
-            snapshot
-                .options
-                .iter()
-                .find(|option| {
-                    option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
-                })
-                .is_some_and(|option| {
-                    option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
-                }),
-        );
         if emit {
             emit_config_options(
                 &self.out_tx,
@@ -956,7 +944,6 @@ async fn install_session_with_lock(
         out_tx: srv.out_tx.clone(),
         session_id,
         read: coordinator.read(),
-        permissions: Arc::clone(&handle.permissions),
         supports_boolean: srv.supports_boolean,
         emitted_version: Mutex::new(option_snapshot.version),
     });
@@ -2577,7 +2564,6 @@ mod tests {
             out_tx: srv.out_tx.clone(),
             session_id: SessionId::from(session.handle.session_id.to_string()),
             read: coordinator.read(),
-            permissions: Arc::clone(&session.handle.permissions),
             supports_boolean: false,
             emitted_version: Mutex::new(coordinator.read().options().version),
         }));
@@ -2922,6 +2908,7 @@ mod tests {
                 }),
             )
             .unwrap();
+        maki_lua::orchestration::project_yolo(&coordinator, Arc::clone(&handle.permissions));
         let command_registry = test_registry(&[]);
         let command_target = command_registry.bind_target_with_presentation(
             maki_agent::command::session_capabilities(),
@@ -2942,7 +2929,6 @@ mod tests {
                     out_tx: out_tx.clone(),
                     session_id: SessionId::from(handle.session_id.to_string()),
                     read: coordinator.read(),
-                    permissions: Arc::clone(&handle.permissions),
                     supports_boolean: false,
                     emitted_version: Mutex::new(coordinator.read().options().version),
                 })),
@@ -3295,7 +3281,6 @@ mod tests {
                 out_tx: srv.out_tx.clone(),
                 session_id: SessionId::from(session.handle.session_id.to_string()),
                 read: coordinator.read(),
-                permissions: Arc::clone(&session.handle.permissions),
                 supports_boolean: srv.supports_boolean,
                 emitted_version: Mutex::new(coordinator.read().options().version),
             }));
@@ -3443,7 +3428,6 @@ mod tests {
             out_tx: srv.out_tx.clone(),
             session_id: SessionId::from(session_id.to_string()),
             read: coordinator.read(),
-            permissions: Arc::clone(&session.handle.permissions),
             supports_boolean: false,
             emitted_version: Mutex::new(before.version),
         }));

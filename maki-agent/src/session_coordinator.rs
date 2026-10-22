@@ -1078,6 +1078,14 @@ impl SessionReadHandle {
         binding.agent.effective_config().ok().flatten()
     }
 
+    /// See [`SessionOptions::project`].
+    pub fn project_options(
+        &self,
+        project: impl Fn(&SessionOptionsSnapshot) + Send + Sync + 'static,
+    ) {
+        self.options.project(project);
+    }
+
     pub fn model(&self) -> Option<Arc<str>> {
         self.config().map(|config| Arc::from(config.model.spec()))
     }

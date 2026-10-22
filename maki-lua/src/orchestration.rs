@@ -9,10 +9,12 @@ use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use maki_agent::headless::{
     InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding,
 };
+use maki_agent::permissions::PermissionManager;
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
 use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
+use maki_agent::session_options::YOLO_OPTION_ID;
 use maki_agent::{AgentRef, ModeRegistry, tools::ToolContext};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
@@ -361,8 +363,8 @@ pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
 }
 
 /// Binds a headless frontend's root actor to {coordinator}, so committed
-/// config installs the model and cwd on {handle}, and returns the root that
-/// {root_binding} delivered.
+/// config installs the model and cwd on {handle} and the YOLO option drives
+/// its permissions, and returns the root that {root_binding} delivered.
 pub async fn bind_frontend_root(
     handle: &InteractiveHandle,
     coordinator: &SessionCoordinatorHandle,
@@ -371,6 +373,7 @@ pub async fn bind_frontend_root(
 ) -> Result<TrustedTarget, String> {
     let root = handle.initialized_root().await?;
     let model = handle.model.clone();
+    project_yolo(coordinator, Arc::clone(&handle.permissions));
     let permissions = Arc::clone(&handle.permissions);
     coordinator
         .bind_actor(
@@ -389,6 +392,13 @@ pub async fn bind_frontend_root(
         .recv_async()
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Keeps {permissions}' YOLO state on {coordinator}'s committed option.
+pub fn project_yolo(coordinator: &SessionCoordinatorHandle, permissions: Arc<PermissionManager>) {
+    coordinator
+        .read()
+        .project_options(move |options| permissions.set_yolo(options.enabled(YOLO_OPTION_ID)));
 }
 
 /// The orchestration a non-UI frontend binds to its root graph: the root's
