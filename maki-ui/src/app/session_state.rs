@@ -56,10 +56,8 @@ pub(crate) struct SessionState {
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
     pub context_size: u32,
-    /// The mode the agent runs in. `plan` is UI-owned bookkeeping the agent only
-    /// learns through the plan path carried in its mode, so the two live
-    /// together here rather than deriving one from the other.
-    pub mode: Mode,
+    /// UI-owned plan bookkeeping. The agent's committed mode carries the plan
+    /// path; whether the plan is drafted or ready is only tracked here.
     pub plan: PlanState,
     pub warnings: Vec<String>,
     /// A saved `/fast` the model cannot honour until discovery says whether it
@@ -108,11 +106,7 @@ impl SessionState {
             }
         };
 
-        let mode = match &session.meta.mode {
-            Some(StoredMode::Plan) => Mode::Plan,
-            Some(StoredMode::Custom(name)) => Mode::Custom(name.clone().into()),
-            _ => Mode::Build,
-        };
+        let mode = stored_mode(&session.meta.mode);
 
         let mut warnings = Vec::new();
 
@@ -148,7 +142,6 @@ impl SessionState {
             token_usage,
             cost,
             context_size,
-            mode,
             plan,
             warnings,
         }
@@ -158,9 +151,10 @@ impl SessionState {
         Arc::make_mut(&mut self.session)
     }
 
-    /// The mode the agent runs in, carrying the plan path plan mode writes to.
-    pub fn agent_mode(&self) -> AgentMode {
-        match &self.mode {
+    /// The mode the session was saved in, carrying the plan path plan mode
+    /// writes to.
+    fn agent_mode(&self) -> AgentMode {
+        match stored_mode(&self.session.meta.mode) {
             Mode::Plan => match self.plan.path() {
                 Some(path) => AgentMode::Plan(path.to_path_buf()),
                 None => {
@@ -169,7 +163,7 @@ impl SessionState {
                 }
             },
             Mode::Build => AgentMode::Build,
-            Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(Arc::clone(name))),
+            Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(name)),
         }
     }
 
@@ -200,18 +194,8 @@ impl SessionState {
         .with_context(AgentContextSnapshot::new(cwd))
     }
 
-    /// Makes `config` this session's own. Construction runs it against the
-    /// config it just seeded the agent with, so the two cannot start apart.
+    /// Adopts the plan path of the config the agent was seeded with.
     pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
-        self.mode = match &config.mode {
-            AgentMode::Build => Mode::Build,
-            AgentMode::Plan(_) => Mode::Plan,
-            AgentMode::Custom(id) => match id {
-                maki_agent::ModeId::Build => Mode::Build,
-                maki_agent::ModeId::Plan => Mode::Plan,
-                maki_agent::ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
-            },
-        };
         if let Some(path) = config.mode.plan_path()
             && self.plan.path() != Some(path)
         {
@@ -223,6 +207,14 @@ impl SessionState {
         self.fast_pending &= model.fast_pending();
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
+    }
+}
+
+fn stored_mode(mode: &Option<StoredMode>) -> Mode {
+    match mode {
+        Some(StoredMode::Plan) => Mode::Plan,
+        Some(StoredMode::Custom(name)) => Mode::Custom(name.as_str().into()),
+        _ => Mode::Build,
     }
 }
 
@@ -450,7 +442,6 @@ mod tests {
         let session = make_plan_session(Some(StoredMode::Plan), None);
         let state =
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
-        assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
 
@@ -462,7 +453,6 @@ mod tests {
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
         let state =
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
-        assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
         assert_eq!(state.warnings.len(), 1);
@@ -481,7 +471,6 @@ mod tests {
         );
         let state =
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
-        assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
     }
 
@@ -511,7 +500,6 @@ mod tests {
         let session = make_plan_session(Some(StoredMode::Build), None);
         let state =
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
-        assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
     }
 

@@ -590,7 +590,7 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
 
 /// Projects the parts of a committed option snapshot that are not agent config.
 /// Thinking, fast and workflow are actor config and are written by
-/// `project_actor_config` alone; YOLO is permission state, which has no actor
+/// `project_root_mode` alone; YOLO is permission state, which has no actor
 /// home.
 fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
@@ -753,24 +753,6 @@ fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::
     ))
 }
 
-fn project_actor_config(app: &mut App, config: &maki_agent::EffectiveAgentConfig) {
-    app.update_model(&config.model);
-    let mode = match &config.mode {
-        maki_agent::AgentMode::Build => {
-            app.state.plan = crate::app::mode::PlanState::None;
-            "build".to_owned()
-        }
-        maki_agent::AgentMode::Plan(path) => {
-            if app.state.plan.path() != Some(path.as_path()) {
-                app.state.plan = crate::app::mode::PlanState::Drafting(path.clone());
-            }
-            "plan".to_owned()
-        }
-        maki_agent::AgentMode::Custom(id) => id.to_string(),
-    };
-    app.set_mode_id(mode);
-}
-
 fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
     app.apply_toggled_option(id, enabled);
 }
@@ -778,23 +760,6 @@ fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
 fn complete_mode_change(app: &mut App, id: String, plan: crate::app::mode::PlanState) {
     if id == "plan" {
         app.state.plan = plan;
-    } else if id == "build" {
-        app.state.plan = crate::app::mode::PlanState::None;
-    }
-    app.set_mode_id(id);
-}
-
-#[cfg(test)]
-fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
-    match app.state.mode.id_key().as_str() {
-        "build" => maki_agent::AgentMode::Build,
-        "plan" => app
-            .state
-            .plan
-            .path()
-            .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
-            .unwrap_or_default(),
-        id => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(id))),
     }
 }
 
@@ -907,7 +872,9 @@ impl Drop for CoordinatorRetirement {
 struct SessionRuntime {
     generation: u64,
     config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
-    projected_config_generation: Option<u64>,
+    /// The last root commit the app followed, so the next one can tell what
+    /// changed.
+    projected_config: Option<maki_agent::actor::ConfigCommit>,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -1030,7 +997,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: None,
+            projected_config: None,
             app,
             handles,
             model_slot,
@@ -1105,7 +1072,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: None,
+            projected_config: None,
             app,
             handles,
             model_slot,
@@ -1212,13 +1179,18 @@ impl SessionRuntime {
         };
         if !Arc::ptr_eq(&actor.identity(), &commit.identity)
             || self
-                .projected_config_generation
-                .is_some_and(|projected| commit.generation <= projected)
+                .projected_config
+                .as_ref()
+                .is_some_and(|projected| commit.generation <= projected.generation)
         {
             return false;
         }
-        self.projected_config_generation = Some(commit.generation);
-        project_actor_config(&mut self.app, &commit.config);
+        let previous = self.projected_config.replace(commit.clone()).map_or_else(
+            || self.app.seed_mode(),
+            |projected| projected.config.mode.clone(),
+        );
+        self.app.update_model(&commit.config.model);
+        self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
         true
     }
@@ -1737,7 +1709,6 @@ enum SessionOpKind {
     LuaOptionSet { reply_tx: flume::Sender<UiReply> },
     /// Lua mode transition, committed to the app after the actor accepts it.
     LuaModeSet {
-        id: String,
         plan_path: Option<PathBuf>,
         reply_tx: flume::Sender<UiReply>,
     },
@@ -2853,7 +2824,7 @@ impl<'t> EventLoop<'t> {
                 self.dispatch_pinned_mode_set(target, id, reply_tx);
             }
             UiAction::GetMode { reply_tx } => {
-                let id = self.focused_app().state.mode.id_key();
+                let id = self.focused_app().root_mode().id_key();
                 let _ = reply_tx.try_send(id);
             }
             UiAction::Flash(msg) => {
@@ -3669,7 +3640,6 @@ impl<'t> EventLoop<'t> {
                 session,
                 runtime: identity,
                 kind: SessionOpKind::LuaModeSet {
-                    id,
                     plan_path,
                     reply_tx,
                 },
@@ -3832,7 +3802,7 @@ impl<'t> EventLoop<'t> {
             model: app.state.model.spec(),
             fast: config.fast,
             thinking: config.thinking.to_string(),
-            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+            mode: if app.root_mode() == crate::app::mode::Mode::Plan {
                 MODE_PLAN
             } else {
                 MODE_BUILD
@@ -4548,7 +4518,6 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(result.map(|()| json!(true)));
             }
             SessionOpKind::LuaModeSet {
-                id,
                 plan_path,
                 reply_tx,
             } => {
@@ -4557,7 +4526,6 @@ impl<'t> EventLoop<'t> {
                     if let Some(path) = plan_path {
                         rt.app.state.plan = crate::app::mode::PlanState::Drafting(path);
                     }
-                    rt.app.set_mode_id(id);
                     rt.settle_plan_approval();
                     json!(true)
                 });
@@ -5956,12 +5924,12 @@ mod tests {
     }
 
     #[test]
-    fn reserved_mode_change_waits_for_lease_before_projecting_app_mode() {
+    fn reserved_mode_change_waits_for_lease_before_committing() {
         smol::block_on(async {
             let mut runtime = test_runtime(model_named("test-model"));
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
-            let initial_app_mode = agent_mode_for_app(&runtime.app);
+            let initial_mode = runtime.app.root_config().mode.clone();
             let predecessor = actor.reserve_prepared_operation(None).unwrap();
             let (internal_tx, internal_rx) = flume::unbounded();
             let temp_dir = tempfile::tempdir().unwrap();
@@ -5976,7 +5944,7 @@ mod tests {
                 "plan".into(),
             );
 
-            assert_eq!(agent_mode_for_app(&runtime.app), initial_app_mode);
+            assert_eq!(runtime.app.root_config().mode, initial_mode);
             assert!(internal_rx.is_empty());
             drop(predecessor);
             let InternalEvent::SessionOp { kind, result, .. } =
@@ -5990,10 +5958,10 @@ mod tests {
             } else {
                 panic!("expected mode change completion");
             }
-            assert_eq!(
-                agent_mode_for_app(&runtime.app),
-                actor.effective_config().unwrap().mode
-            );
+            assert!(matches!(
+                actor.effective_config().unwrap().mode,
+                maki_agent::AgentMode::Plan(_)
+            ));
             drop(temp_dir);
             release_runtime(runtime);
         });
@@ -6300,17 +6268,23 @@ mod tests {
                     reply.unwrap();
                 }
                 assert_eq!(
-                    event_loop.sessions[0].projected_config_generation,
+                    event_loop.sessions[0]
+                        .projected_config
+                        .as_ref()
+                        .map(|commit| commit.generation),
                     Some(latest.generation)
                 );
-                assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
+                assert_eq!(event_loop.sessions[0].app.root_mode().id_key(), "plan");
                 queued_tx.send(older).unwrap();
                 let _ = event_loop.tick();
                 assert_eq!(
-                    event_loop.sessions[0].projected_config_generation,
+                    event_loop.sessions[0]
+                        .projected_config
+                        .as_ref()
+                        .map(|commit| commit.generation),
                     Some(latest.generation)
                 );
-                assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
+                assert_eq!(event_loop.sessions[0].app.root_mode().id_key(), "plan");
                 assert!(event_loop.sessions[0].app.root_config().workflow);
                 drop(observer);
             })
@@ -6396,10 +6370,16 @@ mod tests {
                     app.state.session.model,
                     model_named("replacement-model").spec()
                 );
-                assert_eq!(app.state.mode.id_key(), "build");
+                assert_eq!(app.root_mode().id_key(), "build");
                 assert_eq!(app.root_config().thinking, replacement_thinking);
                 assert!(!app.root_config().workflow);
-                assert_eq!(event_loop.sessions[0].projected_config_generation, None);
+                assert_eq!(
+                    event_loop.sessions[0]
+                        .projected_config
+                        .as_ref()
+                        .map(|commit| commit.generation),
+                    None
+                );
                 let final_config = replacement_actor.config_snapshot().unwrap();
                 assert_eq!(final_config.generation, initial_config.generation);
                 assert!(Arc::ptr_eq(
@@ -6764,7 +6744,7 @@ mod tests {
         SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: None,
+            projected_config: None,
             app,
             handles,
             model_slot,
@@ -7972,7 +7952,6 @@ mod tests {
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
         assert!(matches!(config.mode, maki_agent::AgentMode::Plan(_)));
-        assert_eq!(config.mode, agent_mode_for_app(&runtime.app));
         assert_eq!(config.mode.plan_path(), runtime.app.state.plan.path());
         assert_ne!(
             config.mode.plan_path(),

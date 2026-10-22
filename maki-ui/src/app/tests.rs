@@ -527,11 +527,7 @@ fn root_config() -> EffectiveAgentConfig {
 }
 
 fn root_actor(app: &App) -> maki_agent::actor::AgentActorHandle {
-    app.command_runtime
-        .target_agent(&app.command_target)
-        .unwrap()
-        .actor()
-        .unwrap()
+    app.queue.root_actor().unwrap().clone()
 }
 
 fn root_submissions(app: &App) -> Vec<String> {
@@ -551,6 +547,28 @@ fn commit_root_config(app: &App, change: maki_agent::actor::ConfigChange) {
             .commit_when_ready(Some(change)),
     )
     .unwrap();
+}
+
+/// Commits `mode` on the root and follows it the way the event loop does.
+fn set_root_mode(app: &mut App, mode: Mode) {
+    let mode_def = mode.def(&app.lua_event_handle.mode_registry());
+    let agent_mode = match mode {
+        Mode::Build => AgentMode::Build,
+        Mode::Plan => {
+            app.state.plan.allocate_path(&app.storage);
+            AgentMode::Plan(app.state.plan.path().unwrap().to_path_buf())
+        }
+        Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(name)),
+    };
+    let previous = app.root_config().mode.clone();
+    commit_root_config(
+        app,
+        maki_agent::actor::ConfigChange::Mode {
+            mode: agent_mode.clone(),
+            mode_def: Some(mode_def),
+        },
+    );
+    app.project_root_mode(&previous, &agent_mode);
 }
 
 fn commit_root_model(app: &App, model: Model) {
@@ -1006,11 +1024,11 @@ fn standalone_compaction_returns_to_idle_without_ending_the_session() {
 #[test]
 fn toggle_mode_emits_change_mode_without_mutating_state() {
     let mut app = test_app();
-    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.root_mode(), Mode::Build);
 
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
     assert!(matches!(&actions[..], [Action::ChangeMode(id)] if id == "plan"));
-    assert_eq!(app.state.mode, Mode::Build);
+    assert_eq!(app.root_mode(), Mode::Build);
 }
 
 #[test_case(FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
@@ -1033,7 +1051,7 @@ fn tool_done_transitions_plan_to_ready(
     expect_ready: bool,
 ) {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -1634,7 +1652,7 @@ fn lifecycle_app() -> (
     let _ = app.command_palette.sync("/deploy a");
     settle_command_palette(&mut app);
     app.command_palette
-        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
+        .sync_arguments("/deploy a", 9, &app.root_mode().id_key());
     let items = vec![CommandArgumentItem {
         label: "alpha".into(),
         insertion: "alpha".into(),
@@ -1684,7 +1702,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
     app.input_box.set_input("/deploy b".into());
     let _ = app.command_palette.sync("/deploy b");
     app.command_palette
-        .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
+        .sync_arguments("/deploy b", 9, &app.root_mode().id_key());
     assert!(app.command_palette.completion_session_id().is_some());
     assert!(rendered(&mut app).contains("old-result"));
     wait_for(
@@ -1719,7 +1737,7 @@ fn unmatched_completion_items_keep_session_until_dismissal() {
     let _ = app.command_palette.sync("/deploy z");
     settle_command_palette(&mut app);
     app.command_palette
-        .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
+        .sync_arguments("/deploy z", 9, &app.root_mode().id_key());
 
     wait_for(
         || {
@@ -1852,7 +1870,7 @@ fn reset_session_clears_plan() {
     let mut app = test_app();
     app.state.token_usage.input = 500;
     app.chats[0].context_size = 1000;
-    app.state.mode = Mode::Build;
+    set_root_mode(&mut app, Mode::Build);
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
     app.queue_and_notify(queued_msg("q"));
     app.queue.set_focus_at(0);
@@ -1880,7 +1898,7 @@ fn reset_session_clears_plan() {
 #[test]
 fn reset_session_assigns_new_plan_path_in_plan_mode() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("old-plan.md"));
     let actions = app.reset_session();
     let Action::ReplaceSession(request) = &actions[0] else {
@@ -1894,7 +1912,7 @@ fn reset_session_assigns_new_plan_path_in_plan_mode() {
 #[test]
 fn reset_session_clears_drafting_plan_in_build_mode() {
     let mut app = test_app();
-    app.state.mode = Mode::Build;
+    set_root_mode(&mut app, Mode::Build);
     app.state.plan = PlanState::Drafting(PathBuf::from("leftover.md"));
     let actions = app.reset_session();
     let Action::ReplaceSession(request) = &actions[0] else {
@@ -1916,7 +1934,7 @@ fn load_session_clears_plan() {
         .push_message(Message::user("test".into()));
     app.state.session_mut().save(&app.storage).unwrap();
     let id = app.state.session.id;
-    app.state.mode = Mode::Build;
+    set_root_mode(&mut app, Mode::Build);
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
     let actions = app.load_loaded_session(AppSession::load(id, &app.storage).unwrap());
     let Action::ReplaceSession(request) = &actions[0] else {
@@ -4749,7 +4767,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "streaming"
 )]
 #[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
+    |app: &mut App| { set_root_mode(app, Mode::Plan); app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
     &[KeybindContext::FormInput],
     &[KeybindContext::Editing]
     ; "plan_form"
@@ -4834,7 +4852,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(app.state.session.meta.input_draft.is_none());
     assert!(!session_has_content(&app.state.session));
 
-    app.set_mode_id("plan".into());
+    set_root_mode(&mut app, Mode::from_id("plan"));
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
     assert!(session_has_content(&app.state.session));
@@ -5596,7 +5614,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
 #[test]
 fn focused_plan_state_is_isolated() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting("root-plan.md".into());
     app.plan_form.on_plan_ready();
     let (target, _) = spawn_input_child_with_mode(
@@ -6294,7 +6312,7 @@ fn mcp_toggle_dispatches_action() {
 }
 
 #[test_case(
-    |app: &mut App| { app.state.mode = Mode::Plan; app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
+    |app: &mut App| { set_root_mode(app, Mode::Plan); app.state.plan = PlanState::Drafting("test-plan.md".into()); app.plan_form.on_plan_ready(); },
     ""
     ; "consumed_by_plan_form"
 )]
@@ -6729,7 +6747,7 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 fn plan_app() -> App {
     let mut app = streaming_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
@@ -6747,7 +6765,7 @@ fn plan_app() -> App {
 #[test_case(Mode::Build, false ; "build_mode_tooldone_no_form")]
 fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
     let mut app = streaming_app();
-    app.state.mode = mode;
+    set_root_mode(&mut app, mode);
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
@@ -6766,7 +6784,7 @@ fn tool_done_write_opens_plan_form(mode: Mode, expect_form: bool) {
 #[test]
 fn done_event_does_not_open_plan_form() {
     let mut app = streaming_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.update(done_event());
     assert!(!app.plan_form.is_visible());
@@ -6799,7 +6817,7 @@ fn plan_submit_builtin_shows_form_marks_ready_pushes_message() {
     std::fs::write(&plan_path, PLAN_BODY).unwrap();
 
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(plan_path);
 
     let actions = app.run_builtin(BuiltinAction::PlanSubmit);
@@ -6827,7 +6845,7 @@ fn plan_submit_builtin_empty_file_does_not_show_form() {
     std::fs::write(&plan_path, "").unwrap();
 
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(plan_path);
 
     assert!(app.run_builtin(BuiltinAction::PlanSubmit).is_empty());
@@ -6859,7 +6877,7 @@ fn plan_submit_mode_disables_auto_open() {
         maki_lua::EventHandle::disconnected_for_test_with_modes(Arc::new(registry));
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("/tmp/plans/test.md"));
 
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
@@ -6885,7 +6903,7 @@ fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_form.is_visible());
-    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.root_mode(), Mode::Plan);
     assert!(app.state.plan.is_ready());
     assert!(app.plan_approval_pending);
     assert!(matches!(actions.as_slice(), [Action::ApprovePlan {
@@ -6919,7 +6937,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     let models = install_model_slot(&mut app);
     const MODEL: &str = "zai/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.plan_form.on_plan_ready();
     let original = app.state.model.spec();
@@ -6964,7 +6982,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
 fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.plan_form.on_plan_ready();
@@ -7002,7 +7020,7 @@ fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
     const MODEL: &str = "zai/glm-5";
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![MODEL.into()])));
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.plan_form.on_plan_ready();
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
@@ -7083,7 +7101,7 @@ fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     app.plan_form
         .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
-    app.set_mode_id(mode.into());
+    set_root_mode(&mut app, Mode::from_id(mode));
     assert_eq!(app.plan_form.implementation_model(), None);
     assert!(!app.model_picker.is_open());
     assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
@@ -7269,7 +7287,7 @@ fn ctrl_t_toggles_plan_form_in_plan_mode() {
 #[test]
 fn ctrl_t_noop_when_plan_not_ready() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     assert!(!app.plan_form.is_visible());
 
@@ -7337,7 +7355,7 @@ fn override_shadows_quit_builtin() {
 #[test]
 fn override_shadows_tab_mode_toggle() {
     let mut app = test_app();
-    let initial_mode = app.state.mode.clone();
+    let initial_mode = app.root_mode().clone();
     let _probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
@@ -7347,7 +7365,8 @@ fn override_shadows_tab_mode_toggle() {
         "{OVERRIDE_DISPATCHED}"
     );
     assert_eq!(
-        app.state.mode, initial_mode,
+        app.root_mode(),
+        initial_mode,
         "override must consume Tab before the built-in mode toggle runs"
     );
 }
@@ -7510,7 +7529,7 @@ fn bash_prefix_overrides_mode() {
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
-        app.state.mode,
+        app.root_mode(),
         Mode::Build,
         "tab must not toggle while bash prefix present"
     );
@@ -8209,7 +8228,7 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                                 assert!(app.question_active());
                             }
                             RenderSurface::Plan => {
-                                app.state.mode = Mode::Plan;
+                                set_root_mode(&mut app, Mode::Plan);
                                 app.state.plan = PlanState::Drafting("matrix-plan.md".into());
                                 app.plan_form.on_plan_ready();
                                 assert!(app.plan_form_active());
@@ -9346,11 +9365,11 @@ fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expec
     app.update(Msg::Key(key(close)));
     assert!(!app.command_palette.is_active());
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
-    let mode = app.state.mode.clone();
+    let mode = app.root_mode().clone();
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.input_box.buffer.value(), expected);
     if close == KeyCode::Esc {
-        assert_eq!(app.state.mode, mode);
+        assert_eq!(app.root_mode(), mode);
     }
     assert!(!app.command_palette.is_active());
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
@@ -9369,10 +9388,10 @@ fn cd_completion_no_match_tab_preserves_input_enter_submits(query: &str) {
     settle_command_palette(&mut app);
     assert!(app.command_palette.is_active());
     assert!(!app.command_palette.has_argument_selectable());
-    let mode = app.state.mode.clone();
+    let mode = app.root_mode().clone();
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.input_box.buffer.value(), input);
-    assert_eq!(app.state.mode, mode);
+    assert_eq!(app.root_mode(), mode);
     assert!(app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
@@ -9775,6 +9794,7 @@ fn at_subagent_prefix_lists_subagents() {
 #[test]
 fn mode_switch_closes_completion_source_snapshot() {
     let (_tmp, mut app, backend) = completion_app();
+    bind_root(&mut app, parked_root());
     seed_subagents(&backend, "build");
     for character in "@a:".chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
@@ -9782,14 +9802,15 @@ fn mode_switch_closes_completion_source_snapshot() {
     converge_completion(&mut app);
     assert!(app.file_completion.is_active());
 
-    app.set_mode_id("plan".into());
+    set_root_mode(&mut app, Mode::from_id("plan"));
     assert!(!app.file_completion.is_active());
 }
 
 #[test]
 fn at_a_prefix_in_plan_mode_hides_general() {
     let (_tmp, mut app, backend) = completion_app();
-    app.set_mode_id("plan".into());
+    bind_root(&mut app, parked_root());
+    set_root_mode(&mut app, Mode::from_id("plan"));
     seed_subagents(&backend, "plan");
     for c in "@a:".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -11610,7 +11631,7 @@ fn non_input_window_not_deferred() {
         // Plan mode with a ready plan: `transition_plan(InteractivePrompt)`
         // would flip it back to drafting, so a ready plan afterwards proves the
         // non-input path never invokes it.
-        app.state.mode = Mode::Plan;
+        set_root_mode(&mut app, Mode::Plan);
         app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
         let buf = Arc::new(maki_agent::SharedBuf::new());
         let config = maki_lua::FloatConfig {
@@ -11881,7 +11902,7 @@ fn defer_hint_pins_above_status_bar_until_restored() {
 #[test]
 fn plan_ready_fires_once_per_draft() {
     let mut app = test_app();
-    app.state.mode = Mode::Plan;
+    set_root_mode(&mut app, Mode::Plan);
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = StateDir::from_path(tmp.path().to_path_buf());
     app.state.plan.allocate_path(&state_dir);

@@ -150,6 +150,11 @@ impl MessageQueue {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn root_actor(&self) -> Option<&AgentActorHandle> {
+        self.shared.as_ref().map(QueueSender::actor)
+    }
+
     pub(crate) fn root_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
         self.shared.as_ref()?.effective_config()
     }

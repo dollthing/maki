@@ -68,7 +68,7 @@ use maki_agent::agent::isolated_turn::IsolatedTurnRequest;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, ImageMediaType, ImageSource,
-    McpConfigErrors, McpPromptRef, McpSnapshotReader, ModeId, Post, SharedBuf, SharedMessages,
+    McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf, SharedMessages,
     SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
@@ -744,6 +744,10 @@ impl App {
         }
     }
 
+    pub(crate) fn seed_mode(&self) -> AgentMode {
+        self.seed_config.mode.clone()
+    }
+
     /// The root's committed config, or the seed before the root is bound.
     pub(crate) fn root_config(&self) -> Arc<maki_agent::EffectiveAgentConfig> {
         self.queue
@@ -763,23 +767,15 @@ impl App {
     }
 
     pub(super) fn focused_mode(&self) -> Mode {
-        self.focused_config()
-            .map(|config| match &config.mode {
-                AgentMode::Build => Mode::Build,
-                AgentMode::Plan(_) => Mode::Plan,
-                AgentMode::Custom(id) => match id {
-                    ModeId::Build => Mode::Build,
-                    ModeId::Plan => Mode::Plan,
-                    ModeId::Custom(name) => Mode::Custom(Arc::clone(name)),
-                },
-            })
-            .unwrap_or_else(|| {
-                if self.is_main_chat() {
-                    self.state.mode.clone()
-                } else {
-                    Mode::Build
-                }
-            })
+        match self.focused_config() {
+            Some(config) => Mode::from(&config.mode),
+            None if self.is_main_chat() => self.root_mode(),
+            None => Mode::Build,
+        }
+    }
+
+    pub(crate) fn root_mode(&self) -> Mode {
+        Mode::from(&self.root_config().mode)
     }
 
     pub(super) fn focused_retry(&self) -> Option<&RetryInfo> {
@@ -1537,7 +1533,7 @@ impl App {
 
     fn plan_toggle_ready(&self) -> bool {
         if self.is_main_chat() {
-            self.state.mode == Mode::Plan && self.state.plan.is_ready()
+            self.root_mode() == Mode::Plan && self.state.plan.is_ready()
         } else {
             self.focused_plan_path().is_some() && self.plan_form.is_visible()
         }
@@ -1552,7 +1548,10 @@ impl App {
         let def = self
             .focused_config()
             .and_then(|config| config.mode_def.clone())
-            .unwrap_or_else(|| self.state.mode.def(&self.lua_event_handle.mode_registry()));
+            .unwrap_or_else(|| {
+                self.focused_mode()
+                    .def(&self.lua_event_handle.mode_registry())
+            });
         def.tools
             .as_deref()
             .is_some_and(|tools| tools.iter().any(|t| t.as_str() == PLAN_SUBMIT_TOOL))
@@ -2302,7 +2301,7 @@ impl App {
                 self.plan_form.on_plan_ready();
             }
             if chat_idx == 0
-                && self.state.mode == Mode::Plan
+                && self.root_mode() == Mode::Plan
                 && !self.plan_submit_active()
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -2370,7 +2369,7 @@ impl App {
             }
         }
 
-        let plan_path = if self.state.mode == Mode::Plan && !self.plan_submit_active() {
+        let plan_path = if self.root_mode() == Mode::Plan && !self.plan_submit_active() {
             self.state.plan.path()
         } else {
             None

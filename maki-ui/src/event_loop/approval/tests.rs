@@ -336,7 +336,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
                     .expect("aborted approval must release source"),
             );
             assert_eq!(provider.root_requests.load(Ordering::SeqCst), calls + 1);
-            assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
+            assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
             assert!(requests.is_empty());
             shutdown_manager(&manager);
             return;
@@ -365,7 +365,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         ));
         assert_eq!(read_recents(&event_loop.ctx.storage), recent);
         assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
+        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
         assert_eq!(
             event_loop.sessions[index].app.state.plan.path(),
             Some(path.as_path())
@@ -1043,7 +1043,7 @@ fn assert_preserved(
     let app = &event_loop.sessions[index].app;
     assert_eq!(app.status_bar.flash_text(), flash);
     assert_eq!(app.state.model.spec(), SOURCE_MODEL);
-    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(app.root_mode(), Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
     assert_eq!(app.plan_form.implementation_model(), Some(TARGET_MODEL));
     assert_eq!(app.run_id, run_id);
@@ -1182,7 +1182,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         assert!(requests.is_empty());
         let runtime = &mut event_loop.sessions[index];
         assert_eq!(runtime.id(), original_id);
-        assert_eq!(runtime.app.state.mode, Mode::Build);
+        assert_eq!(runtime.app.root_mode(), Mode::Build);
         assert_eq!(runtime.app.state.model.spec(), TARGET_MODEL);
         assert_eq!(runtime.app.plan_form.implementation_model(), None);
         let (manager, root) = runtime.handles.manager_and_root();
@@ -1249,7 +1249,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
         let before = observed(event_loop, index, MODE_COMMAND_PREFIX).len();
         approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build
+            event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
                 && !requests.is_empty()
         });
@@ -1329,7 +1329,7 @@ fn clear_context_preserves_runtime_and_session_state() {
         let committed_options = coordinator.read().options();
         assert!(committed_options.version > options.version);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build
+            event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
@@ -1374,7 +1374,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         });
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build && !recorded.is_empty()
+            event_loop.sessions[index].app.root_mode() == Mode::Build && !recorded.is_empty()
         });
         let (model, _, _, _) = recorded.recv_timeout(WAIT).unwrap();
         assert_eq!(model, TARGET_MODEL);
@@ -1398,7 +1398,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
             &identity,
             &event_loop.sessions[index].handles.identity()
         ));
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Build);
+        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Build);
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
             TARGET_MODEL
@@ -1421,7 +1421,7 @@ fn captured_plan_survives_later_edits(fresh: bool) {
         fs::write(&path, MUTATED_PLAN).unwrap();
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build
+            event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
                 && !requests.is_empty()
         });
@@ -1466,11 +1466,11 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
         event_loop.handle_internal(ready);
         assert!(
             event_loop.sessions[index].app.plan_approval_pending
-                || event_loop.sessions[index].app.state.mode == Mode::Build
+                || event_loop.sessions[index].app.root_mode() == Mode::Build
         );
         release.send(()).unwrap();
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build
+            event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
                 && !requests.is_empty()
         });
@@ -1580,7 +1580,7 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
         }
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == Mode::Build
+            event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
                 && !requests.is_empty()
         });
@@ -1614,7 +1614,11 @@ fn stale_plan_path_rejects_approval() {
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let source = manager.actor(root).unwrap().config_snapshot().unwrap();
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].projected_config_generation == Some(source.generation)
+            event_loop.sessions[index]
+                .projected_config
+                .as_ref()
+                .map(|commit| commit.generation)
+                == Some(source.generation)
         });
         let relative = PathBuf::from(path.file_name().unwrap());
         event_loop.set_focused(index);
@@ -1754,7 +1758,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
-            app.state.mode == Mode::Build && app.status == Status::Idle && !requests.is_empty()
+            app.root_mode() == Mode::Build && app.status == Status::Idle && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
@@ -1780,7 +1784,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
             event_loop.sessions[index].app.state.model.spec(),
             TARGET_MODEL
         );
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Build);
+        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Build);
         fs::remove_dir(&log).unwrap();
         fs::rename(&moved, &log).unwrap();
         event_loop.sessions[index].app.checkpoint_now();
@@ -1842,7 +1846,7 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
             let app = &event_loop.sessions[index].app;
             if !app.plan_approval_pending {
                 assert_eq!(
-                    app.state.mode,
+                    app.root_mode(),
                     Mode::Build,
                     "{:?}",
                     app.status_bar.flash_text()
@@ -1908,7 +1912,7 @@ fn busy_rejection_preserves_active_turn(fresh: bool) {
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert_eq!(event_loop.sessions[index].app.status, Status::Streaming);
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
+        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
         assert_eq!(
             event_loop.sessions[index].app.state.plan.path(),
             Some(path.as_path())

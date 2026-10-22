@@ -19,6 +19,7 @@ use maki_providers::RequestOptions;
 
 #[cfg(test)]
 use super::PendingInput;
+use super::mode::Mode;
 #[cfg(test)]
 use super::session_state::SessionState;
 use super::session_state::rules_to_stored;
@@ -151,7 +152,7 @@ impl App {
         let draft = self.input_box.buffer.value();
         SessionMeta {
             compacted: state.session.meta.compacted,
-            mode: Some(state.mode.clone().into()),
+            mode: Some(Mode::from(&config.mode).into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
@@ -328,9 +329,9 @@ impl App {
         self.checkpoint_now();
         let ended_id = self.state.session.id;
         let mut session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
-        session.meta.mode = Some(self.state.mode.clone().into());
-        session.meta.session_rules = self.state.session.meta.session_rules.clone();
         let config = self.root_config();
+        session.meta.mode = Some(Mode::from(&config.mode).into());
+        session.meta.session_rules = self.state.session.meta.session_rules.clone();
         session.meta.thinking = Some(config.thinking.into());
         session.meta.fast = config.fast || self.state.fast_pending;
         session.meta.workflow = config.workflow;

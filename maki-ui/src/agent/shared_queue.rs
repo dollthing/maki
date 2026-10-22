@@ -111,6 +111,11 @@ impl QueueSender {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn actor(&self) -> &AgentActorHandle {
+        &self.actor
+    }
+
     pub(crate) fn effective_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
         self.actor.effective_config()
     }
