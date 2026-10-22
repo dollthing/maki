@@ -1,7 +1,7 @@
 use maki_agent::SessionMailbox;
 use maki_agent::session_coordinator::{
-    SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
-    SessionTransactionReservation, builtin_option_definitions,
+    ConfigMutation, SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+    SessionOptionCatalog, SessionTransactionReservation, builtin_option_definitions,
 };
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
@@ -26,9 +26,8 @@ use maki_lua::{
         TURN_WAIT_TIMEOUT, UNKNOWN_SPAWN_OPTION,
     },
     orchestration::{
-        AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver,
-        OrchestrationServices, TrustedTarget, TurnCompletion, TurnCompletionFuture,
-        nonpersistent_config_mutation,
+        AgentOrchestration, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
+        TurnCompletion, TurnCompletionFuture, nonpersistent_config_mutation,
     },
     test_support::InMemoryFs,
 };
@@ -316,7 +315,7 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
         &self,
         target: &maki_agent::AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutationReservation, String> {
+    ) -> Result<ConfigMutation, String> {
         self.validate_target(target)?;
         match &self.config_mutations {
             Some(reserve) => reserve(target, publication),

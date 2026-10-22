@@ -192,13 +192,8 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
-pub type ConfigMutationReservation = ConfigMutation;
-
-pub type ConfigMutationReserver = Arc<
-    dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutationReservation, String>
-        + Send
-        + Sync,
->;
+pub type ConfigMutationReserver =
+    Arc<dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutation, String> + Send + Sync>;
 
 pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
@@ -375,7 +370,7 @@ pub fn frontend_root(
 fn default_config_mutation(
     target: &AgentRef,
     publication: CheckpointPublication,
-) -> Result<ConfigMutationReservation, String> {
+) -> Result<ConfigMutation, String> {
     if target
         .snapshot()
         .map_err(|error| error.to_string())?
@@ -431,9 +426,7 @@ pub async fn commit_config_change(
         .map_err(|error| error.to_string())
 }
 
-pub fn nonpersistent_config_mutation(
-    publication: CheckpointPublication,
-) -> ConfigMutationReservation {
+pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {
     Box::new(move |_, claim| {
         Ok(PreparedTransaction {
             publication,
@@ -463,7 +456,7 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         &self,
         target: &AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutationReservation, String> {
+    ) -> Result<ConfigMutation, String> {
         self.validate_target(target)?;
         default_config_mutation(target, publication)
     }

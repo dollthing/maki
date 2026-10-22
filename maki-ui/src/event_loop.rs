@@ -27,7 +27,7 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
+    ConfigMutation, PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
     SessionCoordinatorParams, SessionTransactionReservation, builtin_option_definitions,
     canonical_directory, publication_claim,
 };
@@ -44,9 +44,7 @@ use maki_commands::{BuiltinOperation, CommandError, HostResponse};
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
-use maki_lua::orchestration::{
-    AgentOrchestration, ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices,
-};
+use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, OrchestrationServices};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -5334,7 +5332,7 @@ fn runtime_config_mutations(
 
 struct ConfigChangeReservation {
     operation: maki_agent::actor::PreparedOperationTicket,
-    transaction: ConfigMutationReservation,
+    transaction: ConfigMutation,
     publication: CheckpointPublication,
 }
 
@@ -5345,7 +5343,7 @@ fn reserve_config_change(
 ) -> Result<ConfigChangeReservation, String> {
     target.validate_live().map_err(|error| error.to_string())?;
     let publication = CheckpointPublication::default();
-    let transaction: ConfigMutationReservation = if target
+    let transaction: ConfigMutation = if target
         .snapshot()
         .map_err(|error| error.to_string())?
         .parent_id

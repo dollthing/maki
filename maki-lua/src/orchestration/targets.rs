@@ -1,4 +1,5 @@
 use arc_swap::ArcSwapOption;
+use maki_agent::session_coordinator::ConfigMutation;
 use maki_agent::{
     AgentRef,
     actor::ConfigChange,
@@ -17,8 +18,8 @@ use tracing::warn;
 use crate::agent_errors::FIXED_ROOT_CONFIG_ERROR;
 
 use super::{
-    ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
-    TurnCompletion, TurnCompletionFuture, commit_config_change, default_config_mutation,
+    ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
+    TurnCompletionFuture, commit_config_change, default_config_mutation,
 };
 
 struct RootTarget {
@@ -277,7 +278,7 @@ impl OrchestrationServices for AgentOrchestration {
         &self,
         target: &AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutationReservation, String> {
+    ) -> Result<ConfigMutation, String> {
         self.validate_target(target)?;
         let reserve = self
             .lock()
