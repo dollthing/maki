@@ -27,8 +27,8 @@ use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, PermissionsConfig, ToolOutput,
-    TurnOutcome,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
+    ToolOutput, TurnOutcome,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
@@ -37,7 +37,7 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
-use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
+use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -874,7 +874,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         smol::block_on(change).map(|_| ())
     };
     if permission_mode == PermissionMode::Plan {
-        set_mode(MODE_PLAN).map_err(|error| eyre!("enter plan mode: {error}"))?;
+        set_mode(ModeId::Plan.key()).map_err(|error| eyre!("enter plan mode: {error}"))?;
     }
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -928,22 +928,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         active_cancel: None,
     }));
 
-    let snapshot = HeadlessSnapshot::default();
-    let snapshot_root = root.clone();
-    snapshot.install(
-        &lua_handle,
-        HeadlessMeta {
-            id: handle.session_id.to_string(),
-            cwd: working_dir.clone(),
-            model: startup_model.spec(),
-            fast: params.defaults.fast,
-            thinking: maki_agent::ThinkingConfig::from(params.defaults.thinking).to_string(),
-        },
-        move || match snapshot_root.effective_config() {
-            Ok(Some(config)) if config.mode.plan_path().is_some() => MODE_PLAN,
-            _ => MODE_BUILD,
-        },
-    );
+    let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
+    observer.install(root.clone());
 
     let pump = EventPump {
         writer: writer.clone(),
@@ -956,9 +942,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         cost: None,
         request_counter: 0,
         terminal_run_id: None,
-        lua_handle: lua_handle.clone(),
-        session_id: handle.session_id.to_string(),
-        snapshot,
+        observer,
     }
     .spawn(handle.event_rx.clone());
     let command_driver = spawn_command_driver(CommandDriverParams {
@@ -1320,9 +1304,9 @@ fn set_permission_mode(
         smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
     apply_permission_option(&snapshot, permissions, shared);
     set_mode(if mode == PermissionMode::Plan {
-        MODE_PLAN
+        ModeId::Plan.key()
     } else {
-        MODE_BUILD
+        ModeId::Build.key()
     })
 }
 
@@ -1741,9 +1725,7 @@ struct EventPump {
     cost: Option<f64>,
     request_counter: u64,
     terminal_run_id: Option<u64>,
-    lua_handle: maki_lua::EventHandle,
-    session_id: String,
-    snapshot: HeadlessSnapshot,
+    observer: HeadlessObserver,
 }
 
 impl EventPump {
@@ -1753,15 +1735,7 @@ impl EventPump {
                 if matches!(envelope.event, AgentEvent::StreamClosed) {
                     break;
                 }
-                // Folded in first, so a plugin handling `TurnEnd` finds the
-                // finished totals when it calls `maki.session.read()`.
-                self.snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(
-                    &self.lua_handle,
-                    &self.session_id,
-                    &envelope,
-                    envelope.subagent.is_some(),
-                );
+                self.observer.observe(&envelope);
                 if let Err(e) = self.handle(envelope) {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
@@ -2925,9 +2899,7 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            lua_handle,
-            session_id: handle.session_id.to_string(),
-            snapshot: HeadlessSnapshot::default(),
+            observer: HeadlessObserver::new(lua_handle, handle.session_id.id()),
         }
         .spawn(handle.event_rx.clone());
         let input = prepare_sdk_turn(
@@ -3207,9 +3179,9 @@ mod tests {
         assert!(!permissions.is_yolo());
         assert!(!shared.lock().unwrap().bypass_permissions);
         let expected = if mode == PermissionMode::Plan {
-            MODE_PLAN
+            ModeId::Plan.key()
         } else {
-            MODE_BUILD
+            ModeId::Build.key()
         };
         assert_eq!(*committed.lock().unwrap(), [expected]);
         let snapshot = coordinator.read().options();
@@ -3679,9 +3651,10 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
-            session_id: "test".into(),
-            snapshot: HeadlessSnapshot::default(),
+            observer: HeadlessObserver::new(
+                maki_lua::EventHandle::disconnected_for_test(),
+                MakiId::generate(),
+            ),
         };
         let outcome = || {
             TurnOutcome::completed(
@@ -3757,9 +3730,10 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
-            session_id: "test".into(),
-            snapshot: HeadlessSnapshot::default(),
+            observer: HeadlessObserver::new(
+                maki_lua::EventHandle::disconnected_for_test(),
+                MakiId::generate(),
+            ),
         };
         let agent_id = maki_agent::AgentId::generate();
         let turn_id = maki_agent::TurnId::generate();

@@ -38,6 +38,7 @@ use maki_config::{
     TrustConfig,
 };
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -917,6 +918,8 @@ async fn install_session_with_lock(
         .install_orchestration_services(orchestration.clone());
     let pending = PendingState::default();
     let project_trusted = handle.permissions.project_is_trusted();
+    let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
+    observer.install(trusted_root.target.clone());
     start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
@@ -929,6 +932,7 @@ async fn install_session_with_lock(
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+        observer,
     );
     let command_registry = params.command_registry.clone();
     let portable_capabilities = maki_agent::command::portable_capabilities();
@@ -1910,6 +1914,7 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    observer: HeadlessObserver,
 ) {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
@@ -1918,6 +1923,7 @@ fn start_event_pump(
 
         while let Ok(envelope) = event_rx.recv_async().await
         {
+            observer.observe(&envelope);
             // ACP fences on the presentation the actor stamped, which is the
             // same identity the rest of the frontend uses.
             let run_id = envelope.presentation().unwrap_or_default();
@@ -2208,6 +2214,14 @@ mod tests {
     const DISCOVERED_WINDOW: u32 = 524_000;
     const NEW_SESSION_REQUEST: i64 = 91;
     static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
+    const ACP_TURN_END: &str = "turn end ";
+
+    fn test_observer() -> HeadlessObserver {
+        HeadlessObserver::new(
+            maki_lua::EventHandle::disconnected_for_test(),
+            MakiId::generate(),
+        )
+    }
 
     struct RecordingAcpProvider {
         name: &'static str,
@@ -2380,6 +2394,7 @@ mod tests {
         Receiver<(&'static str, String, bool)>,
         Receiver<String>,
         TempDir,
+        Receiver<String>,
     ) {
         let (requests, received) = flume::unbounded();
         let provider: Arc<dyn maki_providers::provider::Provider> =
@@ -2400,7 +2415,8 @@ mod tests {
             Some(Arc::new(move |model| Ok((model, Arc::clone(&prepared))))),
         )
         .unwrap();
-        host.serve_ui(maki_lua::ui_sink::HeadlessUi);
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
+        host.serve_ui(ui);
         host.load_source(
             "acp_bundled_task",
             include_str!("../../plugins/task/init.lua"),
@@ -2416,13 +2432,19 @@ mod tests {
                     local root = assert(maki.agent.current(ctx))
                     assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                     assert(assert(root:model(ctx)).fast)
+                    local session = assert(maki.session.read({{ session = ctx:session_id() }}))
+                    assert(session.fast and session.model == "{FAST_SPEC}", maki.json.encode(session))
                     local view, view_err = maki.fn.winsaveview()
-                    assert(view == nil and view_err == "{}", view_err)
-                    maki.ui.flash("acp fast set")
+                    assert(view == nil and view_err == "{no_ui}", view_err)
+                end,
+            }})
+            maki.api.create_autocmd("TurnEnd", {{
+                callback = function(ev)
+                    maki.ui.flash("{ACP_TURN_END}" .. ev.data.session_id)
                 end,
             }})
         "#,
-                maki_lua::ui_sink::NO_UI_ERR
+                no_ui = maki_lua::ui_sink::NO_UI_ERR
             ),
         )
         .unwrap();
@@ -2536,12 +2558,14 @@ mod tests {
             };
             maki_lua::orchestration::frontend_root(
                 vec![FAST_SPEC.into()],
-                root,
+                root.clone(),
                 child_config,
                 coordinator.clone(),
             )
             .with_completion(completion)
         });
+        let observer = HeadlessObserver::new(host.event_handle(), id.id());
+        observer.install(root.target);
         host.event_handle().install_orchestration_services(services);
         let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
@@ -2568,9 +2592,10 @@ mod tests {
             None,
             PUMP_TRUSTED,
             None,
+            observer,
         );
         srv.lua_event_handle = host.event_handle();
-        (host, received, root_answers, state)
+        (host, received, root_answers, state, notices)
     }
 
     async fn prompt_terminal(out: &Receiver<Value>, id: i64) -> Value {
@@ -3781,6 +3806,7 @@ mod tests {
                 maki_storage::paths::home(),
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
             let session_id = session.handle.session_id.to_string();
 
@@ -4019,6 +4045,7 @@ mod tests {
                     maki_storage::paths::home(),
                     PUMP_TRUSTED,
                     None,
+                    test_observer(),
                 );
                 let session_id = session.handle.session_id.to_string();
                 let request_id = RequestId::Number(iteration as i64 + 1);
@@ -4152,6 +4179,7 @@ mod tests {
                 None,
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
 
             handle_prompt(
@@ -4343,6 +4371,7 @@ mod tests {
             maki_storage::paths::home(),
             PUMP_TRUSTED,
             None,
+            test_observer(),
         );
         event_tx
             .send(Envelope {
@@ -4394,6 +4423,7 @@ mod tests {
             maki_storage::paths::home(),
             PUMP_TRUSTED,
             None,
+            test_observer(),
         );
 
         event_tx
@@ -4465,6 +4495,7 @@ mod tests {
                 maki_storage::paths::home(),
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
 
             let completed = |run_id| Envelope {
@@ -4543,6 +4574,7 @@ mod tests {
             maki_storage::paths::home(),
             PUMP_TRUSTED,
             None,
+            test_observer(),
         );
 
         for event in [
@@ -4624,6 +4656,7 @@ mod tests {
             None,
             PUMP_TRUSTED,
             Some(INITIAL_COST),
+            test_observer(),
         );
         let turn_complete = |cost| {
             AgentEvent::TurnComplete(Box::new(maki_agent::TurnCompleteEvent {
@@ -4664,7 +4697,7 @@ mod tests {
         let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (_host, received, root_answer_rx, _state) =
+            let (_host, received, root_answer_rx, _state, notices) =
                 managed_test_session(&mut srv, true, true, None, successful_checkpoint()).await;
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             handle_prompt(
@@ -4712,6 +4745,10 @@ mod tests {
             assert_eq!(
                 prompt_terminal(&out_rx, 93).await["result"]["stopReason"],
                 "end_turn"
+            );
+            assert_eq!(
+                notices.recv_timeout(PRIMARY_TURN_TIMEOUT).unwrap(),
+                format!("{ACP_TURN_END}{session_id}")
             );
             assert!(root_answer_rx.is_empty());
             assert!(
@@ -4763,6 +4800,7 @@ mod tests {
             maki_storage::paths::home(),
             PUMP_TRUSTED,
             None,
+            test_observer(),
         );
 
         event_tx
@@ -5252,6 +5290,7 @@ mod tests {
                 None,
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
             let session_id = session.handle.session_id.to_string();
             let request_id = RequestId::Number(71);
@@ -5361,7 +5400,7 @@ mod tests {
                     Ok(())
                 })
             });
-            let (_host, received, _, _state) =
+            let (_host, received, _, _state, _) =
                 managed_test_session(&mut srv, nested, false, Some(completion), checkpoint).await;
             let session = srv.session.as_ref().unwrap();
             let session_id = session.handle.session_id.to_string();
@@ -5710,6 +5749,7 @@ mod tests {
                 None,
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
             let old_id = old.handle.session_id.to_string();
 
@@ -6546,6 +6586,7 @@ mod tests {
                 None,
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
             let session_id_str = session_id.to_string();
             let request_id = RequestId::Number(41);
@@ -6635,6 +6676,7 @@ mod tests {
                 None,
                 PUMP_TRUSTED,
                 None,
+                test_observer(),
             );
             let session_id = session.handle.session_id.to_string();
 

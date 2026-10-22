@@ -4173,7 +4173,8 @@ status of the session you name in `session`.
 The returned table:
 ```lua
 {
-  id, cwd, model, mode = "build" | "plan",
+  id, cwd, model, fast, thinking,
+  mode,              -- committed mode id: "build", "plan" or a plugin mode
   status = "idle" | "working" | "needs_input",
   focused, updated_at,
   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },

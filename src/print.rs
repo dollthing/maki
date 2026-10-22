@@ -35,9 +35,9 @@ use maki_commands::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
-use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
+use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::{CompleteModelSelection, TokenUsage, add_cost};
+use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -509,8 +509,6 @@ pub fn run(
         with_print_handle(handle, |handle| {
             smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
             let (trusted, orchestration) = installed.recv().map_err(|error| eyre!(error))?;
-            let selection =
-                CompleteModelSelection::from_model(&trusted.template.model, trusted.template.opts);
             let root = trusted.target.clone();
             let target = command_registry.bind_target(
                 print_capabilities(),
@@ -523,18 +521,8 @@ pub fn run(
                     target.clone(),
                 ),
             );
-            let snapshot = HeadlessSnapshot::default();
-            snapshot.install(
-                &lua_handle,
-                HeadlessMeta {
-                    id: handle.session_id.to_string(),
-                    cwd: handle.cwd.clone(),
-                    model: selection.spec.to_string(),
-                    fast: selection.fast,
-                    thinking: selection.thinking.to_string(),
-                },
-                || MODE_BUILD,
-            );
+            let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
+            observer.install(root.clone());
             drive_print(
                 &command_registry,
                 &target,
@@ -574,13 +562,7 @@ pub fn run(
                             if matches!(envelope.event, AgentEvent::StreamClosed) {
                                 break;
                             }
-                            snapshot.observe(&envelope);
-                            maki_lua::agent_autocmd::dispatch(
-                                &lua_handle,
-                                &session_id,
-                                &envelope,
-                                envelope.subagent.is_some(),
-                            );
+                            observer.observe(&envelope);
                             let Envelope {
                                 ref event,
                                 ref subagent,

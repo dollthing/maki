@@ -1,7 +1,7 @@
-//! One place that turns agent events into autocmds, shared by the UI app loop,
-//! `makima --print` and sdk mode, so a plugin sees the same events whichever way maki
-//! was started. `maki-acp` drives the agent from its own loop and does not call
-//! this yet, so plugins loaded under ACP get no turn events.
+//! One place that turns agent events into autocmds, shared by the UI app loop
+//! and the headless drivers (print, SDK, ACP) through
+//! [`crate::session_snapshot::HeadlessObserver`], so a plugin sees the same
+//! events whichever way maki was started.
 
 use std::fmt::Display;
 

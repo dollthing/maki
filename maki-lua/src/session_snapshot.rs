@@ -4,14 +4,14 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use maki_agent::{AgentEvent, Envelope};
+use maki_agent::{AgentEvent, AgentRef, Envelope};
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::id::MakiId;
 use serde::Serialize;
 
-use crate::EventHandle;
+use crate::{EventHandle, agent_autocmd};
 
-pub const MODE_BUILD: &str = "build";
-pub const MODE_PLAN: &str = "plan";
+const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 pub const STATUS_IDLE: &str = "idle";
 pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
@@ -29,8 +29,8 @@ pub struct SessionSnapshot {
     pub model: String,
     pub fast: bool,
     pub thinking: String,
-    /// [`MODE_BUILD`] or [`MODE_PLAN`].
-    pub mode: &'static str,
+    /// The committed mode's id: `build`, `plan` or a plugin mode.
+    pub mode: String,
     /// [`STATUS_IDLE`], [`STATUS_WORKING`], or [`STATUS_NEEDS_INPUT`].
     pub status: &'static str,
     /// Whether this is the session the user is looking at. Always true
@@ -63,22 +63,11 @@ pub struct SessionQueueSnapshot {
     pub count: usize,
 }
 
-/// What a headless driver knows about its session before it runs.
-pub struct HeadlessMeta {
-    pub id: String,
-    pub cwd: String,
-    /// Model spec (`provider/id`).
-    pub model: String,
-    pub fast: bool,
-    pub thinking: String,
-}
-
 #[derive(Default)]
 struct Totals {
     usage: TokenUsage,
     cost: Option<f64>,
     context_size: u32,
-    context_window: u32,
     working: bool,
 }
 
@@ -89,18 +78,43 @@ fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
     totals.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Backs `maki.session.read` for the single session headless drivers
-/// (`makima --print`, sdk mode). The driver writes while the Lua thread reads, hence
-/// the lock, though the two rarely meet.
-#[derive(Clone, Default)]
-pub struct HeadlessSnapshot(Arc<Mutex<Totals>>);
+/// What a headless driver (print, SDK, ACP) feeds every envelope of its one
+/// session to: the totals `maki.session.read` answers from and the Lua turn
+/// autocmds, so plugins see the same events and numbers as under the TUI. The
+/// driver writes while the Lua thread reads, hence the lock, though the two
+/// rarely meet.
+#[derive(Clone)]
+pub struct HeadlessObserver {
+    handle: EventHandle,
+    session_id: MakiId,
+    totals: Arc<Mutex<Totals>>,
+}
 
-impl HeadlessSnapshot {
-    /// Fold one envelope in. The drivers already loop over the stream, so
-    /// they hand every envelope here and keep no bookkeeping of their own.
+impl HeadlessObserver {
+    pub fn new(handle: EventHandle, session_id: MakiId) -> Self {
+        Self {
+            handle,
+            session_id,
+            totals: Arc::default(),
+        }
+    }
+
+    /// Folds one envelope into the totals, then fires its autocmd. Folded
+    /// first, so a plugin handling `TurnEnd` finds the finished totals when
+    /// it calls `maki.session.read()`.
     pub fn observe(&self, envelope: &Envelope) {
+        self.fold(envelope);
+        agent_autocmd::dispatch(
+            &self.handle,
+            &self.session_id,
+            envelope,
+            envelope.subagent.is_some(),
+        );
+    }
+
+    fn fold(&self, envelope: &Envelope) {
         let event = &envelope.event;
-        let mut totals = lock(&self.0);
+        let mut totals = lock(&self.totals);
         // Envelopes only flow while a run is alive, so anything that is not
         // an ending means the agent is busy. Sdk mode runs many turns and no
         // driver has to remember to clear a flag between them.
@@ -115,44 +129,43 @@ impl HeadlessSnapshot {
                 totals.usage += outcome.usage();
                 add_cost(&mut totals.cost, outcome.cost());
                 totals.context_size = outcome.context_size();
-                totals.context_window = outcome.context_window();
             }
             AgentEvent::TurnComplete(turn) if envelope.subagent.is_none() => {
                 totals.context_size = turn.context_size.unwrap_or(totals.context_size);
-                totals.context_window = turn.context_window;
             }
             _ => {}
         }
     }
 
-    /// Install as the provider `maki.session.read` answers from. `mode`
-    /// is a callback because sdk mode can flip between build and plan
-    /// mid-run.
+    /// Installs the provider `maki.session.read` answers from, for the
+    /// session whose root is {root}. Model, thinking, fast, mode, cwd and
+    /// context window come from the root's committed config at read time,
+    /// the same source the TUI reads, so a `/model` or mode change shows up
+    /// at once.
     ///
-    /// There is no stored session and no rename path under either driver,
-    /// so `title` stays nil rather than echoing the id back as a fake one.
-    pub fn install(
-        &self,
-        handle: &EventHandle,
-        meta: HeadlessMeta,
-        mode: impl Fn() -> &'static str + Send + Sync + 'static,
-    ) {
-        let totals = Arc::clone(&self.0);
-        handle.install_session_snapshot(Box::new(move |id| {
+    /// There is no rename path under the headless drivers, so `title` stays
+    /// nil rather than echoing the id back as a fake one.
+    pub fn install(&self, root: AgentRef) {
+        let totals = Arc::clone(&self.totals);
+        let id = self.session_id;
+        self.handle.install_session_snapshot(Box::new(move |want| {
             // One session here, so any other id names a tab that is not ours.
-            if id.to_string() != meta.id {
-                return Err(format!("session {id} not live"));
+            if want != id {
+                return Err(format!("session {want} not live"));
             }
-            let mode = mode();
+            let config = root
+                .effective_config()
+                .map_err(|error| error.to_string())?
+                .ok_or(ROOT_CONFIG_UNAVAILABLE)?;
             let totals = lock(&totals);
             serde_json::to_value(SessionSnapshot {
-                id: meta.id.clone(),
-                cwd: meta.cwd.clone(),
+                id: id.to_string(),
+                cwd: config.context.cwd().to_string_lossy().into_owned(),
                 title: None,
-                model: meta.model.clone(),
-                fast: meta.fast,
-                thinking: meta.thinking.clone(),
-                mode,
+                model: config.model.spec(),
+                fast: config.fast,
+                thinking: config.thinking.to_string(),
+                mode: config.mode.id().key().to_owned(),
                 status: if totals.working {
                     STATUS_WORKING
                 } else {
@@ -163,7 +176,7 @@ impl HeadlessSnapshot {
                 queue: None,
                 usage: totals.usage,
                 context_size: totals.context_size,
-                context_window: totals.context_window,
+                context_window: config.model.context_window,
                 cost: totals.cost,
             })
             .map_err(|e| e.to_string())
@@ -228,18 +241,19 @@ mod tests {
     /// back to life on turn two, with no driver clearing anything by hand.
     #[test]
     fn totals_grow_and_status_revives_across_turns() {
-        let snapshot = HeadlessSnapshot::default();
+        let observer =
+            HeadlessObserver::new(EventHandle::disconnected_for_test(), MakiId::generate());
 
-        snapshot.observe(&turn_complete(FIRST_TURN_INPUT));
-        assert!(lock(&snapshot.0).working);
-        snapshot.observe(&done(FIRST_TURN_INPUT));
-        assert!(!lock(&snapshot.0).working);
+        observer.fold(&turn_complete(FIRST_TURN_INPUT));
+        assert!(lock(&observer.totals).working);
+        observer.fold(&done(FIRST_TURN_INPUT));
+        assert!(!lock(&observer.totals).working);
 
-        snapshot.observe(&turn_complete(SECOND_TURN_INPUT));
-        assert!(lock(&snapshot.0).working, "{WORKING_MSG}");
-        snapshot.observe(&done(SECOND_TURN_INPUT));
+        observer.fold(&turn_complete(SECOND_TURN_INPUT));
+        assert!(lock(&observer.totals).working, "{WORKING_MSG}");
+        observer.fold(&done(SECOND_TURN_INPUT));
 
-        let totals = lock(&snapshot.0);
+        let totals = lock(&observer.totals);
         assert!(!totals.working);
         assert_eq!(
             totals.usage.input,

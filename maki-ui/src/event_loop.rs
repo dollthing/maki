@@ -55,8 +55,7 @@ use maki_lua::orchestration::{
     TrustedTarget,
 };
 use maki_lua::session_snapshot::{
-    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
-    SessionSnapshot,
+    STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot, SessionSnapshot,
 };
 use maki_lua::ui_sink::UiSink;
 use maki_lua::{
@@ -3166,19 +3165,15 @@ impl<'t> EventLoop<'t> {
     fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
         let rt = &self.sessions[idx];
         let app = &rt.app;
-        let config = app.root_config();
+        let config = rt.config().unwrap_or_else(|| app.root_config());
         let snapshot = SessionSnapshot {
             id: rt.id().to_string(),
-            cwd: app.state.session.cwd.clone(),
+            cwd: config.context.cwd().to_string_lossy().into_owned(),
             title: Some(app.state.session.title.clone()),
             model: config.model.spec(),
             fast: config.fast,
             thinking: config.thinking.to_string(),
-            mode: if app.root_mode() == crate::app::mode::Mode::Plan {
-                MODE_PLAN
-            } else {
-                MODE_BUILD
-            },
+            mode: config.mode.id().key().to_owned(),
             status: SessionStatus::of(app).as_str(),
             focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
@@ -3190,15 +3185,7 @@ impl<'t> EventLoop<'t> {
             context_window: config.model.context_window,
             cost: app.state.cost,
         };
-        let mut value = serde_json::to_value(snapshot).unwrap_or_default();
-        if let Some(config) = rt.config() {
-            value["model"] = json!(config.model.spec());
-            value["fast"] = json!(config.fast);
-            value["thinking"] = json!(config.thinking.to_string());
-            value["mode"] = json!(config.mode.id().to_string());
-            value["context_window"] = json!(config.model.context_window);
-        }
-        value
+        serde_json::to_value(snapshot).unwrap_or_default()
     }
 
     /// The single place that removes a runtime: keeps `focused` pointing at
