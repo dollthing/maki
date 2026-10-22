@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
@@ -51,8 +50,8 @@ use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::orchestration::{
-    AgentOrchestration, ConfigMutationReserver, DURABLE_CONFIG_UNAVAILABLE, OrchestrationServices,
-    TrustedTarget,
+    AgentOrchestration, ConfigMutationReserver, DURABLE_CONFIG_UNAVAILABLE, Discovery,
+    ModelCatalog, OrchestrationServices, TrustedTarget,
 };
 use maki_lua::session_snapshot::{
     STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot, SessionSnapshot,
@@ -64,7 +63,7 @@ use maki_lua::{
     SessionRequest, StatusContentReader, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
@@ -1239,7 +1238,7 @@ struct SpawnCtx {
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     model_slot: Arc<ProviderSlot>,
-    available_models: Arc<ArcSwapOption<Vec<String>>>,
+    catalog: ModelCatalog,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
@@ -1293,13 +1292,6 @@ impl SpawnCtx {
             model_policy: Arc::clone(&self.model_policy),
             checkpoint: self.storage_writer.coordinator_checkpoint(),
         }
-    }
-
-    fn available_model_specs(&self) -> Vec<Arc<str>> {
-        self.available_models
-            .load_full()
-            .map(|models| models.iter().map(|spec| Arc::from(spec.as_str())).collect())
-            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1439,7 +1431,7 @@ impl SpawnCtx {
             config.clone(),
             session.clone(),
             self.storage.clone(),
-            Arc::clone(&self.available_models),
+            self.catalog.specs(),
             self.mcp_handle
                 .as_ref()
                 .map(McpHandle::reader)
@@ -1477,7 +1469,7 @@ impl SpawnCtx {
         let coordinator = prepare_coordinator(
             &deps,
             &session,
-            self.available_model_specs(),
+            self.catalog.snapshot(),
             &handles,
             &permissions,
             crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
@@ -1650,12 +1642,9 @@ pub(crate) struct EventLoop<'t> {
     provider_usage: ProviderUsageCoordinator<flume::Sender<ProviderUsageReply>>,
     next_status_invalidation: u64,
     pending_status_invalidation: Option<ProviderUsageInvalidation>,
-    /// The model list last published into every session's coordinator. See
-    /// [`Self::sync_model_values`].
-    published_model_specs: Option<Arc<Vec<String>>>,
     internal_tx: flume::Sender<InternalEvent>,
     internal_rx: flume::Receiver<InternalEvent>,
-    _model_fetch_task: smol::Task<()>,
+    model_discovery: Discovery,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -1673,13 +1662,6 @@ enum Wake {
     Internal(InternalEvent),
 }
 
-struct BackgroundModels {
-    available: Arc<ArcSwapOption<Vec<String>>>,
-    warn_rx: flume::Receiver<String>,
-    warn_tx: flume::Sender<String>,
-    task: smol::Task<()>,
-}
-
 fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, PreparedProvider) {
     let current = slot.load();
     (
@@ -1691,48 +1673,21 @@ fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, Prepare
     )
 }
 
-fn merge_batch(
-    available: &Arc<ArcSwapOption<Vec<String>>>,
-    batch: maki_providers::provider::ModelBatch,
-    warn_tx: &flume::Sender<String>,
-    internal_tx: &flume::Sender<InternalEvent>,
-) {
-    for w in batch.warnings {
-        let _ = warn_tx.try_send(w);
-    }
-    if batch.models.is_empty() {
-        return;
-    }
-    let mut merged = available.load().as_deref().cloned().unwrap_or_default();
-    for spec in &batch.models {
-        if !merged.contains(spec) {
-            merged.push(spec.clone());
-        }
-    }
-    available.store(Some(Arc::new(merged)));
-    let _ = internal_tx.send(InternalEvent::ModelsDiscovered);
-}
-
-fn spawn_model_fetch(
-    internal_tx: flume::Sender<InternalEvent>,
+/// Runs {catalog}'s discovery; each applied batch's warnings flash and the
+/// loop re-projects the catalog.
+fn discover_models(
+    catalog: &ModelCatalog,
     policy: Arc<ModelPolicy>,
-) -> BackgroundModels {
-    let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
-    let bg = Arc::clone(&available);
-    let (warn_tx, warn_rx) = flume::unbounded::<String>();
-    let warn_tx_bg = warn_tx.clone();
-    let task = smol::spawn(async move {
-        fetch_all_models(&policy, |batch| {
-            merge_batch(&bg, batch, &warn_tx_bg, &internal_tx)
-        })
-        .await;
-    });
-    BackgroundModels {
-        available,
-        warn_rx,
-        warn_tx,
-        task,
-    }
+    active: String,
+    warn_tx: flume::Sender<String>,
+    internal_tx: flume::Sender<InternalEvent>,
+) -> Discovery {
+    catalog.discover(policy, active, move |warnings| {
+        for warning in warnings {
+            let _ = warn_tx.try_send(warning);
+        }
+        let _ = internal_tx.send(InternalEvent::ModelsDiscovered);
+    })
 }
 
 impl<'t> EventLoop<'t> {
@@ -1809,12 +1764,13 @@ impl<'t> EventLoop<'t> {
         let (model_slot, provider_change_rx) = ProviderSlot::new(model.clone(), provider);
         let initial_provider = model_slot.load().provider.identity();
         let (internal_tx, internal_rx) = flume::unbounded();
-        let bg = spawn_model_fetch(internal_tx.clone(), Arc::clone(&model_policy));
-        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
+        let (warn_tx, warn_rx) = flume::unbounded::<String>();
+        let catalog = ModelCatalog::offline(&model_policy);
+        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
-        let model_completion = Arc::new(ModelArgSource::new(Arc::clone(&bg.available)));
+        let model_completion = Arc::new(ModelArgSource::new(catalog.specs()));
         let theme_completion = Arc::new(ThemeArgSource::new(
             crate::theme::default_provider().clone(),
         ));
@@ -1843,7 +1799,7 @@ impl<'t> EventLoop<'t> {
             mcp_handle,
             mcp_config_errors,
             model_slot,
-            available_models: bg.available,
+            catalog,
             storage_writer,
             model_policy,
             system_prompt: SystemPromptOverride {
@@ -1903,9 +1859,17 @@ impl<'t> EventLoop<'t> {
         }
 
         let session_cwd = runtimes[focused].app.state.session.cwd.clone();
-        let orchestration = Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models)));
+        let orchestration = Arc::new(AgentOrchestration::new(ctx.catalog.specs()));
+        ctx.catalog.attach(&orchestration);
         ctx.lua_event_handle
             .install_orchestration_services(orchestration.clone());
+        let model_discovery = discover_models(
+            &ctx.catalog,
+            Arc::clone(&ctx.model_policy),
+            model.provider.to_string(),
+            warn_tx.clone(),
+            internal_tx.clone(),
+        );
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -1922,18 +1886,17 @@ impl<'t> EventLoop<'t> {
             session_cwd,
             last_heartbeat: Instant::now(),
             input: InputReader::spawn(),
-            warn_rx: bg.warn_rx,
-            warn_tx: bg.warn_tx,
+            warn_rx,
+            warn_tx,
             ui_action_rx,
             command_rx,
             provider_change_rx,
             provider_usage: ProviderUsageCoordinator::new(initial_provider),
             next_status_invalidation: 0,
             pending_status_invalidation: None,
-            published_model_specs: None,
             internal_tx,
             internal_rx,
-            _model_fetch_task: bg.task,
+            model_discovery,
         })
     }
 
@@ -2612,8 +2575,6 @@ impl<'t> EventLoop<'t> {
                 None => break,
             }
         }
-
-        self.sync_model_values();
 
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
@@ -3824,45 +3785,6 @@ impl<'t> EventLoop<'t> {
         app.record_recent_model(spec);
     }
 
-    /// A session's model option fixes its value list when the coordinator is
-    /// registered, but providers discover models in the background long after
-    /// that. Without republishing, `/model <a model discovered later>` is
-    /// rejected as an invalid option value -- and a session registered before
-    /// the first fetch landed can only ever select the model it started on.
-    fn sync_model_values(&mut self) {
-        let available = self.ctx.available_models.load_full();
-        let unchanged = match (&self.published_model_specs, &available) {
-            (Some(published), Some(current)) => Arc::ptr_eq(published, current),
-            (None, None) => true,
-            _ => false,
-        };
-        if unchanged {
-            return;
-        }
-        self.published_model_specs = available.clone();
-        self.sync_model_discovery();
-        // A refresh clears the list before refetching; publishing the empty
-        // state would strip every session back to its current model.
-        let Some(available) = available else {
-            return;
-        };
-        let specs: Vec<Arc<str>> = available
-            .iter()
-            .map(|spec| Arc::from(spec.as_str()))
-            .collect();
-        for rt in &self.sessions {
-            let coordinator = rt.coordinator.clone();
-            let specs = specs.clone();
-            // Off-thread like every other coordinator call (see SessionOpKind).
-            smol::spawn(async move {
-                if let Err(error) = coordinator.update_model_values(specs).await {
-                    warn!(%error, "publishing discovered models into a session failed");
-                }
-            })
-            .detach();
-        }
-    }
-
     /// The slot the status line, usage panel, and new-session default are
     /// about. Sessions own their models, so "current provider" means the
     /// focused tab's, falling back to the startup slot before any tab exists.
@@ -3909,23 +3831,12 @@ impl<'t> EventLoop<'t> {
     /// The model catalog filtered by {target}'s model policy, so `/model`
     /// fragments resolve only to models the pinned agent may use.
     fn target_model_specs(&self, target: &AgentRef) -> Result<HostResponse, CommandError> {
-        let policy = OrchestrationServices::template(&*self.orchestration, target)
-            .map_err(|_| CommandError::StaleTarget)?
-            .model_policy;
-        let specs = self
-            .ctx
-            .available_models
-            .load_full()
-            .map(|models| {
-                models
-                    .iter()
-                    .filter(|spec| policy.allows(spec))
-                    .map(|spec| Arc::from(spec.as_str()))
-                    .collect()
-            })
-            .unwrap_or_else(|| Arc::from([]));
+        let specs = OrchestrationServices::available_models(&*self.orchestration, target)
+            .map_err(|_| CommandError::StaleTarget)?;
         Ok(HostResponse::Context(
-            maki_commands::HostContextResponse::Values(specs),
+            maki_commands::HostContextResponse::Values(
+                specs.iter().map(|spec| Arc::from(spec.as_str())).collect(),
+            ),
         ))
     }
 
@@ -4303,22 +4214,18 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn refresh_models(&self) {
-        let available = Arc::clone(&self.ctx.available_models);
-        let warn_tx = self.warn_tx.clone();
-        let internal_tx = self.internal_tx.clone();
-        let policy = Arc::clone(&self.ctx.model_policy);
-        smol::spawn(async move {
-            fetch_all_models(&policy, |batch| {
-                merge_batch(&available, batch, &warn_tx, &internal_tx)
-            })
-            .await;
-        })
-        .detach();
+    fn refresh_models(&mut self) {
+        self.model_discovery = discover_models(
+            &self.ctx.catalog,
+            Arc::clone(&self.ctx.model_policy),
+            self.focused_model_slot().load().model.provider.to_string(),
+            self.warn_tx.clone(),
+            self.internal_tx.clone(),
+        );
     }
 
-    /// The UI slot only seeds new tabs, so it is written directly; live agents
-    /// go through their durable config path.
+    /// The UI slot only seeds new tabs, so it is written directly; the
+    /// catalog's discovery refreshes live agents.
     fn refresh_discovered_models(&mut self) {
         let current = self.ctx.model_slot.load();
         if let Some(model) =
@@ -4329,9 +4236,7 @@ impl<'t> EventLoop<'t> {
             self.ctx.model_slot.project(model, provider);
         }
         self.sync_orchestration();
-        if let Some(refresh) = self.orchestration.refresh_discovered_models() {
-            smol::spawn(refresh).detach();
-        }
+        self.sync_model_discovery();
     }
 
     fn refresh_provider(&mut self, slug: String) {
@@ -5599,19 +5504,14 @@ mod tests {
                     }],
                 );
 
+                event_loop.sync_orchestration();
+                smol::block_on(event_loop.ctx.catalog.apply(Vec::new()));
                 event_loop.handle_internal(InternalEvent::ModelsDiscovered);
 
                 let runtime = &event_loop.sessions[0];
                 if refreshed {
                     let commit = smol::block_on(runtime.config_commits.recv_async()).unwrap();
                     assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
-                } else {
-                    assert!(
-                        event_loop
-                            .orchestration
-                            .refresh_discovered_models()
-                            .is_none()
-                    );
                 }
                 let window = |model: &Model| model.context_window == DISCOVERED_WINDOW;
                 assert_eq!(window(&runtime.config().unwrap().model), refreshed);
@@ -5656,10 +5556,7 @@ mod tests {
                         .reserve_transaction(CheckpointPublication::default())
                         .unwrap()
                 });
-                let mut refresh = event_loop
-                    .orchestration
-                    .refresh_discovered_models()
-                    .unwrap();
+                let mut refresh = Box::pin(event_loop.ctx.catalog.apply(Vec::new()));
 
                 assert!(smol::block_on(futures_lite::future::poll_once(&mut refresh)).is_none());
                 drop((guard, lease));
@@ -5819,6 +5716,7 @@ mod tests {
 
     const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+    const TEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
         with_event_loop_runtime(|harness| harness.runtime(harness.session()), test);
@@ -5852,7 +5750,11 @@ mod tests {
             notifier: None,
             sessions_dir: ctx.sessions_dir.clone(),
             session_cwd: harness._temp_dir.path().to_string_lossy().into_owned(),
-            orchestration: Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models))),
+            orchestration: {
+                let orchestration = Arc::new(AgentOrchestration::new(ctx.catalog.specs()));
+                ctx.catalog.attach(&orchestration);
+                orchestration
+            },
             orchestration_revisions: Vec::new(),
             orchestration_focus: None,
             ctx,
@@ -5866,12 +5768,21 @@ mod tests {
             provider_usage: ProviderUsageCoordinator::new(initial_provider),
             next_status_invalidation: 0,
             pending_status_invalidation: None,
-            published_model_specs: None,
             internal_tx,
             internal_rx,
-            _model_fetch_task: smol::spawn(async {}),
+            model_discovery: Discovery::idle(),
         };
         test(&mut event_loop);
+        smol::block_on(
+            event_loop
+                .model_discovery
+                .wait_active(TEST_DISCOVERY_TIMEOUT),
+        );
+        drop(event_loop.model_discovery);
+        event_loop
+            .ctx
+            .storage_writer
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
         for runtime in event_loop.sessions.drain(..) {
             release_runtime(runtime);
         }
@@ -6001,12 +5912,12 @@ mod tests {
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-            let available_models = Arc::new(ArcSwapOption::empty());
+            let catalog = ModelCatalog::default();
             let command_registry = maki_commands::CommandRegistry::new();
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
                 command_registry,
-                Arc::new(ModelArgSource::new(Arc::clone(&available_models))),
+                Arc::new(ModelArgSource::new(catalog.specs())),
                 Arc::new(ThemeArgSource::new(
                     crate::theme::default_provider().clone(),
                 )),
@@ -6038,7 +5949,7 @@ mod tests {
                 mcp_handle: None,
                 mcp_config_errors: McpConfigErrors::new(temp_dir.path().to_path_buf()),
                 model_slot,
-                available_models,
+                catalog,
                 storage_writer,
                 model_policy: Arc::new(ModelPolicy::default()),
                 system_prompt: SystemPromptOverride::default(),
@@ -7941,7 +7852,8 @@ mod tests {
             app.command_target = command_runtime.bind_target();
             event_loop
                 .ctx
-                .available_models
+                .catalog
+                .specs()
                 .store(Some(Arc::new(vec![ALLOWED.into(), EXCLUDED.into()])));
             event_loop.sessions[0]
                 .handles
@@ -8279,7 +8191,7 @@ mod tests {
             select_child_chat(event_loop, child, CHILD_CHAT);
             let root_model = event_loop.sessions[0].app.root_config().model.spec();
             assert_ne!(root_model, CHILD_MODEL);
-            event_loop.ctx.available_models.store(Some(Arc::new(vec![
+            event_loop.ctx.catalog.specs().store(Some(Arc::new(vec![
                 root_model.clone(),
                 CHILD_MODEL.into(),
                 NEXT_MODEL.into(),

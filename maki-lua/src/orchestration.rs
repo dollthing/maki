@@ -2,7 +2,6 @@ use crate::agent_errors::{
     NO_ORCHESTRATION_SERVICES, ORCHESTRATION_CONTEXT_EXPIRED, ORCHESTRATION_SERVICES_EXPIRED,
 };
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
-use arc_swap::ArcSwapOption;
 use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
@@ -35,7 +34,9 @@ use std::{
     },
 };
 
+mod catalog;
 mod targets;
+pub use catalog::{ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog};
 pub use targets::AgentOrchestration;
 
 const WRONG_TASK: &str = "orchestration context belongs to another task";
@@ -403,31 +404,34 @@ pub fn project_yolo(coordinator: &SessionCoordinatorHandle, permissions: Arc<Per
 
 /// The orchestration a non-UI frontend binds to its root graph: the root's
 /// config commits through {coordinator} and its children persist to
-/// {checkpoint}. `label` names the frontend in the closed-graph error.
+/// {checkpoint}, and {catalog}'s discovery refreshes it. `label` names the
+/// frontend in the closed-graph error.
 pub fn durable_frontend(
     label: &'static str,
-    models: Vec<String>,
+    catalog: &ModelCatalog,
     root: TrustedTarget,
     coordinator: SessionCoordinatorHandle,
     checkpoint: Arc<SessionLogCheckpoint>,
 ) -> Arc<AgentOrchestration> {
-    Arc::new_cyclic(|services| {
+    let orchestration = Arc::new_cyclic(|services| {
         let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
-        frontend_root(models, root, child_config, coordinator).with_completion(completion)
-    })
+        frontend_root(catalog, root, child_config, coordinator).with_completion(completion)
+    });
+    catalog.attach(&orchestration);
+    orchestration
 }
 
 /// The root half of [`durable_frontend`]: root config goes through
 /// {coordinator}, children through {child_config}.
 pub fn frontend_root(
-    models: Vec<String>,
+    catalog: &ModelCatalog,
     target: TrustedTarget,
     child_config: ConfigMutationReserver,
     coordinator: SessionCoordinatorHandle,
 ) -> AgentOrchestration {
     let root_id = target.target.id();
     let root = target.target.clone();
-    let services = AgentOrchestration::new(Arc::new(ArcSwapOption::from_pointee(models)));
+    let services = AgentOrchestration::new(catalog.specs());
     services.register_root(
         target,
         Some(Arc::new(move |target, publication| {

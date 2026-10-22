@@ -37,10 +37,11 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
-use maki_lua::orchestration::{self, TrustedTarget};
+use maki_lua::orchestration::{
+    self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, TrustedTarget,
+};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::provider::available_model_specs;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::checkpoint::ClaimingWriter;
 use maki_storage::id::{MakiId, SessionRef};
@@ -305,6 +306,7 @@ struct PrintSession {
     coordinator: SessionCoordinatorHandle,
     root: TrustedTarget,
     commands: TargetHandle,
+    _discovery: Discovery,
 }
 
 fn start_print_session(
@@ -314,10 +316,11 @@ fn start_print_session(
     lua_handle: &EventHandle,
     registry: &CommandRegistry,
 ) -> Result<PrintSession> {
-    let models = available_model_specs(&params.model_policy);
+    let catalog = ModelCatalog::offline(&params.model_policy);
+    let active_provider = params.model.provider.to_string();
     let definitions = builtin_option_definitions(
         Arc::from(params.model.spec()),
-        models.iter().map(|spec| Arc::from(spec.as_str())),
+        catalog.snapshot(),
         params.permissions_config.yolo,
         params.defaults.fast,
         params.defaults.workflow,
@@ -333,7 +336,7 @@ fn start_print_session(
         catalog: session_options,
         definitions,
         persisted_options: Default::default(),
-        model_policy,
+        model_policy: Arc::clone(&model_policy),
         checkpoint: ClaimingWriter::accept_all(),
         mailbox: handle.mailbox.clone(),
     })
@@ -346,11 +349,14 @@ fn start_print_session(
     ))
     .map_err(|error| eyre!("bind print root: {error}"))?;
     let orchestration = Arc::new(orchestration::frontend_root(
-        models,
+        &catalog,
         root.clone(),
         Arc::new(|_, publication| Ok(orchestration::nonpersistent_config_mutation(publication))),
         coordinator.clone(),
     ));
+    catalog.attach(&orchestration);
+    let discovery = catalog.discover(model_policy, active_provider, |_| {});
+    smol::block_on(discovery.wait_active(ACTIVE_DISCOVERY_BOUND));
     let commands = registry.bind_target(
         session_capabilities(),
         Arc::new(
@@ -372,6 +378,7 @@ fn start_print_session(
         coordinator,
         root,
         commands,
+        _discovery: discovery,
     })
 }
 
@@ -788,6 +795,11 @@ mod tests {
     const CHILD_RESPONSE: &str = "print child response";
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
+    const DISCOVERY_PROVIDER: &str = "mistral";
+    const DISCOVERY_KEY: &str = "print-discovery-key";
+    const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
+    const DISCOVERED_WINDOW: u32 = 777_000;
+    const MODELS_COMMAND: &str = "/print_models";
 
     #[test_case("completed"; "completed")]
     #[test_case("failed"; "failed")]
@@ -1327,6 +1339,115 @@ mod tests {
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         let _ = release.send(());
         assert!(execution.try_recv().is_err());
+    }
+
+    /// The run's own provider is discovered before the session is handed
+    /// over, so the root starts on the discovered metadata and the catalog
+    /// plugins read already has the provider's models.
+    #[test]
+    fn print_root_starts_on_its_discovered_provider() {
+        let state = tempfile::tempdir().unwrap();
+        maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        std::fs::write(state.path().join("models-dev-catalog.json"), "{}").unwrap();
+        let listener =
+            smol::Async::new(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
+        let mut providers = maki_config::providers::ProvidersConfig::default();
+        providers.upsert(
+            DISCOVERY_PROVIDER.into(),
+            maki_config::providers::ProviderDef {
+                api_key: Some(DISCOVERY_KEY.into()),
+                base_url: Some(format!(
+                    "http://{}",
+                    listener.get_ref().local_addr().unwrap()
+                )),
+                ..Default::default()
+            },
+        );
+        providers.save().unwrap();
+        let _server = smol::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                futures_lite::AsyncReadExt::read_exact(&mut stream, &mut byte)
+                    .await
+                    .unwrap();
+                request.push(byte[0]);
+            }
+            let body = serde_json::json!({ "data": [{
+                "id": DISCOVERY_MODEL_ID,
+                "max_context_length": DISCOVERED_WINDOW,
+                "capabilities": { "completion_chat": true },
+            }] })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            futures_lite::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
+        let registry = CommandRegistry::new();
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
+        let host = maki_lua::PluginHost::with_session_provider_preparer(
+            Arc::clone(ToolRegistry::global_arc()),
+            registry.clone(),
+            true,
+            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            Some(state.path().to_path_buf()),
+            None,
+            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
+        )
+        .unwrap();
+        host.load_source(
+            "print_models",
+            &format!(
+                r#"
+                maki.api.register_command({{
+                    name = "{MODELS_COMMAND}", tui_only = false,
+                    handler = function(_, ctx)
+                        local found = false
+                        for _, model in ipairs(assert(assert(maki.agent.current(ctx)):available_models(ctx))) do
+                            found = found or model == "{spec}"
+                        end
+                        maki.ui.flash(tostring(found))
+                    end,
+                }})
+            "#
+            ),
+        )
+        .unwrap();
+        let lua_handle = host.event_handle();
+        let mut params = print_params(&std::env::temp_dir(), None);
+        params.model = Model::from_spec(&spec).unwrap();
+        assert_ne!(params.model.context_window, DISCOVERED_WINDOW);
+        let (requests, _) = flume::unbounded();
+        let session = start_print_session(
+            params,
+            provided(Arc::new(RecordingPrintProvider {
+                requests,
+                nested: None,
+            })),
+            lua_handle.session_option_catalog(),
+            &lua_handle,
+            &registry,
+        )
+        .unwrap();
+
+        with_print_session(session, |session| {
+            let config = session.root.target.effective_config().unwrap().unwrap();
+            assert_eq!(config.model.context_window, DISCOVERED_WINDOW);
+            host.wait_for_worker_barrier_for_test();
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&session.commands, MODELS_COMMAND.into())),
+                InputDispatch::Dispatched(CommandOutcome::Completed)
+            ));
+            assert_eq!(notices.recv_timeout(GATE_TIMEOUT).unwrap(), "true");
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// The provider's report is a rendezvous, so the run can't reach its

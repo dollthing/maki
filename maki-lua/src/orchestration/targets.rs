@@ -3,22 +3,19 @@ use maki_agent::config_change::ConfigChangeError;
 use maki_agent::session_coordinator::ConfigMutation;
 use maki_agent::{
     AgentRef,
-    actor::ConfigChange,
     agent::LoadedInstructions,
     cancel::CancelToken,
-    session_coordinator::publication_claim,
-    tools::{Deadline, ToolContext, TurnToolBindings, registry::BoxFuture},
+    tools::{Deadline, ToolContext, TurnToolBindings},
 };
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tracing::warn;
 
 use super::{
     CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
-    TurnCompletionFuture, commit_config_change, default_config_mutation,
+    TurnCompletionFuture, default_config_mutation,
 };
 
 const CHILD_HISTORY_KEY_UNAVAILABLE: &str = "child agent history key is unavailable";
@@ -121,35 +118,12 @@ impl AgentOrchestration {
             .ok_or_else(|| CHILD_HISTORY_KEY_UNAVAILABLE.into())
     }
 
-    /// Commits a metadata refresh for every live agent whose model resolves
-    /// differently now that discovery has run. `None` when none does.
-    pub fn refresh_discovered_models(self: &Arc<Self>) -> Option<BoxFuture<'static, ()>> {
-        let roots = self
-            .lock()
+    pub(super) fn roots(&self) -> Vec<TrustedTarget> {
+        self.lock()
             .roots
             .iter()
-            .map(|entry| entry.target.target.clone())
-            .collect::<Vec<_>>();
-        let refreshes = roots
-            .iter()
-            .flat_map(|root| root.manager().list())
-            .filter_map(|target| {
-                let config = target.effective_config().ok()??;
-                Some((target, ConfigChange::rediscovered(&config)?))
-            })
-            .collect::<Vec<_>>();
-        if refreshes.is_empty() {
-            return None;
-        }
-        let services = Arc::clone(self);
-        Some(Box::pin(async move {
-            for (target, change) in refreshes {
-                let fixed = async |_, _| Ok((publication_claim(), change));
-                if let Err(error) = commit_config_change(&*services, &target, fixed).await {
-                    warn!(agent = %target.id(), %error, "failed to refresh discovered model");
-                }
-            }
-        }))
+            .map(|entry| entry.target.clone())
+            .collect()
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {

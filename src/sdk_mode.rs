@@ -35,10 +35,9 @@ use maki_agent::{
 };
 use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::orchestration::AgentOrchestration;
+use maki_lua::orchestration::{AgentOrchestration, ModelCatalog};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -647,7 +646,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
-    let models = available_model_specs(&model_policy);
+    let catalog = ModelCatalog::offline(&model_policy);
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
         InteractiveParams {
@@ -680,9 +679,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
         startup_model.spec(),
-        available_model_specs(&model_policy)
-            .into_iter()
-            .map(Arc::from),
+        catalog.snapshot(),
         yolo,
         fast,
         workflow,
@@ -734,7 +731,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let root = trusted_root.target.clone();
     let orchestration = maki_lua::orchestration::durable_frontend(
         "SDK",
-        models,
+        &catalog,
         trusted_root,
         coordinator.clone(),
         Arc::clone(&checkpoint),
@@ -826,10 +823,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         observer,
     }
     .spawn(handle.event_rx.clone());
-    let model_discovery = watch_model_discovery(
+    let model_discovery = catalog.discover(
         Arc::clone(&model_policy),
-        coordinator.clone(),
-        Arc::clone(&orchestration),
+        startup_model.provider.to_string(),
+        |_| {},
     );
 
     let input_result = (|| -> Result<()> {
@@ -988,7 +985,8 @@ pub fn run(params: SdkParams) -> Result<()> {
     })();
 
     drop(sdk_commands);
-    smol::block_on(stop_sdk_tasks(projection_watcher, model_discovery));
+    drop(model_discovery);
+    smol::block_on(projection_watcher.cancel());
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
@@ -1053,41 +1051,6 @@ fn watch_command_projection(
                 return;
             }
         }
-    })
-}
-
-async fn stop_sdk_tasks(projection_watcher: smol::Task<()>, model_discovery: smol::Task<()>) {
-    projection_watcher.cancel().await;
-    model_discovery.cancel().await;
-}
-
-fn watch_model_discovery(
-    policy: Arc<ModelPolicy>,
-    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
-    orchestration: Arc<AgentOrchestration>,
-) -> smol::Task<()> {
-    smol::spawn(async move {
-        let mut specs: Vec<Arc<str>> = available_model_specs(&policy)
-            .into_iter()
-            .map(Arc::from)
-            .collect();
-        fetch_all_models(&policy, |batch| {
-            if let Some(refresh) = orchestration.refresh_discovered_models() {
-                smol::spawn(refresh).detach();
-            }
-            specs.extend(batch.models.into_iter().map(Arc::from));
-            specs.sort_unstable();
-            specs.dedup();
-            let specs = specs.clone();
-            let coordinator = coordinator.clone();
-            smol::spawn(async move {
-                if let Err(error) = coordinator.update_model_values(specs).await {
-                    warn!(%error, "failed to publish discovered SDK models");
-                }
-            })
-            .detach();
-        })
-        .await;
     })
 }
 
@@ -1814,6 +1777,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_agent::{AgentError, AgentRef, ModelSource, PreparedModel};
     use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
+    use maki_lua::orchestration::OrchestrationServices;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
@@ -1839,6 +1803,8 @@ mod tests {
     const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const UNSTARTED_ROOT: &str = "root never starts";
     const TARGET_MODEL: &str = "openai/gpt-5";
+    const SDK_DISCOVERED_MODEL: &str = "openai/sdk-discovered";
+    const SDK_LATE_MODEL: &str = "openai/sdk-discovered-late";
     const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
 
     #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
@@ -2690,6 +2656,8 @@ mod tests {
             )
             .unwrap(),
         );
+        let catalog = ModelCatalog::default();
+        smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()]));
         let services = Arc::new_cyclic(|weak| {
             let persistence = maki_lua::orchestration::child_persistence(
                 "SDK",
@@ -2698,7 +2666,7 @@ mod tests {
             );
             let persist = persistence.1;
             maki_lua::orchestration::frontend_root(
-                vec![STARTUP_MODEL.into(), TARGET_MODEL.into()],
+                &catalog,
                 trusted_root.clone(),
                 persistence.0,
                 coordinator.clone(),
@@ -2784,6 +2752,13 @@ mod tests {
         );
         assert_eq!(handle.model.current().unwrap().1.spec(), TARGET_MODEL);
 
+        smol::block_on(catalog.apply(vec![SDK_DISCOVERED_MODEL.into()]));
+        assert!(
+            OrchestrationServices::available_models(&*services, &agent)
+                .unwrap()
+                .iter()
+                .any(|spec| spec == SDK_DISCOVERED_MODEL)
+        );
         assert_eq!(checkpointed.lock().unwrap().len(), 1);
         host.wait_for_worker_barrier_for_test();
         let (out_tx, out_rx) = flume::unbounded();
@@ -3013,6 +2988,12 @@ mod tests {
         assert!(requests.iter().all(|(model, options)| model == TARGET_MODEL
             && options.thinking == thinking
             && !options.fast));
+        catalog.attach(&services);
+        smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()]));
+        let values = &coordinator.read().options().options[0].definition.values;
+        for spec in [SDK_DISCOVERED_MODEL, SDK_LATE_MODEL] {
+            assert!(values.iter().any(|value| &*value.value == spec));
+        }
         smol::block_on(coordinator.close()).unwrap();
     }
 

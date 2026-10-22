@@ -16,7 +16,7 @@ use agent_client_protocol_schema::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
-use flume::{Receiver, Sender, WeakSender};
+use flume::{Receiver, Sender};
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
@@ -33,13 +33,11 @@ use maki_commands::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
-    MAX_SERVER_NAME_LEN, ModelPolicy, PermissionsConfig, ProjectConfig, SessionDefaults,
-    TrustConfig,
+    MAX_SERVER_NAME_LEN, PermissionsConfig, ProjectConfig, SessionDefaults, TrustConfig,
 };
-use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use maki_lua::orchestration::{AgentOrchestration, ModelCatalog, TrustedTarget};
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -181,7 +179,7 @@ struct InstallSession<'a> {
 
 struct Server {
     out_tx: Sender<Value>,
-    model_specs: Vec<String>,
+    catalog: ModelCatalog,
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
     elicitation: bool,
@@ -212,7 +210,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
 
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&params.model_policy),
+        catalog: ModelCatalog::offline(&params.model_policy),
         session: None,
         elicitation: false,
         supports_boolean: false,
@@ -220,14 +218,15 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         defaults: params.defaults,
     };
 
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
-    discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
+    let _discovery = server.catalog.discover(
+        Arc::clone(&params.model_policy),
+        params.model.provider.to_string(),
+        |_| {},
+    );
+    let (in_tx, in_rx) = flume::unbounded::<String>();
     let _reader_task = smol::spawn(read_stdin(in_tx));
-    while let Ok(incoming) = in_rx.recv_async().await {
-        match incoming {
-            Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
-            Incoming::Models(batch) => refresh_models(&mut server, batch).await,
-        }
+    while let Ok(line) = in_rx.recv_async().await {
+        handle_line(&mut server, &line, &params).await;
     }
 
     close_session(&mut server).await;
@@ -237,73 +236,16 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     Ok(())
 }
 
-enum Incoming {
-    Line(String),
-    Models(Vec<String>),
-}
-
-async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
+async fn read_stdin(tx: Sender<String>) -> std::io::Result<()> {
     let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        if tx.send_async(Incoming::Line(line)).await.is_err() {
+        if tx.send_async(line).await.is_err() {
             return Ok(());
         }
-    }
-}
-
-fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
-    smol::spawn(async move {
-        fetch_all_models(&policy, |batch| {
-            if let Some(tx) = tx.upgrade() {
-                let _ = tx.send(Incoming::Models(batch.models));
-            }
-        })
-        .await;
-    })
-    .detach();
-}
-
-async fn refresh_models(srv: &mut Server, batch: Vec<String>) {
-    if let Some(refresh) = srv
-        .session
-        .as_ref()
-        .and_then(|session| session.orchestration.as_ref())
-        .and_then(|orchestration| orchestration.refresh_discovered_models())
-    {
-        smol::spawn(refresh).detach();
-    }
-    let old_len = srv.model_specs.len();
-    for spec in batch {
-        if !srv.model_specs.contains(&spec) {
-            srv.model_specs.push(spec);
-        }
-    }
-    if srv.model_specs.len() == old_len {
-        return;
-    }
-    let Some(session) = &srv.session else { return };
-    let Some(coordinator) = &session.coordinator else {
-        return;
-    };
-    match coordinator
-        .update_model_values(
-            srv.model_specs
-                .iter()
-                .map(|spec| Arc::from(spec.as_str()))
-                .collect(),
-        )
-        .await
-    {
-        Ok(_) => {
-            if let Some(projection) = &session.option_projection {
-                projection.emit_current();
-            }
-        }
-        Err(error) => warn!(%error, "failed to publish discovered models"),
     }
 }
 
@@ -823,7 +765,7 @@ async fn install_session_with_lock(
     } = session;
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
         Arc::from(current_model.as_str()),
-        srv.model_specs.iter().map(|spec| Arc::from(spec.as_str())),
+        srv.catalog.snapshot(),
         handle.permissions.is_yolo(),
         fast,
         workflow,
@@ -885,7 +827,7 @@ async fn install_session_with_lock(
     };
     let orchestration = maki_lua::orchestration::durable_frontend(
         "ACP",
-        available_model_specs(&params.model_policy),
+        &srv.catalog,
         trusted_root.clone(),
         coordinator.clone(),
         Arc::clone(&checkpoint),
@@ -2180,7 +2122,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use maki_commands::TargetCapabilities;
-    use maki_lua::orchestration::TurnCompletion;
+    use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
@@ -2546,7 +2488,7 @@ mod tests {
                 None => persist,
             };
             maki_lua::orchestration::frontend_root(
-                vec![FAST_SPEC.into()],
+                &ModelCatalog::default(),
                 root.clone(),
                 child_config,
                 coordinator.clone(),
@@ -2923,7 +2865,7 @@ mod tests {
         );
         let server = Server {
             out_tx: out_tx.clone(),
-            model_specs: Vec::new(),
+            catalog: ModelCatalog::default(),
             session: Some(SessionState {
                 option_projection: Some(Arc::new(OptionProjection {
                     out_tx: out_tx.clone(),
@@ -2976,7 +2918,7 @@ mod tests {
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
-                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
@@ -3047,7 +2989,7 @@ mod tests {
             let (out_tx, _) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
-                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
@@ -3595,7 +3537,7 @@ mod tests {
             let (out_tx, _out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
-                model_specs: Vec::new(),
+                catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
@@ -4878,45 +4820,6 @@ mod tests {
         smol::block_on(coordinator.close()).unwrap();
     }
 
-    #[test]
-    fn discovered_models_are_pushed_to_the_client() {
-        let (mut srv, _, out_rx, _) = server_awaiting_answer();
-        srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
-        smol::block_on(refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]));
-        let update = out_rx.try_recv().expect("the fuller list is announced");
-        let config_options = update["params"]["update"]["configOptions"]
-            .as_array()
-            .unwrap();
-        assert_eq!(
-            config_options.len(),
-            5,
-            "discovery publishes the full snapshot"
-        );
-        assert_eq!(
-            config_options[1]["currentValue"],
-            maki_agent::session_options::DISABLED_VALUE
-        );
-        assert_eq!(
-            config_options[2]["currentValue"],
-            maki_agent::session_options::DISABLED_VALUE
-        );
-        assert_eq!(
-            config_options[3]["currentValue"],
-            maki_agent::session_options::DISABLED_VALUE
-        );
-        let options = &config_options[0]["options"];
-        let selectable: Vec<&str> = options
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|o| o["value"].as_str())
-            .collect();
-        assert!(selectable.contains(&OFFLINE_SPEC));
-        assert!(selectable.contains(&DISCOVERED_SPEC));
-        smol::block_on(refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]));
-        assert!(out_rx.is_empty());
-    }
-
     fn lifecycle_state(srv: &Server) -> String {
         let Some(session) = &srv.session else {
             return "session=none".to_owned();
@@ -5651,7 +5554,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_refreshes_managed_root_context_window() {
+    fn discovery_reaches_the_root_its_catalog_and_the_client() {
         smol::block_on(async {
             let previous_host = std::env::var_os("OLLAMA_HOST");
             unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
@@ -5674,16 +5577,11 @@ mod tests {
                 out_rx.recv_async().await.unwrap()["id"],
                 NEW_SESSION_REQUEST
             );
-            let actor = srv
-                .session
-                .as_ref()
-                .unwrap()
-                .handle
-                .manager
-                .root()
-                .unwrap()
-                .actor()
-                .unwrap();
+            let session = srv.session.as_ref().unwrap();
+            let root = session.handle.manager.root().unwrap();
+            let orchestration = Arc::clone(session.orchestration.as_ref().unwrap());
+            let read = session.coordinator.as_ref().unwrap().read();
+            let actor = root.actor().unwrap();
             let commits = actor.subscribe_config_commits();
             maki_providers::model_registry::set_known_models(
                 DISCOVERY_PROVIDER,
@@ -5693,7 +5591,7 @@ mod tests {
                 }],
             );
 
-            refresh_models(&mut srv, Vec::new()).await;
+            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
 
             let commit = commits.recv_async().await.unwrap();
             assert_eq!(commit.config.model.context_window, DISCOVERED_WINDOW);
@@ -5701,6 +5599,28 @@ mod tests {
                 actor.effective_config().unwrap().model.context_window,
                 DISCOVERED_WINDOW
             );
+            assert!(
+                OrchestrationServices::available_models(&*orchestration, &root)
+                    .unwrap()
+                    .iter()
+                    .any(|spec| spec == DISCOVERED_SPEC)
+            );
+            let options = loop {
+                let update = out_rx.recv_async().await.unwrap();
+                if let Some(options) = update["params"]["update"]["configOptions"].as_array() {
+                    break options.clone();
+                }
+            };
+            assert!(
+                options[0]["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|option| option["value"] == DISCOVERED_SPEC)
+            );
+            let version = read.options().version;
+            srv.catalog.apply(vec![DISCOVERED_SPEC.to_owned()]).await;
+            assert_eq!(read.options().version, version);
             close_session(&mut srv).await;
             match previous_host {
                 Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
@@ -6367,7 +6287,7 @@ mod tests {
             let (out_tx, out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
-                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                catalog: ModelCatalog::default(),
                 session: None,
                 elicitation: false,
                 supports_boolean: false,

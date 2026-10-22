@@ -423,6 +423,8 @@ pub async fn from_model_async(
 }
 
 pub struct ModelBatch {
+    /// The one builtin or dynamic provider this batch lists, if it lists one.
+    pub provider: Option<&'static str>,
     pub models: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -506,6 +508,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         }
                     }
                     ModelBatch {
+                        provider: Some(slug),
                         models: specs,
                         warnings: Vec::new(),
                     }
@@ -519,6 +522,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                         .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
+                        provider: Some(slug),
                         models: fallback,
                         warnings: vec![format!(
                             "{display_name}: {e} (using static fallback)"
@@ -531,9 +535,9 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
         .detach();
     }
 
-    for slug in dynamic::discovered_slugs() {
+    for listed in dynamic::discovered_slugs() {
         let tx = tx.clone();
-        let slug = slug.to_string();
+        let slug = listed.to_string();
         smol::spawn(async move {
             let static_fallback = |reason: String| {
                 warn!(
@@ -542,6 +546,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
                     "dynamic model listing failed, using static fallback"
                 );
                 ModelBatch {
+                    provider: Some(listed),
                     models: dynamic::dynamic_model_specs_for(&slug),
                     warnings: vec![format!("{slug}: {reason} (using static fallback)")],
                 }
@@ -549,6 +554,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
             let batch = match dynamic::create(&slug, timeouts) {
                 Ok(provider) => match provider.list_models().await {
                     Ok(models) => ModelBatch {
+                        provider: Some(listed),
                         models: models.iter().map(|m| format!("{slug}/{}", m.id)).collect(),
                         warnings: Vec::new(),
                     },
@@ -578,6 +584,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog
                 .send_async(ModelBatch {
+                    provider: None,
                     models,
                     warnings: Vec::new(),
                 })
@@ -593,6 +600,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
         if !declared.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    provider: None,
                     models: declared,
                     warnings: Vec::new(),
                 })
@@ -603,6 +611,7 @@ pub async fn fetch_all_models(policy: &ModelPolicy, mut on_ready: impl FnMut(Mod
         if !custom_specs.is_empty() {
             let _ = tx_custom
                 .send_async(ModelBatch {
+                    provider: None,
                     models: custom_specs,
                     warnings: Vec::new(),
                 })

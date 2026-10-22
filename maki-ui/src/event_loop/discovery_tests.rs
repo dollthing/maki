@@ -105,7 +105,8 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
         let catalog = Arc::new(vec![RECENT.into(), CATALOG.into()]);
         event_loop
             .ctx
-            .available_models
+            .catalog
+            .specs()
             .store(Some(Arc::clone(&catalog)));
         event_loop.sync_orchestration();
         event_loop.sessions[0]
@@ -118,7 +119,7 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
         event_loop.handle_action(0, Action::RefreshModels);
         entered_rx.recv_timeout(TIMEOUT).unwrap();
         assert!(Arc::ptr_eq(
-            &event_loop.ctx.available_models.load_full().unwrap(),
+            &event_loop.ctx.catalog.specs().load_full().unwrap(),
             &catalog
         ));
         event_loop.sync_model_discovery();
@@ -168,14 +169,15 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
         }
         event_loop.sync_model_discovery();
         assert!(Arc::ptr_eq(
-            &event_loop.ctx.available_models.load_full().unwrap(),
+            &event_loop.ctx.catalog.specs().load_full().unwrap(),
             &catalog
         ));
         assert_picker_usable(event_loop);
 
         event_loop
             .ctx
-            .available_models
+            .catalog
+            .specs()
             .store(Some(Arc::new(Vec::new())));
         event_loop.sync_model_discovery();
         event_loop.sessions[0].app.model_picker.open(RECENT);
