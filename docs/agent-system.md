@@ -63,6 +63,8 @@ Standalone controls and compaction are not turns. They have no `TurnId`, create 
 
 Managed actors own the committed `EffectiveAgentConfig`. Typed changes and admissions share one FIFO; materialized work runs through the separate execution queue. Preparation runs outside actor locks, and completion checks the reserved entry identity before committing or enqueueing work. Active execution does not wait for later configuration preparation.
 
+Every frontend, the coordinator and Lua commit a config change through one `config_change::ConfigChangeTicket`. Reserving takes the durable mutation (for a root, the session option lease) and then the FIFO slot, both synchronously, so changes hold the lease in dispatch order and a refused reservation queues nothing. A model in a patch is re-resolved against discovery when the actor materializes it, so a model prepared before discovery finished still gets the discovered metadata. Errors are a typed `ConfigChangeError`; `is_busy()` means an idle guard or the lease refused the change, and `wait_released` waits for that holder. The discovery refresh retries busy agents that way.
+
 An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints use the existing session format and project onto stored metadata without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
 
 ### Durable publication

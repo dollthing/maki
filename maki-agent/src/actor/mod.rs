@@ -1100,6 +1100,7 @@ fn retire_turn(
     vacant.insert(outcome.clone());
     if state.release_idle_permission(turn_id) {
         inner.queue.notify();
+        inner.policy_changed.notify(usize::MAX);
     }
     let history = inner.history.load();
     inner

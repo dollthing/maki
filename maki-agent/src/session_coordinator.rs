@@ -1078,6 +1078,11 @@ impl SessionReadHandle {
             .map(|config| config.context.cwd().to_path_buf())
     }
 
+    /// Waits until no change holds the session option lease.
+    pub async fn wait_unreserved(&self) {
+        self.options.wait_unreserved().await;
+    }
+
     pub fn subscribe(&self) -> SessionOptionsSubscription {
         self.options.subscribe()
     }

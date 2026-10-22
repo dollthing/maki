@@ -13,7 +13,8 @@ use crate::actor::{
     PreparedOperationTicket,
 };
 use crate::session_coordinator::{
-    ConfigMutation, ModelPreparer, SessionCoordinatorError, publication_claim,
+    ConfigMutation, ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
+    publication_claim,
 };
 use crate::session_options::{MODEL_OPTION_ID, SessionOptionError};
 use crate::{ActorError, AgentRef, ManagerError};
@@ -56,6 +57,24 @@ impl ConfigChangeError {
             Self::Actor(ActorError::Busy)
                 | Self::Coordinator(SessionCoordinatorError::SessionBusy(_))
         )
+    }
+
+    /// Waits until the holder that refused this change as busy lets go of
+    /// {target}. Returns at once for any other error.
+    pub async fn wait_released(&self, target: &AgentRef) {
+        match self {
+            Self::Actor(ActorError::Busy) => {
+                if let Ok(actor) = target.actor() {
+                    actor.wait_unguarded().await;
+                }
+            }
+            Self::Coordinator(SessionCoordinatorError::SessionBusy(id)) => {
+                if let Ok(coordinator) = SessionCoordinatorHandle::resolve(*id) {
+                    coordinator.read().wait_unreserved().await;
+                }
+            }
+            _ => {}
+        }
     }
 }
 

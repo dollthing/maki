@@ -122,7 +122,11 @@ impl Runner {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 super::delivery::schedule(&self.inner, &mut state);
+                let guarded = state.idle.is_some();
                 let work = state.pop_work(&self.queue);
+                if guarded && state.idle.is_none() {
+                    self.inner.policy_changed.notify(usize::MAX);
+                }
                 if let Some(work) = &work {
                     state.idle_pending = true;
                     state.retire_superseded_precancels(work);

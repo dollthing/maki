@@ -182,6 +182,20 @@ impl AgentActorHandle {
             .has_pending_work(&self.inner.queue)
     }
 
+    /// Waits until no idle guard is held or the actor stops.
+    pub async fn wait_unguarded(&self) {
+        loop {
+            let listener = self.inner.policy_changed.listen();
+            {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.idle.is_none() || state.lifecycle != ActorLifecycle::Open {
+                    return;
+                }
+            }
+            listener.await;
+        }
+    }
+
     pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {

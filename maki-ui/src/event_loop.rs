@@ -5474,6 +5474,7 @@ mod tests {
     const STARTUP_MODEL_ID: &str = "tui-discovery-startup";
     const RESUMED_MODEL_ID: &str = "tui-discovery-resumed";
     const UNRELATED_MODEL_ID: &str = "tui-discovery-unrelated";
+    const BUSY_MODEL_ID: &str = "tui-discovery-busy";
     const DISCOVERED_WINDOW: u32 = 524_000;
 
     #[test]
@@ -6436,6 +6437,54 @@ mod tests {
                 assert_eq!(window(&slot.model), refreshed);
                 assert_eq!(slot.provider.identity(), identity);
                 assert_eq!(window(&event_loop.ctx.model_slot.load().model), refreshed);
+            },
+        );
+    }
+
+    #[test_case(true ; "idle_guard")]
+    #[test_case(false ; "session_lease")]
+    fn busy_discovery_refresh_retries_once_released(idle_guard: bool) {
+        let spec = format!("{DISCOVERY_PROVIDER}/{BUSY_MODEL_ID}");
+        with_event_loop_runtime(
+            |harness| {
+                let startup = Model::from_spec(&spec).unwrap();
+                harness.ctx.as_mut().unwrap().model_slot =
+                    ProviderSlot::new(startup, Arc::new(StubProvider)).0;
+                harness
+                    .ctx()
+                    .spawn_runtime_with_provider(harness.session(), None)
+                    .unwrap()
+            },
+            |event_loop| {
+                event_loop.sync_orchestration();
+                maki_providers::model_registry::set_known_models(
+                    DISCOVERY_PROVIDER,
+                    vec![maki_providers::ModelInfo {
+                        context_window: Some(DISCOVERED_WINDOW),
+                        ..maki_providers::ModelInfo::id_only(BUSY_MODEL_ID.into())
+                    }],
+                );
+                let runtime = &event_loop.sessions[0];
+                let (manager, root) = runtime.handles.manager_and_root();
+                let guard =
+                    idle_guard.then(|| manager.actor(root).unwrap().prepare_idle().unwrap());
+                let lease = (!idle_guard).then(|| {
+                    runtime
+                        .coordinator
+                        .reserve_transaction(CheckpointPublication::default())
+                        .unwrap()
+                });
+                let mut refresh = event_loop
+                    .orchestration
+                    .refresh_discovered_models()
+                    .unwrap();
+
+                assert!(smol::block_on(futures_lite::future::poll_once(&mut refresh)).is_none());
+                drop((guard, lease));
+                smol::block_on(refresh);
+
+                let window = runtime.config().unwrap().model.context_window;
+                assert_eq!(window, DISCOVERED_WINDOW);
             },
         );
     }

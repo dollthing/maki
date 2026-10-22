@@ -157,6 +157,7 @@ impl SessionOptionsReservation {
 impl Drop for SessionOptionsReservation {
     fn drop(&mut self) {
         lock(&self.options.state).reserved = false;
+        self.options.changed.notify(usize::MAX);
     }
 }
 
@@ -598,6 +599,16 @@ impl SessionOptions {
         candidate: &SessionOptionsCandidate,
     ) -> SessionOptionsSnapshot {
         snapshot(&candidate.state)
+    }
+
+    pub(crate) async fn wait_unreserved(&self) {
+        loop {
+            let listener: EventListener = self.changed.listen();
+            if !lock(&self.state).reserved {
+                return;
+            }
+            listener.await;
+        }
     }
 
     pub fn subscribe(self: &Arc<Self>) -> SessionOptionsSubscription {
