@@ -2675,10 +2675,7 @@ impl App {
     }
 
     /// Hands the toggle to the event loop rather than awaiting the
-    /// coordinator here. A running turn holds the session lease for its whole
-    /// duration and the coordinator parks every other operation behind it, so
-    /// blocking on this thread freezes the UI until the turn ends -- and
-    /// deadlocks outright when the turn is itself waiting on the UI.
+    /// coordinator on the UI thread (see the event loop's SessionOpKind).
     /// Without a coordinator there is nothing to await, so it applies at once.
     fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
         if self.coordinator.is_none() {

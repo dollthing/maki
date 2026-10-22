@@ -693,7 +693,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&after_push.messages, &mirror.load().messages));
     }
 
-    /// After a respawn the old run's messages must be gone from the mirror
+    /// When a new run binds the mirror, the old run's messages must be gone
     /// right away, not only once the new run pushes something.
     #[test]
     fn with_mirror_overwrites_previous_run_snapshot_immediately() {

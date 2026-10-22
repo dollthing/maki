@@ -6,10 +6,6 @@
 //! (initialization, cwd/instruction reload, MCP prompt expansion, prompt
 //! slots, model/tools, the answer receiver) and constructs the transient
 //! [`Agent`] for each executed turn.
-//!
-//! `run_id` is an `Arc<AtomicU64>` shared with `AgentHandles`; the app bumps
-//! it on each run and the backend reads it to stamp events that arrive with
-//! no correlation (standalone compacts).
 
 use std::path::PathBuf;
 use std::sync::Arc;

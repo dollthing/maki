@@ -1659,13 +1659,11 @@ enum InternalEvent {
     SessionHeartbeat(u64),
 }
 
-/// The event loop must never await a coordinator operation on its own thread.
-/// A running turn holds the session lease for its whole duration, and the
-/// coordinator parks every other operation behind it -- including one issued
-/// from here. If that turn is itself waiting on the UI (a permission prompt, a
-/// question), the wait is circular and the process hangs unkillably. So the
-/// operation is dispatched, the loop keeps rendering, and the follow-up work
-/// named here runs when the result comes back.
+/// The event loop must never await a coordinator operation on its own thread:
+/// the operation can wait on the actor's queue and on a durable save, and if
+/// the actor is itself waiting on the UI (a permission prompt, a question) the
+/// wait is circular. So the operation is dispatched, the loop keeps rendering,
+/// and the follow-up work named here runs when the result comes back.
 enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
@@ -4329,9 +4327,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// The coordinator serves option changes while a turn holds the lease, but
-    /// still queues anything that changes what the turn is working on. Say so:
-    /// a command that is accepted and deferred should not look ignored.
+    /// A change accepted while a turn runs applies to later turns. Say so: a
+    /// command that is accepted and deferred should not look ignored.
     fn note_if_deferred(&mut self, idx: usize, what: &str) {
         if SessionStatus::of(&self.sessions[idx].app) != SessionStatus::Idle {
             self.sessions[idx]
@@ -4526,8 +4523,7 @@ impl<'t> EventLoop<'t> {
         for rt in &self.sessions {
             let coordinator = rt.coordinator.clone();
             let specs = specs.clone();
-            // Off-thread like every other coordinator call: a running turn
-            // holds the lease and this would otherwise block the UI.
+            // Off-thread like every other coordinator call (see SessionOpKind).
             smol::spawn(async move {
                 if let Err(error) = coordinator.update_model_values(specs).await {
                     warn!(%error, "publishing discovered models into a session failed");
@@ -5140,9 +5136,8 @@ impl<'t> EventLoop<'t> {
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
         // Dropping the handles is the teardown: the coordinator's loop ends
         // when its channel closes and unregisters on the way out, and `Close`
-        // persists nothing. Awaiting it would buy nothing and could hang exit,
-        // because a turn that never releases its lease defers the close
-        // forever.
+        // persists nothing. Awaiting it would buy nothing and could hang exit
+        // behind a turn that never finishes.
         drop(coordinators);
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
