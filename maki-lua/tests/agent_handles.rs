@@ -426,7 +426,12 @@ struct LuaInvocationBackend {
     completed: flume::Sender<Result<(), String>>,
     observations: flume::Sender<(TurnId, TurnProvenance, Vec<Message>)>,
     invocation_cancel: Option<CancelToken>,
+    sibling: Option<SiblingInvocation>,
 }
+
+/// Receives the tool context of the managed turn, so a test can run a
+/// sibling invocation of the fixture tool under that same turn.
+type SiblingInvocation = flume::Sender<ToolContext>;
 
 impl ActorBackend for LuaInvocationBackend {
     fn run_turn<'a>(
@@ -488,6 +493,9 @@ impl ActorBackend for LuaInvocationBackend {
                 .tool
                 .parse(&json!({}))
                 .unwrap();
+            if let Some(sibling) = &self.sibling {
+                sibling.send(self.context.clone()).unwrap();
+            }
             let result = invocation.execute(&self.context).await.output.map(|_| ());
             let _ = self.completed.send(result.clone());
             if let Some(inbox) = &context.inbox {
@@ -564,6 +572,7 @@ struct FixtureOptions {
     config_mutations: Option<ConfigMutationReserver>,
     completion: Option<TurnCompletion>,
     invocation_cancel: Option<CancelToken>,
+    sibling: Option<SiblingInvocation>,
 }
 
 async fn wait_for_child_reclamation(manager: &AgentManagerHandle, operation: &str) {
@@ -648,6 +657,7 @@ impl Fixture {
             config_mutations,
             completion,
             invocation_cancel,
+            sibling,
         } = options;
         let mode = mode.unwrap_or(AgentMode::Build);
         let registry = Arc::clone(ToolRegistry::global_arc());
@@ -837,6 +847,7 @@ impl Fixture {
                     completed: completed_tx,
                     observations: observations_tx,
                     invocation_cancel,
+                    sibling,
                 }) as Box<dyn ActorBackend>)
             })
             .unwrap();
@@ -2261,6 +2272,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                         completed: completed_tx,
                         observations: flume::unbounded().0,
                         invocation_cancel: None,
+                        sibling: None,
                     }) as Box<dyn ActorBackend>)
                 },
             )
@@ -3771,6 +3783,54 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
             .reply
             .send(common::canned_reply("second complete"))
             .unwrap();
+        fixture.finish().await;
+    });
+}
+
+#[test]
+fn managed_sibling_tool_call_cannot_use_another_calls_ctx() {
+    const TOOL: &str = "pr5_managed_sibling";
+    const FOREIGN_CONTEXT: &str = "context belongs to another invocation";
+    smol::block_on(async {
+        let (sibling, sibling_context) = flume::bounded(1);
+        let fixture = Fixture::start_with_options(
+            TOOL,
+            FixtureOptions {
+                plugin_source: "local gate, held, shared = maki.async.semaphore(1)".into(),
+                sibling: Some(sibling),
+                ..Default::default()
+            },
+            &format!(
+                r#"
+                if shared == nil then
+                    shared = ctx
+                    held = gate:acquire()
+                    gate:acquire():release()
+                else
+                    local listed, err = maki.agent.list(shared)
+                    assert(listed == nil and err == "{FOREIGN_CONTEXT}", err)
+                    assert(maki.agent.list(ctx))
+                    held:release()
+                end
+            "#
+            ),
+        );
+        let context = bounded(sibling_context.recv_async(), "managed tool context")
+            .await
+            .unwrap();
+        let sibling = ToolRegistry::global()
+            .get(TOOL)
+            .unwrap()
+            .tool
+            .parse(&json!({}))
+            .unwrap();
+        assert_eq!(
+            bounded(sibling.execute(&context), "sibling invocation")
+                .await
+                .output
+                .map(|_| ()),
+            Ok(())
+        );
         fixture.finish().await;
     });
 }

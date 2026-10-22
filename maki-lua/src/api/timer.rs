@@ -186,6 +186,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                             (plugin, owner)
                         }),
                     managed_turn: None,
+                    ancestors: Arc::default(),
                     delegated_tool: None,
                     command_depth: 0,
                     command_invocation: None,

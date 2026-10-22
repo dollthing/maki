@@ -555,6 +555,8 @@ pub(crate) struct TaskCell {
     publication_cancel: CancelToken,
     publication_trigger: Option<CancelTrigger>,
     pub(crate) delegated_tool: Option<DelegatedTool>,
+    /// Ids of the tasks whose `maki.async.run` spawned this one, outermost first.
+    ancestors: Arc<[u64]>,
     defer_close: Vec<Box<dyn FnOnce() + Send>>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
@@ -661,6 +663,7 @@ impl TaskCell {
             cancel,
             managed_turn: None,
             delegated_tool: None,
+            ancestors: Arc::default(),
             plugin_origin: None,
             plugin_owner: None,
             scope_alive: true,
@@ -1498,10 +1501,9 @@ pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
     Some(lock_cell(&handle).id)
 }
 
-/// Whether the running task may act on behalf of `origin`. A managed turn's
-/// descendants (async workers, joined callbacks) inherit that turn's authority,
-/// so a shared managed turn makes them equivalent; everything else must be the
-/// very same task. Callers must not hold `origin`'s lock.
+/// Whether the running task may act on behalf of `origin`: it is `origin`
+/// or an async worker `origin` spawned. A sibling invocation under the same
+/// managed turn is not. Callers must not hold `origin`'s lock.
 pub(crate) fn same_invocation(lua: &Lua, origin: &TaskHandle) -> bool {
     let Some(current) = lua.app_data_ref::<TaskHandle>() else {
         return false;
@@ -1509,12 +1511,8 @@ pub(crate) fn same_invocation(lua: &Lua, origin: &TaskHandle) -> bool {
     if Arc::ptr_eq(&current, origin) {
         return true;
     }
-    let current = lock_cell(&current);
-    let origin = lock_cell(origin);
-    matches!(
-        (&current.managed_turn, &origin.managed_turn),
-        (Some(active), Some(expected)) if expected.same_authority(active)
-    )
+    let origin = lock_cell(origin).id;
+    lock_cell(&current).ancestors.contains(&origin)
 }
 
 /// Slash-command hops that led to the running task; 0 outside a command
@@ -1607,19 +1605,21 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
-        Some(h) => {
-            let cell = lock_cell(h);
-            (
-                cell.cancel.clone(),
-                cell.live.clone(),
-                cell.managed_turn.clone(),
-                cell.command_depth,
-                cell.command_invocation.clone(),
-            )
-        }
-        None => (CancelToken::none(), None, None, 0, None),
-    };
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation, ancestors) =
+        match &handle {
+            Some(h) => {
+                let cell = lock_cell(h);
+                (
+                    cell.cancel.clone(),
+                    cell.live.clone(),
+                    cell.managed_turn.clone(),
+                    cell.command_depth,
+                    cell.command_invocation.clone(),
+                    cell.ancestors.iter().copied().chain([cell.id]).collect(),
+                )
+            }
+            None => (CancelToken::none(), None, None, 0, None, Arc::default()),
+        };
 
     let mut task = PendingAsyncTask {
         work_fn,
@@ -1629,6 +1629,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         owner: None,
         plugin_grant: None,
         managed_turn,
+        ancestors,
         delegated_tool: handle
             .as_ref()
             .and_then(|handle| lock_cell(handle).delegated_tool.clone()),
@@ -1865,6 +1866,7 @@ pub(crate) struct PendingAsyncTask {
     pub owner: Option<Arc<BufsClaim>>,
     pub plugin_grant: Option<(Arc<str>, Arc<crate::orchestration::PluginAuthority>)>,
     pub managed_turn: Option<CurrentManagedTurn>,
+    pub ancestors: Arc<[u64]>,
     pub delegated_tool: Option<DelegatedTool>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
@@ -2087,6 +2089,7 @@ fn spawn_async_task(
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
         cell.managed_turn = task.managed_turn;
+        cell.ancestors = task.ancestors;
         cell.delegated_tool = task.delegated_tool;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
@@ -6549,6 +6552,7 @@ mod tests {
             owner: None,
             plugin_grant: None,
             managed_turn: None,
+            ancestors: Arc::default(),
             delegated_tool: None,
             command_depth: 0,
             command_invocation: None,
@@ -7084,6 +7088,7 @@ mod tests {
             owner: None,
             plugin_grant: None,
             managed_turn: None,
+            ancestors: Arc::default(),
             delegated_tool: None,
             command_depth: 0,
             command_invocation: None,
