@@ -542,7 +542,7 @@ fn settle_deferred(
                 admission: None,
                 ticket,
             };
-            finalize_turn(inner, turn_id, outcome, Some(&admission), true);
+            finalize_turn(inner, turn_id, outcome, &admission, true);
         }
     }
     inner
@@ -781,7 +781,7 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
                 retryable,
             },
         );
-        finalize_turn(inner, turn_id, outcome, Some(&admission), true);
+        finalize_turn(inner, turn_id, outcome, &admission, true);
     }
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
     state.pending_publications -= 1;
@@ -1197,7 +1197,7 @@ fn retire_turn(
     inner: &ActorInner,
     turn_id: TurnId,
     outcome: &mut TurnOutcome,
-    settled: Option<ActorWorkIdentity>,
+    settled: ActorWorkIdentity,
     settle_runner: bool,
     history_ready: bool,
 ) -> Option<Option<TurnTicket>> {
@@ -1244,9 +1244,7 @@ fn retire_turn(
             history_ready.then_some((history.epoch, history.messages.len())),
         );
     state.latest = Some(outcome.clone());
-    if let Some(settled) = settled {
-        state.settled = Some(settled);
-    }
+    state.settled = Some(settled);
     if history_ready {
         state.latest_history_turn = Some((turn_id, history.epoch, history.messages.len()));
     }
@@ -1283,7 +1281,7 @@ pub(crate) fn finalize_turn(
     inner: &ActorInner,
     turn_id: TurnId,
     outcome: TurnOutcome,
-    admission: Option<&TurnAdmission>,
+    admission: &TurnAdmission,
     deliver: bool,
 ) {
     retire_and_publish(inner, turn_id, outcome, admission, deliver, false, false);
@@ -1302,7 +1300,7 @@ pub(crate) fn settle_and_finalize_turn(
         inner,
         admission.turn_id,
         outcome,
-        Some(admission),
+        admission,
         deliver,
         true,
         history_ready,
@@ -1313,21 +1311,22 @@ fn retire_and_publish(
     inner: &ActorInner,
     turn_id: TurnId,
     outcome: TurnOutcome,
-    admission: Option<&TurnAdmission>,
+    admission: &TurnAdmission,
     deliver: bool,
     settle_runner: bool,
     history_ready: bool,
 ) {
-    let presentation = admission.filter(|_| deliver).and_then(|admission| {
-        let sender = admission.event_sender.as_ref()?;
-        Some(sender.with_identity_of(sender.identity().or(Some(admission.work))))
-    });
+    let presentation = admission
+        .event_sender
+        .as_ref()
+        .filter(|_| deliver)
+        .map(|sender| sender.with_identity_of(sender.identity().or(Some(admission.work))));
     let mut outcome = outcome;
     if let Some(ticket) = retire_turn(
         inner,
         turn_id,
         &mut outcome,
-        admission.map(|admission| admission.work),
+        admission.work,
         settle_runner,
         history_ready,
     ) {
@@ -1378,7 +1377,7 @@ fn terminalize_work(inner: &ActorInner, drained: Vec<ActorWork>, reason: TurnCan
     for work in drained {
         if let ActorWork::Turn(admission) = work {
             let outcome = cancelled_outcome(inner.agent_id, admission.turn_id, reason);
-            finalize_turn(inner, admission.turn_id, outcome, Some(&admission), true);
+            finalize_turn(inner, admission.turn_id, outcome, &admission, true);
         }
     }
     inner
@@ -2636,13 +2635,7 @@ impl AgentActorHandle {
             return Err(ActorError::UnknownTurn(turn_id));
         };
         let outcome = cancelled_outcome(self.inner.agent_id, turn_id, TurnCancellationReason::User);
-        finalize_turn(
-            &self.inner,
-            turn_id,
-            outcome.clone(),
-            Some(&admission),
-            true,
-        );
+        finalize_turn(&self.inner, turn_id, outcome.clone(), &admission, true);
         Ok(outcome)
     }
 
@@ -2782,13 +2775,7 @@ impl AgentActorHandle {
         settle_deferred(&self.inner, cut.deferred, reason);
         if let Some(admission) = cut.queued {
             let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
-            finalize_turn(
-                &self.inner,
-                admission.turn_id,
-                outcome,
-                Some(&admission),
-                true,
-            );
+            finalize_turn(&self.inner, admission.turn_id, outcome, &admission, true);
         }
     }
 

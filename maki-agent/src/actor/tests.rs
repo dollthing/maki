@@ -755,7 +755,15 @@ fn transcript_keeps_tool_groups(last_messages: usize, max_bytes: usize, expected
         .store(Arc::new(crate::HistorySnapshot::new(messages)));
     let turn_id = crate::TurnId::generate();
     let outcome = super::cancelled_outcome(actor.agent_id(), turn_id, TurnCancellationReason::User);
-    super::retire_and_publish(&actor.inner, turn_id, outcome, None, false, false, true);
+    super::retire_and_publish(
+        &actor.inner,
+        turn_id,
+        outcome,
+        &bare_admission(&actor, turn_id, 0),
+        false,
+        false,
+        true,
+    );
     let snapshot = actor
         .transcript(super::TranscriptRequest {
             through_turn: None,
@@ -2564,7 +2572,7 @@ fn control_produces_no_outcome() {
         assert_eq!(snapshot.latest, None, "control must not produce an outcome");
         assert_eq!(snapshot.queued, 0);
         // A control retires no turn, so its settlement identity is recorded
-        // when it is popped rather than when an outcome is finalized.
+        // when it finishes rather than when an outcome is finalized.
         loop {
             match events.recv_async().await.unwrap() {
                 super::ActorEvent::Idle {
@@ -2589,6 +2597,62 @@ fn control_produces_no_outcome() {
 }
 
 #[test]
+fn control_settles_after_a_turn_cancelled_while_it_ran() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let events = handle.subscribe_events();
+        let (popped, release) = handle.pause_after_next_pop();
+        handle.push_control("pin".into(), "c1".into()).unwrap();
+        popped.recv_async().await.unwrap();
+        let queued = handle
+            .admit_turn(input("queued"), None, "q".into())
+            .unwrap();
+        handle.cancel_turn(queued.turn_id()).unwrap();
+        assert!(matches!(queued.wait().await, TurnOutcome::Cancelled { .. }));
+        release.send(()).unwrap();
+        let settled = loop {
+            if let super::ActorEvent::Idle { settled, .. } = events.recv_async().await.unwrap() {
+                break settled;
+            }
+        };
+        assert!(
+            settled.is_some_and(|settled| matches!(
+                settled.kind,
+                super::ActorWorkKind::Control { .. }
+            )),
+            "the last work to settle was the control: {settled:?}"
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+fn bare_admission(
+    actor: &AgentActorHandle,
+    turn_id: TurnId,
+    presentation: u64,
+) -> super::TurnAdmission {
+    super::TurnAdmission {
+        turn_id,
+        input: None,
+        event_sender: None,
+        correlation: String::new(),
+        work: crate::ActorWorkIdentity::new(
+            actor.agent_id(),
+            crate::ActorWorkKind::Turn {
+                operation_id: presentation,
+                turn_id,
+            },
+            presentation,
+        ),
+        generation: 0,
+        policy: None,
+        ticket: crate::TurnTicket::new(turn_id, actor.identity()),
+        admission: None,
+    }
+}
+
+#[test]
 fn duplicate_finalize_keeps_the_first_settled_identity() {
     let (actor, task) = AgentActorHandle::spawn(
         AgentId::generate(),
@@ -2597,29 +2661,11 @@ fn duplicate_finalize_keeps_the_first_settled_identity() {
         Box::new(ScriptedBackend::new()),
     );
     let settle = |turn_id: TurnId, presentation: u64| {
-        let admission = super::TurnAdmission {
-            turn_id,
-            input: None,
-            event_sender: None,
-            correlation: String::new(),
-            work: crate::ActorWorkIdentity::new(
-                actor.agent_id(),
-                crate::ActorWorkKind::Turn {
-                    operation_id: presentation,
-                    turn_id,
-                },
-                presentation,
-            ),
-            generation: 0,
-            policy: None,
-            ticket: crate::TurnTicket::new(turn_id, actor.identity()),
-            admission: None,
-        };
         super::retire_and_publish(
             &actor.inner,
             turn_id,
             super::cancelled_outcome(actor.agent_id(), turn_id, TurnCancellationReason::User),
-            Some(&admission),
+            &bare_admission(&actor, turn_id, presentation),
             false,
             false,
             true,

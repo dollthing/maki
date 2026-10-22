@@ -125,11 +125,6 @@ impl Runner {
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
                     state.idle_pending = true;
-                    // Controls and compacts never retire a turn, so their
-                    // settlement identity is recorded here.
-                    if let Some(identity) = work.identity() {
-                        state.settled = Some(identity);
-                    }
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(|work| {
@@ -149,6 +144,9 @@ impl Runner {
             let Some((work, cancellation_generation)) = popped else {
                 break;
             };
+            // Controls and compacts retire no turn, so they record their
+            // settlement here once they finish; turns record theirs on retire.
+            let settles = work.identity();
             #[cfg(test)]
             if let Some((popped, release)) = take_after_pop_hook(&self.inner) {
                 let _ = popped.send(());
@@ -169,6 +167,9 @@ impl Runner {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.processing = None;
+            if let Some(identity) = settles {
+                state.settled = Some(identity);
+            }
             state.finish_close(&self.inner);
             state.publish_idle(&self.inner);
             drop(state);
