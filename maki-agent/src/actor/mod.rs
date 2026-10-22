@@ -1659,7 +1659,7 @@ impl AgentActorHandle {
         state: &mut ActorState,
         displayed: u64,
     ) -> LocalCancellationCut {
-        state.cancel_prepared_publication();
+        state.cancel_prepared_where(|turn| turn.is_some());
         let turn_id = state
             .processing
             .as_ref()
@@ -2707,7 +2707,7 @@ impl AgentActorHandle {
     /// cannot move a turn through the pop/install gap without observing the cut.
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.cancel_prepared_publication();
+        state.cancel_prepared_where(|turn| turn.is_some());
         state.instructions.clear();
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
         if let Some(processing) = &mut state.processing {
@@ -2826,7 +2826,7 @@ impl AgentActorHandle {
         correlation: &str,
         reason: TurnCancellationReason,
     ) -> CorrelationCancelCut {
-        state.cancel_prepared_correlation(correlation);
+        state.cancel_prepared_where(|turn| turn == Some(correlation));
         let matched_active = state.active_matches_correlation(correlation);
         let active_turn = match state.status {
             ActorStatus::Running(turn_id) if matched_active => Some(turn_id),
@@ -3036,7 +3036,7 @@ impl AgentActorHandle {
             if let Some(processing) = &mut state.processing {
                 processing.cancellation_reason.get_or_insert(reason);
             }
-            state.cancel_prepared_publication();
+            state.cancel_prepared_where(|_| true);
             state.instructions.clear();
             let deliveries = delivery::take_pending(&mut state);
             state.lifecycle = lifecycle;

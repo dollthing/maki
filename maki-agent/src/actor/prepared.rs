@@ -588,34 +588,20 @@ impl ActorState {
         }
     }
 
-    pub(super) fn cancel_prepared_correlation(&self, correlation: &str) {
+    /// Cancels the publication of every prepared operation whose turn
+    /// correlation `select` accepts; config-only operations pass `None`.
+    pub(super) fn cancel_prepared_where(&self, select: impl Fn(Option<&str>) -> bool) {
         for operation in &self.operations {
             if let ActorOperation::Prepared(pending) = operation
-                && pending
-                    .turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.correlation == correlation)
+                && select(pending.turn.as_ref().map(|turn| turn.correlation.as_str()))
                 && let Some(publication) = &pending.publication
             {
                 publication.cancel();
             }
         }
         if let Some(pending) = &self.prepared_publication
-            && pending.correlation.as_deref() == Some(correlation)
+            && select(pending.correlation.as_deref())
         {
-            pending.publication.cancel();
-        }
-    }
-
-    pub(super) fn cancel_prepared_publication(&self) {
-        for operation in &self.operations {
-            if let ActorOperation::Prepared(pending) = operation
-                && let Some(publication) = &pending.publication
-            {
-                publication.cancel();
-            }
-        }
-        if let Some(pending) = &self.prepared_publication {
             pending.publication.cancel();
         }
     }

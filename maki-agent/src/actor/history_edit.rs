@@ -1065,16 +1065,18 @@ mod tests {
         });
     }
 
-    #[test_case(false, false, "cancel", false; "config_cancel_preclaim")]
-    #[test_case(false, true, "cancel", false; "config_cancel_postclaim")]
+    #[test_case(false, false, "cancel", false; "config_survives_turn_cancel_preclaim")]
+    #[test_case(false, true, "cancel", false; "config_survives_turn_cancel_postclaim")]
+    #[test_case(false, false, "cancel_all", false; "config_survives_cancel_all_preclaim")]
     #[test_case(false, false, "close", false; "config_close_preclaim")]
     #[test_case(false, true, "close", false; "config_close_postclaim")]
     #[test_case(false, false, "drop", false; "config_drop_preclaim")]
     #[test_case(false, true, "drop", false; "config_drop_postclaim")]
     #[test_case(false, true, "close", true; "config_claimed_storage_failure")]
     #[test_case(false, false, "unclaimed", false; "config_rejects_unclaimed_success")]
-    #[test_case(true, false, "cancel", false; "history_cancel_preclaim")]
-    #[test_case(true, true, "cancel", false; "history_cancel_postclaim")]
+    #[test_case(true, false, "cancel", false; "history_survives_turn_cancel_preclaim")]
+    #[test_case(true, true, "cancel", false; "history_survives_turn_cancel_postclaim")]
+    #[test_case(true, false, "cancel_all", false; "history_survives_cancel_all_preclaim")]
     #[test_case(true, false, "close", false; "history_close_preclaim")]
     #[test_case(true, true, "close", false; "history_close_postclaim")]
     #[test_case(true, false, "drop", false; "history_drop_preclaim")]
@@ -1176,6 +1178,10 @@ mod tests {
             assert!(!actor.effective_config().unwrap().fast);
             match invalidation {
                 "cancel" => actor.cancel_local(0),
+                "cancel_all" => {
+                    actor.cancel_all();
+                    (None, 0)
+                }
                 "close" => {
                     actor.close();
                     (None, 0)
@@ -1187,7 +1193,10 @@ mod tests {
                 "unclaimed" => (None, 0),
                 _ => unreachable!(),
             };
-            assert_eq!(publication.is_cancelled(), !claimed && !unclaimed);
+            assert_eq!(
+                publication.is_cancelled(),
+                !claimed && matches!(invalidation, "close" | "drop")
+            );
             assert!(
                 !events
                     .try_iter()
@@ -1196,7 +1205,7 @@ mod tests {
             assert_eq!(actor.inner.state.lock().unwrap().pending_publications, 1);
             release.send(()).unwrap();
             settlement.recv_async().await.unwrap();
-            let succeeds = claimed && !fail;
+            let succeeds = !fail && (claimed || invalidation.starts_with("cancel"));
             if let Some(commit) = commit {
                 let result = commit.await;
                 assert_eq!(result.is_ok(), succeeds);
