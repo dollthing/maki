@@ -1085,7 +1085,6 @@ pub fn run(params: SdkParams) -> Result<()> {
                             handle: &handle,
                             coordinator: &coordinator,
                             shared: &shared,
-                            model_policy: &model_policy,
                             commands: &sdk_commands,
                         },
                     )?;
@@ -1311,7 +1310,7 @@ fn set_permission_mode(
     coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
     permissions: &maki_agent::permissions::PermissionManager,
     shared: &Mutex<Shared>,
-) -> Result<(), maki_agent::session_coordinator::SessionCoordinatorError> {
+) -> Result<(), maki_agent::config_change::ConfigChangeError> {
     let value = if mode == PermissionMode::BypassPermissions {
         maki_agent::session_options::ENABLED_VALUE
     } else {
@@ -1584,7 +1583,6 @@ struct ControlRequestContext<'a> {
     handle: &'a InteractiveHandle,
     coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
     shared: &'a Mutex<Shared>,
-    model_policy: &'a ModelPolicy,
     commands: &'a SdkCommands,
 }
 
@@ -1612,7 +1610,6 @@ fn handle_control_request(
         handle,
         coordinator,
         shared,
-        model_policy,
         commands,
     } = ctx;
     let ok = Some(Value::Object(Default::default()));
@@ -1660,29 +1657,23 @@ fn handle_control_request(
         }
         InboundControlRequestType::SetModel => {
             let current_model = shared.lock().unwrap().model.clone();
-            match resolve_set_model(cr.request.extra.get("model"), &current_model, model_policy) {
-                Some(model) => {
-                    match smol::block_on(route_model(&commands.route_tx, model.spec())) {
-                        Ok(HostResponse::Completed) => {
-                            writer.emit_control_response(&cr.request_id, ok, None)
-                        }
-                        Ok(_) => writer.emit_control_response(
-                            &cr.request_id,
-                            None,
-                            Some("model change returned an unexpected response".into()),
-                        ),
-                        Err(error) => writer.emit_control_response(
-                            &cr.request_id,
-                            None,
-                            Some(error.to_string()),
-                        ),
+            match resolve_set_model(cr.request.extra.get("model"), &current_model) {
+                Some(spec) => match smol::block_on(route_model(&commands.route_tx, spec)) {
+                    Ok(HostResponse::Completed) => {
+                        writer.emit_control_response(&cr.request_id, ok, None)
                     }
+                    Ok(_) => writer.emit_control_response(
+                        &cr.request_id,
+                        None,
+                        Some("model change returned an unexpected response".into()),
+                    ),
+                    Err(error) => {
+                        writer.emit_control_response(&cr.request_id, None, Some(error.to_string()))
+                    }
+                },
+                None => {
+                    writer.emit_control_response(&cr.request_id, None, Some("invalid model".into()))
                 }
-                None => writer.emit_control_response(
-                    &cr.request_id,
-                    None,
-                    Some("invalid or disallowed model".into()),
-                ),
             }
         }
         InboundControlRequestType::Unknown(subtype) => writer.emit_control_response(
@@ -1693,27 +1684,11 @@ fn handle_control_request(
     }
 }
 
-fn resolve_set_model(
-    model_val: Option<&Value>,
-    current_model: &Model,
-    model_policy: &ModelPolicy,
-) -> Option<Model> {
+/// The spec a `set_model` request names; the coordinator validates it.
+fn resolve_set_model(model_val: Option<&Value>, current_model: &Model) -> Option<String> {
     match model_val? {
-        Value::Null => Some(current_model.clone()),
-        Value::String(model_str) => {
-            let spec = resolve_model_spec(model_str);
-            if !model_policy.allows(&spec) {
-                warn!(model = %spec, "ignoring model disallowed by policy");
-                return None;
-            }
-            match Model::from_spec(&spec) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    warn!(model = %model_str, error = %e, "ignoring invalid model");
-                    None
-                }
-            }
-        }
+        Value::Null => Some(current_model.spec()),
+        Value::String(model_str) => Some(resolve_model_spec(model_str)),
         _ => None,
     }
 }
@@ -3968,32 +3943,8 @@ mod tests {
     #[test]
     fn resolve_set_model_null_keeps_current_model() {
         let current = Model::from_spec("openai/gpt-5").unwrap();
-        let result = resolve_set_model(
-            Some(&Value::Null),
-            &current,
-            &maki_config::ModelPolicy::default(),
-        )
-        .unwrap();
-        assert_eq!(result.id, current.id);
-    }
-
-    #[test]
-    fn resolve_set_model_rejects_disallowed_exact_spec() {
-        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
-            "provider": {"allowed_models": [startup.spec()]}
-        }))
-        .unwrap();
-        let policy = raw.into_config().unwrap().provider.model_policy;
-
-        assert!(
-            resolve_set_model(
-                Some(&Value::String("openai/gpt-5".into())),
-                &startup,
-                &policy
-            )
-            .is_none()
-        );
+        let result = resolve_set_model(Some(&Value::Null), &current).unwrap();
+        assert_eq!(result, current.spec());
     }
 
     #[test]

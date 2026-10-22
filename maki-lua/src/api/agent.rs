@@ -23,12 +23,15 @@ use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
     ActorBackend, AdmissionPreparation, AgentContextSnapshot, BackendResult, EffectiveAgentConfig,
-    ModeCeiling, TurnContext, WorkKind,
+    ModeCeiling, PreparedModel, TurnContext, WorkKind,
 };
 use maki_agent::agent::{
     Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
 };
 use maki_agent::cancel::CancelMap;
+use maki_agent::config_change::prepare_model;
+use maki_agent::headless::default_model_preparer;
+use maki_agent::session_coordinator::ModelPreparer;
 use maki_agent::template::env_vars_for;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::offload::OffloadStore;
@@ -100,23 +103,25 @@ async fn build_session_provider(
     agent_ctx: &AgentContext,
     prepare: Option<SessionProviderPreparer>,
 ) -> Result<(Model, Arc<dyn provider::Provider>), String> {
-    if inherit_provider || model_spec.is_none() {
-        Ok((
+    let Some(spec) = model_spec.as_deref().filter(|_| !inherit_provider) else {
+        return Ok((
             Model::clone(&agent_ctx.model),
             Arc::clone(&agent_ctx.provider),
-        ))
-    } else {
-        let spec = model_spec.as_deref().expect("model_spec present");
-        let mut m = Model::from_spec_with_policy(spec, &agent_ctx.model_policy)
-            .map_err(|e| e.to_string())?;
-        if let Some(prepare) = prepare {
-            return prepare(m);
-        }
-        let p = provider::from_model_async(&mut m, agent_ctx.timeouts)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok((m, Arc::from(p)))
-    }
+        ));
+    };
+    let preparer: ModelPreparer = match prepare {
+        Some(prepare) => Arc::new(move |model| {
+            let prepared = prepare(model)
+                .map(|(model, provider)| PreparedModel { model, provider })
+                .map_err(Arc::from);
+            Box::pin(async move { prepared })
+        }),
+        None => default_model_preparer(agent_ctx.timeouts),
+    };
+    let prepared = prepare_model(spec, &agent_ctx.model_policy, &preparer)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((prepared.model, prepared.provider))
 }
 
 /// Shared backend state, owned by the adapter and cloned into the actor's

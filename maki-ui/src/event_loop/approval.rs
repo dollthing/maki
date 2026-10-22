@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{
-    ActorIdleGuard, ActorSourceSnapshot, ConfigCommit, HistoryChange, PreparedOperationTicket,
-    PreparedTransaction, PreparedTurn, TurnTicket,
+    ActorIdleGuard, ActorSourceSnapshot, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange,
+    PreparedOperationTicket, PreparedTransaction, PreparedTurn, TurnTicket,
 };
+use maki_agent::config_change::prepare_patch;
 use maki_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
     SessionDefaults,
@@ -15,12 +16,12 @@ use maki_storage::sessions::{HistorySnapshot, StoredRule};
 
 use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
-    bounded_session_op,
+    bounded_session_op, model_preparer,
 };
 use crate::app::session_state::rules_to_stored;
 use crate::plan_approval::{
     APPROVAL_CANCELLED, APPROVAL_CHANGED, APPROVAL_LOCK_LOST, ApprovedPlan, idle_error_message,
-    prepare_change, read_plan,
+    read_plan,
 };
 
 #[cfg(test)]
@@ -500,24 +501,27 @@ impl EventLoop<'_> {
         } else {
             source.config.config.context.cwd().join(&request.path)
         };
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), template.timeouts);
         self.spawn_approval_step(idx, target.id(), publication, async move {
             let parallel = request.parallel;
             let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;
             operation
                 .replace_turn_input(build_input(plan.message.clone()))
                 .map_err(|error| error.to_string())?;
-            let model = request.model.clone();
-            let change = smol::unblock(move || {
-                prepare_change(
-                    model,
-                    &template.model_policy,
-                    template.timeouts,
-                    &prepare,
-                    mode,
-                )
-            })
-            .await?;
+            let spec = request.model.as_deref();
+            let patch = prepare_patch(
+                ConfigPatch::default(),
+                spec,
+                &template.model_policy,
+                &prepare,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let change = ConfigChange::PatchAndMode {
+                patch,
+                mode: AgentMode::Build,
+                mode_def: mode,
+            };
             operation
                 .resolve(Some(change))
                 .map_err(|error| error.to_string())?;

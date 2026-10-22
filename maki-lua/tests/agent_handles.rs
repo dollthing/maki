@@ -1,8 +1,10 @@
 use maki_agent::SessionMailbox;
+use maki_agent::config_change::ConfigChangeError;
 use maki_agent::session_coordinator::{
     ConfigMutation, SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
-    SessionOptionCatalog, SessionTransactionReservation, builtin_option_definitions,
+    SessionOptionCatalog, builtin_option_definitions,
 };
+use maki_agent::session_options::SessionOptionError;
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
     ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings, TurnCancellationReason,
@@ -32,8 +34,8 @@ use maki_lua::{
     test_support::InMemoryFs,
 };
 use maki_providers::{
-    AgentError, ContentBlock, Effort, Message, Model, ModelError, ModelInfo, ObservationSource,
-    ProviderEvent, RequestOptions, Role, StreamResponse, ThinkingConfig,
+    AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
+    RequestOptions, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
 use maki_storage::checkpoint::{
@@ -188,20 +190,12 @@ fn gated_config_mutations(
     coordinator: Arc<Mutex<Option<SessionCoordinatorHandle>>>,
 ) -> ConfigMutationReserver {
     Arc::new(move |target, publication| {
-        if target
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .parent_id
-            .is_some()
-        {
+        if target.snapshot()?.parent_id.is_some() {
             return Ok(nonpersistent_config_mutation(publication));
         }
         let mut slot = coordinator.lock().unwrap();
         if slot.is_none() {
-            let config = target
-                .effective_config()
-                .map_err(|error| error.to_string())?
-                .unwrap();
+            let config = target.effective_config()?.unwrap();
             let id = MakiId::generate();
             let handle = SessionCoordinatorHandle::register(SessionCoordinatorParams {
                 session_id: id,
@@ -218,32 +212,29 @@ fn gated_config_mutations(
                 model_policy: Arc::new(maki_config::ModelPolicy::default()),
                 checkpoint: checkpoint.clone(),
                 mailbox: SessionMailbox::new(id),
-            })
-            .map_err(|error| error.to_string())?;
+            })?;
             let provider = Arc::clone(&config.provider);
             let committed = Arc::clone(&committed);
             *committed.lock().unwrap() = Some(Arc::clone(&config));
-            handle
-                .bind_actor(
-                    target.clone(),
-                    Arc::new(move |model| {
-                        let provider = Arc::clone(&provider);
-                        Box::pin(
-                            async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
-                        )
-                    }),
-                    Arc::new(move |commit| {
-                        *committed.lock().unwrap() = Some(Arc::clone(&commit.config))
-                    }),
-                )
-                .map_err(|error| error.to_string())?;
+            handle.bind_actor(
+                target.clone(),
+                Arc::new(move |model| {
+                    let provider = Arc::clone(&provider);
+                    Box::pin(
+                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
+                    )
+                }),
+                Arc::new(move |commit| {
+                    *committed.lock().unwrap() = Some(Arc::clone(&commit.config))
+                }),
+            )?;
             *slot = Some(handle);
         }
-        slot.as_ref()
+        Ok(slot
+            .as_ref()
             .unwrap()
-            .reserve_transaction(publication)
-            .map(SessionTransactionReservation::into_config_mutation)
-            .map_err(|error| error.to_string())
+            .reserve_transaction(publication)?
+            .into_config_mutation())
     })
 }
 
@@ -315,7 +306,7 @@ impl OrchestrationServices for RegisteredOrchestrationTargets {
         &self,
         target: &maki_agent::AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutation, String> {
+    ) -> Result<ConfigMutation, ConfigChangeError> {
         self.validate_target(target)?;
         match &self.config_mutations {
             Some(reserve) => reserve(target, publication),
@@ -2350,7 +2341,7 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
         ]));
         let handle = owner._host.event_handle();
         handle.install_orchestration_services(services.clone());
-        let not_allowed = ModelError::NotAllowed(UPDATED_MODEL.into()).to_string();
+        let not_allowed = SessionOptionError::PolicyRejected(UPDATED_MODEL.into()).to_string();
         owner
             ._host
             .load_source(

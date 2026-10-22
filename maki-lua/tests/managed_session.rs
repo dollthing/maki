@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_agent::actor::DeliveryStatus;
+use maki_agent::config_change::ConfigChangeError;
 use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, RequestTools, ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
@@ -889,7 +890,10 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     return "ok"
                 end,
             })
-        "#.replace("$PREPARATION_ERROR", PREPARATION_ERROR),
+        "#.replace(
+            "$PREPARATION_ERROR",
+            &ConfigChangeError::ModelPreparation(PREPARATION_ERROR.into()).to_string(),
+        ),
         )
         .unwrap();
         let (mut context, events, _cancel) = common::ctx_with_canned_provider();

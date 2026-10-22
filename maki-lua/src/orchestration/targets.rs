@@ -1,4 +1,5 @@
 use arc_swap::ArcSwapOption;
+use maki_agent::config_change::ConfigChangeError;
 use maki_agent::session_coordinator::ConfigMutation;
 use maki_agent::{
     AgentRef,
@@ -281,7 +282,7 @@ impl OrchestrationServices for AgentOrchestration {
         &self,
         target: &AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutation, String> {
+    ) -> Result<ConfigMutation, ConfigChangeError> {
         self.validate_target(target)?;
         let reserve = self
             .lock()

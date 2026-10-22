@@ -41,6 +41,7 @@ pub use manager::{
     ShutdownReport, TurnPermitLease,
 };
 pub mod command;
+pub mod config_change;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;

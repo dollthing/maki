@@ -11,6 +11,7 @@ use maki_agent::actor::{
     ActorEvent, ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch,
     PreparedModel,
 };
+use maki_agent::config_change::ConfigChangeError;
 use maki_agent::manager::ManagerError;
 use maki_agent::tools::ToolRegistry;
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
@@ -29,8 +30,8 @@ use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
 use super::super::{
-    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, commit_config_change,
-    reserve_config_change, start_runtime_heartbeat_with,
+    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, reserve_config_change,
+    start_runtime_heartbeat_with,
 };
 use super::ApprovalStep;
 use crate::AppSession;
@@ -451,13 +452,10 @@ fn managed_child_approval_is_pinned(
             None,
         )
         .unwrap();
-        smol::block_on(commit_config_change(
-            reservation,
-            ConfigChange::Mode {
-                mode: mode.clone(),
-                mode_def: Some(host.event_handle().mode_registry().current(&mode)),
-            },
-        ))
+        smol::block_on(reservation.commit_change(ConfigChange::Mode {
+            mode: mode.clone(),
+            mode_def: Some(host.event_handle().mode_registry().current(&mode)),
+        }))
         .unwrap();
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
@@ -1537,9 +1535,8 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
         let mode = AgentMode::Plan(relative);
         let reservation =
             reserve_config_change(&manager.lookup(root).unwrap(), &coordinator, None).unwrap();
-        smol::block_on(commit_config_change(
-            reservation,
-            ConfigChange::Mode {
+        smol::block_on(
+            reservation.commit_change(ConfigChange::Mode {
                 mode: mode.clone(),
                 mode_def: Some(
                     event_loop
@@ -1548,8 +1545,8 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
                         .mode_registry()
                         .current(&mode),
                 ),
-            },
-        ))
+            }),
+        )
         .unwrap();
         approve(event_loop, index, true);
         let ready = next_ready(event_loop);
@@ -1670,7 +1667,8 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        assert_preserved(event_loop, index, &path, run, Some(PROVIDER_FAILURE));
+        let failure = ConfigChangeError::ModelPreparation(PROVIDER_FAILURE.into()).to_string();
+        assert_preserved(event_loop, index, &path, run, Some(&failure));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });

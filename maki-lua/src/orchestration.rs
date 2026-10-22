@@ -5,11 +5,10 @@ use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use arc_swap::ArcSwapOption;
 use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
+use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use maki_agent::headless::{InteractiveHandle, RootBinding};
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
-use maki_agent::session_coordinator::{
-    ConfigMutation, ModelPreparer, SessionCoordinatorHandle, SessionTransactionReservation,
-};
+use maki_agent::session_coordinator::{ConfigMutation, ModelPreparer, SessionCoordinatorHandle};
 use maki_agent::{AgentRef, tools::ToolContext};
 use maki_commands::CommandInvocation;
 use maki_providers::Message;
@@ -193,8 +192,11 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
-pub type ConfigMutationReserver =
-    Arc<dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutation, String> + Send + Sync>;
+pub type ConfigMutationReserver = Arc<
+    dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>
+        + Send
+        + Sync,
+>;
 
 pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
@@ -356,10 +358,9 @@ pub fn frontend_root(
             if target.id() != root_id {
                 return child_config(target, publication);
             }
-            coordinator
-                .reserve_transaction(publication)
-                .map(SessionTransactionReservation::into_config_mutation)
-                .map_err(|error| error.to_string())
+            Ok(coordinator
+                .reserve_transaction(publication)?
+                .into_config_mutation())
         })),
     );
     services.select(Some(root));
@@ -371,60 +372,28 @@ pub fn frontend_root(
 fn default_config_mutation(
     target: &AgentRef,
     publication: CheckpointPublication,
-) -> Result<ConfigMutation, String> {
-    if target
-        .snapshot()
-        .map_err(|error| error.to_string())?
-        .parent_id
-        .is_none()
-    {
+) -> Result<ConfigMutation, ConfigChangeError> {
+    if target.snapshot()?.parent_id.is_none() {
         return Err(DURABLE_CONFIG_UNAVAILABLE.into());
     }
     Ok(nonpersistent_config_mutation(publication))
 }
 
-/// Commits one config change through {target}'s FIFO. Once the predecessor has
-/// settled and the durable mutation is reserved, `prepare` claims the
-/// publication and derives the change from the predecessor's config.
+/// Commits one config change through {target}'s FIFO; see
+/// [`ConfigChangeTicket::commit`] for what `prepare` receives.
 pub async fn commit_config_change(
     services: &(impl OrchestrationServices + ?Sized),
     target: &AgentRef,
     prepare: impl AsyncFnOnce(
         CheckpointPublication,
         Arc<EffectiveAgentConfig>,
-    ) -> Result<(CheckpointClaim, ConfigChange), String>,
-) -> Result<ConfigCommit, String> {
-    let operation = target
-        .actor()
-        .map_err(|error| error.to_string())?
-        .reserve_prepared_operation(None)
-        .map_err(|error| error.to_string())?;
-    let publication = CheckpointPublication::default();
-    operation
-        .register_publication(&publication)
-        .map_err(|error| error.to_string())?;
-    let predecessor = operation
-        .wait_predecessor()
-        .await
-        .map_err(|error| error.to_string())?;
-    let reserve = services.reserve_config_mutation(target, publication.clone())?;
-    let (claim, change) = prepare(publication, predecessor).await?;
-    operation
-        .resolve(Some(change))
-        .map_err(|error| error.to_string())?;
-    operation
-        .wait_ready()
-        .await
-        .map_err(|error| error.to_string())?;
-    let config = operation
-        .ready_config()
-        .map_err(|error| error.to_string())?;
-    let transaction = reserve(config, claim)?;
-    operation
-        .commit_durable(transaction)
-        .await
-        .map(|commit| commit.config)
-        .map_err(|error| error.to_string())
+    ) -> Result<(CheckpointClaim, ConfigChange), ConfigChangeError>,
+) -> Result<ConfigCommit, ConfigChangeError> {
+    ConfigChangeTicket::reserve(target, CheckpointPublication::default(), |publication| {
+        services.reserve_config_mutation(target, publication)
+    })?
+    .commit(prepare)
+    .await
 }
 
 pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {
@@ -457,7 +426,7 @@ pub trait OrchestrationServices: Send + Sync + 'static {
         &self,
         target: &AgentRef,
         publication: CheckpointPublication,
-    ) -> Result<ConfigMutation, String> {
+    ) -> Result<ConfigMutation, ConfigChangeError> {
         self.validate_target(target)?;
         default_config_mutation(target, publication)
     }

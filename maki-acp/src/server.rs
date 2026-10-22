@@ -18,10 +18,13 @@ use agent_client_protocol_schema::{
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
 use flume::{Receiver, Sender, WeakSender};
+use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use maki_agent::session_coordinator::SessionCoordinatorError;
+use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
@@ -1522,22 +1525,25 @@ fn command_error(error: maki_commands::CommandError) -> AcpError {
     AcpError::new(-32602, error.to_string())
 }
 
-fn coordinator_error(error: maki_agent::session_coordinator::SessionCoordinatorError) -> AcpError {
-    use maki_agent::session_coordinator::SessionCoordinatorError;
-    use maki_agent::session_options::SessionOptionError;
-
-    match error {
-        SessionCoordinatorError::StaleSession(id) => {
+fn config_error(error: ConfigChangeError) -> AcpError {
+    match &error {
+        ConfigChangeError::Coordinator(SessionCoordinatorError::StaleSession(id)) => {
             AcpError::resource_not_found(Some(format!("session/{id}")))
         }
-        SessionCoordinatorError::SessionBusy(_) => AcpError::new(-32600, error.to_string()),
-        SessionCoordinatorError::Option(
-            SessionOptionError::UnknownId(_)
-            | SessionOptionError::InvalidValue { .. }
-            | SessionOptionError::FastUnsupported
-            | SessionOptionError::PolicyRejected(_)
-            | SessionOptionError::CallbackFailed(_),
-        ) => AcpError::invalid_params().data(json_str(&error.to_string())),
+        _ if error.is_busy() => AcpError::new(-32600, error.to_string()),
+        ConfigChangeError::Option(option)
+        | ConfigChangeError::Coordinator(SessionCoordinatorError::Option(option))
+            if matches!(
+                option,
+                SessionOptionError::UnknownId(_)
+                    | SessionOptionError::InvalidValue { .. }
+                    | SessionOptionError::FastUnsupported
+                    | SessionOptionError::PolicyRejected(_)
+                    | SessionOptionError::CallbackFailed(_)
+            ) =>
+        {
+            AcpError::invalid_params().data(json_str(&error.to_string()))
+        }
         _ => AcpError::internal_error().data(json_str(&error.to_string())),
     }
 }
@@ -1684,7 +1690,7 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
         .set_session_option(coordinator.clone(), config_id.as_str(), value.as_str())
         .await
         .map_err(|error| match error {
-            maki_lua::SessionOptionMutationError::Coordinator(error) => coordinator_error(error),
+            maki_lua::SessionOptionMutationError::Config(error) => config_error(error),
             maki_lua::SessionOptionMutationError::HostDead => {
                 AcpError::internal_error().data(json_str(&error.to_string()))
             }

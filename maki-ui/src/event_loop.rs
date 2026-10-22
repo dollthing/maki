@@ -8,6 +8,7 @@
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,13 +27,15 @@ use maki_agent::actor::{
     PreparedTransaction,
 };
 use maki_agent::command::CustomCommand;
+use maki_agent::config_change::{
+    ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_patch,
+};
 #[cfg(test)]
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    ConfigMutation, PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
-    SessionCoordinatorParams, SessionTransactionReservation, builtin_option_definitions,
-    canonical_directory, publication_claim,
+    ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
+    builtin_option_definitions, canonical_directory, publication_claim,
 };
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
@@ -634,7 +637,7 @@ fn dispatch_mode_commit(
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
-    let reservation = target.and_then(|target| {
+    let reservation = target.map_err(ConfigChangeError::from).and_then(|target| {
         reserve_config_change(&target, &runtime.coordinator, services)
             .map(|reservation| (target, reservation))
     });
@@ -645,7 +648,8 @@ fn dispatch_mode_commit(
                 commit_mode_change(reservation, target, &id, &storage, &modes).await
             }
             Err(error) => Err(error),
-        };
+        }
+        .map_err(|error| error.to_string());
         let reply = match reply {
             ModeReply::Committed(reply) => {
                 let _ = reply.send(result.clone());
@@ -683,16 +687,17 @@ fn dispatch_thinking_change(
     let (manager, root) = runtime.handles.manager_and_root();
     let reservation = manager
         .lookup(root)
-        .map_err(|error| error.to_string())
+        .map_err(ConfigChangeError::from)
         .and_then(|target| reserve_config_change(&target, &runtime.coordinator, None));
     smol::spawn(async move {
         let mut committed = None;
         let result = match reservation {
-            Ok(ticket) => commit_config_change(ticket, change).await.map(|commit| {
+            Ok(ticket) => ticket.commit_change(change).await.map(|commit| {
                 committed = Some(commit);
             }),
             Err(error) => Err(error),
-        };
+        }
+        .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
@@ -748,37 +753,30 @@ fn observe_config_commits(
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
     prepare: PrepareProvider,
-) -> Result<flume::Receiver<ConfigCommit>, SessionCoordinatorError> {
+) -> Result<flume::Receiver<ConfigCommit>, ConfigChangeError> {
     let (manager, root) = handles.manager_and_root();
     let (ui_tx, ui_rx) = flume::unbounded();
-    let actor = manager
-        .actor(root)
-        .map_err(|error| SessionCoordinatorError::Actor(Arc::from(error.to_string())))?;
+    let actor = manager.actor(root)?;
     {
         let target = manager.lookup(root);
         let timeouts = handles.orchestration_template.timeouts;
         let cwd = handles.cwd_slot();
         let permissions = Arc::clone(&handles.orchestration_template.permissions);
-        let binding = target
-            .map_err(|error| SessionCoordinatorError::Actor(Arc::from(error.to_string())))
-            .and_then(|target| {
-                coordinator.bind_actor(
-                    target,
-                    Arc::new(move |model| {
-                        let prepare = Arc::clone(&prepare);
-                        Box::pin(async move { prepare(model, timeouts) })
-                    }),
-                    Arc::new(move |commit| {
-                        model_slot.project(
-                            commit.config.model.clone(),
-                            Arc::clone(&commit.config.provider),
-                        );
-                        let path = commit.config.context.cwd().to_path_buf();
-                        cwd.store(Arc::new(path.clone()));
-                        permissions.set_cwd(path);
-                    }),
-                )
-            });
+        let binding = target.map_err(ConfigChangeError::from).and_then(|target| {
+            coordinator.bind_actor(
+                target,
+                model_preparer(prepare, timeouts),
+                Arc::new(move |commit| {
+                    model_slot.project(
+                        commit.config.model.clone(),
+                        Arc::clone(&commit.config.provider),
+                    );
+                    let path = commit.config.context.cwd().to_path_buf();
+                    cwd.store(Arc::new(path.clone()));
+                    permissions.set_cwd(path);
+                }),
+            )
+        });
         if let Err(error) = binding {
             coordinator.retire();
             actor.close();
@@ -925,7 +923,7 @@ impl PreparedSessionRuntime {
         self,
         startup_model_slot: &ProviderSlot,
         mut session_lock: Option<SessionLockState>,
-    ) -> Result<SessionRuntime, SessionCoordinatorError> {
+    ) -> Result<SessionRuntime, ConfigChangeError> {
         let Self {
             storage_writer,
             app,
@@ -950,7 +948,7 @@ impl PreparedSessionRuntime {
                 if let Err(release_error) = release_lock_state(session_lock.take()) {
                     warn!(%release_error, "session lock release failed after activation error");
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
@@ -1004,8 +1002,7 @@ impl PreparedSessionRuntime {
         startup_model_slot: &ProviderSlot,
         session_lock: Option<SessionLockState>,
         current: &SessionCoordinatorHandle,
-    ) -> std::result::Result<SessionRuntime, (SessionCoordinatorError, Option<SessionLockState>)>
-    {
+    ) -> std::result::Result<SessionRuntime, (ConfigChangeError, Option<SessionLockState>)> {
         let Self {
             storage_writer,
             app,
@@ -1032,7 +1029,7 @@ impl PreparedSessionRuntime {
         };
         let coordinator = match activated {
             Ok(coordinator) => coordinator,
-            Err(error) => return Err((error, session_lock)),
+            Err(error) => return Err((error.into(), session_lock)),
         };
         storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
         if let Some(provider) = provider {
@@ -1196,7 +1193,7 @@ impl SessionRuntime {
         let (manager, root) = self.handles.manager_and_root();
         let reservation = match manager
             .lookup(root)
-            .map_err(|error| error.to_string())
+            .map_err(ConfigChangeError::from)
             .and_then(|target| reserve_config_change(&target, &self.coordinator, None))
         {
             Ok(reservation) => reservation,
@@ -1207,20 +1204,16 @@ impl SessionRuntime {
         };
         self.app.state.fast_pending = false;
         smol::spawn(async move {
-            let result = match reservation.operation.wait_predecessor().await {
-                Ok(current) if current.model.spec() == spec && !current.fast => {
-                    commit_config_change(
-                        reservation,
-                        ConfigChange::Patch(ConfigPatch {
-                            fast: Some(true),
-                            ..Default::default()
-                        }),
-                    )
+            let result = match reservation.wait_predecessor().await {
+                Ok(current) if current.model.spec() == spec && !current.fast => reservation
+                    .commit_change(ConfigChange::Patch(ConfigPatch {
+                        fast: Some(true),
+                        ..Default::default()
+                    }))
                     .await
-                    .map(|_| ())
-                }
+                    .map(|_| ()),
                 Ok(_) => Ok(()),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(error),
             };
             if let Err(error) = result {
                 warn!(%error, "failed to commit the restored fast mode");
@@ -3606,7 +3599,7 @@ impl<'t> EventLoop<'t> {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let reservation = manager
             .lookup(root)
-            .map_err(|error| error.to_string())
+            .map_err(ConfigChangeError::from)
             .and_then(|target| {
                 reserve_config_change(&target, &self.sessions[idx].coordinator, None)
             });
@@ -3614,35 +3607,26 @@ impl<'t> EventLoop<'t> {
         let identity = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
-        let timeouts = self.ctx.timeouts;
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
         smol::spawn(async move {
             let mut committed = None;
-            let result = match reservation {
-                Ok(reservation) => prepare_config_change(
-                    reservation,
-                    prepare_model_patch(
-                        spec.as_deref().map(Arc::from),
-                        ConfigPatch {
-                            thinking,
-                            toggle_thinking,
-                            fast,
-                            ..Default::default()
-                        },
-                        policy,
-                        prepare,
-                        timeouts,
-                    ),
-                    async {
-                        smol::Timer::after(SESSION_OP_TIMEOUT).await;
-                    },
-                )
-                .await
-                .map(|commit| {
-                    committed = Some(commit);
-                }),
-                Err(error) => Err(error),
+            let patch = ConfigPatch {
+                thinking,
+                toggle_thinking,
+                fast,
+                ..Default::default()
             };
+            let result = match reservation {
+                Ok(reservation) => {
+                    commit_model_patch(reservation, patch, spec.as_deref(), &policy, &prepare)
+                        .await
+                        .map(|commit| {
+                            committed = Some(commit);
+                        })
+                }
+                Err(error) => Err(error),
+            }
+            .map_err(|error| error.to_string());
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime: identity,
@@ -4660,12 +4644,17 @@ impl<'t> EventLoop<'t> {
             target,
             &self.sessions[idx].coordinator,
             Some(&*self.orchestration),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
-            let result = commit_config_change(ticket, change).await.map(|_| ());
+            let result = ticket
+                .commit_change(change)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
             if let Some(reply) = reply {
                 let _ = reply.send(
                     result
@@ -4696,7 +4685,8 @@ impl<'t> EventLoop<'t> {
             target,
             &self.sessions[idx].coordinator,
             Some(&*self.orchestration),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let root = self.sessions[idx].handles.manager_and_root().1;
         let is_root = target.id() == root;
         let session = self.sessions[idx].id();
@@ -4704,22 +4694,19 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let adopted = Arc::new(Mutex::new(None));
-            let result = async {
-                let config = ticket
-                    .operation
-                    .wait_predecessor()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let path = canonical_directory(config.context.cwd(), path)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                commit_config_change(ticket, ConfigChange::WorkingDirectory(path.clone())).await?;
-                if is_root {
-                    *adopted.lock().unwrap_or_else(|error| error.into_inner()) = Some(path);
-                }
-                Ok(())
-            }
-            .await;
+            let result = ticket
+                .commit(async |_, predecessor| {
+                    let path = canonical_directory(predecessor.context.cwd(), path).await?;
+                    Ok((publication_claim(), ConfigChange::WorkingDirectory(path)))
+                })
+                .await
+                .map(|commit| {
+                    if is_root {
+                        *adopted.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some(commit.config.context.cwd().to_path_buf());
+                    }
+                })
+                .map_err(|error| error.to_string());
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -4836,7 +4823,7 @@ impl<'t> EventLoop<'t> {
                 .map(|template| template.model_policy)
         });
         let reservation = target
-            .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+            .ok_or_else(|| CLOSED_TARGET_ERR.into())
             .and_then(|target| {
                 self.target_actor(idx, &target)?;
                 reserve_config_change(
@@ -4845,35 +4832,25 @@ impl<'t> EventLoop<'t> {
                     Some(&*self.orchestration),
                 )
             });
-        let timeouts = self.ctx.timeouts;
         let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
         let internal_tx = self.internal_tx.clone();
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
         smol::spawn(async move {
-            let result = match reservation {
-                Ok(ticket) => prepare_config_change(
-                    ticket,
-                    prepare_model_patch(
-                        selection.spec,
-                        ConfigPatch {
-                            thinking: selection.thinking,
-                            fast: selection.fast,
-                            ..Default::default()
-                        },
-                        policy,
-                        prepare,
-                        timeouts,
-                    ),
-                    async {
-                        smol::Timer::after(SESSION_OP_TIMEOUT).await;
-                    },
-                )
-                .await
-                .map(|_| ()),
-                Err(error) => Err(error),
+            let patch = ConfigPatch {
+                thinking: selection.thinking,
+                fast: selection.fast,
+                ..Default::default()
             };
+            let spec = selection.spec.as_deref();
+            let result = match reservation {
+                Ok(ticket) => commit_model_patch(ticket, patch, spec, &policy, &prepare)
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            }
+            .map_err(|error| error.to_string());
             if result.is_ok()
                 && let Some(spec) = root_spec
             {
@@ -4907,54 +4884,43 @@ impl<'t> EventLoop<'t> {
     /// Re-prepares the root's current model, for instance after logging in to its provider.
     fn reprepare_root_model(&self, idx: usize, spec: String) {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
-        let actor = manager.actor(root).map_err(|error| error.to_string());
-        let reserved = actor.and_then(|actor| {
-            let expected = actor
-                .effective_config()
-                .ok_or("missing actor configuration")?;
-            let target = manager.lookup(root).map_err(|error| error.to_string())?;
-            let ticket = reserve_config_change(&target, &self.sessions[idx].coordinator, None)?;
-            Ok((ticket, expected))
-        });
+        let reserved = manager
+            .actor(root)
+            .map_err(ConfigChangeError::from)
+            .and_then(|actor| {
+                let expected = actor
+                    .effective_config()
+                    .ok_or("missing actor configuration")?;
+                let target = manager.lookup(root)?;
+                let ticket = reserve_config_change(&target, &self.sessions[idx].coordinator, None)?;
+                Ok((ticket, expected))
+            });
         let session = self.sessions[idx].id();
         let identity = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
-        let timeouts = self.ctx.timeouts;
         let policy = Arc::clone(&self.ctx.model_policy);
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = model_preparer(Arc::clone(&self.ctx.prepare_provider), self.ctx.timeouts);
         smol::spawn(async move {
             let result = match reserved {
-                Ok((ticket, expected)) => {
-                    let requested = spec;
-                    prepare_config_change(
-                        ticket,
-                        async move {
-                            let replacement = smol::unblock(move || {
-                                if !policy.allows(&requested) {
-                                    return Err(format!("model is not allowed: {requested}"));
-                                }
-                                let model = Model::from_spec(&requested)
-                                    .map_err(|error| error.to_string())?;
-                                prepare(model, timeouts).map_err(|error| error.to_string())
-                            })
-                            .await?;
-                            Ok(ConfigChange::Refresh {
-                                expected: PreparedModel {
-                                    provider: Arc::clone(&expected.provider),
-                                    model: expected.model.clone(),
-                                },
-                                replacement,
-                            })
-                        },
-                        async {
-                            smol::Timer::after(SESSION_OP_TIMEOUT).await;
-                        },
-                    )
-                    .await
-                    .map(|_| ())
-                }
+                Ok((ticket, expected)) => prepare_config_change(
+                    ticket,
+                    async move {
+                        let replacement = prepare_model(&spec, &policy, &prepare).await?;
+                        Ok(ConfigChange::Refresh {
+                            expected: PreparedModel {
+                                provider: Arc::clone(&expected.provider),
+                                model: expected.model.clone(),
+                            },
+                            replacement,
+                        })
+                    },
+                    smol::Timer::after(SESSION_OP_TIMEOUT),
+                )
+                .await
+                .map(|_| ()),
                 Err(error) => Err(error),
-            };
+            }
+            .map_err(|error| error.to_string());
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime: identity,
@@ -5180,25 +5146,12 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
     }
 }
 
-async fn prepare_model_patch(
-    spec: Option<Arc<str>>,
-    mut patch: maki_agent::actor::ConfigPatch,
-    policy: Arc<ModelPolicy>,
-    prepare: PrepareProvider,
-    timeouts: Timeouts,
-) -> Result<ConfigChange, String> {
-    patch.model = smol::unblock(move || {
-        spec.map(|spec| {
-            if !policy.allows(&spec) {
-                return Err(format!("model is not allowed: {spec}"));
-            }
-            let model = Model::from_spec(&spec).map_err(|error| error.to_string())?;
-            prepare(model, timeouts).map_err(|error| error.to_string())
-        })
-        .transpose()
+/// The TUI's provider preparation as the coordinator's async preparer.
+fn model_preparer(prepare: PrepareProvider, timeouts: Timeouts) -> ModelPreparer {
+    Arc::new(move |model| {
+        let prepare = Arc::clone(&prepare);
+        Box::pin(smol::unblock(move || prepare(model, timeouts)))
     })
-    .await?;
-    Ok(ConfigChange::Patch(patch))
 }
 
 fn runtime_config_mutations(
@@ -5215,28 +5168,22 @@ fn runtime_config_mutations(
         _ => None,
     };
     Arc::new(move |target, publication| {
-        let root = manager.lookup(root_id).map_err(|error| error.to_string())?;
-        if !root.same_manager(target) {
-            return Err(NOT_LIVE_ERR.to_owned());
+        if !manager.lookup(root_id)?.same_manager(target) {
+            return Err(NOT_LIVE_ERR.into());
         }
-        target.validate_live().map_err(|error| error.to_string())?;
+        target.validate_live()?;
         if target.id() == root_id {
-            return coordinator
-                .reserve_transaction(publication)
-                .map(SessionTransactionReservation::into_config_mutation)
-                .map_err(|error| error.to_string());
+            return Ok(coordinator
+                .reserve_transaction(publication)?
+                .into_config_mutation());
         }
         let key = orchestration
             .upgrade()
-            .ok_or_else(|| NOT_LIVE_ERR.to_owned())?
+            .ok_or(NOT_LIVE_ERR)?
             .history_key(target)?;
-        let guard = guard
-            .clone()
-            .ok_or_else(|| LOCK_LOST_REPLACEMENT_ERR.to_owned())?;
+        let guard = guard.clone().ok_or(LOCK_LOST_REPLACEMENT_ERR)?;
         let writer = Arc::clone(&writer);
-        let registration = coordinator
-            .register_publication(&publication)
-            .map_err(|error| error.to_string())?;
+        let registration = coordinator.register_publication(&publication)?;
         Ok(Box::new(move |_, claim| {
             Ok(PreparedTransaction {
                 publication,
@@ -5265,146 +5212,86 @@ fn runtime_config_mutations(
     })
 }
 
-struct ConfigChangeReservation {
-    operation: maki_agent::actor::PreparedOperationTicket,
-    transaction: ConfigMutation,
-    publication: CheckpointPublication,
-}
-
 fn reserve_config_change(
     target: &AgentRef,
     coordinator: &SessionCoordinatorHandle,
     services: Option<&dyn OrchestrationServices>,
-) -> Result<ConfigChangeReservation, String> {
-    target.validate_live().map_err(|error| error.to_string())?;
-    let publication = CheckpointPublication::default();
-    let transaction: ConfigMutation = if target
-        .snapshot()
-        .map_err(|error| error.to_string())?
-        .parent_id
-        .is_none()
-    {
-        coordinator
-            .reserve_transaction(publication.clone())
-            .map_err(|error| error.to_string())?
-            .into_config_mutation()
-    } else {
+) -> Result<ConfigChangeTicket, ConfigChangeError> {
+    ConfigChangeTicket::reserve(target, CheckpointPublication::default(), |publication| {
+        if target.snapshot()?.parent_id.is_none() {
+            return Ok(coordinator
+                .reserve_transaction(publication)?
+                .into_config_mutation());
+        }
         services
-            .ok_or_else(|| DURABLE_CONFIG_UNAVAILABLE.to_owned())?
-            .reserve_config_mutation(target, publication.clone())?
-    };
-    let operation = target
-        .actor()
-        .map_err(|error| error.to_string())?
-        .reserve_prepared_operation(None)
-        .map_err(|error| error.to_string())?;
-    operation
-        .register_publication(&publication)
-        .map_err(|error| error.to_string())?;
-    Ok(ConfigChangeReservation {
-        operation,
-        transaction,
-        publication,
+            .ok_or(DURABLE_CONFIG_UNAVAILABLE)?
+            .reserve_config_mutation(target, publication)
     })
 }
 
 async fn commit_mode_change(
-    reservation: ConfigChangeReservation,
+    ticket: ConfigChangeTicket,
     target: AgentRef,
     id: &str,
     storage: &StateDir,
     modes: &maki_agent::ModeRegistry,
-) -> Result<(), String> {
-    let predecessor = reservation
-        .operation
-        .wait_predecessor()
+) -> Result<(), ConfigChangeError> {
+    ticket
+        .commit(async |_, predecessor| {
+            let mut plan = predecessor
+                .mode
+                .plan_path()
+                .map(|path| crate::app::mode::PlanState::Drafting(path.to_path_buf()))
+                .unwrap_or_default();
+            if id == "plan" {
+                plan.allocate_path(storage);
+            }
+            let mode = match id {
+                "build" => maki_agent::AgentMode::Build,
+                "plan" => plan
+                    .path()
+                    .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
+                    .unwrap_or_default(),
+                name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
+            };
+            let mode_def = modes.current(&mode);
+            target.actor()?.validate_mode_change(&mode, &mode_def)?;
+            let change = ConfigChange::Mode {
+                mode,
+                mode_def: Some(mode_def),
+            };
+            Ok((publication_claim(), change))
+        })
         .await
-        .map_err(|error| error.to_string())?;
-    let mut plan = predecessor
-        .mode
-        .plan_path()
-        .map(|path| crate::app::mode::PlanState::Drafting(path.to_path_buf()))
-        .unwrap_or_default();
-    if id == "plan" {
-        plan.allocate_path(storage);
-    }
-    let mode = match id {
-        "build" => maki_agent::AgentMode::Build,
-        "plan" => plan
-            .path()
-            .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
-            .unwrap_or_default(),
-        name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
-    };
-    let mode_def = modes.current(&mode);
-    target
-        .actor()
-        .map_err(|error| error.to_string())?
-        .validate_mode_change(&mode, &mode_def)
-        .map_err(|error| error.to_string())?;
-    commit_config_change(
-        reservation,
-        ConfigChange::Mode {
-            mode,
-            mode_def: Some(mode_def),
-        },
-    )
-    .await
-    .map(|_| ())
+        .map(|_| ())
 }
 
-async fn commit_config_change(
-    reservation: ConfigChangeReservation,
-    change: ConfigChange,
-) -> Result<ConfigCommit, String> {
-    let ConfigChangeReservation {
-        operation,
-        transaction,
-        publication: _,
-    } = reservation;
-    operation
-        .wait_predecessor()
-        .await
-        .map_err(|error| error.to_string())?;
-    operation
-        .resolve(Some(change))
-        .map_err(|error| error.to_string())?;
-    operation
-        .wait_ready()
-        .await
-        .map_err(|error| error.to_string())?;
-    let transaction = transaction(
-        operation
-            .ready_config()
-            .map_err(|error| error.to_string())?,
-        publication_claim(),
-    )?;
-    operation
-        .commit_durable(transaction)
-        .await
-        .map(|commit| commit.config)
-        .map_err(|error| error.to_string())
+/// Commits {patch} with {spec}'s model prepared, unless preparation outlives
+/// the session op timeout.
+async fn commit_model_patch(
+    ticket: ConfigChangeTicket,
+    patch: ConfigPatch,
+    spec: Option<&str>,
+    policy: &ModelPolicy,
+    prepare: &ModelPreparer,
+) -> Result<ConfigCommit, ConfigChangeError> {
+    let change = async {
+        Ok(ConfigChange::Patch(
+            prepare_patch(patch, spec, policy, prepare).await?,
+        ))
+    };
+    prepare_config_change(ticket, change, smol::Timer::after(SESSION_OP_TIMEOUT)).await
 }
 
-async fn prepare_config_change<F, E>(
-    ticket: ConfigChangeReservation,
-    prepare: F,
-    expiry: E,
-) -> Result<ConfigCommit, String>
-where
-    F: std::future::Future<Output = Result<ConfigChange, String>>,
-    E: std::future::Future<Output = ()>,
-{
-    let publication = ticket.publication.clone();
-    let operation = async move {
-        ticket
-            .operation
-            .wait_predecessor()
-            .await
-            .map_err(|error| error.to_string())?;
-        let change = prepare.await?;
-        commit_config_change(ticket, change).await
-    };
+/// Commits the change `prepare` yields once the predecessor settles, unless
+/// `expiry` fires before the publication is claimed.
+async fn prepare_config_change<T>(
+    ticket: ConfigChangeTicket,
+    prepare: impl Future<Output = Result<ConfigChange, ConfigChangeError>>,
+    expiry: impl Future<Output = T>,
+) -> Result<ConfigCommit, ConfigChangeError> {
+    let publication = ticket.publication();
+    let operation = ticket.commit(async |_, _| Ok((publication_claim(), prepare.await?)));
     futures_lite::pin!(operation);
     match futures_lite::future::or(async { Some(operation.as_mut().await) }, async {
         expiry.await;
@@ -5413,7 +5300,7 @@ where
     .await
     {
         Some(result) => result,
-        None if publication.cancel() => Err(CONFIG_EXPIRED_ERR.to_owned()),
+        None if publication.cancel() => Err(CONFIG_EXPIRED_ERR.into()),
         None => operation.await,
     }
 }
@@ -5546,14 +5433,11 @@ mod tests {
 
     fn spawn_root_workflow_toggle(
         runtime: &SessionRuntime,
-    ) -> smol::Task<Result<ConfigCommit, String>> {
+    ) -> smol::Task<Result<ConfigCommit, ConfigChangeError>> {
         let (manager, root) = runtime.handles.manager_and_root();
         let target = manager.lookup(root).unwrap();
         let reservation = reserve_config_change(&target, &runtime.coordinator, None).unwrap();
-        smol::spawn(commit_config_change(
-            reservation,
-            ConfigChange::ToggleWorkflow,
-        ))
+        smol::spawn(reservation.commit_change(ConfigChange::ToggleWorkflow))
     }
 
     async fn wait_projected_option(runtime: &SessionRuntime, id: &str, value: &str) {
@@ -6092,7 +5976,10 @@ mod tests {
                     .commit_when_ready(Some(ConfigChange::ToggleWorkflow)),
             );
             expire_tx.send(()).unwrap();
-            assert_eq!(pending.await.err().unwrap(), CONFIG_EXPIRED_ERR);
+            assert_eq!(
+                pending.await.err().unwrap(),
+                ConfigChangeError::from(CONFIG_EXPIRED_ERR)
+            );
             assert!(successor.await.unwrap().config.config.workflow);
             release_tx.send(()).unwrap();
             finished_rx.recv_async().await.unwrap();
@@ -6118,15 +6005,13 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let older = commit_config_change(
-                    reservation,
-                    ConfigChange::Patch(ConfigPatch {
+                let older = reservation
+                    .commit_change(ConfigChange::Patch(ConfigPatch {
                         workflow: Some(true),
                         ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
+                    }))
+                    .await
+                    .unwrap();
                 let (reply_tx, reply_rx) = flume::bounded(1);
                 event_loop.handle_session_request(
                     SessionRequest::SetMode {
@@ -6185,20 +6070,19 @@ mod tests {
                 let session = old.id();
                 let identity = old.handles.identity();
                 let (manager, root) = old.handles.manager_and_root();
-                let commit = commit_config_change(
+                let commit =
                     reserve_config_change(&manager.lookup(root).unwrap(), &old.coordinator, None)
-                        .unwrap(),
-                    ConfigChange::Patch(ConfigPatch {
-                        model: Some(maki_agent::actor::PreparedModel {
-                            model: model_named("retired-model"),
-                            provider: Arc::new(StubProvider),
-                        }),
-                        workflow: Some(true),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
+                        .unwrap()
+                        .commit_change(ConfigChange::Patch(ConfigPatch {
+                            model: Some(maki_agent::actor::PreparedModel {
+                                model: model_named("retired-model"),
+                                provider: Arc::new(StubProvider),
+                            }),
+                            workflow: Some(true),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap();
                 let (reply_tx, reply_rx) = flume::bounded(1);
                 let completion = match operation {
                     "mode" => {
@@ -6454,7 +6338,8 @@ mod tests {
             };
             assert_eq!(
                 result.unwrap_err(),
-                SessionCoordinatorError::SessionBusy(id).to_string()
+                maki_agent::session_coordinator::SessionCoordinatorError::SessionBusy(id)
+                    .to_string()
             );
             drop(reservation);
 
@@ -7749,7 +7634,8 @@ mod tests {
             let (manager, root) = runtime.handles.manager_and_root();
             let target = manager.lookup(root).unwrap();
             let ticket = reserve_config_change(&target, &runtime.coordinator, None).unwrap();
-            commit_config_change(ticket, ConfigChange::ToggleWorkflow)
+            ticket
+                .commit_change(ConfigChange::ToggleWorkflow)
                 .await
                 .unwrap();
         });
@@ -9492,11 +9378,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            smol::block_on(commit_config_change(
-                reservation,
-                ConfigChange::ToggleWorkflow,
-            ))
-            .unwrap();
+            smol::block_on(reservation.commit_change(ConfigChange::ToggleWorkflow)).unwrap();
             event_loop.sync_orchestration();
             assert!(!Arc::ptr_eq(
                 event_loop.orchestration_revisions[0]

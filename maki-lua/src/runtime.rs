@@ -5635,10 +5635,8 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     .await
                                     .map_err(Into::into),
                                 Err(error) => Err(
-                                    maki_agent::session_coordinator::SessionCoordinatorError::from(
-                                        error,
-                                    )
-                                    .into(),
+                                    maki_agent::config_change::ConfigChangeError::from(error)
+                                        .into(),
                                 ),
                             };
                             let _ = reply.send(result);
