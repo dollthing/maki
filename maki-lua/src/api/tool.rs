@@ -784,7 +784,6 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                llm_output  (string)  Text sent to the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.
 ///                                output_limits (table) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
-///                                content     (string)  Alias for llm_output (legacy).
 ///                                body        (BufHandle) Rich rendered body shown in the UI.
 ///                                header      (BufHandle) One-line header shown before the body.
 ///                                format      (string)  "plain" (default) or "markdown".
@@ -2518,11 +2517,7 @@ fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
 }
 
 fn extract_tool_output(t: &Table) -> mlua::Result<Option<String>> {
-    let output = match t.get::<LuaValue>("llm_output")? {
-        LuaValue::Nil => t.get::<LuaValue>("content")?,
-        output => output,
-    };
-    match output {
+    match t.get::<LuaValue>("llm_output")? {
         LuaValue::Nil => Ok(None),
         LuaValue::String(output) => output.to_str().map(|output| Some(output.to_owned())),
         _ => Err(mlua::Error::runtime("tool output must be a string")),
@@ -2911,47 +2906,6 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(false; "success")]
-    #[test_case::test_case(true; "error")]
-    fn coerce_legacy_content_preserves_result_kind(is_error: bool) {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("content", "body").unwrap();
-        t.set("is_error", is_error).unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            if is_error {
-                Err("body".to_owned())
-            } else {
-                Ok("body".to_owned())
-            }
-        );
-    }
-
-    #[test]
-    fn coerce_llm_output_precedes_legacy_content() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "primary").unwrap();
-        t.set("content", "legacy").unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            Ok("primary".to_owned())
-        );
-    }
-
-    #[test]
-    fn coerce_unsupported_llm_output_does_not_fall_back_to_content() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", false).unwrap();
-        t.set("content", "legacy").unwrap();
-        assert_eq!(
-            coerce_tool_result(&LuaValue::Table(t)),
-            Err(TOOL_HANDLER_RETURN_ERR.to_owned())
-        );
-    }
-
     #[test]
     fn coerce_error_paths() {
         let lua = Lua::new();
@@ -3184,17 +3138,6 @@ mod tests {
             );
             assert!(parsed.output_limits.is_none());
         }
-
-        let reply = lua.create_table().unwrap();
-        reply.set("content", "legacy body").unwrap();
-        reply
-            .set("output_limits", lua.create_table().unwrap())
-            .unwrap();
-        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
-        assert!(
-            parsed.result.is_err(),
-            "content alias must not satisfy llm_output"
-        );
 
         let reply = lua.create_table().unwrap();
         reply

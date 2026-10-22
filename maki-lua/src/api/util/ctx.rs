@@ -546,17 +546,6 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
-        // The matching check before a write is run by the dispatcher under the
-        // file write lock for every tool declaring `mutable_path`. Kept as a
-        // compatibility shim returning (Some(true), None).
-        methods.add_method("check_before_edit", |lua, this, _path: String| {
-            if this.agent().is_none() {
-                return Ok(this.cap_err_pair("check_before_edit"));
-            }
-            try_pair!(this.validate_origin(lua));
-            Ok((Some(true), None))
-        });
-
         methods.add_async_method(
             "find_instructions",
             |lua, this, dir_path: String| async move {
@@ -864,7 +853,6 @@ mod tests {
                         function() return ctx:set_deadline(1) end,
                         function() return ctx:capture_read(read_path) end,
                         function() return ctx:record_read(read_path) end,
-                        function() return ctx:check_before_edit(read_path) end,
                         function() return ctx:question_mode() end,
                         commit,
                     }) do

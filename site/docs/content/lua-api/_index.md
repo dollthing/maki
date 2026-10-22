@@ -425,7 +425,6 @@ string or a table with richer output fields.
     - `llm_output` (`string`) Text sent to the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
     - `output_limits` (`table`) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
-    - `content` (`string`) Alias for llm_output (legacy).
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
     - `header` (`BufHandle`) One-line header shown before the body.
     - `format` (`string`) "plain" (default) or "markdown".
