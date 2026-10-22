@@ -2400,6 +2400,7 @@ mod tests {
             Some(Arc::new(move |model| Ok((model, Arc::clone(&prepared))))),
         )
         .unwrap();
+        host.serve_ui(maki_lua::ui_sink::HeadlessUi);
         host.load_source(
             "acp_bundled_task",
             include_str!("../../plugins/task/init.lua"),
@@ -2407,16 +2408,22 @@ mod tests {
         .unwrap();
         host.load_source(
             "acp_options",
-            r#"
-            maki.api.register_command({
+            &format!(
+                r#"
+            maki.api.register_command({{
                 name = "/acp_fast", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(maki.agent.current(ctx))
-                    assert(assert(root:set_model(ctx, { fast = true })).fast)
+                    assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                     assert(assert(root:model(ctx)).fast)
+                    local view, view_err = maki.fn.winsaveview()
+                    assert(view == nil and view_err == "{}", view_err)
+                    maki.ui.flash("acp fast set")
                 end,
-            })
+            }})
         "#,
+                maki_lua::ui_sink::NO_UI_ERR
+            ),
         )
         .unwrap();
         if permission {

@@ -14,6 +14,7 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 mod splash;
+pub mod ui_sink;
 #[cfg(test)]
 mod write_lock_regression;
 
@@ -208,6 +209,23 @@ pub mod test_support {
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
         (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
+    }
+
+    /// A headless sink that hands notifications to a channel, so a test can
+    /// wait on them where a real frontend would write to stderr.
+    pub struct RecordingUi(flume::Sender<String>);
+
+    impl RecordingUi {
+        pub fn new() -> (Self, flume::Receiver<String>) {
+            let (tx, rx) = flume::unbounded();
+            (Self(tx), rx)
+        }
+    }
+
+    impl crate::ui_sink::UiSink for RecordingUi {
+        fn notify(&mut self, text: String) {
+            let _ = self.0.send(text);
+        }
     }
 
     /// Synthetic state dir for hosts booted by [`spawn_host_for_tests`].

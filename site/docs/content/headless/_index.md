@@ -45,6 +45,8 @@ SDK stream mode and ACP project the built-ins supported by their target capabili
 
 See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
 
+Plugins run the same way as in the TUI. A notification from `maki.ui.flash` or `maki.notify` is written to stderr, and any other UI call, such as opening a window or a picker, returns `nil, "no interactive UI attached"` right away.
+
 ## Claude Code Compatibility
 
 Makima's `--print` output matches Claude Code. One flag differs: in Makima, `-p` is the prompt, so print mode is always the long `--print`.

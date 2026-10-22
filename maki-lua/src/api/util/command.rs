@@ -13,8 +13,7 @@ use strum::{EnumString, VariantNames};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
-pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) use crate::ui_sink::NO_UI_ERR;
 
 pub type StatusContent = Vec<(String, String)>;
 pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
@@ -588,16 +587,17 @@ pub(crate) fn ui_send(
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
-/// Send an action carrying a reply channel and await the answer. Only
-/// works from a callback: the loop drains `UiAction` between frames, so a
-/// call at config load time would wait forever.
+/// Send an action carrying a reply channel and await the answer. A frontend
+/// that does not render the action drops it, which lands here as
+/// `NO_UI_ERR`. The TUI drains between frames, so a call at config load time
+/// waits until its loop starts.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
-    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+    reply_rx.recv_async().await.map_err(|_| NO_UI_ERR)
 }
 
 /// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua

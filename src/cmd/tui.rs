@@ -14,6 +14,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
+use maki_lua::ui_sink::HeadlessUi;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
@@ -359,6 +360,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         for warning in &startup_warnings {
             eprintln!("warning: {warning}");
         }
+        stack.plugin_host.serve_ui(HeadlessUi);
     }
 
     if cli.is_sdk_mode() {

@@ -2060,6 +2060,7 @@ mod tests {
     const SDK_NESTED_TOOL: &str = "sdk_nested_task";
     const SDK_ROOT_PROMPT: &str = "sdk root request";
     const SDK_CHILD_PROMPT: &str = "sdk child request";
+    const SDK_COMMAND_DONE: &str = "sdk command done";
     const SDK_GRANDCHILD_PROMPT: &str = "sdk grandchild request";
     const SDK_ROOT_RESPONSE: &str = "sdk root response";
     const SDK_CHILD_RESPONSE: &str = "sdk child response";
@@ -2601,18 +2602,26 @@ mod tests {
         .unwrap();
         host.load_source("sdk_bundled_task", include_str!("../plugins/task/init.lua"))
             .unwrap();
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
+        host.serve_ui(ui);
         host.load_source(
             "sdk_command_spawn",
-            r#"
-            maki.api.register_command({
+            &format!(
+                r#"
+            maki.api.register_command({{
                 name = "/sdk_spawn", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(maki.agent.current(ctx))
-                    local child = assert(root:spawn(ctx, { name = "SDK command child" }))
+                    local child = assert(maki.agent.spawn(ctx, {{ name = "SDK command child" }}))
                     assert(child:close(ctx))
+                    local view, view_err = maki.fn.winsaveview()
+                    assert(view == nil and view_err == "{no_ui}", view_err)
+                    maki.ui.flash("{SDK_COMMAND_DONE}")
                 end,
-            })
+            }})
         "#,
+                no_ui = maki_lua::ui_sink::NO_UI_ERR
+            ),
         )
         .unwrap();
         host.load_source(SDK_NESTED_TOOL, &format!(r#"
@@ -2849,6 +2858,10 @@ mod tests {
             commands.dispatch_input("/sdk_spawn", &[]),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
+        assert_eq!(
+            notices.recv_timeout(SDK_GATE_TIMEOUT).unwrap(),
+            SDK_COMMAND_DONE
+        );
         assert_eq!(handle.manager.snapshot().len(), 1);
         let (route_tx, route_rx) = flume::unbounded();
         let driver = spawn_command_driver(CommandDriverParams {

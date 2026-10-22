@@ -58,6 +58,7 @@ use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
 };
+use maki_lua::ui_sink::UiSink;
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ProviderUsageAck, ProviderUsageInvalidation,
     ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot, ProviderUsageWindow,
@@ -2140,7 +2141,7 @@ impl<'t> EventLoop<'t> {
         match wake {
             Wake::Input(ev) => self.handle_input(ev),
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
-            Wake::Ui(action) => self.handle_ui_action(action),
+            Wake::Ui(action) => self.render(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Actor(i, event) => {
                 self.handle_actor_settlement(i, &event);
@@ -2635,96 +2636,6 @@ impl<'t> EventLoop<'t> {
             ));
         }
         Ok(dirty)
-    }
-
-    fn handle_ui_action(&mut self, action: UiAction) {
-        match action {
-            UiAction::Flash(msg) => {
-                self.focused_app().flash(msg);
-            }
-            UiAction::SetWindowTitle(title) => {
-                if let Err(error) = terminal::set_window_title(&title) {
-                    tracing::warn!(%error, "failed to set window title");
-                }
-            }
-            UiAction::OpenEditor {
-                target,
-                path,
-                reply_tx,
-            } => {
-                let pinned = target
-                    .as_ref()
-                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                    .and_then(|target| self.pinned_editor_path(target, &path));
-                let code = match pinned {
-                    Ok((index, path)) => self.open_editor(index, &path),
-                    Err(error) => {
-                        self.focused_app().flash(error);
-                        -1
-                    }
-                };
-                let _ = reply_tx.send(code);
-            }
-            UiAction::OpenListPicker {
-                id,
-                items,
-                config,
-                reply_tx,
-            } => {
-                self.focused_app()
-                    .lua_picker
-                    .open(id, items, config, reply_tx);
-            }
-            UiAction::OpenWin {
-                buf,
-                config,
-                focus,
-                event_tx,
-                cmd_rx,
-            } => {
-                let app = self.focused_app();
-                app.handle_open_win(buf, config, focus, event_tx, cmd_rx);
-                // An active (non-deferred) ask rings now; a deferred one rings
-                // on promotion. Draining here keeps the active path immediate.
-                if app.take_pending_bell() {
-                    ring_bell();
-                }
-            }
-            UiAction::Session { req, reply_tx } => {
-                self.handle_session_request(req, reply_tx);
-            }
-            UiAction::ProviderUsageAck(ack) => {
-                self.handle_provider_usage_ack(ack);
-            }
-            UiAction::UsageFetch { force, reply_tx } => {
-                let provider = self.focused_model_slot().load().provider.identity();
-                let outputs = self
-                    .provider_usage
-                    .handle(ProviderUsageInput::Transition { provider });
-                self.handle_provider_usage_outputs(outputs);
-                let kind = if force {
-                    ProviderUsageRequestKind::Forced
-                } else {
-                    ProviderUsageRequestKind::Ordinary
-                };
-                let outputs = self.provider_usage.handle(ProviderUsageInput::Request {
-                    provider,
-                    kind,
-                    waiter: reply_tx,
-                });
-                self.handle_provider_usage_outputs(outputs);
-            }
-            UiAction::WinSaveView { reply_tx } => {
-                let _ = reply_tx.send(self.focused_app().win_view());
-            }
-            UiAction::WinRestView { scroll_top } => {
-                self.focused_app().set_scroll_top(scroll_top);
-            }
-            UiAction::Builtin(action) => {
-                let actions = self.focused_app().run_builtin(action);
-                self.dispatch(self.focused, actions);
-            }
-        }
     }
 
     fn handle_provider_usage_ack(&mut self, ack: ProviderUsageAck) {
@@ -4563,6 +4474,100 @@ fn live_message_count(app: &App) -> usize {
         .as_ref()
         .map(|h| h.load().messages.len())
         .unwrap_or_else(|| app.state.session.messages().len())
+}
+
+impl UiSink for EventLoop<'_> {
+    fn notify(&mut self, text: String) {
+        self.focused_app().flash(text);
+    }
+
+    fn render(&mut self, action: UiAction) {
+        match action {
+            UiAction::Flash(text) => self.notify(text),
+            UiAction::SetWindowTitle(title) => {
+                if let Err(error) = terminal::set_window_title(&title) {
+                    tracing::warn!(%error, "failed to set window title");
+                }
+            }
+            UiAction::OpenEditor {
+                target,
+                path,
+                reply_tx,
+            } => {
+                let pinned = target
+                    .as_ref()
+                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                    .and_then(|target| self.pinned_editor_path(target, &path));
+                let code = match pinned {
+                    Ok((index, path)) => self.open_editor(index, &path),
+                    Err(error) => {
+                        self.focused_app().flash(error);
+                        -1
+                    }
+                };
+                let _ = reply_tx.send(code);
+            }
+            UiAction::OpenListPicker {
+                id,
+                items,
+                config,
+                reply_tx,
+            } => {
+                self.focused_app()
+                    .lua_picker
+                    .open(id, items, config, reply_tx);
+            }
+            UiAction::OpenWin {
+                buf,
+                config,
+                focus,
+                event_tx,
+                cmd_rx,
+            } => {
+                let app = self.focused_app();
+                app.handle_open_win(buf, config, focus, event_tx, cmd_rx);
+                // An active (non-deferred) ask rings now; a deferred one rings
+                // on promotion. Draining here keeps the active path immediate.
+                if app.take_pending_bell() {
+                    ring_bell();
+                }
+            }
+            UiAction::Session { req, reply_tx } => {
+                self.handle_session_request(req, reply_tx);
+            }
+            UiAction::ProviderUsageAck(ack) => {
+                self.handle_provider_usage_ack(ack);
+            }
+            UiAction::UsageFetch { force, reply_tx } => {
+                let provider = self.focused_model_slot().load().provider.identity();
+                let outputs = self
+                    .provider_usage
+                    .handle(ProviderUsageInput::Transition { provider });
+                self.handle_provider_usage_outputs(outputs);
+                let kind = if force {
+                    ProviderUsageRequestKind::Forced
+                } else {
+                    ProviderUsageRequestKind::Ordinary
+                };
+                let outputs = self.provider_usage.handle(ProviderUsageInput::Request {
+                    provider,
+                    kind,
+                    waiter: reply_tx,
+                });
+                self.handle_provider_usage_outputs(outputs);
+            }
+            UiAction::WinSaveView { reply_tx } => {
+                let _ = reply_tx.send(self.focused_app().win_view());
+            }
+            UiAction::WinRestView { scroll_top } => {
+                self.focused_app().set_scroll_top(scroll_top);
+            }
+            UiAction::Builtin(action) => {
+                let actions = self.focused_app().run_builtin(action);
+                self.dispatch(self.focused, actions);
+            }
+        }
+    }
 }
 
 fn session_usage(
@@ -7673,7 +7678,7 @@ mod tests {
                     .is_err()
             );
             let (reply_tx, response) = flume::bounded(1);
-            event_loop.handle_ui_action(UiAction::OpenEditor {
+            event_loop.render(UiAction::OpenEditor {
                 target: None,
                 path: PathBuf::from("plan.md"),
                 reply_tx,

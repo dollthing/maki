@@ -28,6 +28,7 @@ use crate::runtime::{
     SplashFrameRequest, lifecycle_superseded,
 };
 use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
+use crate::ui_sink::UiSink;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -755,6 +756,13 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
+    }
+
+    /// Renders this host's UI actions on {sink} from a thread of its own, for
+    /// a frontend that has no event loop draining `ui_action_rx`.
+    pub fn serve_ui(&self, sink: impl UiSink + Send + 'static) {
+        let actions = self.ui_action_rx();
+        std::thread::spawn(move || crate::ui_sink::serve(actions, sink));
     }
 }
 

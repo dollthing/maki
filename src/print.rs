@@ -1376,6 +1376,8 @@ mod tests {
             })),
         )
         .unwrap();
+        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
+        host.serve_ui(ui);
         if nested {
             host.load_source(
                 "print_bundled_task",
@@ -1431,6 +1433,8 @@ mod tests {
                         assert(selection.spec == "{SPEC}" and selection.fast)
                         local changed, err = root:set_model(ctx, {{ fast = false }})
                         assert(changed == nil and err == "{fixed_root}")
+                        local view, view_err = maki.fn.winsaveview()
+                        assert(view == nil and view_err == "{no_ui}", view_err)
                         local mode, mode_err = root:set_mode(ctx, "build")
                         assert(mode == nil and mode_err == "{fixed_root}", mode_err)
                         local set, set_err = maki.session.set_option("model", "{SPEC}")
@@ -1446,6 +1450,7 @@ mod tests {
             "#,
                 fixed_root = maki_lua::agent_errors::FIXED_ROOT_CONFIG_ERROR,
                 session_required = maki_lua::agent_errors::SESSION_REQUIRED_ERR,
+                no_ui = maki_lua::ui_sink::NO_UI_ERR,
             ),
         ).unwrap();
         let mut literal = input(match outcome {
@@ -1521,9 +1526,9 @@ mod tests {
                     ),
                     "{dispatch:?}"
                 );
-                let action = host.ui_action_rx().recv_timeout(GATE_TIMEOUT).unwrap();
-                assert!(
-                    matches!(action, maki_lua::UiAction::Flash(ref text) if text == COMMAND_FINISHED),
+                assert_eq!(
+                    notices.recv_timeout(GATE_TIMEOUT).unwrap(),
+                    COMMAND_FINISHED,
                     "initialized command did not finish"
                 );
             }
