@@ -310,6 +310,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `max_concurrent` | integer | - | 1 | Deprecated and ignored. Subagent capacity comes from agent.max_concurrent_agent_turns. |
 
 ### `plugins.webfetch`
 
