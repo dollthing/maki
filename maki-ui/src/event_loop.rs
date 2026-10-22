@@ -21,7 +21,6 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
-use maki_agent::SessionMailbox;
 use maki_agent::actor::{ConfigChange, HistoryChange};
 use maki_agent::command::CustomCommand;
 #[cfg(test)]
@@ -632,18 +631,6 @@ fn handle_toggle_session_option(
         (runtime.id(), id),
         &internal_tx,
     );
-}
-
-#[cfg(test)]
-fn dispatch_mode_change_op(
-    runtime: &SessionRuntime,
-    storage: &StateDir,
-    modes: Arc<maki_agent::ModeRegistry>,
-    internal_tx: flume::Sender<InternalEvent>,
-    id: String,
-) {
-    let target = selected_agent(runtime);
-    dispatch_target_mode_change_op(runtime, target, storage, modes, None, internal_tx, id);
 }
 
 fn dispatch_target_mode_change_op(
@@ -1356,9 +1343,6 @@ struct SpawnCtx {
     trust_question: Option<TrustQuestion>,
 }
 
-/// The slice of [`SpawnCtx`] that registering a coordinator needs. Split out
-/// so the session-rotation invariant can be tested without standing up an
-/// event loop, which owns a terminal and has no test harness.
 struct RuntimeCheckpointBinding {
     ordinary: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
     guarded: Mutex<Option<Arc<dyn CheckpointWriter<SessionCheckpoint>>>>,
@@ -1418,113 +1402,22 @@ impl CheckpointWriter<SessionCheckpoint> for RuntimeCheckpointBinding {
 struct CoordinatorDeps {
     catalog: maki_agent::session_coordinator::SessionOptionCatalog,
     model_policy: Arc<ModelPolicy>,
-    #[cfg(test)]
-    storage_writer: Arc<StorageWriter>,
     checkpoint: Arc<RuntimeCheckpointBinding>,
 }
 
-/// Registers the coordinator that owns a session's options, history and lease.
-/// Keyed to the session id, so anything that changes a tab's session -- `/new`
-/// rotates to a fresh one -- must register again rather than keep the old
-/// handle.
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn register_coordinator<H: CoordinatorHandles>(
+fn prepare_coordinator(
     deps: &CoordinatorDeps,
     session: &AppSession,
     history: Vec<Message>,
     available_models: Vec<Arc<str>>,
-    handles: &H,
-    permissions: &Arc<PermissionManager>,
-    thinking: DomainThinkingConfig,
-) -> Result<SessionCoordinatorHandle> {
-    prepare_coordinator(
-        deps,
-        session,
-        history,
-        available_models,
-        handles,
-        permissions,
-        thinking,
-    )?
-    .activate()
-    .map_err(|error| eyre!(error))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_coordinator<H: CoordinatorHandles>(
-    deps: &CoordinatorDeps,
-    session: &AppSession,
-    history: Vec<Message>,
-    available_models: Vec<Arc<str>>,
-    handles: &H,
+    handles: &PreparedAgentHandles,
     permissions: &Arc<PermissionManager>,
     thinking: DomainThinkingConfig,
 ) -> Result<PreparedSessionCoordinator> {
     let mailbox = handles
         .mailbox()
         .ok_or_else(|| eyre!("session mailbox unavailable"))?;
-    prepare_coordinator_with_mailbox(
-        deps,
-        session,
-        history,
-        available_models,
-        permissions,
-        mailbox,
-        thinking,
-    )
-}
-
-trait CoordinatorHandles {
-    fn mailbox(&self) -> Option<SessionMailbox>;
-}
-
-impl CoordinatorHandles for AgentHandles {
-    fn mailbox(&self) -> Option<SessionMailbox> {
-        self.mailbox()
-    }
-}
-
-impl CoordinatorHandles for PreparedAgentHandles {
-    fn mailbox(&self) -> Option<SessionMailbox> {
-        self.mailbox()
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn register_coordinator_with_mailbox(
-    deps: &CoordinatorDeps,
-    session: &AppSession,
-    history: Vec<Message>,
-    available_models: Vec<Arc<str>>,
-    permissions: &Arc<PermissionManager>,
-    mailbox: SessionMailbox,
-    thinking: DomainThinkingConfig,
-) -> Result<SessionCoordinatorHandle> {
-    prepare_coordinator_with_mailbox(
-        deps,
-        session,
-        history,
-        available_models,
-        permissions,
-        mailbox,
-        thinking,
-    )?
-    .activate()
-    .map_err(|error| eyre!(error))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_coordinator_with_mailbox(
-    deps: &CoordinatorDeps,
-    session: &AppSession,
-    history: Vec<Message>,
-    available_models: Vec<Arc<str>>,
-    permissions: &Arc<PermissionManager>,
-    mailbox: SessionMailbox,
-    thinking: DomainThinkingConfig,
-) -> Result<PreparedSessionCoordinator> {
     let model_spec = session.model.clone();
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
@@ -1549,47 +1442,11 @@ fn prepare_coordinator_with_mailbox(
     .map_err(|error| eyre!(error))
 }
 
-/// Retires a tab's coordinator and registers one for the session id its app
-/// has just rotated onto, returning the retired handle for the caller to
-/// close. A runtime's coordinator, mailbox and app session id must always
-/// agree: `/new` mints a new session, and a coordinator left on the old id
-/// makes the previous session unrestorable and denies the new one a lease.
-#[cfg(test)]
-fn rotate_session_coordinator(
-    deps: &CoordinatorDeps,
-    rt: &mut SessionRuntime,
-    available_models: Vec<Arc<str>>,
-) -> Result<SessionCoordinatorHandle> {
-    let session = Arc::clone(&rt.app.state.session);
-    let permissions = Arc::clone(&rt.app.permissions);
-    let thinking = rt.app.state.thinking;
-    // Registration first: rotating the mailbox is not undoable, and a failure
-    // after it would leave the tab on a session id nothing can resolve, with
-    // every later operation checkpointing into the retired session's file.
-    let mailbox = SessionMailbox::new(session.id);
-    let coordinator = register_coordinator_with_mailbox(
-        deps,
-        &session,
-        Vec::new(),
-        available_models,
-        &permissions,
-        mailbox.clone(),
-        thinking,
-    )?;
-    deps.storage_writer.seed(session);
-    rt.handles.set_mailbox(mailbox);
-    let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
-    rt.app.coordinator = Some(coordinator);
-    Ok(retired)
-}
-
 impl SpawnCtx {
     fn coordinator_deps(&self) -> CoordinatorDeps {
         CoordinatorDeps {
             catalog: self.lua_event_handle.session_option_catalog(),
             model_policy: Arc::clone(&self.model_policy),
-            #[cfg(test)]
-            storage_writer: Arc::clone(&self.storage_writer),
             checkpoint: Arc::new(RuntimeCheckpointBinding::new(&self.storage_writer)),
         }
     }
@@ -1769,7 +1626,6 @@ impl SpawnCtx {
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
-            self.mcp_config_errors.clone(),
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
@@ -6126,10 +5982,12 @@ mod tests {
             let (internal_tx, internal_rx) = flume::unbounded();
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
-            dispatch_mode_change_op(
+            dispatch_target_mode_change_op(
                 &runtime,
+                Some(manager.lookup(root).unwrap()),
                 &storage,
                 EventHandle::disconnected_for_test().mode_registry(),
+                None,
                 internal_tx,
                 "plan".into(),
             );
@@ -6904,7 +6762,6 @@ mod tests {
             Timeouts::default(),
             EventHandle::disconnected_for_test(),
             None,
-            McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),
             SystemPromptOverride::default(),
         );
@@ -7067,91 +6924,6 @@ mod tests {
         > {
             Box::pin(async { Ok(vec![maki_providers::ModelInfo::id_only("focused".into())]) })
         }
-    }
-
-    /// A real `StorageWriter`, so the coordinator checkpoint path -- which
-    /// merges into the writer's snapshot for the session -- is exercised
-    /// rather than stubbed away.
-    fn test_coordinator_deps() -> CoordinatorDeps {
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let storage_writer = Arc::new(StorageWriter::new(
-            StateDir::from_path(std::env::temp_dir()),
-            warn_tx,
-        ));
-        CoordinatorDeps {
-            catalog: Default::default(),
-            model_policy: Arc::default(),
-            checkpoint: Arc::new(RuntimeCheckpointBinding::new(&storage_writer)),
-            storage_writer,
-        }
-    }
-
-    /// `/new` swaps the app onto a fresh session id. The coordinator is keyed
-    /// to the id, so it has to move with it: leaving it behind made the
-    /// previous session unrestorable ("session already live"), denied the new
-    /// session a lease, and left the tab's mailbox on the retired session.
-    #[test]
-    fn rotating_a_session_moves_its_coordinator_and_mailbox() {
-        let deps = test_coordinator_deps();
-        let mut rt = test_runtime(model_named("first"));
-        let old_id = rt.id();
-        assert_eq!(rt.coordinator.read().session_id(), old_id);
-
-        // What `reset_session` does: a brand new session in the same tab.
-        rt.app.state.session = Arc::new(AppSession::new("anthropic/test-model", "/tmp"));
-        let new_id = rt.id();
-        assert_ne!(new_id, old_id);
-
-        let retired = rotate_session_coordinator(&deps, &mut rt, Vec::new())
-            .expect("rotation registers a coordinator for the new session");
-
-        assert_eq!(retired.read().session_id(), old_id);
-        assert_eq!(
-            rt.coordinator.read().session_id(),
-            new_id,
-            "the tab's coordinator must follow its session id"
-        );
-        assert_eq!(
-            rt.handles.mailbox().map(|mailbox| mailbox.session_id()),
-            Some(new_id),
-            "the new coordinator hands out the mailbox the agent polls"
-        );
-        assert!(
-            SessionCoordinatorHandle::resolve(new_id).is_ok(),
-            "the new session must be addressable"
-        );
-
-        // The first option change on the rotated session checkpoints, which
-        // merges into the storage writer's snapshot for that id. Registering
-        // without seeding that snapshot failed here with "session snapshot is
-        // unavailable".
-        smol::block_on(rt.coordinator.set_option(
-            maki_agent::session_options::YOLO_OPTION_ID,
-            maki_agent::session_options::ENABLED_VALUE,
-        ))
-        .expect("a rotated session must be able to checkpoint");
-
-        // Restoring the previous session means registering it again, which is
-        // what failed with "session already live" while the retired handle
-        // stayed registered.
-        let _ = smol::block_on(retired.close());
-        let restored = register_coordinator(
-            &deps,
-            &AppSession::new("anthropic/test-model", "/tmp"),
-            Vec::new(),
-            Vec::new(),
-            &rt.handles,
-            &Arc::clone(&rt.app.permissions),
-            DomainThinkingConfig::Off,
-        );
-        assert!(
-            restored.is_ok(),
-            "a retired session must be re-registerable: {:?}",
-            restored.err().map(|error| error.to_string())
-        );
-
-        let _ = smol::block_on(restored.unwrap().close());
-        let _ = smol::block_on(rt.coordinator.close());
     }
 
     /// Tabs hold their own models. A sync that read one shared slot would

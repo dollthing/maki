@@ -310,8 +310,7 @@ impl App {
     }
 
     /// Resume at process start: the agent was already spawned with this
-    /// history, so no respawn follows and the restored queue must be
-    /// flushed here.
+    /// history, so the restored queue must be flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
         self.permissions
             .set_session_yolo(self.state.session.meta.yolo);

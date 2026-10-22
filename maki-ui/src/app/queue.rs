@@ -442,9 +442,8 @@ impl App {
             .is_ok()
     }
 
-    /// Push restored queue items only here, never in `restore_display`: on
-    /// load/rewind the display is restored before `respawn` swaps the shared
-    /// queue, so pushing earlier would fill a queue that is about to die.
+    /// Push restored queue items only here, never in `restore_display`, which
+    /// runs before the loaded or rewound history is committed.
     pub(crate) fn flush_restored_queue(&mut self) {
         // The live queue owns the text from here on, so the recovery
         // snapshot must stop overriding it on save.

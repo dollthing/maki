@@ -4810,7 +4810,7 @@ fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
 }
 
 #[test]
-fn apply_loaded_session_defers_queued_messages_until_respawn() {
+fn apply_loaded_session_defers_queued_messages_until_flush() {
     let mut app = test_app();
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.queued_messages = vec!["deferred".into()];

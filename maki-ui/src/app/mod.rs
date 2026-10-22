@@ -1,8 +1,7 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
-//! `run_id` invalidates in-flight agent events. It bumps in exactly three
-//! places, one per transition: `start_run`, `handle_cancel`, and
-//! `AgentHandles::respawn`. Everything else only reads it.
+//! `run_id` invalidates in-flight agent events. Only `record_run_start` and
+//! the cancel fence write it. Everything else only reads it.
 
 mod btw;
 mod image_paste;
