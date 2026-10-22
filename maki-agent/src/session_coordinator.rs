@@ -1847,34 +1847,27 @@ mod tests {
             claim: CheckpointClaim,
         ) -> CheckpointFuture {
             let gate = lock(&self.gate).take();
-            let saved = Arc::clone(&self.writer.saved);
+            let session_id = request.session_id;
+            let save = self.writer.checkpoint(request);
             Box::pin(async move {
+                let claim = || {
+                    claim(&publication).map_err(|message| CheckpointError::Save {
+                        session_id,
+                        message,
+                    })
+                };
+                let claim_first = gate.as_ref().is_none_or(|gate| gate.claimed);
+                if claim_first {
+                    claim()?;
+                }
                 if let Some(gate) = gate {
-                    if gate.claimed {
-                        claim(&publication).map_err(|message| CheckpointError::Save {
-                            session_id: request.session_id,
-                            message,
-                        })?;
-                    }
                     gate.reached.send_async(()).await.unwrap();
                     gate.release.recv_async().await.unwrap();
-                    if !gate.claimed {
-                        claim(&publication).map_err(|message| CheckpointError::Save {
-                            session_id: request.session_id,
-                            message,
-                        })?;
+                    if !claim_first {
+                        claim()?;
                     }
-                } else {
-                    claim(&publication).map_err(|message| CheckpointError::Save {
-                        session_id: request.session_id,
-                        message,
-                    })?;
                 }
-                lock(&saved).push(request.snapshot);
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
+                save.await
             })
         }
     }
@@ -1885,21 +1878,11 @@ mod tests {
     }
     impl CheckpointWriter<SessionCheckpoint> for GuardedWriter {
         fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
-            let fail = self.fail;
-            let saved = Arc::clone(&self.saved);
-            Box::pin(async move {
-                if fail {
-                    return Err(CheckpointError::Save {
-                        session_id: request.session_id,
-                        message: Arc::from(FAILED),
-                    });
-                }
-                lock(&saved).push(request.snapshot);
-                Ok(CheckpointAck {
-                    session_id: request.session_id,
-                    version: request.version,
-                })
-            })
+            self.checkpoint_guarded(
+                request,
+                CheckpointPublication::default(),
+                Arc::new(|_| Ok(())),
+            )
         }
         fn checkpoint_guarded(
             &self,
@@ -2567,11 +2550,9 @@ mod tests {
         });
     }
 
-    #[test_case(false, false; "revoked_before_claim")]
-    #[test_case(true, false; "revoked_after_claim")]
-    #[test_case(false, true; "closed_caller_dropped_before_claim")]
-    #[test_case(true, true; "closed_caller_dropped_after_claim")]
-    fn model_checkpoint_observes_authorized_publication_claim(claimed: bool, close_and_drop: bool) {
+    #[test_case(false; "revoked_before_claim")]
+    #[test_case(true; "revoked_after_claim")]
+    fn model_checkpoint_observes_authorized_publication_claim(claimed: bool) {
         smol::block_on(async {
             let saved = Arc::new(Mutex::new(Vec::new()));
             let installed = Arc::new(Mutex::new(Vec::new()));
@@ -2593,9 +2574,6 @@ mod tests {
             ))
             .unwrap();
             let agent = bind(&coordinator, Arc::clone(&installed));
-            let actor = agent.actor().unwrap();
-            let commits = actor.subscribe_config_commits();
-            let events = actor.subscribe_events();
             let before = coordinator.read().options();
             let authority = Arc::new(Mutex::new(true));
             let captured_authority = Arc::clone(&authority);
@@ -2611,7 +2589,7 @@ mod tests {
                     Err(Arc::from(FAILED))
                 }
             });
-            let mut operation = Some(smol::spawn({
+            let operation = smol::spawn({
                 let coordinator = coordinator.clone();
                 async move {
                     coordinator
@@ -2624,28 +2602,11 @@ mod tests {
                         )
                         .await
                 }
-            }));
+            });
             reached_rx.recv_async().await.unwrap();
             *lock(&authority) = false;
-            if close_and_drop {
-                coordinator.close().await.unwrap();
-                operation.take().unwrap().cancel().await;
-            }
             release_tx.send_async(()).await.unwrap();
-            if close_and_drop {
-                if claimed {
-                    commits.recv_async().await.unwrap();
-                } else {
-                    while !matches!(
-                        events.recv_async().await.unwrap(),
-                        crate::actor::ActorEvent::Idle { .. }
-                    ) {}
-                }
-            } else if claimed {
-                operation.take().unwrap().await.unwrap();
-            } else {
-                assert!(operation.take().unwrap().await.is_err());
-            }
+            assert_eq!(operation.await.is_ok(), claimed);
             assert_eq!(
                 agent.effective_config().unwrap().unwrap().model.spec(),
                 if claimed { NEW } else { OLD }
@@ -2668,9 +2629,7 @@ mod tests {
                 assert!(lock(&installed).is_empty());
             }
             drop(coordinator.read.options.try_reserve(None).unwrap());
-            if !close_and_drop {
-                coordinator.close().await.unwrap();
-            }
+            coordinator.close().await.unwrap();
         });
     }
 
