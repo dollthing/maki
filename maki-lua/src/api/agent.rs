@@ -1184,13 +1184,6 @@ impl SessionParent {
             }
             return Ok(AgentContext::from(&template));
         }
-        if let Ok(host) = ctx.trusted_host_root(lua) {
-            let template = host
-                .template
-                .as_ref()
-                .ok_or("host root spawn template is unavailable")?;
-            return Ok(AgentContext::from(template));
-        }
         dispatch_ctx(lua, ctx, "session").cloned()
     }
 

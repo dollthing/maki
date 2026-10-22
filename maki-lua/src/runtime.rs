@@ -199,7 +199,6 @@ pub enum Request {
         provider: crate::api::session::SessionSnapshotFn,
     },
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
-    InstallHostRootServices(Box<crate::orchestration::HostRootServicesSlot>),
     SetClockFormat(maki_config::ClockFormat),
     LoadSource {
         name: Arc<str>,
@@ -4605,7 +4604,6 @@ async fn run_tool_call(
     cell.plugin_owner = Some(owner);
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
-    ctx.pin_host_root(&lua);
     ctx.bind_origin(&handle);
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
@@ -5001,14 +4999,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
-                        Request::InstallHostRootServices(services) => {
-                            if let Some(previous) = rt.lua.app_data_ref::<crate::orchestration::HostRootServicesSlot>().and_then(|slot| slot.services.clone())
-                                && !services.services.as_ref().is_some_and(|current| Arc::ptr_eq(&previous, current))
-                            {
-                                previous.retire();
-                            }
-                            rt.lua.set_app_data(*services);
-                        }
                         Request::InstallOrchestrationServices(services) => {
                             rt.lua.set_app_data(services);
                         }
@@ -5177,11 +5167,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                             parsed.as_ref(),
                                             typed,
                                         )?;
-                                        let ctx = match target.map_err(mlua::Error::runtime)? {
-                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin.clone())),
-                                            None => LuaCtx::trusted_host_root_context(&lua, plugin.clone())
-                                                .map_err(mlua::Error::runtime)?,
-                                        };
+                                        let ctx = target
+                                            .map_err(mlua::Error::runtime)?
+                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
@@ -5269,11 +5257,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         bind_plugin_owner(&lua, plugin.clone(), owner)?;
                                         let opts = lua.create_table()?;
                                         set_lua_command_options(&lua, &opts, &options_invocation)?;
-                                        let ctx = match target.map_err(mlua::Error::runtime)? {
-                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin.clone())),
-                                            None => LuaCtx::trusted_host_root_context(&lua, plugin.clone())
-                                                .map_err(mlua::Error::runtime)?,
-                                        };
+                                        let ctx = target
+                                            .map_err(mlua::Error::runtime)?
+                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
@@ -5544,11 +5530,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     }
                                     let run = async {
                                         bind_plugin_owner(&lua, plugin.clone(), owner)?;
-                                        let ctx = match target.map_err(mlua::Error::runtime)? {
-                                            Some(target) => Some(LuaCtx::trusted_context(&lua, target, plugin)),
-                                            None => LuaCtx::trusted_host_root_context(&lua, plugin)
-                                                .map_err(mlua::Error::runtime)?,
-                                        };
+                                        let ctx = target
+                                            .map_err(mlua::Error::runtime)?
+                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin));
                                         func.call_async::<()>((LuaValue::Nil, ctx)).await
                                     };
                                     if let Err(e) = run_scoped(&lua, scope, run).await {

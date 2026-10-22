@@ -4,13 +4,12 @@ use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Function, Lua, UserDataRef};
 use serde_json::{Value as JsonValue, json};
 
-use super::authority::{authorize, validate_host_root};
+use super::LuaAgent;
+use super::authority::authorize;
 use super::projection::{origin_json, result_json, selection_json};
-use super::{AgentRuntime, LuaAgent};
 use crate::agent_errors::{NO_ORCHESTRATION_SERVICES, TRUSTED_SUBSCRIPTION_REQUIRED};
 use crate::api::util::ctx::LuaCtx;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
+use crate::api::util::pair::{Pair, try_pair};
 use crate::orchestration::{
     self, AgentEventRequest, TrustedTarget, close_event_callback, event_callback,
     register_event_callback,
@@ -82,10 +81,6 @@ fn subscribe(
     handler: Function,
     kind: EventKind,
 ) -> mlua::Result<Pair<LuaAgentSubscription>> {
-    if matches!(agent.manager, AgentRuntime::HostRoot { .. }) {
-        try_pair!(validate_host_root(lua, ctx, agent));
-        return Ok(err_pair(UNSUPPORTED_OPERATION_ERROR));
-    }
     try_pair!(ctx.trusted(lua).map_err(|_| TRUSTED_SUBSCRIPTION_REQUIRED));
     try_pair!(authorize(lua, ctx, agent));
     let (plugin, _) = try_pair!(current_plugin(lua).ok_or("no active plugin identity"));

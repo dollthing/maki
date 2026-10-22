@@ -1,6 +1,6 @@
 use maki_agent::{EffectiveAgentConfig, TurnOrigin, TurnOutcome, TurnProvenance, TurnResult};
 use maki_providers::{CompleteModelSelection, RequestOptions};
-use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
+use mlua::{Lua, Table, Value as LuaValue};
 use serde_json::{Value as JsonValue, json};
 
 use crate::api::util::convert::json_to_lua;
@@ -13,13 +13,6 @@ fn expect_table(value: LuaValue, error: &'static str) -> mlua::Result<Table> {
         LuaValue::Table(table) => Ok(table),
         _ => Err(mlua::Error::runtime(error)),
     }
-}
-
-pub(super) fn host_selection_table(
-    lua: &Lua,
-    selection: &CompleteModelSelection,
-) -> mlua::Result<Table> {
-    expect_table(lua.to_value(selection)?, SELECTION_NOT_TABLE)
 }
 
 pub(super) fn selection_table(lua: &Lua, config: &EffectiveAgentConfig) -> mlua::Result<Table> {

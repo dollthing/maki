@@ -34,11 +34,10 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
-use maki_lua::host_root::HostRootServices;
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
+use maki_providers::{CompleteModelSelection, TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -404,33 +403,19 @@ fn with_print_handle<T>(
     )
 }
 
-fn bind_print_root(
-    lua_handle: EventHandle,
-) -> (
-    RootBinding,
-    flume::Receiver<(Arc<HostRootServices>, TrustedTarget)>,
-) {
+fn bind_print_root(lua_handle: EventHandle) -> (RootBinding, flume::Receiver<TrustedTarget>) {
     let (installed, services) = flume::bounded(1);
     let binding: RootBinding = Box::new(move |_, root, template| {
         Box::pin(async move {
-            let host_root = Arc::new(HostRootServices::fixed(
-                root.id(),
-                &template.model,
-                template.opts,
-                Arc::clone(&template.model_policy),
-            ));
             let target = TrustedTarget {
                 target: root,
                 template,
             };
-            lua_handle.install_host_root_services(Arc::clone(&host_root));
             lua_handle.install_orchestration_services(Arc::new(
                 AgentOrchestration::bind_fixed_root(Arc::default(), target.clone())
                     .with_completion(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
             ));
-            installed
-                .send((host_root, target))
-                .map_err(|error| error.to_string())
+            installed.send(target).map_err(|error| error.to_string())
         })
     });
     (binding, services)
@@ -492,7 +477,7 @@ pub fn run(
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
     let outcome = (|| {
-        let (binding, host_root) = bind_print_root(lua_handle.clone());
+        let (binding, installed) = bind_print_root(lua_handle.clone());
         let handle = maki_agent::headless::spawn_with_binding(
             HeadlessParams {
                 model: model.clone(),
@@ -526,13 +511,13 @@ pub fn run(
 
         with_print_handle(handle, |handle| {
             smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-            let (host_root, trusted) = host_root.recv().map_err(|error| eyre!(error))?;
-            let _host_root_retirement = host_root.retirement_guard();
+            let trusted = installed.recv().map_err(|error| eyre!(error))?;
+            let selection =
+                CompleteModelSelection::from_model(&trusted.template.model, trusted.template.opts);
             let target = command_registry.bind_target(
                 print_capabilities(),
                 Arc::new(PrintCommandHost(Some(trusted))),
             );
-            let selection = host_root.model(&host_root.reference())?;
             let snapshot = HeadlessSnapshot::default();
             snapshot.install(
                 &lua_handle,
@@ -1331,17 +1316,11 @@ mod tests {
         assert!(!dir.exists(), "print mode must remove its offload dir");
     }
 
-    #[test_case(maki_providers::ModelSelection { fast: Some(false), ..Default::default() }, false, "turn"; "options_only")]
-    #[test_case(maki_providers::ModelSelection::default(), false, "turn"; "empty_patch")]
-    #[test_case(maki_providers::ModelSelection { spec: Some(Arc::from("openai/gpt-5")), ..Default::default() }, false, "turn"; "model_switch")]
-    #[test_case(maki_providers::ModelSelection::default(), true, "turn"; "nested_task")]
-    #[test_case(maki_providers::ModelSelection::default(), false, "completed"; "completed_command")]
-    #[test_case(maki_providers::ModelSelection::default(), false, "unknown"; "unknown_command")]
-    fn print_turn_uses_initialized_config(
-        patch: maki_providers::ModelSelection,
-        nested: bool,
-        outcome: &str,
-    ) {
+    #[test_case(false, "turn"; "command_turn")]
+    #[test_case(true, "turn"; "nested_task")]
+    #[test_case(false, "completed"; "completed_command")]
+    #[test_case(false, "unknown"; "unknown_command")]
+    fn print_turn_uses_initialized_config(nested: bool, outcome: &str) {
         const SPEC: &str = "anthropic/claude-opus-4-8";
         const SYSTEM: &str = "print initialized system";
         const COMMAND: &str = "/print_initialized";
@@ -1421,7 +1400,7 @@ mod tests {
                         return result.result.text
                     end,
                 }})
-            "#, fixed_model = maki_lua::host_root::FIXED_MODEL_ERROR)).unwrap();
+            "#, fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR)).unwrap();
         }
         host.load_source(
             "print_initialized_command",
@@ -1443,7 +1422,7 @@ mod tests {
                         maki.ui.flash("{COMMAND_FINISHED}")
                     end,
                 }})
-            "#, fixed_model = maki_lua::host_root::FIXED_MODEL_ERROR),
+            "#, fixed_model = maki_lua::agent_errors::FIXED_MODEL_ERROR),
         ).unwrap();
         let mut literal = input(match outcome {
             "unknown" => "/print_unknown",
@@ -1490,16 +1469,11 @@ mod tests {
         let mut ran = false;
         let result = with_print_handle(handle, |handle| {
             let root = smol::block_on(handle.initialized_root()).unwrap();
-            let (host_root, trusted) = installed.recv_timeout(GATE_TIMEOUT).unwrap();
+            let trusted = installed.recv_timeout(GATE_TIMEOUT).unwrap();
+            assert_eq!(trusted.target.id(), root.id());
+            assert!(trusted.template.opts.fast);
             let command_host = Arc::new(PrintCommandHost(Some(trusted)));
             let target = registry.bind_target(print_capabilities(), command_host.clone());
-            let reference = host_root.reference();
-            assert_eq!(reference.id(), root.id());
-            assert!(host_root.model(&reference).unwrap().fast);
-            assert!(matches!(
-                smol::block_on(host_root.set_model(&reference, patch)),
-                Err(maki_lua::host_root::HostRootError::FixedModel)
-            ));
             assert!(matches!(
                 smol::block_on(command_host.request(HostRequest::Builtin(
                     BuiltinOperation::ChangeDirectory {
@@ -1509,7 +1483,6 @@ mod tests {
                 Err(CommandError::Producer(_))
             ));
             assert_eq!(root.effective_config().unwrap().unwrap().context.cwd(), cwd);
-            let _retirement = host_root.retirement_guard();
             host.wait_for_worker_barrier_for_test();
             assert_eq!(manager.snapshot()[0].parent_id, None);
             assert_eq!(manager.limits().max_concurrent_agent_turns, 1);

@@ -3,12 +3,9 @@ mod common;
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
-use maki_agent::{AgentId, AgentMode};
 use maki_lua::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
-use maki_lua::host_root::HostRootServices;
 use maki_lua::test_support::InMemoryFs;
 use maki_lua::{PluginHost, UiAction};
-use serde_json::json;
 use test_case::test_case;
 
 const OWNER: &str = "invocation_owner";
@@ -18,8 +15,6 @@ const RELEASE: &str = "/invocation_release";
 const PUBLISHED: &str = "/invocation_published";
 const READY: &str = "invocation parked";
 const UNAVAILABLE: &str = "command handler is unavailable";
-const HOST_RETIRED: &str = "host root reference is stale";
-const PROBE: &str = "invocation_child_probe";
 
 fn host(registry: Arc<ToolRegistry>) -> PluginHost {
     PluginHost::with_session_provider_preparer(
@@ -37,15 +32,6 @@ fn host(registry: Arc<ToolRegistry>) -> PluginHost {
 #[test_case(false; "rejected_reload_preserves_effects")]
 fn suspended_command_effects_use_captured_owner(accepted: bool) {
     let host = host(Arc::clone(ToolRegistry::global_arc()));
-    let (ctx, _trigger) = common::production_like_ctx();
-    host.event_handle()
-        .install_host_root_services(Arc::new(HostRootServices::fixed(
-            AgentId::generate(),
-            &ctx.model,
-            ctx.opts,
-            ctx.model_policy.clone(),
-        )));
-    host.wait_for_worker_barrier_for_test();
     host.load_source(
         CONTROLLER,
         r#"
@@ -63,8 +49,7 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
         r#"
         maki.api.register_command({
             name = '/invocation_park', description = 'exercise captured authority', tui_only = false,
-            handler = function(_, ctx)
-                assert(ctx ~= nil)
+            handler = function()
                 maki.async.await(1, function(callback)
                     maki.store.collect('invocation_gate').gate.release = callback
                     maki.ui.flash('invocation parked')
@@ -145,60 +130,4 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
         assert_eq!(published.recv_async().await.unwrap(), expected);
         assert!(host.ui_action_rx().try_recv().is_err());
     }));
-}
-
-/// A host-root invocation still resolves its own agent and mode, but it has no
-/// managed graph, so `maki.agent.spawn` must fail closed rather than minting an
-/// agent outside the manager's authority.
-#[test]
-fn standalone_control_and_mode_are_bound_to_live_root_invocations() {
-    let registry = Arc::clone(ToolRegistry::global_arc());
-    let host = host(registry.clone());
-    host.load_source(
-        OWNER,
-        &format!(
-            r#"
-            maki.api.register_tool({{
-                name = '{PROBE}', description = 'host-root authority must fail closed',
-                schema = {{ type = 'object', properties = {{ stage = {{ type = 'string' }} }} }},
-                handler = function(input, ctx)
-                    assert(ctx:mode() ~= nil, 'the invocation resolves its mode')
-                    if input.stage == 'retired' then
-                        local agent, err = maki.agent.current(ctx)
-                        assert(agent == nil and err == '{HOST_RETIRED}', err)
-                        return 'ok'
-                    end
-                    local child, err = maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }})
-                    assert(child == nil, 'a host root must not spawn an agent')
-                    assert(err ~= nil, 'spawn must report an error')
-                    return 'ok'
-                end,
-            }})
-            "#
-        ),
-    )
-    .unwrap();
-    let (mut first, _events, _trigger) = common::ctx_with_canned_provider();
-    first.mode = AgentMode::Plan("/plan.md".into());
-    first.registry = registry.clone();
-    let root_id = AgentId::generate();
-    first.execution_agent_id = Some(root_id);
-    let services = Arc::new(HostRootServices::fixed(
-        root_id,
-        &first.model,
-        first.opts,
-        first.model_policy.clone(),
-    ));
-    host.event_handle()
-        .install_host_root_services(services.clone());
-    host.wait_for_worker_barrier_for_test();
-    assert_eq!(
-        common::exec_tool_text(&registry, &first, PROBE, json!({"stage": "spawn"})).unwrap(),
-        "ok"
-    );
-    services.retire();
-    assert_eq!(
-        common::exec_tool_text(&registry, &first, PROBE, json!({"stage": "retired"})).unwrap(),
-        "ok"
-    );
 }

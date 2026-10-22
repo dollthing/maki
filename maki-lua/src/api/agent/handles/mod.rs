@@ -15,7 +15,6 @@ use mlua::Lua;
 
 use crate::api::agent::{LuaActorState, LuaSession};
 use crate::api::util::pair::Pair;
-use crate::host_root::{HostRootRef, HostRootServices, UNSUPPORTED_OPERATION_ERROR};
 
 pub(crate) use agent_methods::{AGENT_DOCS, agent_defer_close};
 pub(crate) use module_fns::{current, focused_agent_ref};
@@ -27,82 +26,9 @@ pub(crate) use subscriptions::SUBSCRIPTION_DOCS;
 pub(crate) use tickets::TURN_DOCS;
 
 #[derive(Clone)]
-enum AgentRuntime {
-    HostRoot {
-        services: Arc<HostRootServices>,
-        reference: HostRootRef,
-    },
-    Managed(AgentManagerHandle),
-}
-
-impl AgentRuntime {
-    fn host(services: Arc<HostRootServices>) -> Self {
-        Self::HostRoot {
-            reference: services.reference(),
-            services,
-        }
-    }
-
-    fn identity(&self, id: Option<AgentId>) -> String {
-        match self {
-            Self::HostRoot { reference, .. } => reference.id().to_string(),
-            _ => id.map(|id| id.to_string()).unwrap_or_default(),
-        }
-    }
-
-    fn managed(&self) -> Result<&AgentManagerHandle, String> {
-        match self {
-            Self::Managed(manager) => Ok(manager),
-            Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-        }
-    }
-
-    fn actor(&self, id: Option<AgentId>) -> Result<AgentActorHandle, String> {
-        let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
-        match self {
-            Self::Managed(manager) => manager.actor(id).map_err(|error| error.to_string()),
-            Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-        }
-    }
-
-    fn lookup(&self, id: Option<AgentId>) -> Result<AgentRef, String> {
-        let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
-        self.managed()?
-            .lookup(id)
-            .map_err(|error| error.to_string())
-    }
-
-    fn close_subtree(&self, id: Option<AgentId>) -> Result<(), String> {
-        let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
-        match self {
-            Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Managed(manager) => manager.close_subtree(id).map_err(|error| error.to_string()),
-        }
-    }
-
-    fn cancel_agent(&self, id: Option<AgentId>) -> Result<(), String> {
-        let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
-        match self {
-            Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-            Self::Managed(manager) => manager.cancel_agent(id).map_err(|error| error.to_string()),
-        }
-    }
-
-    fn cancel_subtree(&self, id: Option<AgentId>) -> Result<(), String> {
-        let id = id.ok_or(UNSUPPORTED_OPERATION_ERROR)?;
-        match self {
-            Self::Managed(manager) => manager
-                .cancel_subtree(id)
-                .map_err(|error| error.to_string()),
-            Self::HostRoot { .. } => Err(UNSUPPORTED_OPERATION_ERROR.into()),
-        }
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct LuaAgent {
-    manager: AgentRuntime,
-    id: Option<AgentId>,
+    manager: AgentManagerHandle,
+    id: AgentId,
     state: Option<Arc<LuaActorState>>,
     held: Option<AgentRef>,
     root: Option<AgentRef>,
@@ -110,29 +36,13 @@ pub(crate) struct LuaAgent {
 }
 
 impl LuaAgent {
-    /// The id the UI keys this agent's transcript by; `None` for host roots.
+    /// The id the UI keys this agent's transcript by.
     pub(crate) fn transcript_id(&self) -> Option<&str> {
         self.state.as_ref().map(|state| state.ui_id.as_str())
     }
 
-    /// A handle without managed graph identity: host roots and unmanaged children.
-    fn without_graph(
-        manager: AgentRuntime,
-        id: Option<AgentId>,
-        state: Option<Arc<LuaActorState>>,
-    ) -> Self {
-        Self {
-            manager,
-            id,
-            state,
-            held: None,
-            root: None,
-            ancestors: Vec::new(),
-        }
-    }
-
     fn identity(&self) -> String {
-        self.manager.identity(self.id)
+        self.id.to_string()
     }
 
     fn reference(&self) -> LuaAgentRef {
@@ -146,8 +56,8 @@ impl LuaAgent {
 
 #[derive(Clone)]
 pub(crate) struct LuaAgentRef {
-    manager: AgentRuntime,
-    id: Option<AgentId>,
+    manager: AgentManagerHandle,
+    id: AgentId,
     #[expect(dead_code, reason = "keeps the node's terminal snapshot slot alive")]
     held: Option<AgentRef>,
 }
@@ -275,7 +185,7 @@ pub(super) fn session_state(lua: &Lua, id: AgentId) -> Option<Arc<LuaActorState>
 /// @return (string?, string?) Agent ID.
 #[lua_fn(name = "id")]
 fn reference_id(_lua: &Lua, this: &LuaAgentRef) -> mlua::Result<Pair<String>> {
-    Ok((Some(this.manager.identity(this.id)), None))
+    Ok((Some(this.id.to_string()), None))
 }
 
 lua_class! {
@@ -298,8 +208,7 @@ mod tests {
     use maki_commands::{
         CommandError, CommandFuture, CommandHost, HostRequest, HostResponse, TargetCapabilities,
     };
-    use maki_config::ModelPolicy;
-    use maki_providers::{RequestOptions, TokenUsage};
+    use maki_providers::TokenUsage;
     use mlua::{AnyUserData, Table};
     use smol::Timer;
     use test_case::test_case;
@@ -319,8 +228,7 @@ mod tests {
     use crate::api::util::command::WinView;
     use crate::api::util::ctx::LuaCtx;
     use crate::orchestration::{
-        HostRootServicesSlot, OrchestrationServices, OrchestrationServicesSlot, TrustedTarget,
-        revoke_plugin,
+        OrchestrationServices, OrchestrationServicesSlot, TrustedTarget, revoke_plugin,
     };
     use crate::runtime::{TaskScope, lock_cell};
     use crate::test_support::spawn_host_for_tests;
@@ -376,46 +284,6 @@ mod tests {
                 Err("wrong test manager".into())
             }
         }
-    }
-
-    #[test]
-    fn standalone_child_registration_is_rejected() {
-        let lua = Lua::new();
-        crate::orchestration::install_plugin_authority(&lua, Arc::from("child-tool"));
-        let scope = TaskScope::detached(&lua);
-        let provider = Arc::new(StreamOnceProvider::new_replies(Vec::new()));
-        let (actor, state, session, _) = session_with_provider(provider, None);
-        let id = actor.agent_id();
-        let service = Arc::new(HostRootServices::fixed(
-            AgentId::generate(),
-            &stub_ctx(&AgentMode::Build).model,
-            RequestOptions::default(),
-            Arc::new(ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(service),
-            template: Some(stub_ctx(&AgentMode::Build)),
-        });
-        let context = stub_ctx(&AgentMode::Build);
-        let owners = AgentOwners::default();
-        owners.record(
-            id,
-            Arc::downgrade(&actor),
-            Arc::downgrade(&state),
-            Box::new(session),
-            Some(Arc::from("child-tool")),
-        );
-        lua.set_app_data(owners);
-        let mut ctx = LuaCtx::handler(&context);
-        ctx.pin_host_root(&lua);
-        ctx.bind_origin(scope.handle());
-        lock_cell(scope.handle()).plugin_origin = Some((Arc::from("child-tool"), 0));
-        lock_cell(scope.handle()).delegated_tool = Some(Default::default());
-        let userdata = lua.create_userdata(ctx).unwrap();
-        let (child, error) = current(&lua, userdata.borrow().unwrap()).unwrap();
-        assert!(error.is_some(), "bare host root must not resolve an agent");
-        assert!(child.is_none());
-        actor.close();
     }
 
     #[test]
@@ -1269,12 +1137,12 @@ mod tests {
             let actor = child.manager.lookup(child.id).unwrap().actor().unwrap();
             assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
             let sessions = lua.app_data_ref::<AgentOwners>().unwrap().clone();
-            assert!(sessions.lock().contains_key(&child.id.unwrap()));
+            assert!(sessions.lock().contains_key(&child.id));
             drop(scope);
             assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
             race(
                 async {
-                    while sessions.lock().contains_key(&child.id.unwrap()) {
+                    while sessions.lock().contains_key(&child.id) {
                         smol::future::yield_now().await;
                     }
                 },
@@ -1380,8 +1248,8 @@ mod tests {
                 .set(
                     "agent",
                     LuaAgent {
-                        manager: AgentRuntime::Managed(manager.clone()),
-                        id: Some(target.id()),
+                        manager: manager.clone(),
+                        id: target.id(),
                         state: Some(Arc::clone(&managed_fixture.as_ref().unwrap().1)),
                         held: Some(target.clone()),
                         root: Some(manager.root().unwrap()),

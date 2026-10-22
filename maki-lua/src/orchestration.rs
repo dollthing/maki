@@ -1,7 +1,6 @@
 use crate::agent_errors::{
     NO_ORCHESTRATION_SERVICES, ORCHESTRATION_CONTEXT_EXPIRED, ORCHESTRATION_SERVICES_EXPIRED,
 };
-use crate::host_root::HostRootServices;
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use arc_swap::ArcSwapOption;
 use maki_agent::actor::{EffectiveAgentConfig, PreparedTransaction};
@@ -399,64 +398,6 @@ pub struct OrchestrationServicesSlot(pub Option<Arc<dyn OrchestrationServices>>)
 pub(crate) fn services(lua: &Lua) -> Option<Arc<dyn OrchestrationServices>> {
     lua.app_data_ref::<OrchestrationServicesSlot>()
         .and_then(|slot| slot.0.clone())
-}
-
-#[derive(Clone, Default)]
-pub struct HostRootServicesSlot {
-    pub services: Option<Arc<HostRootServices>>,
-    pub template: Option<ToolContext>,
-}
-
-#[derive(Clone)]
-pub(crate) struct TrustedHostRootContext {
-    pub(crate) services: Arc<HostRootServices>,
-    pub(crate) template: Option<ToolContext>,
-    pub(crate) plugin: Arc<str>,
-    pub(crate) generation: u64,
-    authority: ScopeAuthority,
-}
-
-impl TrustedHostRootContext {
-    pub(crate) fn new(
-        lua: &Lua,
-        task: &TaskHandle,
-        plugin: Arc<str>,
-        owner: Arc<PluginAuthority>,
-    ) -> Result<Option<Self>, String> {
-        let Some(slot) = lua.app_data_ref::<HostRootServicesSlot>() else {
-            return Ok(None);
-        };
-        let Some(services) = slot.services.clone() else {
-            return Ok(None);
-        };
-        services
-            .validate(&services.reference())
-            .map_err(|error| error.to_string())?;
-        Ok(Some(Self {
-            services,
-            template: slot.template.clone(),
-            plugin,
-            generation: owner.generation,
-            authority: ScopeAuthority {
-                task: Arc::downgrade(task),
-                owner,
-            },
-        }))
-    }
-
-    pub(crate) fn validate(&self, lua: &Lua) -> Result<(), String> {
-        self.authority.validate(lua)?;
-        let current = lua
-            .app_data_ref::<HostRootServicesSlot>()
-            .and_then(|slot| slot.services.clone())
-            .ok_or("host root services expired")?;
-        if !Arc::ptr_eq(&self.services, &current) {
-            return Err("host root context does not belong to this host scope".into());
-        }
-        self.services
-            .validate(&self.services.reference())
-            .map_err(|error| error.to_string())
-    }
 }
 
 #[derive(Default)]

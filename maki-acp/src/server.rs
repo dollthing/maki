@@ -32,7 +32,6 @@ use maki_commands::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
-use maki_lua::host_root::{HostRootRetirementGuard, HostRootServices};
 use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -209,8 +208,6 @@ impl OptionProjection {
 
 struct SessionState {
     handle: InteractiveHandle,
-    host_root: Arc<HostRootServices>,
-    _host_root_retirement: HostRootRetirementGuard,
     coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
@@ -850,7 +847,6 @@ async fn close_session(srv: &mut Server) {
     let Some(mut state) = srv.session.take() else {
         return;
     };
-    state.host_root.retire();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
     let (operation, permission_answers, elicitation) = {
@@ -1104,15 +1100,6 @@ async fn install_session_with_lock(
             )
             .with_completion(persistence.1)
         }));
-    let host_root = Arc::new(HostRootServices::coordinated(
-        root.id(),
-        coordinator.clone(),
-        Arc::clone(&params.model_policy),
-    ));
-    let host_root_retirement = host_root.retirement_guard();
-    params
-        .lua_event_handle
-        .install_host_root_services(Arc::clone(&host_root));
     let pending = PendingState::default();
     let project_trusted = handle.permissions.project_is_trusted();
     start_event_pump(
@@ -1179,8 +1166,6 @@ async fn install_session_with_lock(
     );
     srv.session = Some(SessionState {
         handle,
-        host_root,
-        _host_root_retirement: host_root_retirement,
         coordinator: Some(coordinator),
         checkpoint: Some(checkpoint),
         mcp,
@@ -2734,12 +2719,6 @@ mod tests {
         let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
         previous.task.cancel().await;
-        session.host_root = Arc::new(HostRootServices::coordinated(
-            root.id(),
-            coordinator.clone(),
-            Arc::default(),
-        ));
-        session._host_root_retirement = session.host_root.retirement_guard();
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {
             out_tx: srv.out_tx.clone(),
@@ -3158,12 +3137,6 @@ mod tests {
                 .with_coordinator(coordinator.clone()),
             ),
         );
-        let host_root = Arc::new(HostRootServices::coordinated(
-            root.id(),
-            coordinator.clone(),
-            Arc::new(ModelPolicy::default()),
-        ));
-        let host_root_retirement = host_root.retirement_guard();
         let server = Server {
             out_tx: out_tx.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
@@ -3179,8 +3152,6 @@ mod tests {
                     emitted_version: Mutex::new(coordinator.read().options().version),
                 })),
                 handle,
-                host_root,
-                _host_root_retirement: host_root_retirement,
                 coordinator: Some(coordinator),
                 checkpoint: None,
                 mcp: None,
@@ -5563,9 +5534,9 @@ mod tests {
     }
 
     #[test_case(false, false; "protocol_option")]
-    #[test_case(true, false; "host_root_option")]
+    #[test_case(true, false; "lua_root_option")]
     #[test_case(false, true; "nested_task")]
-    fn acp_immediate_prompt_and_option_change(use_host_root: bool, nested: bool) {
+    fn acp_immediate_prompt_and_option_change(lua_root_option: bool, nested: bool) {
         let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -5610,7 +5581,6 @@ mod tests {
             let session = srv.session.as_ref().unwrap();
             let session_id = session.handle.session_id.to_string();
             let manager = session.handle.manager.clone();
-            let reference = session.host_root.reference();
             handle_prompt(
                 &mut srv,
                 &prompt_request(&session_id, "immediate", false),
@@ -5717,12 +5687,7 @@ mod tests {
                 .read()
                 .options()
                 .version;
-            if use_host_root {
-                let root = &srv.session.as_ref().unwrap().host_root;
-                assert!(matches!(
-                    root.unsupported(&reference),
-                    Err(maki_lua::host_root::HostRootError::UnsupportedOperation)
-                ));
+            if lua_root_option {
                 let changed = _host.event_handle().run_command_for_test(
                     Arc::from("acp_options"),
                     Arc::from("/acp_fast"),
@@ -5781,12 +5746,7 @@ mod tests {
                     |message| message.get("result").is_none() && message.get("error").is_none()
                 )
             );
-            let root = Arc::clone(&srv.session.as_ref().unwrap().host_root);
             close_session(&mut srv).await;
-            assert!(matches!(
-                root.model(&reference),
-                Err(maki_lua::host_root::HostRootError::Stale)
-            ));
             assert!(manager.snapshot().iter().all(|node| matches!(
                 node.graph_lifecycle,
                 maki_agent::manager::GraphLifecycle::Closed

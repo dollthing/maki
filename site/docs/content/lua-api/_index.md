@@ -182,7 +182,7 @@ Register agent close at the end of the current host task, including cancellation
 
 **Parameters:**
 
-- `{agent}` ([`Agent`](#maki-agent-Agent)) Agent to close. Host roots do not support this operation.
+- `{agent}` ([`Agent`](#maki-agent-Agent)) Agent to close.
 
 **Returns:** (`boolean?`, `string?`) true when cleanup is registered, or nil and an error.
 
@@ -1680,7 +1680,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal. Host roots expose only id and status = "running".
+**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 
 ---
 

@@ -6,13 +6,12 @@ use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Lua, Table, UserDataRef};
 use smol::Timer;
 
+use super::LuaAgentTurn;
 use super::authority::{authorize, observe};
 use super::projection::result_table;
-use super::{AgentRuntime, LuaAgentTurn};
 use crate::agent_errors::{SELF_TURN_WAIT, TURN_WAIT_TIMEOUT};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
 use crate::runtime::CANCELLED_MSG;
 
 const UNSETTLED_TURN_RESULT: &str = "turn has no settled result";
@@ -90,13 +89,13 @@ pub(super) async fn ticket_wait(
     }
     drop(this);
     if let Some(active) = &active {
-        if Some(active.agent_id()) == agent.id {
+        if active.agent_id() == agent.id {
             return Ok(err_pair(SELF_TURN_WAIT));
         }
         let actor = try_pair!(agent.manager.actor(agent.id));
         let wait = try_pair!(active.lease().observe_descendant(
             active,
-            try_pair!(agent.id.ok_or(UNSUPPORTED_OPERATION_ERROR)),
+            agent.id,
             &actor,
             ticket,
             timeout.map(Duration::from_secs)
@@ -140,15 +139,11 @@ fn ticket_cancel(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(lua, &ctx, &this.agent));
-    match (&this.agent.manager, this.agent.id) {
-        (AgentRuntime::Managed(manager), Some(id)) => {
-            try_pair!(manager.cancel_turn(id, this.ticket.turn_id(), TurnCancellationReason::User))
-        }
-        _ => {
-            let actor = try_pair!(this.agent.manager.actor(this.agent.id));
-            try_pair!(actor.cancel_turn(this.ticket.turn_id()));
-        }
-    }
+    try_pair!(this.agent.manager.cancel_turn(
+        this.agent.id,
+        this.ticket.turn_id(),
+        TurnCancellationReason::User
+    ));
     Ok((Some(true), None))
 }
 

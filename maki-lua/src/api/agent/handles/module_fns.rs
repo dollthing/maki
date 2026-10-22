@@ -5,13 +5,12 @@ use maki_agent::{ActorEvent, AgentId, AgentManagerHandle};
 use maki_lua_macro::lua_fn;
 use mlua::{Lua, Table, UserDataRef};
 
-use super::authority::{authorize, context_graph, host_agent, lookup, scope, validate_host_root};
-use super::{AgentOwners, AgentRuntime, LuaAgent, LuaAgentRef};
+use super::authority::{authorize, context_graph, lookup, scope};
+use super::{AgentOwners, LuaAgent, LuaAgentRef};
 use crate::agent_errors::{DELEGATED_FOCUS, FOREIGN_AGENT_REFERENCE, NO_FOCUSED_AGENT};
 use crate::api::agent::build_session;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
 use crate::orchestration::resolve_target;
 use crate::runtime::{current_plugin, in_delegated_tool};
 
@@ -20,9 +19,6 @@ use crate::runtime::{current_plugin, in_delegated_tool};
 /// @return (Agent?, string?) Nonowning agent handle.
 #[lua_fn]
 pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgent>> {
-    if let Some(services) = try_pair!(ctx.host_root(lua)) {
-        return Ok((Some(host_agent(services)), None));
-    }
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
     try_pair!(scope(lua, &ctx, id));
     Ok((Some(try_pair!(lookup(manager, id, lua))), None))
@@ -35,8 +31,8 @@ pub(crate) fn focused_agent_ref(lua: &Lua) -> Result<LuaAgentRef, String> {
     }
     let held = resolve_target(lua, None)?.ok_or(NO_FOCUSED_AGENT)?.target;
     Ok(LuaAgentRef {
-        manager: AgentRuntime::Managed(held.manager()),
-        id: Some(held.id()),
+        manager: held.manager(),
+        id: held.id(),
         held: Some(held),
     })
 }
@@ -46,16 +42,6 @@ pub(crate) fn focused_agent_ref(lua: &Lua) -> Result<LuaAgentRef, String> {
 /// @return (AgentRef?, string?) Visibility-only root reference.
 #[lua_fn]
 fn root(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgentRef>> {
-    if let Some(services) = try_pair!(ctx.host_root(lua)) {
-        return Ok((
-            Some(LuaAgentRef {
-                manager: AgentRuntime::host(services),
-                id: None,
-                held: None,
-            }),
-            None,
-        ));
-    }
     let (manager, _) = try_pair!(context_graph(lua, &ctx));
     let id = try_pair!(manager.root_id());
     if let Ok(trusted) = ctx.trusted(lua) {
@@ -64,8 +50,8 @@ fn root(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgentRef>> 
     Ok((
         Some(LuaAgentRef {
             held: Some(try_pair!(manager.lookup(id))),
-            manager: AgentRuntime::Managed(manager),
-            id: Some(id),
+            manager,
+            id,
         }),
         None,
     ))
@@ -81,20 +67,11 @@ fn get(
     ctx: UserDataRef<LuaCtx>,
     reference: UserDataRef<LuaAgentRef>,
 ) -> mlua::Result<Pair<LuaAgent>> {
-    if let AgentRuntime::HostRoot { .. } = reference.manager {
-        let agent = LuaAgent::without_graph(reference.manager.clone(), None, None);
-        try_pair!(validate_host_root(lua, &ctx, &agent));
-        return Ok((Some(agent), None));
-    }
     let (manager, _) = try_pair!(context_graph(lua, &ctx));
-    if ctx.trusted(lua).is_err() && !manager.same_manager(try_pair!(reference.manager.managed())) {
+    if ctx.trusted(lua).is_err() && !manager.same_manager(&reference.manager) {
         return Ok(err_pair(FOREIGN_AGENT_REFERENCE));
     }
-    let agent = try_pair!(lookup(
-        try_pair!(reference.manager.managed()).clone(),
-        try_pair!(reference.id.ok_or(UNSUPPORTED_OPERATION_ERROR)),
-        lua
-    ));
+    let agent = try_pair!(lookup(reference.manager.clone(), reference.id, lua));
     try_pair!(authorize(lua, &ctx, &agent));
     Ok((Some(agent), None))
 }
@@ -124,15 +101,6 @@ fn is_self_or_ancestor(
 /// @return (table?, string?) Array of visibility-only AgentRef values. Visibility does not grant control.
 #[lua_fn]
 fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
-    if let Some(services) = try_pair!(ctx.host_root(lua)) {
-        let table = lua.create_table()?;
-        table.push(LuaAgentRef {
-            manager: AgentRuntime::host(services),
-            id: None,
-            held: None,
-        })?;
-        return Ok((Some(table), None));
-    }
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
     let trusted = ctx.trusted(lua).ok();
     if trusted.is_none() {
@@ -154,8 +122,8 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
         }
         table.push(LuaAgentRef {
             held: Some(try_pair!(manager.lookup(node.agent_id))),
-            manager: AgentRuntime::Managed(manager.clone()),
-            id: Some(node.agent_id),
+            manager: manager.clone(),
+            id: node.agent_id,
         })?;
     }
     Ok((Some(table), None))

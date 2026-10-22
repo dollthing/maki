@@ -4,21 +4,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::LoadedInstructions;
-use maki_agent::cancel::{CancelToken, PublicationRegistration};
+use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
-use maki_agent::{AgentEvent, AgentId, AgentRef};
+use maki_agent::{AgentEvent, AgentRef};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
-use crate::agent_errors::{INVOCATION_EXPIRED, OTHER_RUNTIME};
+use crate::agent_errors::INVOCATION_EXPIRED;
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
-use crate::host_root::{HostRootRef, HostRootServices};
-use crate::orchestration::{HostRootServicesSlot, TrustedHostRootContext};
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
@@ -85,17 +83,12 @@ impl AgentContext {
 pub(crate) struct LuaCtx {
     caps: Caps,
     origin: Option<crate::runtime::TaskHandle>,
-    host_services: Option<Arc<HostRootServices>>,
-    pub(crate) subject: Option<AgentId>,
     pub(crate) cancel: CancelToken,
     tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
 enum Caps {
-    TrustedHostRoot {
-        authority: Box<TrustedHostRootContext>,
-    },
     Trusted {
         authority: Box<crate::orchestration::TrustedContext>,
         agent: Box<AgentContext>,
@@ -124,31 +117,10 @@ impl LuaCtx {
         Self {
             caps,
             origin: None,
-            host_services: None,
-            subject: None,
             cancel: ctx.cancel.clone(),
             tool_output_lines: ctx.tool_output_lines,
             finish_tx: None,
         }
-    }
-
-    pub(crate) fn pin_host_root(&mut self, lua: &mlua::Lua) {
-        self.host_services = lua
-            .app_data_ref::<HostRootServicesSlot>()
-            .filter(|slot| {
-                self.agent().is_some_and(|agent| {
-                    agent.managed_turn.is_none()
-                        && slot.services.as_ref().is_some_and(|services| {
-                            agent.execution_agent_id == Some(services.reference().id())
-                        })
-                })
-            })
-            .and_then(|slot| slot.services.clone());
-        self.subject = self
-            .host_services
-            .as_ref()
-            .map(|services| services.reference().id());
-        self.pin_subject();
     }
 
     pub(crate) fn bind_origin(&mut self, task: &crate::runtime::TaskHandle) {
@@ -164,9 +136,6 @@ impl LuaCtx {
     pub(crate) fn validate_origin(&self, lua: &mlua::Lua) -> Result<(), String> {
         if matches!(self.caps, Caps::Trusted { .. }) {
             return self.trusted(lua).map(|_| ());
-        }
-        if let Caps::TrustedHostRoot { authority } = &self.caps {
-            return authority.validate(lua);
         }
         validate_task_origin(lua, self.origin.as_ref(), false)
     }
@@ -200,8 +169,6 @@ impl LuaCtx {
         Self {
             caps: Caps::Restore { state },
             origin: None,
-            host_services: None,
-            subject: None,
             cancel: CancelToken::none(),
             tool_output_lines,
             finish_tx: None,
@@ -235,8 +202,6 @@ impl LuaCtx {
         Self {
             caps: Caps::Trusted { authority, agent },
             origin: None,
-            host_services: None,
-            subject: None,
             cancel,
             tool_output_lines: ToolOutputLines::default(),
             finish_tx: None,
@@ -254,123 +219,6 @@ impl LuaCtx {
         Ok(authority)
     }
 
-    pub(crate) fn trusted_host_root_context(
-        lua: &mlua::Lua,
-        plugin: Arc<str>,
-    ) -> Result<Option<Self>, String> {
-        crate::runtime::validate_plugin_effect(lua)?;
-        let task = active_task(lua);
-        {
-            let cell = lock_cell(&task);
-            if cell.delegated_tool.is_some() {
-                return Err("delegated tools cannot mint host root authority".into());
-            }
-            if cell.managed_turn.is_some() {
-                return Ok(None);
-            }
-        }
-        let owner = lock_cell(&task)
-            .plugin_owner
-            .clone()
-            .unwrap_or_else(|| crate::orchestration::plugin_authority(lua, plugin.clone()));
-        let Some(authority) =
-            TrustedHostRootContext::new(lua, &task, plugin.clone(), owner.clone())?
-        else {
-            return Ok(None);
-        };
-        let mut cell = lock_cell(&task);
-        if cell
-            .plugin_origin
-            .as_ref()
-            .is_some_and(|(captured, generation)| {
-                captured != &plugin || *generation != authority.generation
-            })
-        {
-            return Err("plugin generation expired before host root admission".into());
-        }
-        cell.set_plugin_origin(Some((authority.plugin.clone(), authority.generation)));
-        cell.plugin_owner = Some(owner);
-        Ok(Some(Self {
-            caps: Caps::TrustedHostRoot {
-                authority: Box::new(authority),
-            },
-            origin: None,
-            host_services: None,
-            subject: None,
-            cancel: cell.cancel.clone(),
-            tool_output_lines: ToolOutputLines::default(),
-            finish_tx: None,
-        }))
-    }
-
-    pub(crate) fn trusted_host_root(
-        &self,
-        lua: &mlua::Lua,
-    ) -> Result<&TrustedHostRootContext, String> {
-        let Caps::TrustedHostRoot { authority } = &self.caps else {
-            return Err(self.cap_err("host root orchestration"));
-        };
-        authority.validate(lua)?;
-        Ok(authority)
-    }
-
-    pub(crate) fn host_root(
-        &self,
-        lua: &mlua::Lua,
-    ) -> Result<Option<Arc<HostRootServices>>, String> {
-        self.validate_origin(lua)?;
-        if crate::runtime::current_managed_turn(lua).is_some() {
-            return Ok(None);
-        }
-        match &self.caps {
-            Caps::TrustedHostRoot { authority } => return Ok(Some(authority.services.clone())),
-            Caps::Handler { agent, .. } if agent.managed_turn.is_none() => {}
-            _ => return Ok(None),
-        }
-        let Some(services) = &self.host_services else {
-            return Ok(None);
-        };
-        if self.subject != Some(services.reference().id()) {
-            return Err("host root execution subject mismatch".into());
-        }
-        let current = lua
-            .app_data_ref::<HostRootServicesSlot>()
-            .and_then(|slot| slot.services.clone())
-            .ok_or("host root services expired")?;
-        if !Arc::ptr_eq(services, &current) {
-            return Err("host root context does not belong to this host scope".into());
-        }
-        services
-            .validate(&services.reference())
-            .map_err(|error| error.to_string())?;
-        Ok(Some(services.clone()))
-    }
-
-    pub(crate) fn host_model_publication_claim(
-        &self,
-        lua: &mlua::Lua,
-        services: &Arc<HostRootServices>,
-        reference: &HostRootRef,
-        publication: &CheckpointPublication,
-    ) -> Result<CheckpointClaim, String> {
-        self.validate_origin(lua)?;
-        let bound = self
-            .host_root(lua)?
-            .ok_or("host root authority is unavailable")?;
-        if !Arc::ptr_eq(&bound, services) {
-            return Err(OTHER_RUNTIME.into());
-        }
-        services
-            .validate(reference)
-            .map_err(|error| error.to_string())?;
-        let (host, session) = services
-            .register_publication(reference, publication)
-            .map_err(|error| error.to_string())?;
-        let mut registrations = vec![host];
-        registrations.extend(session);
-        self.publication_claim(lua, publication, registrations)
-    }
-
     pub(crate) fn agent_publication_claim(
         &self,
         lua: &mlua::Lua,
@@ -379,25 +227,13 @@ impl LuaCtx {
     ) -> Result<CheckpointClaim, String> {
         self.validate_origin(lua)?;
         target.validate_live().map_err(|error| error.to_string())?;
-        let mut registrations = Vec::new();
-        if let Some(host) = lua
-            .app_data_ref::<HostRootServicesSlot>()
-            .and_then(|slot| slot.services.clone())
-        {
-            let (host, session) = host
-                .register_publication(&host.reference(), publication)
-                .map_err(|error| error.to_string())?;
-            registrations.push(host);
-            registrations.extend(session);
-        }
-        self.publication_claim(lua, publication, registrations)
+        self.publication_claim(lua, publication)
     }
 
     fn publication_claim(
         &self,
         lua: &mlua::Lua,
         publication: &CheckpointPublication,
-        registrations: Vec<PublicationRegistration>,
     ) -> Result<CheckpointClaim, String> {
         let task = active_task(lua);
         let (plugin_origin, owner) = {
@@ -417,7 +253,6 @@ impl LuaCtx {
                 &plugin_registration,
                 &task_registrations,
                 &cancel_registration,
-                &registrations,
             );
             if !request.same_request(publication) {
                 return Err(Arc::from(INVOCATION_EXPIRED));
@@ -468,7 +303,7 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(&agent.config),
             Caps::Start { config, .. } => Some(config),
-            Caps::Restore { .. } | Caps::TrustedHostRoot { .. } => None,
+            Caps::Restore { .. } => None,
         }
     }
 
@@ -476,7 +311,7 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent.workflow),
             Caps::Start { workflow, .. } => Some(*workflow),
-            Caps::Restore { .. } | Caps::TrustedHostRoot { .. } => None,
+            Caps::Restore { .. } => None,
         }
     }
 
@@ -484,7 +319,7 @@ impl LuaCtx {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent.audience),
             Caps::Start { audience, .. } => Some(*audience),
-            Caps::Restore { .. } | Caps::TrustedHostRoot { .. } => None,
+            Caps::Restore { .. } => None,
         }
     }
 
@@ -496,7 +331,7 @@ impl LuaCtx {
                 Some(agent.session_id.as_ref())
             }
             Caps::Start { session_id, .. } => Some(session_id.as_ref()),
-            Caps::Restore { .. } | Caps::TrustedHostRoot { .. } => None,
+            Caps::Restore { .. } => None,
         }
     }
 
@@ -524,7 +359,6 @@ impl LuaCtx {
     fn kind(&self) -> &'static str {
         match self.caps {
             Caps::Trusted { .. } => "trusted",
-            Caps::TrustedHostRoot { .. } => "trusted host root",
             Caps::Handler { .. } => "handler",
             Caps::Start { .. } => "start",
             Caps::Restore { .. } => "restore",
@@ -895,50 +729,12 @@ mod tests {
         assert_eq!(ctx.validate_origin(&lua).unwrap_err(), INVOCATION_EXPIRED);
     }
 
-    #[test]
-    fn host_root_context_rejects_service_replacement_retirement_and_scope_exit() {
-        let lua = mlua::Lua::new();
-        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
-        let scope = crate::runtime::TaskScope::detached(&lua);
-        let template = populated_ctx();
-        let services = Arc::new(HostRootServices::fixed(
-            maki_agent::AgentId::generate(),
-            &template.model,
-            maki_providers::RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(services.clone()),
-            template: Some(template.clone()),
-        });
-        let ctx = LuaCtx::trusted_host_root_context(&lua, Arc::from("owner"))
-            .unwrap()
-            .unwrap();
-        assert!(Arc::ptr_eq(
-            &ctx.host_root(&lua).unwrap().unwrap(),
-            &services
-        ));
-        assert!(ctx.trusted_host_root(&lua).unwrap().template.is_some());
-        assert!(ctx.agent().is_none());
-        lua.set_app_data(HostRootServicesSlot::default());
-        assert!(ctx.host_root(&lua).is_err());
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(services.clone()),
-            template: None,
-        });
-        services.retire();
-        assert!(ctx.host_root(&lua).is_err());
-        drop(scope);
-        assert!(ctx.host_root(&lua).is_err());
-    }
-
     #[derive(Clone, Copy, Debug)]
     enum PublicationInvalidation {
         Plugin,
         Invocation,
         Deadline,
         Scope,
-        Host,
         Origin,
     }
 
@@ -946,36 +742,23 @@ mod tests {
     #[test_case::test_case(PublicationInvalidation::Invocation; "invocation_cancellation")]
     #[test_case::test_case(PublicationInvalidation::Deadline; "deadline_expiry")]
     #[test_case::test_case(PublicationInvalidation::Scope; "scope_exit")]
-    #[test_case::test_case(PublicationInvalidation::Host; "host_retirement")]
     #[test_case::test_case(PublicationInvalidation::Origin; "origin_change")]
-    fn captured_host_model_claim_orders_invalidation(invalidation: PublicationInvalidation) {
+    fn publication_claim_orders_invalidation(invalidation: PublicationInvalidation) {
         for claim_first in [false, true] {
             let lua = mlua::Lua::new();
-            crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
+            let owner = crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
             let (trigger, cancel) = CancelToken::new();
             let scope = crate::runtime::TaskScope::new(
                 &lua,
-                crate::runtime::TaskCell::new(cancel, None, None),
+                crate::runtime::TaskCell::new(cancel.clone(), None, None),
             );
             let mut scope = Some(scope);
-            let template = populated_ctx();
-            let services = Arc::new(HostRootServices::fixed(
-                maki_agent::AgentId::generate(),
-                &template.model,
-                maki_providers::RequestOptions::default(),
-                Arc::new(maki_config::ModelPolicy::default()),
-            ));
-            lua.set_app_data(HostRootServicesSlot {
-                services: Some(services.clone()),
-                template: Some(template),
-            });
-            let ctx = LuaCtx::trusted_host_root_context(&lua, Arc::from("owner"))
-                .unwrap()
-                .unwrap();
+            crate::runtime::bind_plugin_owner(&lua, Arc::from("owner"), owner).unwrap();
+            let mut template = populated_ctx();
+            template.cancel = cancel;
+            let ctx = LuaCtx::handler(&template);
             let publication = CheckpointPublication::default();
-            let claim = ctx
-                .host_model_publication_claim(&lua, &services, &services.reference(), &publication)
-                .unwrap();
+            let claim = ctx.publication_claim(&lua, &publication).unwrap();
             if claim_first {
                 let claim = claim.clone();
                 let publication = publication.clone();
@@ -995,7 +778,6 @@ mod tests {
                     .deadline
                     .set(Some(Instant::now() - Duration::from_secs(1))),
                 PublicationInvalidation::Scope => drop(scope.take()),
-                PublicationInvalidation::Host => services.retire(),
                 PublicationInvalidation::Origin => {
                     lock_cell(scope.as_ref().unwrap().handle()).set_plugin_origin(None)
                 }
@@ -1023,36 +805,17 @@ mod tests {
 
     #[test_case::test_case(false; "revoked_before_claim")]
     #[test_case::test_case(true; "revoked_after_claim")]
-    fn tool_host_model_claim_binds_live_plugin_authority(claim_first: bool) {
+    fn publication_claim_binds_live_plugin_authority(claim_first: bool) {
         let lua = mlua::Lua::new();
         let owner = crate::orchestration::install_plugin_authority(&lua, Arc::from("owner"));
         let scope = crate::runtime::TaskScope::detached(&lua);
-        let mut template = populated_ctx();
-        let id = maki_agent::AgentId::generate();
-        template.execution_agent_id = Some(id);
-        let services = Arc::new(HostRootServices::fixed(
-            id,
-            &template.model,
-            maki_providers::RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(services.clone()),
-            template: None,
-        });
         crate::runtime::bind_plugin_owner(&lua, Arc::from("owner"), owner).unwrap();
-        let mut ctx = LuaCtx::handler(&template);
-        ctx.pin_host_root(&lua);
+        let mut ctx = LuaCtx::handler(&populated_ctx());
         ctx.bind_origin(scope.handle());
         let publication = CheckpointPublication::default();
         let aborted = CheckpointPublication::default();
-        let aborted_claim = ctx
-            .host_model_publication_claim(&lua, &services, &services.reference(), &aborted)
-            .unwrap();
-        drop(aborted_claim);
-        let claim = ctx
-            .host_model_publication_claim(&lua, &services, &services.reference(), &publication)
-            .unwrap();
+        drop(ctx.publication_claim(&lua, &aborted).unwrap());
+        let claim = ctx.publication_claim(&lua, &publication).unwrap();
         let other = CheckpointPublication::default();
         assert_eq!(claim(&other).unwrap_err().as_ref(), INVOCATION_EXPIRED);
         assert!(!other.is_cancelled());
@@ -1071,82 +834,6 @@ mod tests {
                 INVOCATION_EXPIRED
             );
         }
-    }
-
-    #[test]
-    fn tool_root_is_pinned_by_execution_id_without_template_and_rejects_replacement() {
-        let lua = mlua::Lua::new();
-        let scope = crate::runtime::TaskScope::detached(&lua);
-        let mut template = populated_ctx();
-        let id = maki_agent::AgentId::generate();
-        template.execution_agent_id = Some(id);
-        let services = Arc::new(HostRootServices::fixed(
-            id,
-            &template.model,
-            maki_providers::RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(services.clone()),
-            template: None,
-        });
-        let mut root = LuaCtx::handler(&template);
-        root.pin_host_root(&lua);
-        root.bind_origin(scope.handle());
-        assert_eq!(root.subject, Some(services.reference().id()));
-        assert!(Arc::ptr_eq(
-            &root.host_root(&lua).unwrap().unwrap(),
-            &services
-        ));
-        let mut child_template = template.clone();
-        child_template.execution_agent_id = Some(maki_agent::AgentId::generate());
-        let mut child = LuaCtx::handler(&child_template);
-        child.pin_host_root(&lua);
-        child.bind_origin(scope.handle());
-        assert!(child.host_root(&lua).unwrap().is_none());
-        let replacement = Arc::new(HostRootServices::fixed(
-            services.reference().id(),
-            &template.model,
-            maki_providers::RequestOptions::default(),
-            Arc::new(maki_config::ModelPolicy::default()),
-        ));
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(replacement),
-            template: Some(template),
-        });
-        assert!(root.host_root(&lua).is_err());
-        assert!(child.host_root(&lua).unwrap().is_none());
-    }
-
-    #[test]
-    fn host_root_mint_rejects_stale_generation_and_delegated_tools() {
-        let lua = mlua::Lua::new();
-        crate::orchestration::install_plugin_authority(&lua, std::sync::Arc::from("owner"));
-        let scope = crate::runtime::TaskScope::detached(&lua);
-        let template = populated_ctx();
-        lua.set_app_data(HostRootServicesSlot {
-            services: Some(Arc::new(HostRootServices::fixed(
-                maki_agent::AgentId::generate(),
-                &template.model,
-                maki_providers::RequestOptions::default(),
-                Arc::new(maki_config::ModelPolicy::default()),
-            ))),
-            template: Some(template),
-        });
-        let plugin: Arc<str> = Arc::from("owner");
-        assert!(
-            LuaCtx::trusted_host_root_context(&lua, plugin.clone())
-                .unwrap()
-                .is_some()
-        );
-        let captured = lock_cell(scope.handle()).plugin_origin.clone();
-        crate::orchestration::revoke_plugin(&lua, &plugin);
-        assert!(LuaCtx::trusted_host_root_context(&lua, plugin.clone()).is_err());
-        assert_eq!(lock_cell(scope.handle()).plugin_origin, captured);
-        lock_cell(scope.handle()).plugin_origin = None;
-        lock_cell(scope.handle()).delegated_tool = Some(Default::default());
-        assert!(LuaCtx::trusted_host_root_context(&lua, plugin).is_err());
-        assert!(lock_cell(scope.handle()).plugin_origin.is_none());
     }
 
     const FOREIGN_CONTEXT_MSG: &str = "context belongs to another invocation";

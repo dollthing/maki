@@ -6,7 +6,6 @@ pub mod docs;
 pub mod docs_render;
 mod error;
 pub(crate) mod hook;
-pub mod host_root;
 pub mod language;
 mod loader;
 pub mod orchestration;

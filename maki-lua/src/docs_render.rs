@@ -160,15 +160,15 @@ Tool handlers receive `handler(input, ctx)`. Slash-command handlers receive `han
 
 `maki.agent.current(ctx)` and `ctx:agent()` resolve the invocation's agent. A tool context refers to the executing agent, not UI focus. A trusted command context pins its target. A keymap context is pinned to the agent selected when the key was pressed, so later focus changes do not retarget it. If the pinned agent closes, the context keeps its plugin authority: `maki.agent.root`, `list` and `get` still work, and only calls that address the closed agent, such as `maki.agent.current` or `spawn` under it, fail. `maki.ui.focused_agent()` resolves the agent that has UI focus at call time as a visibility-only reference; pass it to `maki.agent.get(ctx, ref)` for control. `ctx:defer_close(agent)` registers authorized host-held cleanup at callback exit, including cancellation. Context authority expires when its invocation ends or is cancelled, or when its plugin generation is revoked. Storing a context for a later handler does not extend that authority.
 
-In a tool handler, `ctx:model()` reads the selection admitted for the executing turn. `agent:model(ctx)` reads the agent's committed selection. These can differ after a configuration update while the turn is running. Both selections contain `spec`, `thinking`, and `fast`; descriptive model metadata is separate. `ctx:mode()` similarly reads the admitted mode, including on non-TUI roots whose committed `Agent:mode` operation is unsupported.
+In a tool handler, `ctx:model()` reads the selection admitted for the executing turn. `agent:model(ctx)` reads the agent's committed selection. These can differ after a configuration update while the turn is running. Both selections contain `spec`, `thinking`, and `fast`; descriptive model metadata is separate. `ctx:mode()` and `agent:mode(ctx)` differ the same way.
 
 `Agent` handles do not close their agents when garbage-collected. In managed graphs, children spawned by delegated tools survive normal completion of the creating turn. Cancelling a managed turn through `ticket:cancel` closes the child subtrees that turn delegated; UI cancellation does not. Explicit close through `agent:close` or `task_despawn` closes the selected subtree. Children spawned by trusted plugin handlers have independent ownership and survive unrelated turn cancellation; explicit close or plugin revocation retires them. See [Agent work](/docs/agent-work/#cancellation) for UI cancellation and child lifetime. `AgentSubscription` handles do not unsubscribe when garbage-collected. A subscription requires trusted authority; delegated tool handlers cannot register one. Call `subscription:close()` to revoke future deliveries and cancel active handlers. Plugin unload also revokes registrations. Delegated tool handlers cannot enter the trusted `maki.api.run_command()` route. They also cannot register commands, keymaps, autocmds, completion sources, expanders, usage callbacks, notify handlers, slots, timers, or deferred callbacks, because those later run with host authority. Mutators that address the focused session or the global mode registry, such as `maki.api.mode.set`, `maki.session.set_thinking`, and `maki.session.set_option` without a `session`, refuse them as well, because they address no explicit target. Callbacks a delegated tool fires synchronously, such as autocmds from `exec_autocmds`, run with the same delegated restrictions. These checks confine what a delegated invocation can register. They do not sandbox the plugin's own code, which other callbacks of the same plugin can still call.
 
-The compatibility `Session` API has different lifetime and admission rules. A trusted-created Session remains usable only by same-plugin handlers with current authority in the same host generation. A tool-created Session expires with its creating invocation. Passing userdata to another coroutine does not transfer authority. Context-free Session methods validate current coroutine authority against the creation policy ceiling. Plugin revocation cancels owned work. `Session:send(message)` queues and returns a boolean; `Agent:send(ctx, message)` requires an idle agent and returns an exact-turn ticket. `Agent:enqueue(ctx, message)` queues a distinct FIFO turn and returns its ticket. `Agent:submit(ctx, message)` uses the shared [message queue](/docs/agent-work/#messages-and-turns): it starts work or joins compatible work and returns the ticket for that turn.
+`Agent:send(ctx, message)` requires an idle agent and returns an exact-turn ticket. `Agent:enqueue(ctx, message)` queues a distinct FIFO turn and returns its ticket. `Agent:submit(ctx, message)` uses the shared [message queue](/docs/agent-work/#messages-and-turns): it starts work or joins compatible work and returns the ticket for that turn.
 
 `Agent:prompt(ctx, message, { timeout = seconds })` admits an idle-only turn and waits. A timeout stops observation, not execution. Its error table contains `kind = "timeout"`, `message`, and the exact `ticket`. `timeout = 0` is nonblocking and returns that table while the turn is pending. The ticket can be waited on or cancelled from a current valid context. `send` or `enqueue` followed by `ticket:wait` keeps observation and execution ownership explicit.
 
-### Migration from the previous task and Session APIs
+### Migration from the previous task API
 
 `maki.agent.spawn` uses the shared model selection. Replace the old constructor options:
 
@@ -182,13 +182,13 @@ with:
 { model = { spec = "provider/model", thinking = "high", fast = false } }
 ```
 
-A plain `model = "provider/model"` is also accepted. The old `model_spec` and top-level `thinking` and `fast` fields are rejected, including by the compatibility Session constructor.
+A plain `model = "provider/model"` is also accepted. The old `model_spec` and top-level `thinking` and `fast` fields are rejected.
 
 The blocking `task` and polling `task_get` tools are removed. Callers use `task_spawn`, retain its `task_id` and `turn_id`, and pass both to `task_wait` for the exact turn. `task_send` uses `Agent:submit` and returns the turn ID for the accepted message. `task_despawn` closes the task and its descendants. [Agent work](/docs/agent-work/#task-waits) defines wait snapshots, result shapes, timeouts, and shared-turn behavior. SDK clients naming `Task` now select `task_spawn` and receive the asynchronous spawn result rather than the completed child answer.
 
 Rename `ui.tool_output_lines.task` to `ui.tool_output_lines.task_spawn` in configuration. The old key fails configuration loading. Rename task-keyed permission rules and saved allow entries to `task_spawn`; old entries no longer match. See [Configuration](/docs/configuration/) and [Permissions](/docs/permissions/). Resumed transcripts with old `task` calls use the default tool view because the removed tool no longer supplies a restore view.
 
-A task's `output_schema` describes its structured final report. `task_wait` returns the validated object in `result.captured`; `result.text` remains the assistant reply. Consuming new instructions invalidates older structured and local captured results; only a fresh report can satisfy completion and appear as `captured`. Child observations do not invalidate reports. Standalone children use their host's ownership and cancellation services; this does not make their root a managed graph.
+A task's `output_schema` describes its structured final report. `task_wait` returns the validated object in `result.captured`; `result.text` remains the assistant reply. Consuming new instructions invalidates older structured and local captured results; only a fresh report can satisfy completion and appear as `captured`. Child observations do not invalidate reports.
 
 [Agent work](/docs/agent-work/#child-reports-and-completion) defines main and subagent completion, child-report delivery, and continuations after completion or cancellation.
 
@@ -196,21 +196,9 @@ A task's `output_schema` describes its structured final report. `task_wait` retu
 
 UI agent actions keep the target selected when the action starts. `maki.session.*` retains session scope. See [Agent work](/docs/agent-work/#focused-controls) for shared input, working directories, closed targets, and pending-message controls.
 
-### Host-root operations
+### Roots in other frontends
 
-Non-TUI hosts expose a stable root reference without a managed graph. The current host-root adapter supports the following operations:
-
-| Operation | ACP and SDK root | Fixed print/headless root |
-|-----------|------------------|---------------------------|
-| `current`, `root`, `get`, `ctx:agent` | Supported | Supported |
-| `list` | Root and accessible live plugin-owned standalone children | Root and accessible live plugin-owned standalone children |
-| Tool `ctx:model()` and `ctx:mode()` admitted configuration | Supported | Supported |
-| `Agent:model` committed selection and `available_models` | Supported | Supported |
-| `Agent:set_model`, including options-only updates | Supported through the session coordinator | Rejected before mutation |
-| Root turns, transcript, mode, cancellation, close, subscriptions | Unsupported | Unsupported |
-| Child spawn | Standalone child | Standalone child |
-
-Host-root `status` contains only `id` and `status = "running"`. It does not expose actor queue or usage fields. Unsupported operations return `operation is unavailable for this host root`. Fixed-root model updates return `model changes are unavailable for this fixed host root`. Host shutdown retires the reference; it cannot resolve a replacement runtime. Standalone children support `submit`; this does not imply managed completion delivery or root steering for their host. Concurrent ACP root prompts still reject.
+Print, SDK and ACP roots are managed agents in the same graph as the TUI, so every `Agent` operation, including child spawn, works the same way there. Print runs a fixed root: `Agent:set_model` on it returns `model changes are unavailable for this fixed root` before anything changes. SDK and ACP root model changes go through the session coordinator and persist with the session. Concurrent ACP root prompts still reject.
 
 The [Lua API reference](/docs/lua-api/) defines the method signatures and returned fields. The Context concepts page describes model context windows, not Lua invocation authority.
 

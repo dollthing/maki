@@ -15,14 +15,14 @@ use maki_storage::plans::new_plan_path;
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, observe, retire_closed};
-use super::projection::{host_selection_table, selection_table};
+use super::projection::selection_table;
 use super::subscriptions::{
     on_close__doc, on_close__register, on_config_change__doc, on_config_change__register,
     on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
 use super::tickets::ticket_wait;
-use super::{AgentOwners, AgentRuntime, LuaAgent, LuaAgentRef, LuaAgentTurn};
+use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
     RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT,
@@ -36,7 +36,6 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
-use crate::host_root::UNSUPPORTED_OPERATION_ERROR;
 use crate::orchestration::{self, plugin_authority};
 use crate::runtime::{current_managed_turn, current_plugin, register_defer_close};
 
@@ -49,16 +48,12 @@ fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
 
 /// Read lifecycle, active turn, queue size, and cumulative usage.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal. Host roots expose only id and status = "running".
+/// @return (table?, string?) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 #[lua_fn(name = "status")]
 fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, this));
     let table = lua.create_table()?;
     table.set("id", this.identity())?;
-    if matches!(this.manager, AgentRuntime::HostRoot { .. }) {
-        table.set("status", "running")?;
-        return Ok((Some(table), None));
-    }
     let snapshot = if let Some(held) = &this.held {
         try_pair!(
             try_pair!(held.snapshot())
@@ -89,14 +84,6 @@ fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
 #[lua_fn(name = "model")]
 fn agent_model(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(lua, &ctx, this));
-    if let AgentRuntime::HostRoot {
-        services,
-        reference,
-    } = &this.manager
-    {
-        let selection = try_pair!(services.model(reference));
-        return Ok((Some(host_selection_table(lua, &selection)?), None));
-    }
     let actor = try_pair!(this.manager.actor(this.id));
     let config = try_pair!(actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE));
     Ok((Some(selection_table(lua, &config)?), None))
@@ -112,18 +99,10 @@ fn agent_available_models(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(lua, &ctx, this));
-    let models = if let AgentRuntime::HostRoot {
-        services,
-        reference,
-    } = &this.manager
-    {
-        try_pair!(services.available_models(reference))
-    } else {
-        let service =
-            try_pair!(orchestration::services(lua).ok_or("host model catalog is unavailable"));
-        let target = try_pair!(this.manager.lookup(this.id));
-        try_pair!(service.available_models(&target))
-    };
+    let service =
+        try_pair!(orchestration::services(lua).ok_or("host model catalog is unavailable"));
+    let target = try_pair!(this.manager.lookup(this.id));
+    let models = try_pair!(service.available_models(&target));
     Ok((Some(lua.create_sequence_from(models)?), None))
 }
 
@@ -184,7 +163,10 @@ fn admit(
     submit: bool,
 ) -> Result<LuaAgentTurn, String> {
     authorize(lua, ctx, agent)?;
-    let actor = agent.manager.actor(agent.id)?;
+    let actor = agent
+        .manager
+        .actor(agent.id)
+        .map_err(|error| error.to_string())?;
     let config = actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE)?;
     let input = AgentInput {
         message,
@@ -416,46 +398,21 @@ async fn agent_set_model(
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(&lua, &ctx, &this));
     let selection = try_pair!(selection_from_lua(&lua, patch));
-    if let AgentRuntime::HostRoot {
-        services,
-        reference,
-    } = &this.manager
-    {
-        let publication = CheckpointPublication::default();
-        let claim =
-            try_pair!(ctx.host_model_publication_claim(&lua, services, reference, &publication));
-        let selection = try_pair!(
-            services
-                .set_model_with_claim(reference, selection, publication, claim)
-                .await
-        );
-        return Ok((Some(host_selection_table(&lua, &selection)?), None));
-    }
     let spec = selection.spec.map(|spec| spec.to_string());
     let actor = try_pair!(this.manager.actor(this.id));
     let mut template = try_pair!(destination_template(&lua, &this));
-    let durable = if let AgentRuntime::Managed(_) = &this.manager {
-        let target = try_pair!(this.manager.lookup(this.id));
-        let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-        try_pair!(services.validate_config_mutation(&target));
-        let operation = try_pair!(actor.reserve_prepared_operation(None));
-        let publication = CheckpointPublication::default();
-        try_pair!(operation.register_publication(&publication));
-        let predecessor = try_pair!(operation.wait_predecessor().await);
-        let mut captured = template.to_tool_context();
-        captured.apply_effective_config(&predecessor);
-        template = AgentContext::from(&captured);
-        let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
-        let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
-        Some((operation, reserve, claim))
-    } else {
-        None
-    };
-    let reservation = if durable.is_none() {
-        Some(try_pair!(actor.reserve_config_update()))
-    } else {
-        None
-    };
+    let target = try_pair!(this.manager.lookup(this.id));
+    let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
+    try_pair!(services.validate_config_mutation(&target));
+    let operation = try_pair!(actor.reserve_prepared_operation(None));
+    let publication = CheckpointPublication::default();
+    try_pair!(operation.register_publication(&publication));
+    let predecessor = try_pair!(operation.wait_predecessor().await);
+    let mut captured = template.to_tool_context();
+    captured.apply_effective_config(&predecessor);
+    template = AgentContext::from(&captured);
+    let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
+    let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
         .map(|prepare| Arc::clone(&prepare));
@@ -473,21 +430,13 @@ async fn agent_set_model(
         fast: selection.fast,
         ..Default::default()
     };
-    let commit = if let Some((operation, reserve, claim)) = durable {
-        try_pair!(operation.resolve(Some(ConfigChange::Patch(patch))));
-        try_pair!(operation.wait_ready().await);
-        let config = try_pair!(operation.ready_config());
-        let transaction = try_pair!(reserve(config, claim));
-        drop(this);
-        drop(ctx);
-        try_pair!(operation.commit_durable(transaction).await).config
-    } else {
-        let reservation = reservation.unwrap();
-        try_pair!(reservation.resolve(Ok(ConfigChange::Patch(patch))));
-        drop(this);
-        drop(ctx);
-        try_pair!(reservation.wait().await)
-    };
+    try_pair!(operation.resolve(Some(ConfigChange::Patch(patch))));
+    try_pair!(operation.wait_ready().await);
+    let config = try_pair!(operation.ready_config());
+    let transaction = try_pair!(reserve(config, claim));
+    drop(this);
+    drop(ctx);
+    let commit = try_pair!(operation.commit_durable(transaction).await).config;
     Ok((Some(selection_table(&lua, &commit.config)?), None))
 }
 
@@ -556,31 +505,18 @@ async fn agent_set_mode(
         Some(&definition),
     ));
     let actor = try_pair!(this.manager.actor(this.id));
-    let durable = if let AgentRuntime::Managed(_) = &this.manager {
-        let target = try_pair!(this.manager.lookup(this.id));
-        let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-        let operation = try_pair!(actor.reserve_prepared_operation(None));
-        let publication = CheckpointPublication::default();
-        try_pair!(operation.register_publication(&publication));
-        let predecessor = try_pair!(operation.wait_predecessor().await);
-        let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
-        let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
-        Some((operation, reserve, claim, predecessor))
-    } else {
-        None
-    };
-    let reservation = if durable.is_none() {
-        Some(try_pair!(actor.reserve_config_update()))
-    } else {
-        None
-    };
-    let previous_mode = durable
-        .as_ref()
-        .map_or(&template.mode, |(_, _, _, config)| &config.mode);
+    let target = try_pair!(this.manager.lookup(this.id));
+    let services = try_pair!(orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
+    let operation = try_pair!(actor.reserve_prepared_operation(None));
+    let publication = CheckpointPublication::default();
+    try_pair!(operation.register_publication(&publication));
+    let predecessor = try_pair!(operation.wait_predecessor().await);
+    let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
+    let reserve = try_pair!(services.reserve_config_mutation(&target, publication));
     let mode = match name.as_str() {
         "build" => AgentMode::Build,
         "plan" => {
-            let path = match previous_mode.plan_path() {
+            let path = match predecessor.mode.plan_path() {
                 Some(path) => path.to_path_buf(),
                 None => try_pair!(prepare_plan_path(&lua).await),
             };
@@ -593,22 +529,14 @@ async fn agent_set_mode(
         mode,
         mode_def: Some(definition),
     };
-    let commit = if let Some((operation, reserve, claim, _)) = durable {
-        try_pair!(authorize(&lua, &ctx, &this));
-        try_pair!(operation.resolve(Some(change)));
-        try_pair!(operation.wait_ready().await);
-        let config = try_pair!(operation.ready_config());
-        let transaction = try_pair!(reserve(config, claim));
-        drop(this);
-        drop(ctx);
-        try_pair!(operation.commit_durable(transaction).await).config
-    } else {
-        let reservation = reservation.unwrap();
-        try_pair!(reservation.resolve(Ok(change)));
-        drop(this);
-        drop(ctx);
-        try_pair!(reservation.wait().await)
-    };
+    try_pair!(authorize(&lua, &ctx, &this));
+    try_pair!(operation.resolve(Some(change)));
+    try_pair!(operation.wait_ready().await);
+    let config = try_pair!(operation.ready_config());
+    let transaction = try_pair!(reserve(config, claim));
+    drop(this);
+    drop(ctx);
+    let commit = try_pair!(operation.commit_durable(transaction).await).config;
     Ok((Some(commit.config.mode.id().key().to_string()), None))
 }
 
@@ -657,9 +585,6 @@ pub(crate) fn agent_defer_close(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(lua, &ctx, this));
-    if matches!(this.manager, AgentRuntime::HostRoot { .. }) {
-        return Ok(err_pair(UNSUPPORTED_OPERATION_ERROR));
-    }
     let manager = this.manager.clone();
     let id = this.id;
     let sessions = lua
@@ -685,21 +610,16 @@ fn task_owner_authority(
     authorize(lua, ctx, this).map_err(mlua::Error::runtime)?;
     let plugin_identity =
         || current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY));
-    match &this.manager {
-        AgentRuntime::Managed(manager) => {
-            let (plugin, generation) = plugin_identity()?;
-            let id = this
-                .id
-                .ok_or_else(|| mlua::Error::runtime(UNSUPPORTED_OPERATION_ERROR))?;
-            Ok(TaskOwnerAuthority::Agent {
-                owner: plugin_authority(lua, plugin.clone()),
-                plugin,
-                generation,
-                target: manager.lookup(id).map_err(mlua::Error::external)?,
-            })
-        }
-        AgentRuntime::HostRoot { .. } => Err(mlua::Error::runtime(UNSUPPORTED_OPERATION_ERROR)),
-    }
+    let (plugin, generation) = plugin_identity()?;
+    Ok(TaskOwnerAuthority::Agent {
+        owner: plugin_authority(lua, plugin.clone()),
+        plugin,
+        generation,
+        target: this
+            .manager
+            .lookup(this.id)
+            .map_err(mlua::Error::external)?,
+    })
 }
 
 fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {

@@ -1076,23 +1076,6 @@ impl EventHandle {
         ));
     }
 
-    pub fn install_host_root_services(&self, services: Arc<crate::host_root::HostRootServices>) {
-        self.install_host_root_services_with_template(services, None);
-    }
-
-    pub fn install_host_root_services_with_template(
-        &self,
-        services: Arc<crate::host_root::HostRootServices>,
-        template: Option<maki_agent::tools::ToolContext>,
-    ) {
-        let _ = self.tx.try_send(Request::InstallHostRootServices(Box::new(
-            crate::orchestration::HostRootServicesSlot {
-                services: Some(services),
-                template,
-            },
-        )));
-    }
-
     /// Supply session snapshots for hosts without an interactive event loop.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self

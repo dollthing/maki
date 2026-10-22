@@ -11,6 +11,8 @@ use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex};
 
+use crate::agent_errors::FIXED_MODEL_ERROR;
+
 use super::{
     ConfigMutationReservation, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
     TurnCompletion, TurnCompletionFuture, nonpersistent_config_mutation,
@@ -290,7 +292,7 @@ impl OrchestrationServices for AgentOrchestration {
             .as_ref()
             .is_some_and(|root| root.same_manager(target) && root.id() == target.id())
         {
-            return Err(crate::host_root::FIXED_MODEL_ERROR.into());
+            return Err(FIXED_MODEL_ERROR.into());
         }
         Ok(())
     }

@@ -85,7 +85,7 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
             params: &[ParamDoc {
                 name: "{agent}",
                 ty: "Agent",
-                desc: "Agent to close. Host roots do not support this operation.",
+                desc: "Agent to close.",
             }],
             returns: "(boolean?, string?) true when cleanup is registered, or nil and an error.",
             example: "",

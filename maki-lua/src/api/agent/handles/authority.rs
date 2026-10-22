@@ -1,49 +1,15 @@
-use std::sync::Arc;
-
 use maki_agent::{AgentId, AgentManagerHandle, CurrentManagedTurn};
 use mlua::Lua;
 
-use super::{AgentOwners, AgentRuntime, LuaAgent, session_state};
+use super::{AgentOwners, LuaAgent, session_state};
 use crate::agent_errors::{MANAGED_AUTHORITY_INACTIVE, NOT_DESCENDANT_OF_CALLER, OTHER_RUNTIME};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
-use crate::host_root::{HostRootServices, UNSUPPORTED_OPERATION_ERROR};
 use crate::orchestration;
 use crate::runtime::current_managed_turn;
 
 pub(super) fn retire_closed(lua: &Lua) {
     if let Some(sessions) = lua.app_data_ref::<AgentOwners>() {
         sessions.retire_settled();
-    }
-}
-
-pub(super) fn host_agent(services: Arc<HostRootServices>) -> LuaAgent {
-    LuaAgent::without_graph(AgentRuntime::host(services), None, None)
-}
-
-pub(super) fn validate_host_root(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Result<(), String> {
-    let AgentRuntime::HostRoot {
-        services,
-        reference,
-    } = &agent.manager
-    else {
-        return Err(UNSUPPORTED_OPERATION_ERROR.into());
-    };
-    let current = ctx
-        .host_root(lua)?
-        .ok_or("host root authority is unavailable")?;
-    if !Arc::ptr_eq(services, &current) {
-        return Err(OTHER_RUNTIME.into());
-    }
-    services
-        .validate(reference)
-        .map_err(|error| error.to_string())
-}
-
-/// Validates handles that live outside a managed graph; `None` for managed handles.
-fn validate_outside_graph(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Option<Result<(), String>> {
-    match agent.manager {
-        AgentRuntime::HostRoot { .. } => Some(validate_host_root(lua, ctx, agent)),
-        AgentRuntime::Managed(_) => None,
     }
 }
 
@@ -105,20 +71,20 @@ pub(super) fn authorize(
     ctx: &LuaCtx,
     agent: &LuaAgent,
 ) -> Result<Option<CurrentManagedTurn>, String> {
-    if let Some(result) = validate_outside_graph(lua, ctx, agent) {
-        return result.map(|()| None);
-    }
     if let Ok(trusted) = ctx.trusted(lua) {
-        let target = agent.manager.lookup(agent.id)?;
+        let target = agent
+            .manager
+            .lookup(agent.id)
+            .map_err(|error| error.to_string())?;
         trusted.validate_target(lua, &target)?;
         return Ok(None);
     }
     retire_closed(lua);
     let (manager, _) = context_graph(lua, ctx)?;
-    if !manager.same_manager(agent.manager.managed()?) {
+    if !manager.same_manager(&agent.manager) {
         return Err(OTHER_RUNTIME.into());
     }
-    scope(lua, ctx, agent.id.ok_or(UNSUPPORTED_OPERATION_ERROR)?)
+    scope(lua, ctx, agent.id)
 }
 
 pub(super) fn observe(
@@ -126,15 +92,12 @@ pub(super) fn observe(
     ctx: &LuaCtx,
     agent: &LuaAgent,
 ) -> Result<Option<CurrentManagedTurn>, String> {
-    if let Some(result) = validate_outside_graph(lua, ctx, agent) {
-        return result.map(|()| None);
-    }
     if let Ok(trusted) = ctx.trusted(lua) {
         let root = agent
             .root
             .as_ref()
             .ok_or("managed root identity is unavailable")?;
-        if !root.manager().same_manager(agent.manager.managed()?) {
+        if !root.manager().same_manager(&agent.manager) {
             return Err(OTHER_RUNTIME.into());
         }
         if !trusted.target.manager().same_manager(&root.manager()) {
@@ -151,7 +114,7 @@ pub(super) fn observe(
     }
     retire_closed(lua);
     let (manager, _) = context_graph(lua, ctx)?;
-    if !manager.same_manager(agent.manager.managed()?) {
+    if !manager.same_manager(&agent.manager) {
         return Err(OTHER_RUNTIME.into());
     }
     let current = current_managed_turn(lua).ok_or("managed authority expired")?;
@@ -164,12 +127,20 @@ pub(super) fn observe(
 pub(super) fn destination_template(lua: &Lua, agent: &LuaAgent) -> Result<AgentContext, String> {
     if let Some(template) = agent.state.as_ref().and_then(|state| state.template.get()) {
         let mut template = template.clone();
-        if let Some(config) = agent.manager.actor(agent.id)?.effective_config() {
+        if let Some(config) = agent
+            .manager
+            .actor(agent.id)
+            .map_err(|error| error.to_string())?
+            .effective_config()
+        {
             template.apply_effective_config(&config);
         }
         return Ok(AgentContext::from(&template));
     }
-    let target = agent.manager.lookup(agent.id)?;
+    let target = agent
+        .manager
+        .lookup(agent.id)
+        .map_err(|error| error.to_string())?;
     let service = orchestration::services(lua).ok_or("destination template is unavailable")?;
     Ok(AgentContext::from(&service.template(&target)?))
 }
@@ -194,21 +165,13 @@ pub(super) fn lookup(
             .parent_id;
     }
     Ok(LuaAgent {
-        manager: AgentRuntime::Managed(manager),
-        id: Some(id),
+        manager,
+        id,
         state: session_state(lua, id),
         held: Some(held),
         root: Some(root),
         ancestors,
     })
-}
-
-impl LuaCtx {
-    pub(crate) fn pin_subject(&mut self) {
-        if self.subject.is_none() {
-            self.subject = self.agent().and_then(|context| context.execution_agent_id);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -227,8 +190,8 @@ mod tests {
     use maki_providers::TokenUsage;
     use maki_providers::provider::Provider;
     use smol::Timer;
+    use std::sync::Arc;
 
-    use super::*;
     use crate::api::agent::LuaActorBackend;
     use crate::api::agent::handles::tests::{REPLY, RETIRE_TIMEOUT};
     use crate::api::agent::tests::{

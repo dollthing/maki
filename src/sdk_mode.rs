@@ -35,7 +35,6 @@ use maki_commands::{
     TargetCapability, TargetHandle,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::host_root::HostRootServices;
 use maki_lua::orchestration::{AgentOrchestration, ConfigMutationReserver, TrustedTarget};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
@@ -956,13 +955,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         sdk_orchestration(models, trusted_root, coordinator.clone(), persistence.0)
             .with_completion(persistence.1)
     }));
-    let host_root = Arc::new(HostRootServices::coordinated(
-        root.id(),
-        coordinator.clone(),
-        Arc::clone(&model_policy),
-    ));
-    let _host_root_retirement = host_root.retirement_guard();
-    lua_handle.install_host_root_services(Arc::clone(&host_root));
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -1249,7 +1241,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         Ok(())
     })();
 
-    host_root.retire();
     drop(sdk_commands);
     smol::block_on(stop_sdk_tasks(
         projection_watcher,
@@ -2181,7 +2172,7 @@ mod tests {
     use maki_agent::actor::{ConfigChange, ConfigPatch};
     use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
     use maki_agent::tools::ToolRegistry;
-    use maki_agent::{AgentError, ModelSource, PreparedModel};
+    use maki_agent::{AgentError, AgentRef, ModelSource, PreparedModel};
     use maki_lua::orchestration::OrchestrationServices;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -2719,6 +2710,36 @@ mod tests {
         }
     }
 
+    fn commit_patch(
+        services: &dyn OrchestrationServices,
+        target: &AgentRef,
+        patch: ConfigPatch,
+    ) -> maki_agent::actor::ConfigCommit {
+        smol::block_on(async {
+            let operation = target
+                .actor()
+                .unwrap()
+                .reserve_prepared_operation(None)
+                .unwrap();
+            let publication = CheckpointPublication::default();
+            operation.register_publication(&publication).unwrap();
+            operation.wait_predecessor().await.unwrap();
+            let reserve = services
+                .reserve_config_mutation(target, publication)
+                .unwrap();
+            operation.resolve(Some(ConfigChange::Patch(patch))).unwrap();
+            operation.wait_ready().await.unwrap();
+            let claim: CheckpointClaim = Arc::new(|publication| {
+                publication
+                    .try_publish()
+                    .then_some(())
+                    .ok_or_else(|| Arc::from(SDK_SETTLEMENT_TIMEOUT))
+            });
+            let transaction = reserve(operation.ready_config().unwrap(), claim).unwrap();
+            operation.commit_durable(transaction).await.unwrap().config
+        })
+    }
+
     #[test]
     fn sdk_model_route_and_nested_task_use_managed_root() {
         use std::sync::Mutex as StdMutex;
@@ -3037,36 +3058,7 @@ mod tests {
         );
         assert_eq!(handle.model.current().unwrap().1.spec(), TARGET_MODEL);
 
-        let root = Arc::new(HostRootServices::coordinated(
-            agent.id(),
-            coordinator.clone(),
-            Arc::new(ModelPolicy::default()),
-        ));
-        let reference = root.reference();
-        let before_selection = root.model(&reference).unwrap();
-        assert_eq!(before_selection.spec.as_ref(), TARGET_MODEL);
-        assert!(!before_selection.fast);
-        assert_eq!(
-            before_selection.thinking,
-            maki_providers::ThinkingConfig::Off
-        );
         assert_eq!(checkpointed.lock().unwrap().len(), 1);
-        assert!(matches!(
-            root.unsupported(&reference),
-            Err(maki_lua::host_root::HostRootError::UnsupportedOperation)
-        ));
-        let guard = root.retirement_guard();
-        drop(guard);
-        assert!(matches!(
-            root.model(&reference),
-            Err(maki_lua::host_root::HostRootError::Stale)
-        ));
-
-        lua_handle.install_host_root_services(Arc::new(HostRootServices::coordinated(
-            agent.id(),
-            coordinator.clone(),
-            Arc::default(),
-        )));
         host.wait_for_worker_barrier_for_test();
         let (out_tx, out_rx) = flume::unbounded();
         let pump = EventPump {
@@ -3168,37 +3160,17 @@ mod tests {
         let mut requests = received.try_iter().collect::<Vec<_>>();
         assert_eq!(requests.len(), 4);
         assert!(terminal_gate.try_recv().is_err());
-        let committed = smol::block_on(async {
-            let operation = child_ref
-                .actor()
-                .unwrap()
-                .reserve_prepared_operation(None)
-                .unwrap();
-            let publication = CheckpointPublication::default();
-            operation.register_publication(&publication).unwrap();
-            operation.wait_predecessor().await.unwrap();
-            let reserve = services
-                .reserve_config_mutation(&child_ref, publication)
-                .unwrap();
-            operation
-                .resolve(Some(ConfigChange::Patch(ConfigPatch {
-                    model: Some(PreparedModel {
-                        model: Model::from_spec(TARGET_MODEL).unwrap(),
-                        provider: Arc::clone(&provider),
-                    }),
-                    ..Default::default()
-                })))
-                .unwrap();
-            operation.wait_ready().await.unwrap();
-            let claim: CheckpointClaim = Arc::new(|publication| {
-                publication
-                    .try_publish()
-                    .then_some(())
-                    .ok_or_else(|| Arc::from(SDK_SETTLEMENT_TIMEOUT))
-            });
-            let transaction = reserve(operation.ready_config().unwrap(), claim).unwrap();
-            operation.commit_durable(transaction).await.unwrap().config
-        });
+        let committed = commit_patch(
+            services.as_ref(),
+            &child_ref,
+            ConfigPatch {
+                model: Some(PreparedModel {
+                    model: Model::from_spec(TARGET_MODEL).unwrap(),
+                    provider: Arc::clone(&provider),
+                }),
+                ..Default::default()
+            },
+        );
         assert_eq!(committed.config.model.spec(), TARGET_MODEL);
         assert!(
             StoredSession::load(id, &child_storage)
@@ -3260,31 +3232,24 @@ mod tests {
             TurnOutcome::Completed { .. }
         ));
         assert!(!shared.lock().unwrap().turn_active);
-        let root = HostRootServices::coordinated(
-            agent.id(),
-            coordinator.clone(),
-            Arc::new(ModelPolicy::default()),
-        );
-        let reference = root.reference();
         let before_version = coordinator.read().options().version;
         let selected_thinking =
             maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High);
-        let selection = smol::block_on(root.set_model(
-            &reference,
-            maki_providers::ModelSelection {
+        let committed = commit_patch(
+            services.as_ref(),
+            &agent,
+            ConfigPatch {
                 thinking: Some(selected_thinking),
                 ..Default::default()
             },
-        ))
-        .unwrap();
-        assert_eq!(selection.spec.as_ref(), TARGET_MODEL);
-        assert!(!selection.fast);
-        assert_eq!(selection.thinking, selected_thinking);
+        );
+        assert_eq!(committed.config.model.spec(), TARGET_MODEL);
+        assert!(!committed.config.fast);
+        assert_eq!(committed.config.thinking, selected_thinking);
         assert_eq!(
             agent.effective_config().unwrap().unwrap().settings.thinking,
             selected_thinking
         );
-        assert_eq!(root.model(&reference).unwrap(), selection);
         assert!(coordinator.read().options().version > before_version);
         assert_eq!(checkpointed.lock().unwrap().len(), 3);
         let manager = handle.manager.clone();

@@ -22,7 +22,6 @@ use maki_agent::{
     WorkKind,
 };
 use maki_lua::PluginHost;
-use maki_lua::host_root::HostRootServices;
 use maki_lua::orchestration::{AgentOrchestration, TrustedTarget};
 use maki_providers::TokenUsage;
 use serde_json::{Value, json};
@@ -141,7 +140,7 @@ impl ActorBackend for FixtureRoot {
     }
 }
 
-fn bind_host_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, mode: AgentMode) {
+fn bind_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, mode: AgentMode) {
     ctx.mode = mode;
     let policy = EffectiveAgentConfig::new(
         RunSettings {
@@ -184,13 +183,6 @@ fn bind_host_root(host: &PluginHost, reg: &ToolRegistry, ctx: &mut ToolContext, 
         .unwrap();
     ctx.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
     let template = common::with_request_tools(reg, ctx);
-    host.event_handle()
-        .install_host_root_services(Arc::new(HostRootServices::fixed(
-            root.id(),
-            &ctx.model,
-            ctx.opts,
-            ctx.model_policy.clone(),
-        )));
     host.event_handle().install_orchestration_services(Arc::new(
         AgentOrchestration::bind_fixed_root(
             Arc::default(),
@@ -235,7 +227,7 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
 
     let pass = Arc::new(CannedProvider::new(vec![canned_reply("VERDICT: pass")]));
     let (mut ctx_pass, _rx, _trigger) = ctx_with_provider(Arc::clone(&pass));
-    bind_host_root(
+    bind_root(
         &host,
         &reg,
         &mut ctx_pass,
@@ -252,7 +244,7 @@ fn plan_reviewer_audits_plan_and_returns_verdict() {
         "VERDICT: fail\n- finding: missing AC mapping",
     )]));
     let (mut ctx_fail, _rx, _trigger) = ctx_with_provider(Arc::clone(&fail));
-    bind_host_root(
+    bind_root(
         &host,
         &reg,
         &mut ctx_fail,
@@ -277,7 +269,7 @@ fn plan_reviewer_is_read_only_even_when_asked_to_write() {
         &ctx.local_tools,
         ctx.mcp.as_ref(),
     ));
-    bind_host_root(&host, &reg, &mut ctx, AgentMode::Plan("/plan.md".into()));
+    bind_root(&host, &reg, &mut ctx, AgentMode::Plan("/plan.md".into()));
     let parent = common::with_request_tools(&reg, &ctx);
     assert!(
         maki_agent::agent::tool_dispatch::callable(&parent)
@@ -314,7 +306,7 @@ fn plan_reviewer_only_in_plan_mode() {
     let provider = Arc::new(CannedProvider::new(vec![]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     let (reg, host) = load_reviewer_host(false);
-    bind_host_root(&host, &reg, &mut ctx, AgentMode::Build);
+    bind_root(&host, &reg, &mut ctx, AgentMode::Build);
 
     let err = run_reviewer(&reg, &ctx, "gated-review")
         .expect_err("plan_reviewer must be blocked outside plan mode");
