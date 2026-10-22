@@ -712,7 +712,9 @@ fn materialize(
                 state
                     .instructions
                     .entry(ticket.turn_id())
-                    .or_insert_with(|| inbox::InstructionInbox::new(ticket.clone()));
+                    .or_insert_with(|| {
+                        inbox::InstructionInbox::new(ticket.clone(), identity.presentation_id)
+                    });
             }
             if state
                 .instructions
@@ -1974,6 +1976,19 @@ impl AgentActorHandle {
         correlation: String,
         options: TurnAdmissionOptions,
     ) -> Result<TurnTicket, ActorError> {
+        self.submit_presented(input, event_sender, correlation, options)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// `submit`, also returning the presentation the input landed under: the
+    /// open turn it folded into, or the new turn's.
+    pub fn submit_presented(
+        &self,
+        input: AgentInput,
+        event_sender: Option<EventSender>,
+        correlation: String,
+        options: TurnAdmissionOptions,
+    ) -> Result<(TurnTicket, u64), ActorError> {
         let bytes = submission_bytes(&input)?;
         let batch_key = crate::batch_key(&input);
         if bytes > MAX_PENDING_INSTRUCTION_BYTES {
@@ -2111,7 +2126,7 @@ impl AgentActorHandle {
                     provenance: options.provenance,
                     bytes,
                 });
-                return Ok(inbox.ticket.clone());
+                return Ok((inbox.ticket.clone(), inbox.presentation));
             }
             if options.existing_only {
                 return Err(ActorError::Busy);
@@ -2151,7 +2166,7 @@ impl AgentActorHandle {
                 },
                 presentation_id,
             );
-            let mut inbox = inbox::InstructionInbox::new(ticket.clone());
+            let mut inbox = inbox::InstructionInbox::new(ticket.clone(), presentation_id);
             inbox.drained.push((ticket.provenance().clone(), bytes));
             inbox.submit_operation = Some(id);
             inbox.operation = id;
@@ -2183,7 +2198,7 @@ impl AgentActorHandle {
                 state.operations.push_back(work);
                 drive_operations(&self.inner, &mut state);
             }
-            return Ok(ticket);
+            return Ok((ticket, presentation_id));
         }
     }
 
@@ -2224,12 +2239,13 @@ impl AgentActorHandle {
         let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity))
             .with_provenance(options.provenance);
         state.delivery_suspended = false;
-        state
-            .instructions
-            .insert(turn_id, inbox::InstructionInbox::new(ticket.clone()));
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
         let presentation_id = state.adopt_presentation(options.displayed_presentation);
+        state.instructions.insert(
+            turn_id,
+            inbox::InstructionInbox::new(ticket.clone(), presentation_id),
+        );
         let identity = ActorWorkIdentity::new(
             self.inner.agent_id,
             ActorWorkKind::Turn {

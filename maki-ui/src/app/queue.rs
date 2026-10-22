@@ -323,17 +323,21 @@ impl App {
             displayed_presentation: reserved,
             ..Default::default()
         };
-        let admitted = if display.is_some() {
-            actor.submit(input, None, String::new(), options)
+        let landed = if display.is_some() {
+            actor
+                .submit_presented(input, None, String::new(), options)
+                .map(|(_, presentation)| reserved.and(Some(presentation)))
         } else {
-            actor.admit_turn_with_options(input, None, String::new(), options)
-        };
-        admitted.map_err(|error| error.to_string())?;
+            actor
+                .admit_turn_with_options(input, None, String::new(), options)
+                .map(|_| reserved)
+        }
+        .map_err(|error| error.to_string())?;
         self.shell.drain_results_for(Some(target.id()));
         if root {
             self.shell.drain_results();
         }
-        if let Some(run_id) = reserved {
+        if let Some(run_id) = landed {
             self.record_run_start(run_id);
             if let Some(text) = display {
                 self.main_chat().show_user_message(text, images);

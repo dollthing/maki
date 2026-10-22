@@ -63,6 +63,7 @@ const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
 const REJECTED_COMMAND_SHELL_COMMAND: &str = "pwd";
 const REJECTED_COMMAND_SHELL_OUTPUT: &str = "command shell cwd";
 const RUNNING_TURN_TEXT: &str = "running turn";
+const FOLDED_TEXT: &str = "folded into the running turn";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -503,6 +504,43 @@ fn running_root_app() -> (App, flume::Receiver<AgentInput>) {
     app.record_run_start(run_id);
     rx.recv_timeout(SETTLE_TIMEOUT).unwrap();
     (app, rx)
+}
+
+/// A host turn can start before the app hears of it. Typed input that folds
+/// into that turn must follow its presentation, not the one reserved for a
+/// fresh start, or the turn's output is fenced off as stale.
+#[test]
+fn starting_submit_follows_the_turn_it_folds_into() {
+    let (tx, rx) = flume::unbounded();
+    let root = AgentManagerHandle::new(Default::default())
+        .unwrap()
+        .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let mut app = app_with_root(root.clone());
+    let message = |text: &str| QueuedMessage {
+        text: text.into(),
+        images: Vec::new(),
+    };
+    let (_, host) = root
+        .actor()
+        .unwrap()
+        .submit_presented(
+            app.build_agent_input(&message(RUNNING_TURN_TEXT)),
+            None,
+            String::new(),
+            Default::default(),
+        )
+        .unwrap();
+    rx.recv_timeout(SETTLE_TIMEOUT).unwrap();
+    assert_ne!(app.status, Status::Streaming);
+    let typed = app.build_agent_input(&message(FOLDED_TEXT));
+    assert!(
+        app.admit_user_turn(&root, typed, Some(FOLDED_TEXT.into()))
+            .unwrap()
+    );
+    assert_eq!(app.run_id, host);
 }
 
 fn app_with_root(root: AgentRef) -> App {

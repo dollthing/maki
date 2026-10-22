@@ -82,6 +82,7 @@ pub(super) struct InstructionEntry {
 pub(super) struct InstructionInbox {
     pub open: bool,
     pub ticket: TurnTicket,
+    pub presentation: u64,
     pub pending: VecDeque<InstructionEntry>,
     pub drained: Vec<(TurnProvenance, usize)>,
     pub submit_operation: Option<u64>,
@@ -93,10 +94,11 @@ pub(super) struct InstructionInbox {
 }
 
 impl InstructionInbox {
-    pub fn new(ticket: TurnTicket) -> Self {
+    pub fn new(ticket: TurnTicket, presentation: u64) -> Self {
         Self {
             open: true,
             ticket,
+            presentation,
             pending: VecDeque::new(),
             drained: Vec::new(),
             submit_operation: None,
