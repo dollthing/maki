@@ -237,8 +237,6 @@ fn restored_context_queries_reject_missing_admission(request: HostContextRequest
 #[test_case(Action::Compact(None); "compact")]
 #[test_case(Action::ChangeDirectory("/".into()); "directory")]
 #[test_case(Action::ChangeMode("build".into()); "mode")]
-#[test_case(Action::ToggleSessionOption { id: "fast" }; "fast")]
-#[test_case(Action::ToggleSessionOption { id: "workflow" }; "workflow")]
 fn restored_actions_report_closed_target(action: Action) {
     with_event_loop(|event_loop| {
         select_restored_chat(event_loop);

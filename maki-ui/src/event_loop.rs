@@ -611,31 +611,6 @@ fn project_committed_options(runtime: &mut SessionRuntime) {
     project_committed_options_for_app(&mut runtime.app, &snapshot);
 }
 
-fn handle_toggle_session_option(
-    runtime: &mut SessionRuntime,
-    id: &'static str,
-    internal_tx: flume::Sender<InternalEvent>,
-) {
-    if SessionStatus::of(&runtime.app) != SessionStatus::Idle {
-        match id {
-            FAST_OPTION_ID => runtime
-                .app
-                .flash("fast applies when this turn finishes".into()),
-            WORKFLOW_OPTION_ID => runtime
-                .app
-                .flash("workflow applies when this turn finishes".into()),
-            _ => {}
-        }
-    }
-    dispatch_option_toggle(
-        runtime.coordinator.clone(),
-        Arc::clone(&runtime.model_slot),
-        runtime.handles.manager_and_root(),
-        (runtime.id(), id),
-        &internal_tx,
-    );
-}
-
 /// Who hears how a mode change ended: a pinned command as soon as the actor
 /// commits, Lua once the runtime that owns the change has handled it.
 enum ModeReply {
@@ -4139,21 +4114,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::ToggleSessionOption { id } => {
-                if matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
-                    let result = self
-                        .selected_target(idx)
-                        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                        .and_then(|target| self.dispatch_target_toggle(idx, &target, id, None));
-                    if let Err(error) = result {
-                        self.sessions[idx].app.flash(error);
-                    }
-                } else {
-                    handle_toggle_session_option(
-                        &mut self.sessions[idx],
-                        id,
-                        self.internal_tx.clone(),
-                    );
-                }
+                dispatch_option_toggle(&self.sessions[idx], id, &self.internal_tx);
             }
             Action::ChangeDirectory(path) => {
                 let result = self
@@ -5528,76 +5489,30 @@ fn dispatch_lua_option_set(
 }
 
 fn dispatch_option_toggle(
-    coordinator: SessionCoordinatorHandle,
-    _model_slot: Arc<ProviderSlot>,
-    actor: (maki_agent::AgentManagerHandle, maki_agent::AgentId),
-    session_option: (MakiId, &'static str),
+    runtime: &SessionRuntime,
+    id: &'static str,
     internal_tx: &flume::Sender<InternalEvent>,
 ) {
-    let (session, id) = session_option;
-    let identity = actor
-        .0
-        .actor(actor.1)
-        .map(|actor| actor.identity())
-        .unwrap_or_default();
+    let session = runtime.id();
+    let identity = runtime.handles.identity();
+    let coordinator = runtime.coordinator.clone();
     let committed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
     let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
-    let reservation = if matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
-        actor
-            .0
-            .lookup(actor.1)
-            .map_err(|error| error.to_string())
-            .and_then(|target| reserve_config_change(&target, &coordinator, None))
-            .map(Some)
-    } else {
-        Ok(None)
-    };
     smol::spawn(async move {
-        let result = match reservation {
-            Ok(Some(reservation)) => {
-                let change = match id {
-                    FAST_OPTION_ID => ConfigChange::ToggleFast,
-                    WORKFLOW_OPTION_ID => ConfigChange::ToggleWorkflow,
-                    _ => {
-                        drop(reservation);
-                        let _ = internal_tx.send(InternalEvent::SessionOp {
-                            session,
-                            runtime: identity,
-                            kind: SessionOpKind::OptionToggled { id, committed },
-                            result: Err(format!("unknown boolean configuration option: {id}")),
-                        });
-                        return;
-                    }
-                };
-                commit_config_change(reservation, change)
+        let result = bounded_session_op(
+            async {
+                coordinator
+                    .toggle_boolean_option(id)
                     .await
-                    .map(|commit| {
-                        let enabled = match id {
-                            FAST_OPTION_ID => commit.config.fast,
-                            _ => commit.config.workflow,
-                        };
+                    .map(|(enabled, _)| {
                         *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
                     })
-            }
-            Ok(None) => {
-                bounded_session_op(
-                    async {
-                        coordinator
-                            .toggle_boolean_option(id)
-                            .await
-                            .map(|(enabled, _)| {
-                                *slot.lock().unwrap_or_else(|error| error.into_inner()) =
-                                    Some(enabled);
-                            })
-                            .map_err(|error| error.to_string())
-                    },
-                    SESSION_OP_TIMEOUT,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
+                    .map_err(|error| error.to_string())
+            },
+            SESSION_OP_TIMEOUT,
+        )
+        .await;
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
@@ -5627,6 +5542,18 @@ mod tests {
         while let Ok(commit) = runtime.config_commits.try_recv() {
             runtime.project_config(&commit);
         }
+    }
+
+    fn spawn_root_workflow_toggle(
+        runtime: &SessionRuntime,
+    ) -> smol::Task<Result<ConfigCommit, String>> {
+        let (manager, root) = runtime.handles.manager_and_root();
+        let target = manager.lookup(root).unwrap();
+        let reservation = reserve_config_change(&target, &runtime.coordinator, None).unwrap();
+        smol::spawn(commit_config_change(
+            reservation,
+            ConfigChange::ToggleWorkflow,
+        ))
     }
 
     async fn wait_projected_option(runtime: &SessionRuntime, id: &str, value: &str) {
@@ -5673,14 +5600,7 @@ mod tests {
             let actor = manager.actor(root).unwrap();
             let initial = actor.effective_config().unwrap();
             let lease = actor.reserve_prepared_operation(None).unwrap();
-            let (internal_tx, internal_rx) = flume::unbounded();
-            dispatch_option_toggle(
-                runtime.coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                (manager, root),
-                (runtime.id(), WORKFLOW_OPTION_ID),
-                &internal_tx,
-            );
+            let toggle = spawn_root_workflow_toggle(&runtime);
             runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "after barrier".into(),
@@ -5697,11 +5617,7 @@ mod tests {
             });
             assert_eq!(runtime.handles.queue.text_messages(), vec!["after barrier"]);
             drop(lease);
-            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected option completion");
-            };
-            result.unwrap();
+            toggle.await.unwrap();
             let selected = actor.effective_config().unwrap();
             assert!(!initial.workflow);
             assert!(selected.workflow);
@@ -5714,7 +5630,7 @@ mod tests {
     #[test]
     fn workflow_toggle_completion_does_not_mutate_another_runtime() {
         smol::block_on(async {
-            let mut changed = test_runtime(model_named("changed"));
+            let changed = test_runtime(model_named("changed"));
             let untouched = test_runtime(model_named("untouched"));
             let (changed_manager, changed_root) = changed.handles.manager_and_root();
             let changed_actor = changed_manager.actor(changed_root).unwrap();
@@ -5727,30 +5643,8 @@ mod tests {
             wait_projected_option(&untouched, "model", &initial_actor_config.model.spec()).await;
             let initial_options = untouched.coordinator.read().options();
             let initial_app_model = untouched.app.state.session.model.clone();
-            let (internal_tx, internal_rx) = flume::unbounded();
 
-            dispatch_option_toggle(
-                changed.coordinator.clone(),
-                Arc::clone(&changed.model_slot),
-                (changed_manager, changed_root),
-                (changed.id(), WORKFLOW_OPTION_ID),
-                &internal_tx,
-            );
-
-            let InternalEvent::SessionOp { kind, result, .. } =
-                internal_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected option toggle completion");
-            };
-            result.unwrap();
-            let SessionOpKind::OptionToggled { id, committed } = kind else {
-                panic!("expected workflow option completion");
-            };
-            assert_eq!(id, WORKFLOW_OPTION_ID);
-            let Some(enabled) = committed.lock().unwrap().take() else {
-                panic!("expected committed workflow state");
-            };
-            complete_option_toggle(&mut changed.app, id, enabled);
+            spawn_root_workflow_toggle(&changed).await.unwrap();
 
             assert!(changed.app.root_config().workflow);
             assert!(changed_actor.effective_config().unwrap().workflow);
@@ -5869,7 +5763,6 @@ mod tests {
     fn yolo_toggle_commits_while_actor_operation_is_pending() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
-            let id = runtime.id();
             let (manager, root) = runtime.handles.manager_and_root();
             let pending = manager
                 .actor(root)
@@ -5878,13 +5771,7 @@ mod tests {
                 .unwrap();
             let (internal_tx, internal_rx) = flume::unbounded();
 
-            dispatch_option_toggle(
-                runtime.coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                (manager, root),
-                (id, YOLO_OPTION_ID),
-                &internal_tx,
-            );
+            dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
 
             let InternalEvent::SessionOp {
                 kind: SessionOpKind::OptionToggled { committed, .. },
@@ -6162,18 +6049,7 @@ mod tests {
     fn managed_read_observes_committed_option() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
-            let (tx, rx) = flume::unbounded();
-            dispatch_option_toggle(
-                runtime.coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                runtime.handles.manager_and_root(),
-                (runtime.id(), WORKFLOW_OPTION_ID),
-                &tx,
-            );
-            let InternalEvent::SessionOp { result, .. } = rx.recv_async().await.unwrap() else {
-                panic!("expected option completion");
-            };
-            result.unwrap();
+            spawn_root_workflow_toggle(&runtime).await.unwrap();
             assert!(runtime.config().unwrap().workflow);
             let model = config_model_state(&runtime.config().unwrap());
             assert_eq!(model["spec"], runtime.config().unwrap().model.spec());
@@ -6515,14 +6391,7 @@ mod tests {
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
             let lease = actor.reserve_prepared_operation(None).unwrap();
-            let (internal_tx, internal_rx) = flume::unbounded();
-            dispatch_option_toggle(
-                runtime.coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                (manager, root),
-                (runtime.id(), WORKFLOW_OPTION_ID),
-                &internal_tx,
-            );
+            let toggle = spawn_root_workflow_toggle(&runtime);
             runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "queued root".into(),
@@ -6539,11 +6408,7 @@ mod tests {
             });
             assert!(!runtime.handles.queue.is_empty());
             drop(lease);
-            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected option completion");
-            };
-            result.unwrap();
+            toggle.await.unwrap();
             assert!(
                 runtime
                     .handles
@@ -6577,19 +6442,12 @@ mod tests {
             let runtime = test_runtime(model_named("test-model"));
             let id = runtime.id();
             let coordinator = runtime.coordinator.clone();
-            let (manager, root) = runtime.handles.manager_and_root();
             let (internal_tx, internal_rx) = flume::unbounded();
 
             let reservation = coordinator
                 .reserve_transaction(CheckpointPublication::default())
                 .unwrap();
-            dispatch_option_toggle(
-                coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                (manager.clone(), root),
-                (id, maki_agent::session_options::YOLO_OPTION_ID),
-                &internal_tx,
-            );
+            dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
             let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
             else {
                 panic!("expected busy toggle completion");
@@ -6602,13 +6460,7 @@ mod tests {
 
             let mut committed = Vec::new();
             for _ in 0..2 {
-                dispatch_option_toggle(
-                    coordinator.clone(),
-                    Arc::clone(&runtime.model_slot),
-                    (manager.clone(), root),
-                    (id, maki_agent::session_options::YOLO_OPTION_ID),
-                    &internal_tx,
-                );
+                dispatch_option_toggle(&runtime, YOLO_OPTION_ID, &internal_tx);
                 let InternalEvent::SessionOp {
                     session,
                     kind:
@@ -7924,18 +7776,7 @@ mod tests {
         )
         .unwrap();
         smol::block_on(async {
-            let (tx, rx) = flume::unbounded();
-            dispatch_option_toggle(
-                runtime.coordinator.clone(),
-                Arc::clone(&runtime.model_slot),
-                runtime.handles.manager_and_root(),
-                (runtime.id(), WORKFLOW_OPTION_ID),
-                &tx,
-            );
-            let InternalEvent::SessionOp { result, .. } = rx.recv_async().await.unwrap() else {
-                panic!("expected option completion");
-            };
-            result.unwrap();
+            spawn_root_workflow_toggle(&runtime).await.unwrap();
             wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
         });
 

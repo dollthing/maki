@@ -127,10 +127,6 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
-const FAST_ON_MSG: &str = "Fast mode: on";
-const FAST_OFF_MSG: &str = "Fast mode: off";
-const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
-const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const THEME_APPLIED_PREFIX: &str = "Theme";
 
 /// Stands in for the runtime provider in fixtures that build an app without
@@ -2688,7 +2684,7 @@ impl App {
     /// The app-side half of a toggle, run once the coordinator has committed
     /// it (or immediately when there is no coordinator).
     pub(crate) fn apply_toggled_option(&mut self, id: &str, enabled: bool) {
-        use maki_agent::session_options::{FAST_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+        use maki_agent::session_options::YOLO_OPTION_ID;
         let message = match id {
             YOLO_OPTION_ID => {
                 self.permissions.set_yolo(enabled);
@@ -2698,27 +2694,12 @@ impl App {
                     "YOLO mode disabled"
                 }
             }
-            FAST_OPTION_ID => {
-                self.state.fast_pending = false;
-                if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }
-            }
-            WORKFLOW_OPTION_ID => {
-                if enabled {
-                    WORKFLOW_ON_MSG
-                } else {
-                    WORKFLOW_OFF_MSG
-                }
-            }
             other => {
                 self.flash(format!("unknown session option: {other}"));
                 return;
             }
         };
-        if self.status == Status::Streaming && matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
-            self.flash(format!("{id} applies when this turn finishes"));
-        } else {
-            self.flash(message.into());
-        }
+        self.flash(message.into());
     }
 
     pub(crate) fn execute_host_request(

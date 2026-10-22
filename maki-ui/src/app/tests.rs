@@ -14,7 +14,6 @@ use maki_agent::actor::HistoryChange;
 use maki_agent::agent::estimate_message_tokens;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::session_options::{FAST_OPTION_ID, WORKFLOW_OPTION_ID};
 use maki_agent::tools::{TASK_SPAWN_TOOL_NAME, cli_tool_ctx};
 use maki_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
@@ -1065,17 +1064,6 @@ fn toggle_mode_emits_change_mode_without_mutating_state() {
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
     assert!(matches!(&actions[..], [Action::ChangeMode(id)] if id == "plan"));
     assert_eq!(app.root_mode(), Mode::Build);
-}
-
-#[test_case(FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
-#[test_case(WORKFLOW_OPTION_ID, "workflow applies when this turn finishes" ; "workflow")]
-fn deferred_policy_toggle_shows_applies_notice(id: &str, expected: &str) {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-
-    app.apply_toggled_option(id, true);
-
-    assert_eq!(app.status_bar.flash_text(), Some(expected));
 }
 
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
@@ -7572,19 +7560,6 @@ fn bash_prefix_overrides_mode() {
 
     app.input_box.set_input("ls".into());
     assert_eq!(&*app.mode_label().0, "[BUILD]");
-}
-
-#[test]
-fn deferred_fast_toggle_flash_says_when_it_applies() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-
-    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
-
-    assert_eq!(
-        app.status_bar.flash_text(),
-        Some("fast applies when this turn finishes")
-    );
 }
 
 #[test]
