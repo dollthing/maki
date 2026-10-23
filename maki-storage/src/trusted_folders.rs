@@ -8,6 +8,9 @@ use crate::paths::{canonicalize_clean, normalize_path};
 use crate::{StateDir, StorageError, atomic_write};
 
 const DOCUMENT_FILE: &str = "trusted-folders.json";
+/// The store holds no compatibility with older formats, so the way out of an
+/// unreadable one is to start over.
+const RESET_HINT: &str = "delete the file and makima asks about each folder again";
 const DOCUMENT_VERSION: u32 = 2;
 const LOCK_FILE: &str = "trusted-folders.lock";
 
@@ -105,7 +108,7 @@ pub enum TrustedFoldersError {
     ControlCharacter { path: PathBuf },
     #[error("a missing folder must be removed by absolute path: {path:?}")]
     RelativeMissing { path: PathBuf },
-    #[error("unsupported trusted folder store version {version} in {path:?}")]
+    #[error("unsupported trusted folder store version {version} in {path:?}; {RESET_HINT}")]
     UnsupportedVersion { path: PathBuf, version: u32 },
     #[error("trusted folders are being changed by another Maki process: {path:?}")]
     Locked { path: PathBuf },
@@ -115,7 +118,7 @@ pub enum TrustedFoldersError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot parse trusted folder state at {path:?}: {source}")]
+    #[error("cannot parse trusted folder state at {path:?}: {source}; {RESET_HINT}")]
     Json {
         path: PathBuf,
         #[source]
@@ -662,6 +665,22 @@ mod tests {
             store.list(),
             Err(TrustedFoldersError::UnsupportedVersion { version: 3, .. })
         ));
+    }
+
+    /// Stores upgraded from version 1 kept bare-string entries. Nothing reads
+    /// them any more, so the store is refused with a way out, not migrated.
+    #[test]
+    fn old_bare_string_entry_refuses_the_store_and_says_how_to_reset_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        fs::write(
+            &store.document_path,
+            format!(r#"{{"version":{DOCUMENT_VERSION},"folders":["/old/project"],"rejected":[]}}"#),
+        )
+        .unwrap();
+        let error = store.list().unwrap_err();
+        assert!(matches!(error, TrustedFoldersError::Json { .. }), "{error}");
+        assert!(error.to_string().ends_with(RESET_HINT), "{error}");
     }
 
     #[test]

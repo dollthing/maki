@@ -50,6 +50,9 @@ pub fn run(
     let raw_config = plugin_host
         .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
         .context("load init.lua files")?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let mut config = raw_config
         .unwrap_or_default()
