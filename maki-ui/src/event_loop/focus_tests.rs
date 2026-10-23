@@ -1,12 +1,23 @@
 use std::sync::Arc;
 
 use maki_agent::actor::{ConfigChange, ConfigPatch, PendingQueueEntry, PreparedModel};
+use maki_agent::{AgentError, ThinkingConfig};
 use maki_commands::{CommandError, CommandOutcome, HostContextRequest, HostRequest};
+use maki_config::SessionDefaults;
+use maki_providers::model::Model;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    Effort, Message, ModelInfo, ProviderEvent, RequestOptions, StopReason, StreamResponse,
+    TokenUsage,
+};
+use maki_storage::id::SessionRef;
+use maki_storage::sessions::{Effort as StoredEffort, StoredThinking};
 use test_case::test_case;
 
 use super::tests::{select_child_chat, with_event_loop};
 use super::{
-    CLOSED_TARGET_ERR, CommandEvent, EventLoop, SESSION_OP_TIMEOUT, SessionRequest, UiAction,
+    AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
+    SessionRequest, UiAction,
 };
 use crate::app::shell::ShellEvent;
 use crate::chat::Chat;
@@ -619,5 +630,128 @@ fn model_argument_resolves_against_the_catalog(
                 assert_eq!(error.to_string(), message);
             }
         }
+    });
+}
+
+const THINKING_MODEL: &str = "anthropic/claude-opus-4-6";
+const PLAN_HEADING: &str = "# Plan Mode";
+const PLAN_COMMAND_PLUGIN: &str = "plan_mode_command";
+
+/// Records the system prompt and options of every request, then ends the turn.
+struct RecordingProvider(flume::Sender<(String, RequestOptions)>);
+
+impl Provider for RecordingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        system: &'a str,
+        _: &'a serde_json::Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        options: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        let _ = self.0.send((system.to_owned(), options));
+        Box::pin(async {
+            Ok(StreamResponse {
+                message: Message::user(String::new()),
+                usage: TokenUsage::default(),
+                stop_reason: Some(StopReason::EndTurn),
+            })
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn recording_provider() -> (Arc<dyn Provider>, flume::Receiver<(String, RequestOptions)>) {
+    let (requests, recorded) = flume::unbounded();
+    (Arc::new(RecordingProvider(requests)), recorded)
+}
+
+/// The TUI's half of `tests/frontend_parity.rs`: a blank session sends
+/// `always_thinking` like every headless frontend does.
+#[test]
+fn blank_session_sends_always_thinking_to_the_provider() {
+    with_event_loop(|event_loop| {
+        event_loop.ctx.session_defaults = SessionDefaults {
+            thinking: Some(StoredThinking::Effort {
+                level: StoredEffort::High,
+            }),
+            ..SessionDefaults::default()
+        };
+        let (provider, requests) = recording_provider();
+        let model = Model::from_spec(THINKING_MODEL).unwrap();
+        let runtime = event_loop
+            .ctx
+            .spawn_runtime_with_provider(
+                AppSession::new(THINKING_MODEL, &event_loop.session_cwd),
+                Some(PreparedProvider {
+                    model: model.clone(),
+                    provider,
+                }),
+            )
+            .unwrap();
+        let index = event_loop.push_runtime(runtime);
+        event_loop.submit_text(index, PROMPT.into()).unwrap();
+        let (_, options) = requests.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+        assert_eq!(
+            options,
+            RequestOptions {
+                thinking: ThinkingConfig::Effort(Effort::High),
+                fast: false,
+            }
+            .clamped(&model)
+        );
+    });
+}
+
+/// The TUI's half of `tests/frontend_parity.rs`: a Lua command that sets
+/// plan mode changes what the next turn sends.
+#[test]
+fn lua_mode_command_reaches_the_provider() {
+    with_event_loop(|event_loop| {
+        let runtime = Arc::clone(&event_loop.ctx.command_runtime);
+        let app = &mut event_loop.sessions[0].app;
+        app.command_runtime = Arc::clone(&runtime);
+        app.command_target = runtime.bind_target();
+        let host = install_expanders(event_loop);
+        host.event_handle()
+            .install_orchestration_services(event_loop.orchestration.clone());
+        host.load_source(
+            PLAN_COMMAND_PLUGIN,
+            r#"
+            maki.api.register_command({
+                name = "/plan-now", tui_only = false,
+                handler = function(_, ctx)
+                    assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan"))
+                end,
+            })
+        "#,
+        )
+        .unwrap();
+        event_loop.sync_orchestration();
+        let outcome = dispatch_slash(event_loop, "/plan-now");
+        assert!(matches!(outcome, CommandOutcome::Completed), "{outcome:?}");
+
+        let (provider, requests) = recording_provider();
+        let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let model = actor.effective_config().unwrap().model.clone();
+        smol::block_on(
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::Patch(ConfigPatch {
+                    model: Some(PreparedModel { model, provider }),
+                    ..ConfigPatch::default()
+                }))),
+        )
+        .unwrap();
+        event_loop.submit_text(0, PROMPT.into()).unwrap();
+        let (system, _) = requests.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+        assert!(system.contains(PLAN_HEADING), "{system}");
     });
 }

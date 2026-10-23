@@ -1,9 +1,23 @@
-//! Every headless frontend (`--print`, SDK stream-json, ACP) must start a
-//! session on the same defaults: `always_thinking` from `maki.setup`, and the
-//! saved `/thinking` preference ahead of it. Runs the real binary against a
-//! loopback OpenAI-compatible server and inspects the request body. SDK and
-//! ACP must also finish a turn whose input ended right after the prompt, and
-//! a resumed SDK session comes back in the mode it was saved in.
+//! Every headless frontend (`--print`, SDK stream-json, ACP) must send the
+//! provider the same thing for the same scenario. Runs the real binary
+//! against a loopback OpenAI-compatible server and inspects the request
+//! bodies. The scenarios: session defaults (`always_thinking` from
+//! `maki.setup`, and the saved `/thinking` preference ahead of it), a model
+//! switch between turns through each frontend's own mechanism, a mode set by
+//! a Lua command, and a Lua command whose UI round-trip answers "no UI" at
+//! once. SDK and ACP must also finish a turn whose input ended right after
+//! the prompt, and a resumed SDK session comes back in the mode it was saved
+//! in.
+//!
+//! The TUI cannot join without a pty. Its in-process tests in maki-ui check
+//! the same scenarios at the provider:
+//! `event_loop::tests::live_session_requests_remain_independent_during_changes_and_restore`
+//! (model switch between turns),
+//! `event_loop::focus_tests::lua_mode_command_reaches_the_provider` (mode set
+//! by a Lua command) and
+//! `event_loop::focus_tests::blank_session_sends_always_thinking_to_the_provider`
+//! (session defaults). The UI round-trip has no TUI counterpart: the TUI is
+//! the UI.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
 //! temp dir, which is not how Windows finds its config.
@@ -17,6 +31,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use maki_agent::ToolOutput;
+use maki_lua::ui_sink::NO_UI_ERR;
 use maki_providers::{Message, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
@@ -27,6 +42,28 @@ use test_case::test_case;
 const PROVIDER: &str = "mock";
 const API_KEY_ENV: &str = "MOCK_API_KEY";
 const MODEL: &str = "thinker";
+const OTHER_MODEL: &str = "other";
+const FIRST: &str = "first turn";
+const SECOND: &str = "second turn";
+const SWITCH_COMMAND: &str = "/parity_switch";
+const PLAN_COMMAND: &str = "/parity_plan";
+const UI_COMMAND: &str = "/parity_ui";
+const UI_ANSWER: &str = "ui answered: ";
+/// The toolset the bundled plan mode swaps in.
+const PLAN_TOOLS: [&str; 11] = [
+    "edit",
+    "glob",
+    "grep",
+    "plan_submit",
+    "read",
+    "task_despawn",
+    "task_send",
+    "task_spawn",
+    "task_wait",
+    "webfetch",
+    "write",
+];
+const SWITCH_REQUEST: &str = "switch";
 const PROMPT: &str = "say ok";
 const HIGH: &str = "high";
 const LOW: &str = "low";
@@ -42,6 +79,7 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const NO_REQUEST: &str = "no chat request reached the mock server";
 const NO_RESULT: &str = "the turn's result never arrived";
 const NO_EXIT: &str = "makima did not exit after its input ended";
+const NO_RESPONSE: &str = "makima never answered the request";
 const REPLY: &str = "ok";
 const PROMPT_ID: u64 = 3;
 const NO_INIT: &str = "the SDK never emitted its init event";
@@ -119,10 +157,7 @@ fn first_request(frontend: Frontend, setup: Setup) -> Value {
     let mut stdin = child.stdin.take().unwrap();
     match frontend {
         Frontend::Print => drop(stdin),
-        Frontend::Sdk => send(
-            &mut stdin,
-            json!({"type": "user", "message": {"role": "user", "content": PROMPT}}),
-        ),
+        Frontend::Sdk => send(&mut stdin, sdk_user(PROMPT)),
         Frontend::Acp => drop(acp_prompt(&mut child, &mut stdin, &work)),
     }
     let body = bodies.recv_timeout(TIMEOUT);
@@ -134,6 +169,150 @@ fn first_request(frontend: Frontend, setup: Setup) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Scenario {
+    ModelSwitch,
+    LuaMode,
+    LuaUiRoundTrip,
+}
+
+enum Step {
+    Prompt(String),
+    SwitchModel,
+}
+
+impl Scenario {
+    /// What the client does. Print takes a single prompt, so its scenarios
+    /// run inside one Lua command.
+    fn steps(self, frontend: Frontend) -> Vec<Step> {
+        let prompt = |text: &str| Step::Prompt(text.to_owned());
+        match (self, frontend) {
+            (Self::ModelSwitch, Frontend::Print) => vec![prompt(SWITCH_COMMAND)],
+            (Self::ModelSwitch, _) => vec![prompt(FIRST), Step::SwitchModel, prompt(SECOND)],
+            (Self::LuaMode, Frontend::Print) => vec![prompt(&format!("{PLAN_COMMAND} {PROMPT}"))],
+            (Self::LuaMode, _) => vec![prompt(PLAN_COMMAND), prompt(PROMPT)],
+            (Self::LuaUiRoundTrip, _) => vec![prompt(UI_COMMAND)],
+        }
+    }
+
+    fn check(self, bodies: &[Value], home: &Path) {
+        match self {
+            Self::ModelSwitch => {
+                let models: Vec<_> = bodies.iter().map(|body| &body["model"]).collect();
+                assert_eq!(models, [MODEL, OTHER_MODEL], "{bodies:?}");
+                assert_eq!(
+                    bodies.iter().map(last_user_text).collect::<Vec<_>>(),
+                    [FIRST, SECOND]
+                );
+            }
+            Self::LuaMode => {
+                let [body] = bodies else {
+                    panic!("expected one request: {bodies:?}")
+                };
+                assert_eq!(last_user_text(body), PROMPT);
+                assert_eq!(tool_names(body), PLAN_TOOLS);
+                let plans = home
+                    .join(".local/state")
+                    .join(APP_DIR)
+                    .join(maki_storage::plans::PLANS_DIR);
+                assert!(
+                    system_text(body).contains(plans.to_string_lossy().as_ref()),
+                    "the plan file is not in {}",
+                    plans.display()
+                );
+            }
+            Self::LuaUiRoundTrip => {
+                let [body] = bodies else {
+                    panic!("expected one request: {bodies:?}")
+                };
+                assert_eq!(last_user_text(body), format!("{UI_ANSWER}{NO_UI_ERR}"));
+            }
+        }
+    }
+}
+
+#[test_case(Frontend::Print, Scenario::ModelSwitch ; "print_switches_model_between_turns")]
+#[test_case(Frontend::Sdk, Scenario::ModelSwitch ; "sdk_switches_model_between_turns")]
+#[test_case(Frontend::Acp, Scenario::ModelSwitch ; "acp_switches_model_between_turns")]
+#[test_case(Frontend::Print, Scenario::LuaMode ; "print_lua_command_sets_plan_mode")]
+#[test_case(Frontend::Sdk, Scenario::LuaMode ; "sdk_lua_command_sets_plan_mode")]
+#[test_case(Frontend::Acp, Scenario::LuaMode ; "acp_lua_command_sets_plan_mode")]
+#[test_case(Frontend::Print, Scenario::LuaUiRoundTrip ; "print_lua_ui_round_trip_answers_no_ui")]
+#[test_case(Frontend::Sdk, Scenario::LuaUiRoundTrip ; "sdk_lua_ui_round_trip_answers_no_ui")]
+#[test_case(Frontend::Acp, Scenario::LuaUiRoundTrip ; "acp_lua_ui_round_trip_answers_no_ui")]
+fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let steps = scenario.steps(frontend);
+
+    let mut child = match (frontend, steps.as_slice()) {
+        (Frontend::Print, [Step::Prompt(prompt)]) => {
+            spawn_makima(home.path(), &work, print_args(prompt))
+        }
+        (Frontend::Print, _) => unreachable!("print runs one prompt"),
+        _ => spawn_makima(home.path(), &work, frontend_args(frontend)),
+    };
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    match frontend {
+        Frontend::Print => drop(stdin),
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            for step in &steps {
+                match step {
+                    Step::Prompt(text) => {
+                        send(&mut stdin, sdk_user(text));
+                        let result = expect(&output, |message| message["type"] == "result");
+                        assert_eq!(result["is_error"], false, "{result}");
+                    }
+                    Step::SwitchModel => {
+                        send(
+                            &mut stdin,
+                            json!({"type": "control_request", "request_id": SWITCH_REQUEST,
+                                   "request": {"subtype": "set_model",
+                                               "model": format!("{PROVIDER}/{OTHER_MODEL}")}}),
+                        );
+                        let response = expect(&output, |message| {
+                            message["response"]["request_id"] == SWITCH_REQUEST
+                        });
+                        assert_eq!(response["response"]["subtype"], "success", "{response}");
+                    }
+                }
+            }
+            drop(stdin);
+        }
+        Frontend::Acp => {
+            let (output, session) = acp_session(&mut child, &mut stdin, &work);
+            for (id, step) in (PROMPT_ID..).zip(&steps) {
+                match step {
+                    Step::Prompt(text) => send(
+                        &mut stdin,
+                        json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                               "params": {"sessionId": session,
+                                          "prompt": [{"type": "text", "text": text}]}}),
+                    ),
+                    Step::SwitchModel => send(
+                        &mut stdin,
+                        json!({"jsonrpc": "2.0", "id": id, "method": "session/set_config_option",
+                               "params": {"sessionId": session, "configId": "model",
+                                          "value": format!("{PROVIDER}/{OTHER_MODEL}")}}),
+                    ),
+                }
+                let response = expect(&output, |message| message["id"] == id);
+                assert!(response.get("error").is_none(), "{response}");
+            }
+            drop(stdin);
+        }
+    }
+    let status = wait_exit(child);
+    let log = stderr.join().unwrap();
+    assert!(status.success(), "{log}");
+    scenario.check(&bodies.try_iter().collect::<Vec<_>>(), home.path());
 }
 
 /// `echo prompt | makima`: input ends right after the prompt, yet the turn
@@ -152,10 +331,7 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
     let output = match frontend {
         Frontend::Sdk => {
             let output = json_lines(child.stdout.take().unwrap());
-            send(
-                &mut stdin,
-                json!({"type": "user", "message": {"role": "user", "content": PROMPT}}),
-            );
+            send(&mut stdin, sdk_user(PROMPT));
             output
         }
         Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work),
@@ -213,27 +389,102 @@ fn sdk_resume_restores_the_saved_mode() {
     assert!(wait_exit(child).success());
 }
 
+/// Waits for {child} to exit, killing it if it outlives the bound.
 fn wait_exit(mut child: Child) -> ExitStatus {
+    let pid = child.id().to_string();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait());
     });
-    rx.recv_timeout(TIMEOUT).expect(NO_EXIT).unwrap()
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(status) => status.unwrap(),
+        Err(_) => {
+            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+            panic!("{NO_EXIT}");
+        }
+    }
+}
+
+/// The first message on {output} that {matches}.
+fn expect(output: &Receiver<Value>, matches: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let message = output.recv_timeout(TIMEOUT).expect(NO_RESPONSE);
+        if matches(&message) {
+            return message;
+        }
+    }
+}
+
+fn sdk_user(text: &str) -> Value {
+    json!({"type": "user", "message": {"role": "user", "content": text}})
+}
+
+fn last_user_text(body: &Value) -> String {
+    let message = body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+        })
+        .unwrap_or_else(|| panic!("no user message: {body}"));
+    content_text(&message["content"])
+}
+
+fn tool_names(body: &Value) -> Vec<&str> {
+    let mut names: Vec<_> = body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+fn system_text(body: &Value) -> String {
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "system")
+        .map(|message| content_text(&message["content"]))
+        .collect()
+}
+
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn print_args(prompt: &str) -> Vec<String> {
+    let spec = format!("{PROVIDER}/{MODEL}");
+    [
+        "--print",
+        "--yolo",
+        "--max-turns",
+        "1",
+        "-m",
+        spec.as_str(),
+        "-p",
+        prompt,
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
 }
 
 fn frontend_args(frontend: Frontend) -> Vec<String> {
     let spec = format!("{PROVIDER}/{MODEL}");
     let args: &[&str] = match frontend {
-        Frontend::Print => &[
-            "--print",
-            "--yolo",
-            "--max-turns",
-            "1",
-            "-m",
-            spec.as_str(),
-            "-p",
-            PROMPT,
-        ],
+        Frontend::Print => return print_args(PROMPT),
         Frontend::Sdk => &[
             "--print",
             "--yolo",
@@ -254,6 +505,18 @@ fn frontend_args(frontend: Frontend) -> Vec<String> {
 /// `initialize`, `session/new`, then `session/prompt` on the new session id.
 /// Returns the rest of the server's output.
 fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> Receiver<Value> {
+    let (responses, session) = acp_session(child, stdin, cwd);
+    send(
+        stdin,
+        json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+               "params": {"sessionId": session, "prompt": [{"type": "text", "text": PROMPT}]}}),
+    );
+    responses
+}
+
+/// `initialize` and `session/new`. Returns the server's output and the new
+/// session id.
+fn acp_session(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> (Receiver<Value>, Value) {
     let responses = json_lines(child.stdout.take().unwrap());
     send(
         stdin,
@@ -265,25 +528,22 @@ fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> Receiver
         json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
                "params": {"cwd": cwd, "mcpServers": []}}),
     );
-    let session = loop {
-        let message = responses
-            .recv_timeout(TIMEOUT)
-            .expect("session/new response");
-        if message["id"] == 2 {
-            break message["result"]["sessionId"].clone();
-        }
-    };
-    send(
-        stdin,
-        json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
-               "params": {"sessionId": session, "prompt": [{"type": "text", "text": PROMPT}]}}),
-    );
-    responses
+    let session = expect(&responses, |message| message["id"] == 2)["result"]["sessionId"].clone();
+    (responses, session)
 }
 
 fn send(stdin: &mut ChildStdin, message: Value) {
     writeln!(stdin, "{message}").unwrap();
     stdin.flush().unwrap();
+}
+
+/// Reads all of {stderr} so the child never blocks on a full pipe.
+fn drain(mut stderr: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut log = String::new();
+        let _ = stderr.read_to_string(&mut log);
+        log
+    })
 }
 
 fn json_lines(stdout: impl Read + Send + 'static) -> Receiver<Value> {
@@ -309,7 +569,9 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
             "[{PROVIDER}]\nprotocol = \"openai\"\nbase_url = \"{base_url}\"\n\
              api_key_env = \"{API_KEY_ENV}\"\ndiscover_models = false\n\n\
              [[{PROVIDER}.models]]\nid = \"{MODEL}\"\ntier = \"strong\"\n\
-             context_window = 32768\nmax_output_tokens = 4096\nsupports_thinking = true\n"
+             context_window = 32768\nmax_output_tokens = 4096\nsupports_thinking = true\n\n\
+             [[{PROVIDER}.models]]\nid = \"{OTHER_MODEL}\"\ntier = \"medium\"\n\
+             context_window = 32768\nmax_output_tokens = 4096\n"
         ),
     )
     .unwrap();
@@ -319,7 +581,7 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
         .unwrap_or_default();
     std::fs::write(
         config.join("init.lua"),
-        format!("maki.setup({{ {always} }})\n"),
+        format!("maki.setup({{ {always} }})\n{}", parity_commands()),
     )
     .unwrap();
 
@@ -332,6 +594,42 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
         };
         std::fs::write(state.join(PREFS_FILE), serde_json::to_vec(&prefs).unwrap()).unwrap();
     }
+}
+
+/// The Lua commands the scenarios run: switch the model between two turns,
+/// set plan mode (then prompt with any argument), and prompt with what a UI
+/// round-trip answered.
+fn parity_commands() -> String {
+    format!(
+        r#"
+local function prompt(ctx, text)
+  local _, err = assert(maki.agent.current(ctx)):prompt(ctx, text)
+  assert(err == nil, tostring(err))
+end
+maki.api.register_command({{
+  name = "{SWITCH_COMMAND}", tui_only = false,
+  handler = function(_, ctx)
+    prompt(ctx, "{FIRST}")
+    assert(assert(maki.agent.current(ctx)):set_model(ctx, "{PROVIDER}/{OTHER_MODEL}"))
+    prompt(ctx, "{SECOND}")
+  end,
+}})
+maki.api.register_command({{
+  name = "{PLAN_COMMAND}", tui_only = false, arguments = {{ raw = true }},
+  handler = function(opts, ctx)
+    assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan"))
+    if opts.args ~= "" then prompt(ctx, opts.args) end
+  end,
+}})
+maki.api.register_command({{
+  name = "{UI_COMMAND}", tui_only = false,
+  handler = function(_, ctx)
+    local _, err = maki.fn.winsaveview()
+    prompt(ctx, "{UI_ANSWER}" .. tostring(err))
+  end,
+}})
+"#
+    )
 }
 
 fn spawn_makima(home: &Path, work: &Path, args: Vec<String>) -> Child {
