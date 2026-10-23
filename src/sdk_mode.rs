@@ -26,7 +26,8 @@ use maki_agent::command::{
 };
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{
-    self, InteractiveHandle, InteractiveInputSender, InteractiveParams, WorkCancel,
+    self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
+    WorkCancel,
 };
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
@@ -38,7 +39,9 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
     ToolOutput, TurnOutcome,
 };
-use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
+use maki_commands::{
+    CommandContent, CommandFuture, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle,
+};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::ModelCatalog;
 use maki_lua::session_snapshot::HeadlessObserver;
@@ -581,12 +584,12 @@ impl SdkCommands {
             .collect()
     }
 
-    fn dispatch_input(&self, prompt: &str, images: &[ImageSource]) -> InputDispatch {
+    fn dispatch_input(&self, prompt: &str, images: &[ImageSource]) -> CommandFuture<InputDispatch> {
         let content = CommandContent {
             text: Arc::from(prompt),
             attachments: command_attachments::from_images(images),
         };
-        smol::block_on(self.registry.dispatch_input(&self.target, content))
+        self.registry.dispatch_input(&self.target, content)
     }
 }
 
@@ -733,12 +736,12 @@ pub fn run(params: SdkParams) -> Result<()> {
         headless::default_model_preparer(timeouts),
     ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
-    let sdk_commands = SdkCommands::new(
+    let sdk_commands = Arc::new(SdkCommands::new(
         command_registry,
         &commands,
         SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
             .with_admission_context(trusted_root.clone()),
-    )?;
+    )?);
     let root = trusted_root.target.clone();
     let orchestration = maki_lua::orchestration::durable_frontend(
         "SDK",
@@ -854,6 +857,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         |_| {},
     );
 
+    let (user_tx, dispatcher) = UserDispatch {
+        commands: Arc::clone(&sdk_commands),
+        input_tx: handle.input_tx.clone(),
+        control_tx: handle.control_tx.clone(),
+        writer: writer.clone(),
+        shared: Arc::clone(&shared),
+    }
+    .spawn();
     let input_result = (|| -> Result<()> {
         for line in io::stdin().lock().lines() {
             let line = line.context("read stdin")?;
@@ -878,67 +889,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                     let content = user.message.content;
                     let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
                     let images = content_images(&content);
-                    shared.lock().unwrap().turn_start = Instant::now();
-                    match sdk_commands.dispatch_input(&prompt, &images) {
-                        InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-                            let input = command_attachments::agent_input(turn)?;
-                            match admit_sdk_turn(&shared, &handle.input_tx, input) {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(error) => {
-                                    emit_command_result(&writer, &shared, true, error.into())?
-                                }
-                            }
-                        }
-                        InputDispatch::Dispatched(CommandOutcome::Completed) => {
-                            emit_command_result(&writer, &shared, false, String::new())?
-                        }
-                        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
-                            let result = match feedback {
-                                maki_commands::FrontendFeedback::WorkingDirectory(path) => {
-                                    format!("Working directory: {}", path.display())
-                                }
-                                maki_commands::FrontendFeedback::Text(text) => text.to_string(),
-                            };
-                            emit_command_result(&writer, &shared, false, result)?
-                        }
-                        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
-                            let images =
-                                command_attachments::into_images(&turn.content.attachments)?;
-                            let control = handle.control_tx.clone();
-                            spawn_sdk_operation(&writer, &shared, move |cancel| async move {
-                                control
-                                    .ask_isolated(turn.content.text.to_string(), images, cancel)
-                                    .await
-                            })?
-                        }
-                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(
-                            instructions,
-                        )) => {
-                            let control = handle.control_tx.clone();
-                            spawn_sdk_operation(&writer, &shared, move |cancel| async move {
-                                control
-                                    .compact(instructions, cancel)
-                                    .await
-                                    .map(|()| String::new())
-                            })?
-                        }
-                        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
-                            emit_command_result(&writer, &shared, true, error.to_string())?
-                        }
-                        InputDispatch::LiteralInput(content) => {
-                            let input = AgentInput::new(
-                                content.text.to_string(),
-                                command_attachments::into_images(&content.attachments)?,
-                            );
-                            match admit_sdk_turn(&shared, &handle.input_tx, input) {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(error) => {
-                                    emit_command_result(&writer, &shared, true, error.into())?
-                                }
-                            }
-                        }
+                    if user_tx.send((prompt, images)).is_err() {
+                        break;
                     }
                 }
                 InboundMessageType::ControlRequest => {
@@ -996,7 +948,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         Ok(())
     })();
 
-    smol::block_on(finish_in_flight(&shared));
+    drop(user_tx);
+    let dispatched = smol::block_on(finish_in_flight(&shared, dispatcher));
     drop(sdk_commands);
     drop(model_discovery);
     smol::block_on(projection_watcher.cancel());
@@ -1017,7 +970,101 @@ pub fn run(params: SdkParams) -> Result<()> {
     drop(lock_guard);
     drop(writer);
     let _ = writer_thread.join();
-    input_result
+    input_result.and(dispatched)
+}
+
+type UserInput = (String, Vec<ImageSource>);
+
+/// Dispatches user messages in arrival order on a task of their own, so the
+/// stdin loop keeps reading answers and interrupts while a command handler
+/// waits on them.
+struct UserDispatch {
+    commands: Arc<SdkCommands>,
+    input_tx: InteractiveInputSender,
+    control_tx: InteractiveControlSender,
+    writer: SdkWriter,
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl UserDispatch {
+    fn spawn(self) -> (Sender<UserInput>, smol::Task<Result<()>>) {
+        let (user_tx, user_rx) = flume::unbounded::<UserInput>();
+        let task = smol::spawn(async move {
+            while let Ok((prompt, images)) = user_rx.recv_async().await {
+                if !self.dispatch(&prompt, &images).await? {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        (user_tx, task)
+    }
+
+    /// `Ok(false)` means the session has ended.
+    async fn dispatch(&self, prompt: &str, images: &[ImageSource]) -> Result<bool> {
+        let Self {
+            commands,
+            input_tx,
+            control_tx,
+            writer,
+            shared,
+        } = self;
+        shared.lock().unwrap().turn_start = Instant::now();
+        let input = match commands.dispatch_input(prompt, images).await {
+            InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
+                command_attachments::agent_input(turn)?
+            }
+            InputDispatch::LiteralInput(content) => AgentInput::new(
+                content.text.to_string(),
+                command_attachments::into_images(&content.attachments)?,
+            ),
+            InputDispatch::Dispatched(CommandOutcome::Completed) => {
+                emit_command_result(writer, shared, false, String::new())?;
+                return Ok(true);
+            }
+            InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
+                let result = match feedback {
+                    maki_commands::FrontendFeedback::WorkingDirectory(path) => {
+                        format!("Working directory: {}", path.display())
+                    }
+                    maki_commands::FrontendFeedback::Text(text) => text.to_string(),
+                };
+                emit_command_result(writer, shared, false, result)?;
+                return Ok(true);
+            }
+            InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
+                let images = command_attachments::into_images(&turn.content.attachments)?;
+                let control = control_tx.clone();
+                spawn_sdk_operation(writer, shared, move |cancel| async move {
+                    control
+                        .ask_isolated(turn.content.text.to_string(), images, cancel)
+                        .await
+                })?;
+                return Ok(true);
+            }
+            InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
+                let control = control_tx.clone();
+                spawn_sdk_operation(writer, shared, move |cancel| async move {
+                    control
+                        .compact(instructions, cancel)
+                        .await
+                        .map(|()| String::new())
+                })?;
+                return Ok(true);
+            }
+            InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
+                emit_command_result(writer, shared, true, error.to_string())?;
+                return Ok(true);
+            }
+        };
+        match admit_sdk_turn(shared, input_tx, input).await {
+            Ok(admitted) => Ok(admitted),
+            Err(error) => {
+                emit_command_result(writer, shared, true, error.into())?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 fn projected_commands(registry: &CommandRegistry, target: &TargetHandle) -> Result<Vec<Value>> {
@@ -1335,13 +1382,13 @@ type ModeSetter<'a> = dyn Fn(&str) -> Result<(), ConfigChangeError> + 'a;
 
 /// Admits {input} as the one piece of SDK work in flight; `Ok(false)` means
 /// the session has ended. An interrupt then cancels this turn on the actor.
-fn admit_sdk_turn(
+async fn admit_sdk_turn(
     shared: &Mutex<Shared>,
     input_tx: &InteractiveInputSender,
     input: AgentInput,
 ) -> Result<bool, &'static str> {
     begin_sdk_work(shared)?;
-    let Ok(ticket) = smol::block_on(input_tx.admit(input)) else {
+    let Ok(ticket) = input_tx.admit(input).await else {
         end_sdk_work(shared);
         return Ok(false);
     };
@@ -1368,9 +1415,13 @@ fn end_sdk_work(shared: &Mutex<Shared>) {
     shared.idle.notify(usize::MAX);
 }
 
-/// Stdin ended but stdout is still read: the work in flight runs to its end
-/// and reports, while permission asks nobody can answer any more are denied.
-async fn finish_in_flight(shared: &Mutex<Shared>) {
+/// Stdin ended but stdout is still read: the user messages already read are
+/// dispatched ({dispatched}), and the work in flight runs to its end and
+/// reports, while permission asks nobody can answer any more are denied.
+async fn finish_in_flight(
+    shared: &Mutex<Shared>,
+    dispatched: impl Future<Output = Result<()>>,
+) -> Result<()> {
     let unanswered = {
         let mut shared = shared.lock().unwrap();
         shared.input_closed = true;
@@ -1379,11 +1430,12 @@ async fn finish_in_flight(shared: &Mutex<Shared>) {
     for (ask_id, answer_tx) in unanswered.into_values() {
         let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
     }
+    let dispatched = dispatched.await;
     loop {
         let idle = {
             let shared = shared.lock().unwrap();
             if !shared.turn_active {
-                return;
+                return dispatched;
             }
             shared.idle.listen()
         };
@@ -2093,7 +2145,7 @@ mod tests {
         fn admit(&self) {
             let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
             assert_eq!(
-                admit_sdk_turn(&self.shared, &self.handle.input_tx, input),
+                smol::block_on(admit_sdk_turn(&self.shared, &self.handle.input_tx, input)),
                 Ok(true)
             );
             self.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
@@ -2112,13 +2164,13 @@ mod tests {
         /// Ends input the way stdin EOF does: the turn in flight must hold
         /// the session open until the provider is released, then report.
         fn end_input(self) -> Vec<Value> {
-            let mut finishing = Box::pin(finish_in_flight(&self.shared));
+            let mut finishing = Box::pin(finish_in_flight(&self.shared, async { Ok(()) }));
             assert!(
                 smol::block_on(futures_lite::future::poll_once(&mut finishing)).is_none(),
                 "input end must wait for the turn in flight"
             );
             self.release.send(()).unwrap();
-            smol::block_on(finishing);
+            smol::block_on(finishing).unwrap();
             let PendingSdkSession {
                 handle,
                 coordinator,
@@ -2368,17 +2420,17 @@ mod tests {
             ]
         );
         assert!(matches!(
-            commands.dispatch_input("/mcp:prompt", &[]),
+            smol::block_on(commands.dispatch_input("/mcp:prompt", &[])),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
         let InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) =
-            commands.dispatch_input("/btw explain this", &[])
+            smol::block_on(commands.dispatch_input("/btw explain this", &[]))
         else {
             panic!("quick question did not return an isolated turn");
         };
         assert_eq!(turn.content.text.as_ref(), "explain this");
         assert!(matches!(
-            commands.dispatch_input("/btw", &[]),
+            smol::block_on(commands.dispatch_input("/btw", &[])),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::TypedArguments {
                 command,
                 error: maki_commands::ArgumentParseError::MissingRaw,
@@ -2777,7 +2829,7 @@ mod tests {
         .unwrap();
         host.wait_for_worker_barrier_for_test();
         assert!(matches!(
-            commands.dispatch_input("/sdk_spawn", &[]),
+            smol::block_on(commands.dispatch_input("/sdk_spawn", &[])),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
         assert_eq!(
@@ -2794,13 +2846,14 @@ mod tests {
             1
         );
         assert!(matches!(
-            commands.dispatch_input("/model not-a-model", &[]),
+            smol::block_on(commands.dispatch_input("/model not-a-model", &[])),
             InputDispatch::Dispatched(CommandOutcome::Failed(_))
         ));
         assert_eq!(coordinator.read().model().unwrap().as_ref(), STARTUP_MODEL);
         assert!(checkpointed.lock().unwrap().is_empty());
 
-        let result = commands.dispatch_input(&format!("/model {TARGET_MODEL}"), &[]);
+        let result =
+            smol::block_on(commands.dispatch_input(&format!("/model {TARGET_MODEL}"), &[]));
         assert!(
             matches!(result, InputDispatch::Dispatched(CommandOutcome::Completed)),
             "{result:?}"
@@ -3185,7 +3238,7 @@ mod tests {
     fn sdk_bare_model_returns_shared_usage_error() {
         let commands = sdk_commands(CommandRegistry::new());
         assert!(matches!(
-            commands.dispatch_input("/model", &[]),
+            smol::block_on(commands.dispatch_input("/model", &[])),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
                 if message.as_ref() == maki_agent::command::NONINTERACTIVE_MODEL_USAGE
         ));
@@ -3207,7 +3260,7 @@ mod tests {
         )];
 
         let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
-            commands.dispatch_input("/inspect now", &images)
+            smol::block_on(commands.dispatch_input("/inspect now", &images))
         else {
             panic!("attachment-aware command did not return an agent turn");
         };
@@ -3221,7 +3274,7 @@ mod tests {
         assert_eq!(input.images[0].data.as_ref(), "BBBB");
 
         assert!(matches!(
-            commands.dispatch_input("/reject", &images),
+            smol::block_on(commands.dispatch_input("/reject", &images)),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
                 if message.as_ref() == REJECTED_ATTACHMENT
         ));
@@ -3245,13 +3298,13 @@ mod tests {
             Arc::from("AAAA"),
         )];
         assert!(matches!(
-            commands.dispatch_input("/unknown literal", &images),
+            smol::block_on(commands.dispatch_input("/unknown literal", &images)),
             InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
                 name
             ))) if name.as_ref() == "/unknown"
         ));
         let InputDispatch::LiteralInput(content) =
-            commands.dispatch_input("//unknown literal", &images)
+            smol::block_on(commands.dispatch_input("//unknown literal", &images))
         else {
             panic!("escaped unknown command did not remain literal input");
         };
@@ -3260,13 +3313,13 @@ mod tests {
         assert_eq!(content.attachments[0].media_type.as_ref(), "image/gif");
         assert_eq!(content.attachments[0].data.as_ref(), "AAAA");
         let InputDispatch::LiteralInput(content) =
-            commands.dispatch_input("///unknown literal", &[])
+            smol::block_on(commands.dispatch_input("///unknown literal", &[]))
         else {
             panic!("triple-slash input did not remain literal");
         };
         assert_eq!(content.text.as_ref(), "//unknown literal");
         assert!(matches!(
-            commands.dispatch_input("ordinary literal", &[]),
+            smol::block_on(commands.dispatch_input("ordinary literal", &[])),
             InputDispatch::LiteralInput(_)
         ));
     }

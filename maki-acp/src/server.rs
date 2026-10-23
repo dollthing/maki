@@ -30,8 +30,8 @@ use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
-    AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
-    TargetHandle,
+    AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, InputDispatch,
+    PresentedCommand, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -71,6 +71,7 @@ static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationKind {
+    Command,
     PrimaryTurn,
     IsolatedTurn,
     ManualCompaction,
@@ -208,6 +209,22 @@ struct Server {
     elicitation: bool,
     supports_boolean: bool,
     lua_event_handle: maki_lua::EventHandle,
+    /// The prompt whose command is still being dispatched. It runs beside the
+    /// input loop, so the answers and cancels its handler waits on still
+    /// arrive.
+    dispatch: Option<PendingDispatch>,
+}
+
+struct PendingDispatch {
+    operation_id: u64,
+    request_id: RequestId,
+    future: CommandFuture<InputDispatch>,
+}
+
+enum Step {
+    Line(String),
+    InputClosed,
+    Dispatched(InputDispatch),
 }
 
 impl Server {
@@ -237,6 +254,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         elicitation: false,
         supports_boolean: false,
         lua_event_handle: params.lua_event_handle.clone(),
+        dispatch: None,
     };
 
     let _discovery = server.catalog.discover(
@@ -246,10 +264,36 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     );
     let (in_tx, in_rx) = flume::unbounded::<String>();
     let _reader_task = smol::spawn(read_stdin(in_tx));
-    while let Ok(line) = in_rx.recv_async().await {
-        handle_line(&mut server, &line, &params).await;
+    let next_line = || async {
+        in_rx
+            .recv_async()
+            .await
+            .map_or(Step::InputClosed, Step::Line)
+    };
+    loop {
+        let step = match server.dispatch.as_mut() {
+            Some(dispatch) => {
+                smol::future::or(next_line(), async {
+                    Step::Dispatched((&mut dispatch.future).await)
+                })
+                .await
+            }
+            None => next_line().await,
+        };
+        match step {
+            Step::Line(line) => handle_line(&mut server, &line, &params).await,
+            Step::Dispatched(dispatched) => respond_dispatch(&mut server, dispatched).await,
+            Step::InputClosed => break,
+        }
     }
 
+    if let Some(session) = &server.session {
+        refuse_asks(session);
+    }
+    if let Some(dispatch) = server.dispatch.as_mut() {
+        let dispatched = (&mut dispatch.future).await;
+        respond_dispatch(&mut server, dispatched).await;
+    }
     if let Some(session) = &server.session {
         finish_in_flight(session).await;
     }
@@ -325,7 +369,7 @@ async fn handle_request(
         }
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
-        "session/prompt" => match handle_prompt(srv, raw, &id).await {
+        "session/prompt" => match start_prompt(srv, raw, &id) {
             Ok(()) => return,
             Err(e) => Err(e),
         },
@@ -693,10 +737,9 @@ async fn start_mcp(
     handle
 }
 
-/// The client closed its input but still reads the output: the work in
-/// flight runs to its end and reports, while the asks it can no longer get
-/// answered are refused.
-async fn finish_in_flight(session: &SessionState) {
+/// The client closed its input, so the asks it can no longer answer are
+/// refused, now and from here on.
+fn refuse_asks(session: &SessionState) {
     let (permission_answers, elicitation) = {
         let mut pending = session.pending.lock().unwrap();
         pending.input_closed = true;
@@ -706,6 +749,13 @@ async fn finish_in_flight(session: &SessionState) {
         )
     };
     answer_cancelled_requests(&session.handle, permission_answers, elicitation);
+}
+
+/// The client closed its input but still reads the output: the work in
+/// flight runs to its end and reports, while the asks it can no longer get
+/// answered are refused.
+async fn finish_in_flight(session: &SessionState) {
+    refuse_asks(session);
     loop {
         let settled = {
             let pending = session.pending.lock().unwrap();
@@ -721,6 +771,7 @@ async fn finish_in_flight(session: &SessionState) {
 /// Stop the old session before the next one starts, so two generations of the
 /// same MCP servers never fight over a port or a lock file.
 async fn close_session(srv: &mut Server) {
+    srv.dispatch = None;
     let Some(mut state) = srv.session.take() else {
         return;
     };
@@ -1125,15 +1176,80 @@ fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionS
     Ok(session)
 }
 
-async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+/// Starts dispatching the prompt's command; [`finish_prompt`] takes over
+/// once it resolves.
+fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
     let session = validate_session(srv, req.session_id.0.as_ref())?;
-    admit_prompt(&session.pending)?;
     let content = extract_prompt_content(&req.prompt)?;
-    let dispatch = session
+    admit_prompt(&session.pending)?;
+    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    session.pending.lock().unwrap().operation = Some(PendingOperation {
+        id: operation_id,
+        request_id: id.clone(),
+        kind: OperationKind::Command,
+        run_id: None,
+        cancelling: false,
+        cancel: None,
+    });
+    let future = session
         .command_registry
-        .dispatch_input(&session.command_target, content)
-        .await;
+        .dispatch_input(&session.command_target, content);
+    srv.dispatch = Some(PendingDispatch {
+        operation_id,
+        request_id: id.clone(),
+        future,
+    });
+    Ok(())
+}
+
+async fn respond_dispatch(srv: &mut Server, dispatched: InputDispatch) {
+    let request_id = srv
+        .dispatch
+        .as_ref()
+        .map(|dispatch| dispatch.request_id.clone());
+    if let (Some(request_id), Err(error)) = (request_id, finish_prompt(srv, dispatched).await) {
+        srv.respond(request_id, Err(error));
+    }
+}
+
+/// Runs what the prompt's command resolved to, unless the prompt was
+/// cancelled or its session closed while the command ran.
+async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<(), AcpError> {
+    let Some(PendingDispatch {
+        operation_id,
+        request_id,
+        ..
+    }) = srv.dispatch.take()
+    else {
+        return Ok(());
+    };
+    let Some(session) = srv.session.as_ref() else {
+        return Ok(());
+    };
+    let cancelling = {
+        let mut pending = session.pending.lock().unwrap();
+        let Some(operation) = pending.operation.take_if(|operation| {
+            operation.id == operation_id && operation.kind == OperationKind::Command
+        }) else {
+            return Ok(());
+        };
+        pending.settled.notify(usize::MAX);
+        operation.cancelling
+    };
+    if cancelling {
+        respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
+        return Ok(());
+    }
+    run_dispatch(srv, &request_id, dispatched).await
+}
+
+async fn run_dispatch(
+    srv: &Server,
+    id: &RequestId,
+    dispatch: InputDispatch,
+) -> Result<(), AcpError> {
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
     match dispatch {
         InputDispatch::LiteralInput(content) => {
             send_command_turn(
@@ -2213,6 +2329,14 @@ mod tests {
     const SAVE_FAILED: &str = "save failed";
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYIIA";
 
+    /// A prompt from start to its dispatched command's outcome, the way the
+    /// input loop drives it.
+    async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+        start_prompt(srv, raw, id)?;
+        let dispatched = (&mut srv.dispatch.as_mut().expect("prompt dispatch").future).await;
+        finish_prompt(srv, dispatched).await
+    }
+
     fn test_observer() -> HeadlessObserver {
         HeadlessObserver::new(
             maki_lua::EventHandle::disconnected_for_test(),
@@ -3093,6 +3217,7 @@ mod tests {
             elicitation: false,
             supports_boolean: false,
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+            dispatch: None,
         };
         (server, answer_rx, out_rx, turns)
     }
@@ -3123,6 +3248,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
             };
             let (handle, root_target) = spawn_session(
                 &params,
@@ -3187,6 +3313,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
             };
             let session_id = SessionRef::from(MakiId::generate());
             let persisted_options = BTreeMap::new();
@@ -3734,6 +3861,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: host.event_handle(),
+                dispatch: None,
             };
             new_session(
                 &mut srv,
@@ -3775,6 +3903,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
             };
             new_session(
                 &mut srv,
@@ -6543,6 +6672,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
             };
             let raw = serde_json::json!({
                 "params": {
@@ -6584,6 +6714,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
             };
             let raw = serde_json::json!({
                 "params": {

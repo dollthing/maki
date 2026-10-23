@@ -6,8 +6,8 @@
 //! switch between turns through each frontend's own mechanism, a mode set by
 //! a Lua command, and a Lua command whose UI round-trip answers "no UI" at
 //! once. SDK and ACP must also finish a turn whose input ended right after
-//! the prompt, and a resumed SDK session comes back in the mode it was saved
-//! in.
+//! the prompt, keep reading the answer a Lua command's turn waits on, and a
+//! resumed SDK session comes back in the mode it was saved in.
 //!
 //! The TUI cannot join without a pty. Its in-process tests in maki-ui check
 //! the same scenarios at the provider:
@@ -49,6 +49,8 @@ const SWITCH_COMMAND: &str = "/parity_switch";
 const PLAN_COMMAND: &str = "/parity_plan";
 const UI_COMMAND: &str = "/parity_ui";
 const UI_ANSWER: &str = "ui answered: ";
+const ASK_COMMAND: &str = "/parity_ask";
+const ASK_PROMPT: &str = "run the asking tool";
 /// The toolset the bundled plan mode swaps in.
 const PLAN_TOOLS: [&str; 11] = [
     "edit",
@@ -89,6 +91,16 @@ const SSE_REPLY: &str = concat!(
     "\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
     "\"delta\":{},\"finish_reason\":\"stop\"}],",
+    "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+    "data: [DONE]\n\n",
+);
+const SSE_TOOL_CALL: &str = concat!(
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
+    "\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+    "\"type\":\"function\",\"function\":{\"name\":\"bash\",",
+    "\"arguments\":\"{\\\"command\\\":\\\"touch asked\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
+    "\"delta\":{},\"finish_reason\":\"tool_calls\"}],",
     "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
     "data: [DONE]\n\n",
 );
@@ -356,6 +368,72 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
     assert!(wait_exit(child).success());
 }
 
+/// A Lua command whose turn asks the client for permission: the input loop
+/// keeps reading while the handler waits, so the answer gets through, the
+/// turn ends and the command reports.
+#[test_case(Frontend::Sdk ; "sdk_reads_the_answer_a_command_waits_on")]
+#[test_case(Frontend::Acp ; "acp_reads_the_answer_a_command_waits_on")]
+fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let args = frontend_args(frontend)
+        .into_iter()
+        .filter(|arg| !matches!(arg.as_str(), "--yolo" | "--max-turns" | "1"))
+        .collect();
+    let mut child = spawn_makima(home.path(), &work, args);
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(ASK_COMMAND));
+            let ask = expect(&output, |message| {
+                message["request"]["subtype"] == "can_use_tool"
+            });
+            send(
+                &mut stdin,
+                json!({"type": "control_response",
+                       "response": {"request_id": ask["request_id"], "behavior": "deny"}}),
+            );
+            let result = expect(&output, |message| message["type"] == "result");
+            assert_eq!(result["is_error"], false, "{result}");
+        }
+        Frontend::Acp => {
+            let (output, session) = acp_session(&mut child, &mut stdin, &work);
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+                       "params": {"sessionId": session,
+                                  "prompt": [{"type": "text", "text": ASK_COMMAND}]}}),
+            );
+            let ask = expect(&output, |message| {
+                message["method"] == "session/request_permission"
+            });
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": ask["id"],
+                       "result": {"outcome": {"outcome": "cancelled"}}}),
+            );
+            let response = expect(&output, |message| message["id"] == PROMPT_ID);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        Frontend::Print => unreachable!("print answers no questions"),
+    }
+    drop(stdin);
+    let status = wait_exit(child);
+    let log = stderr.join().unwrap();
+    assert!(status.success(), "{log}");
+    let bodies: Vec<_> = bodies.try_iter().collect();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(
+        bodies[1]["messages"].as_array().unwrap().last().unwrap()["role"],
+        "tool"
+    );
+}
+
 /// Like the TUI and ACP, an SDK resume puts the session back in the mode it
 /// was saved in, here plan mode with its plan file.
 #[test]
@@ -597,8 +675,8 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
 }
 
 /// The Lua commands the scenarios run: switch the model between two turns,
-/// set plan mode (then prompt with any argument), and prompt with what a UI
-/// round-trip answered.
+/// set plan mode (then prompt with any argument), prompt for a tool that
+/// asks permission, and prompt with what a UI round-trip answered.
 fn parity_commands() -> String {
     format!(
         r#"
@@ -620,6 +698,10 @@ maki.api.register_command({{
     assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan"))
     if opts.args ~= "" then prompt(ctx, opts.args) end
   end,
+}})
+maki.api.register_command({{
+  name = "{ASK_COMMAND}", tui_only = false,
+  handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
 }})
 maki.api.register_command({{
   name = "{UI_COMMAND}", tui_only = false,
@@ -656,6 +738,21 @@ fn spawn_makima(home: &Path, work: &Path, args: Vec<String>) -> Child {
         .unwrap()
 }
 
+/// A tool call for a request that ends on {ASK_PROMPT}, text otherwise.
+fn reply_to(body: &Value) -> &'static str {
+    let last = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last());
+    match last {
+        Some(message)
+            if message["role"] == "user" && content_text(&message["content"]) == ASK_PROMPT =>
+        {
+            SSE_TOOL_CALL
+        }
+        _ => SSE_REPLY,
+    }
+}
+
 /// Serves chat completions on loopback and forwards each request body.
 fn mock_server() -> (String, Receiver<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -684,12 +781,12 @@ fn mock_server() -> (String, Receiver<Value>) {
             let mut body = vec![0; length];
             let _ = reader.read_exact(&mut body);
             if request_line.contains("/chat/completions") {
-                if let Ok(json) = serde_json::from_slice(&body) {
-                    let _ = tx.send(json);
-                }
+                let json: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let reply = reply_to(&json);
+                let _ = tx.send(json);
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{SSE_REPLY}"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
                 );
             } else {
                 let _ = write!(
