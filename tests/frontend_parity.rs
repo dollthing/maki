@@ -777,21 +777,21 @@ fn parity_commands() -> String {
     format!(
         r#"
 local function prompt(ctx, text)
-  local _, err = assert(assert(maki.agent.current(ctx)):send(ctx, text, {{ when = "idle" }})):wait(ctx)
+  local _, err = assert(assert(ctx:agent()):send(ctx, text, {{ when = "idle" }})):wait(ctx)
   assert(err == nil, tostring(err))
 end
 maki.api.register_command({{
   name = "{SWITCH_COMMAND}", tui_only = false,
   handler = function(_, ctx)
     prompt(ctx, "{FIRST}")
-    assert(assert(maki.agent.current(ctx)):set_model(ctx, "{PROVIDER}/{OTHER_MODEL}"))
+    assert(assert(ctx:agent()):set_model(ctx, "{PROVIDER}/{OTHER_MODEL}"))
     prompt(ctx, "{SECOND}")
   end,
 }})
 maki.api.register_command({{
   name = "{PLAN_COMMAND}", tui_only = false, arguments = {{ raw = true }},
   handler = function(opts, ctx)
-    assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan"))
+    assert(assert(ctx:agent()):set_mode(ctx, "plan"))
     if opts.args ~= "" then prompt(ctx, opts.args) end
   end,
 }})
@@ -818,7 +818,7 @@ maki.api.register_command({{
 maki.api.register_command({{
   name = "{PARITY_THINKING_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    assert(maki.api.run_command("{THINKING_COMMAND}"))
+    assert(maki.api.run_command(ctx, "{THINKING_COMMAND}"))
     prompt(ctx, "{PROMPT}")
   end,
 }})

@@ -143,7 +143,7 @@ Host-issued invocation context. Tool contexts have delegated authority over the 
 LuaCtx:agent()
 ```
 
-Resolve the pinned invocation subject, not current UI focus. Equivalent to maki.agent.current(ctx).
+Resolve the pinned invocation subject, not current UI focus.
 
 **Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle with no authority independent of this context.
 
@@ -170,22 +170,6 @@ LuaCtx:mode()
 Read the executing turn's admitted mode. This can differ from Agent:config(ctx).mode, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
 
 **Returns:** (`string?`, `string?`) Registered mode name.
-
----
-
-### `LuaCtx:defer_close()` {#LuaCtx-defer_close}
-
-```lua
-LuaCtx:defer_close({agent})
-```
-
-Register agent close at the end of the current host task, including cancellation. Validates current close authority before registration; host-held cleanup does not depend on a retained context remaining valid.
-
-**Parameters:**
-
-- `{agent}` ([`Agent`](#maki-agent-Agent)) Agent to close.
-
-**Returns:** (`boolean?`, `string?`) true when cleanup is registered, or nil and an error.
 
 
 ## maki {#maki}
@@ -566,7 +550,7 @@ browsing memory files or toggling settings.
   - `handler` (`function`) Required. Called as `handler(opts, ctx)` after the
     command arguments pass validation. `ctx` is a trusted
     invocation-scoped LuaCtx, or nil if the host has no
-    agent target. `maki.agent.current(ctx)` resolves its
+    agent target. `ctx:agent()` resolves its
     pinned agent; later focus changes do not retarget it.
     Retaining ctx does not extend its authority beyond
     the handler. Existing one-argument handlers still work.
@@ -799,7 +783,7 @@ end
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua
-maki.api.run_command({cmdline})
+maki.api.run_command({ctx?}, {cmdline})
 ```
 
 Runs a slash command by name, as the explicit name-based executor: the
@@ -823,21 +807,19 @@ fails. A model turn, `/compact` or another long command it starts keeps
 running after the call returns, so aliasing `/compact` does not block
 your handler.
 
-Delegated tool handlers cannot call this trusted command executor. Nested
-trusted command calls retain the invoking command's pinned agent target.
-
-Outside a command handler the command runs on the frontend's own command
-target for the keymap's pinned agent, or the focused agent, the same way
-in every frontend: a model turn starts on that session. Only `/btw` needs
-the TUI, because its answer has nowhere else to show. Inside another
-command's handler the nested command shares that handler's invocation,
-so one that needs more than its handler -- a model turn, a custom
-Markdown command, `/compact`, `/btw` -- reports an error instead of
-pretending it ran. Call it from a keybinding or an autocmd if you need
-those.
+The command runs on the agent {ctx} is pinned to, through the frontend's
+own command target for it, the same way in every frontend: a model turn
+starts on that agent's session. Only `/btw` needs the TUI, because its
+answer has nowhere else to show. Inside another command's handler the
+nested command shares that handler's invocation, so one that needs more
+than its handler -- a model turn, a custom Markdown command, `/compact`,
+`/btw` -- reports an error instead of pretending it ran. Call it from a
+keybinding or an autocmd if you need those. Only a trusted ctx (command,
+keymap, autocmd) can run commands; delegated tool handlers cannot.
 
 **Parameters:**
 
+- `{ctx?}` ([`LuaCtx?`](#LuaCtx)) Trusted context naming the agent to run the command for. Required outside a command handler; a nested call shares its handler's invocation.
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
 
 **Returns:** (`boolean|nil`, `string|nil`) `true` once the command ran, or nil and an error message if it is unknown, failed or cannot run here.
@@ -850,8 +832,8 @@ maki.api.register_command({
   name = "/resume",
   description = "Alias for /sessions",
   tui_only = false,
-  handler = function()
-    local ok, err = maki.api.run_command("/sessions")
+  handler = function(_, ctx)
+    local ok, err = maki.api.run_command(ctx, "/sessions")
     if not ok then
       maki.ui.flash("could not run /sessions: " .. err)
     end
@@ -1525,22 +1507,6 @@ local ok, err = maki.agent.permission_prompt(ctx, {
 })
 if not ok then return { llm_output = err, is_error = true } end
 ```
-
----
-
-### `maki.agent.current()` {#maki-agent-current}
-
-```lua
-maki.agent.current({ctx})
-```
-
-Read the agent associated with an explicit invocation context.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-
-**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning agent handle.
 
 ---
 
@@ -3618,7 +3584,7 @@ mapped, the old binding is replaced and a warning is logged.
   `ctx` is a trusted invocation-scoped LuaCtx, or nil if the host has no
 
 
-  agent target. Resolve the callback's agent with `maki.agent.current(ctx)`.
+  agent target. Resolve the callback's agent with `ctx:agent()`.
 
 
   Later focus changes do not retarget an already resolved context. Retaining
@@ -4041,8 +4007,7 @@ cannot create, focus or delete sessions, and the functions that change
 a session (`set_title`) accept
 only the session its own turn belongs to. Every function that reads or
 changes one session takes it explicitly; `ctx:session_id()` names the
-invocation's session, and `current` names the focused one. Tool
-handlers cannot read UI focus, so `current` refuses them.
+invocation's session.
 
 ---
 
@@ -4111,81 +4076,34 @@ local live, err = maki.session.live()
 
 ---
 
-### `maki.session.current()` {#maki-session-current}
-
-```lua
-maki.session.current()
-```
-
-Returns the id of the focused agent's session; a headless frontend's
-focus is its one session.
-
-**Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
-
-**Example:**
-
-```lua
-local id = maki.session.current()
-```
-
----
-
-### `maki.session.usage()` {#maki-session-usage}
-
-```lua
-maki.session.usage({opts})
-```
-
-Returns a session's token usage without making a network request.
-Costs are the values recorded when each turn was billed and remain nil when
-no turn for that total or model was priced. Models are sorted by total tokens
-descending, then model spec ascending.
-
-**Parameters:**
-
-- `{opts}` (`table`) Required `session` (string) id.
-
-**Returns:** (`table|nil`, `string|nil`) `{total={input, output, cache_creation,
-  cache_read, cost}, models}`, where each model has `{model, input, output,
-  cache_creation, cache_read, cost}`, or nil and an error.
-
-**Example:**
-
-```lua
-local usage, err = maki.session.usage({ session = ctx:session_id() })
-```
-
----
-
 ### `maki.session.read()` {#maki-session-read}
 
 ```lua
 maki.session.read({opts})
 ```
 
-One-call snapshot of a session: queue, usage, context, cost, mode, and
-status of the session you name in `session`.
+Snapshot of the session you name in `session`.
 
 The returned table:
 ```lua
 {
-  id, cwd, model, fast, thinking,
-  mode,              -- committed mode id: "build", "plan" or a plugin mode
-  status = "idle" | "working" | "needs_input",
-  focused, updated_at,
-  usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
-  context_size, context_window,
-  cost,
-  queue = { count }, -- nil under headless drivers
+  id,
   title,             -- nil under headless drivers
+  status = "idle" | "working" | "needs_input",
+  updated_at,        -- unix seconds
+  usage = {
+    total = { input, output, cache_creation, cache_read, cost },
+    models = { { model, input, output, cache_creation, cache_read, cost }, ... },
+  },
 }
 ```
 
-`usage` and `cost` include subagent spend. `context_size` is the main
-session's own, since a subagent runs its own window. There is no
-`list_cost` here because `cost` is re-settled from stored usage when a
-session resumes and list price is not stored, so per-turn list price
-lives on the `TurnEnd` autocmd instead.
+`usage` includes subagent spend. Costs are the values recorded when each
+turn was billed and stay nil when unpriced. `models` is sorted by total
+tokens, descending, then spec; headless drivers do not split usage by
+model and leave it empty. Model, mode and options are on the agent:
+`Agent:config(ctx)`; per-turn context size and list price are on the
+`TurnEnd` autocmd.
 
 **Parameters:**
 
@@ -4197,9 +4115,7 @@ lives on the `TurnEnd` autocmd instead.
 
 ```lua
 local s = maki.session.read({ session = ctx:session_id() })
-if s.context_size > s.context_window * 0.8 then
-  maki.ui.notify("context is nearly full")
-end
+maki.ui.notify("spent " .. tostring(s.usage.total.cost))
 ```
 
 ---

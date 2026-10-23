@@ -14,10 +14,7 @@ use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::orchestration::resolve_target;
 use crate::runtime::{current_plugin, in_delegated_tool};
 
-/// Read the agent associated with an explicit invocation context.
-/// @param ctx LuaCtx Invocation context.
-/// @return (Agent?, string?) Nonowning agent handle.
-#[lua_fn]
+/// The agent of an explicit invocation context, for `ctx:agent()`.
 pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgent>> {
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
     try_pair!(scope(lua, &ctx, id));

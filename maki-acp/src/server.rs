@@ -2611,11 +2611,11 @@ mod tests {
             maki.api.register_command({{
                 name = "/acp_fast", tui_only = false,
                 handler = function(_, ctx)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                     assert(assert(root:config(ctx)).model.fast)
-                    local session = assert(maki.session.read({{ session = ctx:session_id() }}))
-                    assert(session.fast and session.model == "{FAST_SPEC}", maki.json.encode(session))
+                    local config = assert(root:config(ctx))
+                    assert(config.model.fast and config.model.spec == "{FAST_SPEC}", maki.json.encode(config))
                     local view, view_err = maki.fn.winsaveview()
                     assert(view == nil and view_err == "{no_ui}", view_err)
                 end,

@@ -32,14 +32,13 @@ use maki_config::{AgentConfig, Effect, Permission, PermissionRule, ToolKey, Tool
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::SessionRef;
 use mlua::{
-    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table, UserDataRef,
     Value as LuaValue,
 };
 use serde_json::{Value, json};
 
 use crate::agent_errors::{
-    DELEGATED_REGISTRATION, NO_FOCUSED_AGENT, NO_ORCHESTRATION_SERVICES,
-    TRUSTED_RUN_COMMAND_REQUIRED,
+    DELEGATED_REGISTRATION, NO_ORCHESTRATION_SERVICES, TRUSTED_RUN_COMMAND_REQUIRED,
 };
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
@@ -53,7 +52,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::orchestration::{detached_outcome, resolve_target, services};
+use crate::orchestration::{TrustedTarget, detached_outcome, services};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
@@ -1030,7 +1029,7 @@ fn allow_is_delegated(
 ///   handler     (function) Required. Called as `handler(opts, ctx)` after the
 ///                          command arguments pass validation. `ctx` is a trusted
 ///                          invocation-scoped LuaCtx, or nil if the host has no
-///                          agent target. `maki.agent.current(ctx)` resolves its
+///                          agent target. `ctx:agent()` resolves its
 ///                          pinned agent; later focus changes do not retarget it.
 ///                          Retaining ctx does not extend its authority beyond
 ///                          the handler. Existing one-argument handlers still work.
@@ -1131,19 +1130,17 @@ fn register_command(
 /// running after the call returns, so aliasing `/compact` does not block
 /// your handler.
 ///
-/// Delegated tool handlers cannot call this trusted command executor. Nested
-/// trusted command calls retain the invoking command's pinned agent target.
+/// The command runs on the agent {ctx} is pinned to, through the frontend's
+/// own command target for it, the same way in every frontend: a model turn
+/// starts on that agent's session. Only `/btw` needs the TUI, because its
+/// answer has nowhere else to show. Inside another command's handler the
+/// nested command shares that handler's invocation, so one that needs more
+/// than its handler -- a model turn, a custom Markdown command, `/compact`,
+/// `/btw` -- reports an error instead of pretending it ran. Call it from a
+/// keybinding or an autocmd if you need those. Only a trusted ctx (command,
+/// keymap, autocmd) can run commands; delegated tool handlers cannot.
 ///
-/// Outside a command handler the command runs on the frontend's own command
-/// target for the keymap's pinned agent, or the focused agent, the same way
-/// in every frontend: a model turn starts on that session. Only `/btw` needs
-/// the TUI, because its answer has nowhere else to show. Inside another
-/// command's handler the nested command shares that handler's invocation,
-/// so one that needs more than its handler -- a model turn, a custom
-/// Markdown command, `/compact`, `/btw` -- reports an error instead of
-/// pretending it ran. Call it from a keybinding or an autocmd if you need
-/// those.
-///
+/// @param ctx LuaCtx? Trusted context naming the agent to run the command for. Required outside a command handler; a nested call shares its handler's invocation.
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
 /// @return (boolean|nil, string|nil) `true` once the command ran, or nil and an error message if it is unknown, failed or cannot run here.
 /// @example
@@ -1152,15 +1149,19 @@ fn register_command(
 ///   name = "/resume",
 ///   description = "Alias for /sessions",
 ///   tui_only = false,
-///   handler = function()
-///     local ok, err = maki.api.run_command("/sessions")
+///   handler = function(_, ctx)
+///     local ok, err = maki.api.run_command(ctx, "/sessions")
 ///     if not ok then
 ///       maki.ui.flash("could not run /sessions: " .. err)
 ///     end
 ///   end,
 /// })
 #[lua_fn]
-async fn run_command(lua: Lua, cmdline: String) -> LuaResult<Pair<bool>> {
+async fn run_command(
+    lua: Lua,
+    ctx: Option<UserDataRef<LuaCtx>>,
+    cmdline: String,
+) -> LuaResult<Pair<bool>> {
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
     }
@@ -1173,15 +1174,20 @@ async fn run_command(lua: Lua, cmdline: String) -> LuaResult<Pair<bool>> {
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
         try_pair!(detached_outcome(&cmdline, result));
-    } else {
-        let target = match crate::runtime::pinned_target(&lua) {
-            Some(target) => target,
-            None => try_pair!(try_pair!(resolve_target(&lua, None)).ok_or(NO_FOCUSED_AGENT)),
-        };
-        let services = try_pair!(services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-        let run = try_pair!(services.command_runner(&target.target));
-        try_pair!(run(cmdline, depth, target).await);
+        return Ok((Some(true), None));
     }
+    let Some(ctx) = ctx else {
+        return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
+    };
+    let trusted = try_pair!(ctx.trusted(&lua).map_err(|_| TRUSTED_RUN_COMMAND_REQUIRED));
+    let target = TrustedTarget {
+        target: trusted.target.clone(),
+        template: trusted.template.clone(),
+    };
+    drop(ctx);
+    let services = try_pair!(services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
+    let run = try_pair!(services.command_runner(&target.target));
+    try_pair!(run(cmdline, depth, target).await);
     Ok((Some(true), None))
 }
 

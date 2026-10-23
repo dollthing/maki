@@ -448,7 +448,6 @@ pub enum SessionRequest {
     List,
     ListAll,
     Live,
-    Usage { id: MakiId },
     Read { id: MakiId },
     New { prompt: Option<String>, focus: bool },
     Focus { id: String },

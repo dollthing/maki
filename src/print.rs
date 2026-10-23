@@ -1379,7 +1379,7 @@ mod tests {
                     name = "{MODELS_COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local found = false
-                        for _, model in ipairs(assert(assert(maki.agent.current(ctx)):available_models(ctx))) do
+                        for _, model in ipairs(assert(assert(ctx:agent()):available_models(ctx))) do
                             found = found or model == "{spec}"
                         end
                         maki.ui.flash(tostring(found))
@@ -1525,7 +1525,7 @@ mod tests {
                     schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
                     audiences = {{ "main", "general_sub" }},
                     handler = function(input, ctx)
-                        local agent = assert(maki.agent.current(ctx))
+                        local agent = assert(ctx:agent())
                         local selection = assert(agent:config(ctx)).model
                         local root_ref = assert(maki.agent.root(ctx))
                         if input.child then
@@ -1559,11 +1559,9 @@ mod tests {
             &format!(
                 r#"
                 maki.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
-                    callback = function()
-                        maki.async.run(function()
-                            local ok, err = maki.api.run_command("/cd {cwd}")
-                            maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
-                        end)
+                    callback = function(_, ctx)
+                        local ok, err = maki.api.run_command(ctx, "/cd {cwd}")
+                        maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
                     end,
                 }})
             "#,
@@ -1592,7 +1590,7 @@ mod tests {
                 maki.api.register_command({{
                     name = "{COMMAND}", tui_only = false,
                     handler = function(_, ctx)
-                        local root = assert(maki.agent.current(ctx))
+                        local root = assert(ctx:agent())
                         assert(root:id() == assert(maki.agent.root(ctx)):id())
                         local selection = assert(root:config(ctx)).model
                         assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
@@ -1672,8 +1670,11 @@ mod tests {
                 serde_json::json!({}),
             );
             assert_eq!(notices.recv_timeout(GATE_TIMEOUT).unwrap(), MODES_SET);
-            host.event_handle()
-                .fire_autocmd(PRINT_RUNNER_AUTOCMD, serde_json::json!({}));
+            host.event_handle().fire_agent_autocmd(
+                PRINT_RUNNER_AUTOCMD,
+                root.clone(),
+                serde_json::json!({}),
+            );
             assert_eq!(
                 notices.recv_timeout(GATE_TIMEOUT).unwrap(),
                 RUNNER_DISPATCHED

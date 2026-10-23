@@ -54,7 +54,7 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
         FnDoc {
             name: "agent",
             args: "",
-            desc: "Resolve the pinned invocation subject, not current UI focus. Equivalent to maki.agent.current(ctx).",
+            desc: "Resolve the pinned invocation subject, not current UI focus.",
             params: &[],
             returns: "(Agent?, string?) Nonowning handle with no authority independent of this context.",
             example: "",
@@ -75,19 +75,6 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
             desc: "Read the executing turn's admitted mode. This can differ from Agent:config(ctx).mode, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
             params: &[],
             returns: "(string?, string?) Registered mode name.",
-            example: "",
-            guard: None,
-        },
-        FnDoc {
-            name: "defer_close",
-            args: "{agent}",
-            desc: "Register agent close at the end of the current host task, including cancellation. Validates current close authority before registration; host-held cleanup does not depend on a retained context remaining valid.",
-            params: &[ParamDoc {
-                name: "{agent}",
-                ty: "Agent",
-                desc: "Agent to close.",
-            }],
-            returns: "(boolean?, string?) true when cleanup is registered, or nil and an error.",
             example: "",
             guard: None,
         },

@@ -104,7 +104,7 @@ supply both when you override.
 Other methods:
 
 ```lua
-local agent = maki.agent.current(ctx)  -- in a command, keymap or tool handler
+local agent = ctx:agent()  -- in a command, keymap or tool handler
 agent:config(ctx).mode       -- the agent's mode id: "build", "plan", or a custom name
 agent:set_mode(ctx, "plan")  -- enter a mode; fails if it is not defined
 maki.api.mode.list()         -- all modes as { name, label }

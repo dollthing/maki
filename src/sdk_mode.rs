@@ -2756,7 +2756,7 @@ mod tests {
             maki.api.register_command({{
                 name = "/sdk_spawn", tui_only = false,
                 handler = function(_, ctx)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     local child = assert(maki.agent.spawn(ctx, {{ name = "SDK command child" }}))
                     assert(child:close(ctx))
                     local view, view_err = maki.fn.winsaveview()
@@ -2781,7 +2781,7 @@ mod tests {
                 handler = function(input, ctx)
                     if input.child then
                         local inherited = assert(ctx:model())
-                        local child = assert(maki.agent.current(ctx))
+                        local child = assert(ctx:agent())
                         local selected = assert(child:set_model(ctx, {{ spec = "{STARTUP_MODEL}", thinking = "off", fast = false }}))
                         assert(selected.spec == "{STARTUP_MODEL}")
                         assert(assert(child:config(ctx)).model.spec == "{STARTUP_MODEL}")

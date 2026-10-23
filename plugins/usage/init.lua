@@ -82,12 +82,12 @@ local function refresh_modal(current, force)
 end
 
 local function update_session(current)
-  local usage, err = maki.session.usage({ session = current.session_id })
+  local snapshot, err = maki.session.read({ session = current.session_id })
   if modal ~= current then
     return false
   end
-  if usage then
-    current.session = usage
+  if snapshot then
+    current.session = snapshot.usage
   elseif err then
     maki.log.warn("session usage refresh failed: " .. err)
   end

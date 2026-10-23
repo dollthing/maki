@@ -556,15 +556,15 @@ maki.api.register_command({
   description = "Rename the current session",
   arguments = { raw = true, required = true },
   tui_only = true,
-  handler = function(opts)
+  handler = function(opts, ctx)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then
       maki.ui.flash(RENAME_USAGE)
       return
     end
-    local id, err = maki.session.current()
-    if err then
-      maki.ui.flash(err)
+    local id, err = ctx and ctx:session_id()
+    if not id then
+      maki.ui.flash(err or "no session")
       return
     end
     local _, set_err = maki.session.set_title({ id = id, title = title })

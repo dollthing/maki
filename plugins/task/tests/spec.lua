@@ -21,7 +21,6 @@ case("maki_agent_has_expected_functions", function()
     "tools",
     "call_tool",
     "spawn",
-    "current",
     "root",
     "list",
     "get",

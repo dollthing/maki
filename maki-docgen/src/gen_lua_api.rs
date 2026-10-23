@@ -27,7 +27,7 @@ mod tests {
 
     #[test_case("maki.api.register_command()", "maki.api.register_command({spec})"; "register_command")]
     #[test_case("maki.keymap.set()", "maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})"; "keymap_set")]
-    #[test_case("maki.api.run_command()", "maki.api.run_command({cmdline})"; "run_command")]
+    #[test_case("maki.api.run_command()", "maki.api.run_command({ctx?}, {cmdline})"; "run_command")]
     #[test_case("maki.agent.spawn()", "maki.agent.spawn({ctx}, {opts})"; "agent_spawn")]
     #[test_case("Agent:status()", "Agent:status({ctx})"; "agent_status")]
     #[test_case("Agent:config()", "Agent:config({ctx})"; "agent_config")]
@@ -41,7 +41,6 @@ mod tests {
     #[test_case("Agent:on_close()", "Agent:on_close({ctx}, {handler})"; "agent_on_close")]
     #[test_case("LuaCtx:agent()", "LuaCtx:agent()"; "context_agent")]
     #[test_case("LuaCtx:model()", "LuaCtx:model()"; "context_model")]
-    #[test_case("LuaCtx:defer_close()", "LuaCtx:defer_close({agent})"; "context_defer_close")]
     fn generated_docs_render_agent_api_sections(heading: &str, signature: &str) {
         let page = generate();
         let start = page

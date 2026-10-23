@@ -87,7 +87,7 @@ maki.api.register_command({
     arguments = { raw = true, required = true },
     handler = function(opts, ctx)
         local input = maki.json.decode(opts.args)
-        alignment_ancestor = assert(maki.agent.current(ctx))
+        alignment_ancestor = assert(ctx:agent())
         local target = assert(maki.agent.get(ctx, assert(maki.agent.root(ctx))))
         for _, reference in ipairs(assert(maki.agent.list(ctx))) do
             if reference:id() == input.agent_id then target = assert(maki.agent.get(ctx, reference)) end
@@ -101,7 +101,7 @@ maki.api.register_tool({
     schema = { type = "object", properties = {} },
     audiences = { "main", "general_sub" },
     handler = function(_, ctx)
-        local current = assert(maki.agent.current(ctx))
+        local current = assert(ctx:agent())
         local changed, err = alignment_ancestor:set_mode(ctx, "plan")
         assert(changed == nil and err ~= nil)
         local closed, close_err = alignment_ancestor:close(ctx)

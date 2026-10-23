@@ -53,7 +53,7 @@ use maki_lua::orchestration::{
     ModelCatalog, OrchestrationServices, TrustedTarget, project_yolo,
 };
 use maki_lua::session_snapshot::{
-    STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot, SessionSnapshot,
+    STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionSnapshot, session_usage,
 };
 use maki_lua::ui_sink::UiSink;
 use maki_lua::{
@@ -63,13 +63,13 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model, TokenUsage};
+use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::checkpoint::CheckpointPublication;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock::{self, ClaimedSessionLock};
-use maki_storage::sessions::{SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title};
+use maki_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -2999,17 +2999,6 @@ impl<'t> EventLoop<'t> {
                 };
                 let _ = reply_tx.send(reply);
             }
-            SessionRequest::Usage { id } => {
-                let reply = self.resolve_session_index(id).map(|idx| {
-                    let app = &self.sessions[idx].app;
-                    session_usage(
-                        &app.state.token_usage,
-                        app.state.cost,
-                        app.state.session.usage_by_model(),
-                    )
-                });
-                let _ = reply_tx.send(reply);
-            }
             SessionRequest::New { prompt, focus } => {
                 let (session, provider) =
                     new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
@@ -3087,27 +3076,17 @@ impl<'t> EventLoop<'t> {
     /// The totals live on the session, so a plugin that reloads mid run keeps
     /// the accounting it would lose by summing `TurnEnd` payloads itself.
     fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
-        let rt = &self.sessions[idx];
-        let app = &rt.app;
-        let config = rt.config().unwrap_or_else(|| app.root_config());
+        let app = &self.sessions[idx].app;
         let snapshot = SessionSnapshot {
-            id: rt.id().to_string(),
-            cwd: config.context.cwd().to_string_lossy().into_owned(),
+            id: self.sessions[idx].id().to_string(),
             title: Some(app.state.session.title.clone()),
-            model: config.model.spec(),
-            fast: config.fast,
-            thinking: config.thinking.to_string(),
-            mode: config.mode.id().key().to_owned(),
             status: SessionStatus::of(app).as_str(),
-            focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
-            queue: Some(SessionQueueSnapshot {
-                count: app.queue.root_text_messages().len(),
-            }),
-            usage: app.state.token_usage,
-            context_size: app.state.context_size,
-            context_window: config.model.context_window,
-            cost: app.state.cost,
+            usage: session_usage(
+                &app.state.token_usage,
+                app.state.cost,
+                app.state.session.usage_by_model(),
+            ),
         };
         serde_json::to_value(snapshot).unwrap_or_default()
     }
@@ -4423,44 +4402,6 @@ impl UiSink for EventLoop<'_> {
             }
         }
     }
-}
-
-fn session_usage(
-    total: &TokenUsage,
-    cost: Option<f64>,
-    usage_by_model: &HashMap<String, StoredTokenUsage>,
-) -> serde_json::Value {
-    let mut models: Vec<_> = usage_by_model.iter().collect();
-    models.sort_by(|(a_model, a_usage), (b_model, b_usage)| {
-        b_usage
-            .total()
-            .cmp(&a_usage.total())
-            .then_with(|| a_model.cmp(b_model))
-    });
-    let models: Vec<_> = models
-        .into_iter()
-        .map(|(model, usage)| {
-            json!({
-                "model": model,
-                "input": usage.input,
-                "output": usage.output,
-                "cache_creation": usage.cache_creation,
-                "cache_read": usage.cache_read,
-                "cost": usage.cost,
-            })
-        })
-        .collect();
-
-    json!({
-        "total": {
-            "input": total.input,
-            "output": total.output,
-            "cache_creation": total.cache_creation,
-            "cache_read": total.cache_read,
-            "cost": cost,
-        },
-        "models": models,
-    })
 }
 
 fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit {
@@ -8242,13 +8183,13 @@ mod tests {
                     maki.api.register_command({{
                         name = "/keymap-inner", tui_only = false,
                         handler = function(_, ctx)
-                            local target = assert(maki.agent.current(ctx))
+                            local target = assert(ctx:agent())
                             assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
                             maki.ui.flash("{INNER_DONE}")
                         end,
                     }})
-                    maki.keymap.set("n", "<C-y>", function()
-                        assert(maki.api.run_command("/keymap-inner"))
+                    maki.keymap.set("n", "<C-y>", function(_, ctx)
+                        assert(maki.api.run_command(ctx, "/keymap-inner"))
                     end)
                     "#
                 ),
@@ -8331,15 +8272,15 @@ mod tests {
                     }})
                     maki.api.register_command({{
                         name = "/pin-outer", tui_only = false,
-                        handler = function()
+                        handler = function(_, ctx)
                             assert(maki.fn.winsaveview())
-                            assert(maki.api.run_command("/pin-inner"))
+                            assert(maki.api.run_command(ctx, "/pin-inner"))
                         end,
                     }})
                     maki.api.register_command({{
                         name = "/pin-inner", tui_only = false,
                         handler = function(_, ctx)
-                            local target = assert(maki.agent.current(ctx))
+                            local target = assert(ctx:agent())
                             assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
                             maki.ui.flash("{INNER_DONE}")
                         end,
@@ -9421,87 +9362,6 @@ mod tests {
         state.on_done(&done_event());
         state.on_drain();
         state
-    }
-
-    #[test]
-    fn session_usage_preserves_costs_and_sorts_models_deterministically() {
-        let total = TokenUsage {
-            input: 10,
-            output: 20,
-            cache_creation: 30,
-            cache_read: 40,
-        };
-        let usage_by_model = HashMap::from([
-            (
-                "z/model".to_owned(),
-                StoredTokenUsage {
-                    input: 5,
-                    output: 5,
-                    cache_creation: 0,
-                    cache_read: 0,
-                    cost: None,
-                },
-            ),
-            (
-                "b/model".to_owned(),
-                StoredTokenUsage {
-                    input: 14,
-                    output: 1,
-                    cache_creation: 2,
-                    cache_read: 3,
-                    cost: Some(0.25),
-                },
-            ),
-            (
-                "a/model".to_owned(),
-                StoredTokenUsage {
-                    input: 10,
-                    output: 0,
-                    cache_creation: 0,
-                    cache_read: 0,
-                    cost: Some(0.5),
-                },
-            ),
-        ]);
-
-        assert_eq!(
-            session_usage(&total, None, &usage_by_model),
-            json!({
-                "total": {
-                    "input": 10,
-                    "output": 20,
-                    "cache_creation": 30,
-                    "cache_read": 40,
-                    "cost": null,
-                },
-                "models": [
-                    {
-                        "model": "b/model",
-                        "input": 14,
-                        "output": 1,
-                        "cache_creation": 2,
-                        "cache_read": 3,
-                        "cost": 0.25,
-                    },
-                    {
-                        "model": "a/model",
-                        "input": 10,
-                        "output": 0,
-                        "cache_creation": 0,
-                        "cache_read": 0,
-                        "cost": 0.5,
-                    },
-                    {
-                        "model": "z/model",
-                        "input": 5,
-                        "output": 5,
-                        "cache_creation": 0,
-                        "cache_read": 0,
-                        "cost": null,
-                    },
-                ],
-            })
-        );
     }
 
     #[test]

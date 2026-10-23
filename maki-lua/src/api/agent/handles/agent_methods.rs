@@ -520,7 +520,7 @@ fn agent_close(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Re
 /// @param ctx LuaCtx Invocation context.
 /// @return (boolean?, string?) Cleanup registered.
 #[lua_fn(name = "defer_close")]
-pub(crate) fn agent_defer_close(
+fn agent_defer_close(
     lua: &Lua,
     this: &LuaAgent,
     ctx: UserDataRef<LuaCtx>,

@@ -16,12 +16,12 @@ use mlua::Lua;
 use crate::api::agent::{LuaActorState, LuaSession};
 use crate::api::util::pair::Pair;
 
-pub(crate) use agent_methods::{AGENT_DOCS, agent_defer_close};
+pub(crate) use agent_methods::AGENT_DOCS;
 pub(crate) use authority::lookup as lookup_agent;
 pub(crate) use module_fns::{current, focused_agent_ref};
 pub(super) use module_fns::{
-    current__doc, current__register, get__doc, get__register, list__doc, list__register, root__doc,
-    root__register, spawn__doc, spawn__register,
+    get__doc, get__register, list__doc, list__register, root__doc, root__register, spawn__doc,
+    spawn__register,
 };
 pub(crate) use projection::{origin_json, result_json, selection_json};
 pub(crate) use subscriptions::SUBSCRIPTION_DOCS;
@@ -563,14 +563,14 @@ mod tests {
                     maki.api.register_command({
                         name = "/editor", tui_only = false,
                         handler = function(_, ctx)
-                            local agent = assert(maki.agent.current(ctx))
+                            local agent = assert(ctx:agent())
                             local code = maki.ui.open_editor("plan.md")
                             maki.ui.flash(agent:id() .. "|" .. tostring(code))
                         end,
                     })
                     maki.api.register_command({
                         name = "/edit", tui_only = false,
-                        handler = function() assert(maki.api.run_command("/editor")) end,
+                        handler = function(_, ctx) assert(maki.api.run_command(ctx, "/editor")) end,
                     })
                     "#,
                 )

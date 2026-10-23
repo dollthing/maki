@@ -1083,20 +1083,20 @@ fn trusted_model_catalog_filters_destination_policy_and_preserves_error_pair() {
             maki.api.register_command({{
                 name = "/pr7_catalog_error", tui_only = false,
                 handler = function(_, ctx)
-                    local models, err = assert(maki.agent.current(ctx)):available_models(ctx)
+                    local models, err = assert(ctx:agent()):available_models(ctx)
                     assert(models == nil and err == "{MODEL_CATALOG_UNAVAILABLE}")
                 end,
             }})
             maki.api.register_command({{
                 name = "/pr7_catalog_filtered", tui_only = false,
                 handler = function(_, ctx)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     local before = assert(root:config(ctx)).model
                     local models, err = root:available_models(ctx)
                     assert(err == nil and #models == 1 and models[1] == "{FAST_MODEL}")
                     local after = assert(root:config(ctx)).model
                     assert(before.spec == after.spec and before.thinking == after.thinking and before.fast == after.fast)
-                    assert(assert(maki.agent.current(ctx)):id() == root:id())
+                    assert(assert(ctx:agent()):id() == root:id())
                 end,
             }})
         "#)).unwrap();
@@ -1168,7 +1168,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
             maki.api.register_command({{
                 name = "/pr7_gc_config", tui_only = false,
                 handler = function(_, ctx)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     local selection = assert(root:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(selection.spec == "{FAST_MODEL}" and selection.thinking == "low" and selection.fast == true)
                     local roundtrip = assert(root:config(ctx)).model
@@ -1179,7 +1179,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                         for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(event.data.selection[key] == selection[key]) end
                         assert(assert(root:config(callback_ctx)).mode == "plan")
                         local child = assert(maki.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                        assert(callback_ctx:defer_close(child))
+                        assert(child:defer_close(callback_ctx))
                         assert(assert(child:send(callback_ctx, "callback delivered after GC", {{ when = "idle" }})):wait(callback_ctx))
                     end))
                     subscription = nil
@@ -1188,7 +1188,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
             maki.api.register_command({{
                 name = "/pr7_gc_deliver", tui_only = false,
                 handler = function(_, ctx)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     local selection = assert(root:config(ctx)).model
                     local listed_root
                     for _, reference in ipairs(assert(maki.agent.list(ctx))) do
@@ -1502,7 +1502,7 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
                     local rejected, policy_err = maki.agent.spawn(ctx, opts)
                     assert(rejected == nil and policy_err == {POLICY_ERROR:?}, policy_err)
                     assert(#assert(maki.agent.list(ctx)) == before)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     assert(root:set_mode(ctx, "{ALLOWED_MODE}") == "{ALLOWED_MODE}")
                     local child = assert(maki.agent.spawn(ctx, opts))
                     local mode, err = child:set_mode(ctx, "{DENIED_MODE}")
@@ -1589,12 +1589,12 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
             },
             &format!(
                 r#"
-            local parent = assert(maki.agent.current(ctx))
+            local parent = assert(ctx:agent())
             local parent_id = assert(parent:id())
             local sibling = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
             local sibling_ref = assert(sibling:ref())
             pr5_child_authority_handler = function(_, child_ctx)
-                    local current = assert(maki.agent.current(child_ctx))
+                    local current = assert(child_ctx:agent())
                     assert(current:id() ~= parent_id)
                     local function not_descendant(target)
                         return (({not_descendant:?}):gsub({child_placeholder:?}, target:id()):gsub({parent_placeholder:?}, current:id()))
@@ -1723,7 +1723,7 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 name = "/pr5_capture", description = "retain an invocation-bound context", tui_only = false,
                 handler = function(_, ctx)
                     assert(ctx ~= nil)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     assert(root:id() == assert(maki.agent.root(ctx)):id())
                     assert(root:id() == assert(maki.agent.get(ctx, assert(root:ref()))):id())
                     assert(root:set_mode(ctx, "plan") == "plan")
@@ -1735,7 +1735,7 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 handler = function(_, ctx)
                     local rejected, err = retained.root:status(retained.ctx)
                     assert(rejected == nil and err == {ORCHESTRATION_CONTEXT_EXPIRED:?}, err)
-                    local root = assert(maki.agent.current(ctx))
+                    local root = assert(ctx:agent())
                     assert(root:id() == retained.root:id())
                     assert(root:set_mode(ctx, "build") == "build")
                 end,
@@ -1840,7 +1840,7 @@ fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
             },
             &format!(
                 r#"
-            local parent = assert(maki.agent.current(ctx))
+            local parent = assert(ctx:agent())
             assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
             assert(parent:set_mode(ctx, "plan") == "plan")
             local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
@@ -1953,7 +1953,7 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
             maki.api.register_command({{
                 name = "/pr5_spawn_config", tui_only = false,
                 handler = function(_, ctx)
-                    local parent = assert(maki.agent.current(ctx))
+                    local parent = assert(ctx:agent())
                     assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(parent:set_mode(ctx, "plan") == "plan")
                     local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
@@ -2054,14 +2054,14 @@ fn trusted_context_controls_another_registered_graph_with_fresh_authority() {
             maki.api.register_command({
                 name = "/pr5_register_capture", description = "capture the second graph", tui_only = false,
                 handler = function(_, ctx)
-                    other = assert(maki.agent.current(ctx))
+                    other = assert(ctx:agent())
                     other_ref = assert(other:ref())
                 end,
             })
             maki.api.register_command({
                 name = "/pr5_register_control", description = "control a registered graph from another target", tui_only = false,
                 handler = function(_, ctx)
-                    local current = assert(maki.agent.current(ctx))
+                    local current = assert(ctx:agent())
                     local resolved = assert(maki.agent.get(ctx, other_ref))
                     assert(resolved:id() == other:id())
                     assert(resolved:id() ~= current:id())
@@ -2146,7 +2146,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
             maki.api.register_command({{
                 name = "/pr5_foreign_capture", description = "capture a host-registered second runtime", tui_only = false,
                 handler = function(_, ctx)
-                    foreign = assert(maki.agent.current(ctx))
+                    foreign = assert(ctx:agent())
                     foreign_ref = assert(foreign:ref())
                     assert(foreign:set_mode(ctx, "plan") == "plan")
                 end,
@@ -2316,12 +2316,12 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
             local target
             maki.api.register_command({{
                 name = "/pr5_destination_capture", tui_only = false,
-                handler = function(_, ctx) target = assert(maki.agent.current(ctx)) end,
+                handler = function(_, ctx) target = assert(ctx:agent()) end,
             }})
             maki.api.register_command({{
                 name = "/pr5_destination_attack", tui_only = false,
                 handler = function(_, ctx)
-                    assert(assert(maki.agent.current(ctx)):id() ~= target:id())
+                    assert(assert(ctx:agent()):id() ~= target:id())
                     assert(target:set_mode(ctx, "build") == "build")
                     local changed, model_err = target:set_model(ctx, {UPDATED_MODEL:?})
                     assert(changed == nil and model_err == {not_allowed:?}, model_err)
@@ -2412,7 +2412,7 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
                 end,
             }})
             maki.keymap.set("n", "{KEY}", function(_, ctx)
-                assert(assert(maki.agent.current(ctx)):set_model(ctx, {{ thinking = "low" }}))
+                assert(assert(ctx:agent()):set_model(ctx, {{ thinking = "low" }}))
             end)
         "#
                 ),
@@ -2497,7 +2497,7 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
             },
             &format!(
                 r#"
-            local agent = assert(maki.agent.current(ctx))
+            local agent = assert(ctx:agent())
             local admitted = assert(ctx:model())
             assert(admitted.thinking == "off", tostring(admitted.thinking))
             local sentinel = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
@@ -2659,7 +2659,7 @@ fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
             "pr5_self_wait",
             &format!(
                 r#"
-            local own = assert(assert(maki.agent.current(ctx)):latest_turn(ctx))
+            local own = assert(assert(ctx:agent()):latest_turn(ctx))
             local waited, wait_err = own:wait(ctx)
             assert(waited == nil and wait_err == {SELF_TURN_WAIT:?}, wait_err)
             local focused, focus_err = maki.ui.focused_agent()
@@ -2748,9 +2748,9 @@ fn trusted_ctx_keeps_authority_after_its_pinned_target_closes() {
             }})
             maki.keymap.set("n", "{KEY}", function(_, ctx)
                 local ok, err = pcall(function()
-                    local pinned = assert(maki.agent.current(ctx))
+                    local pinned = assert(ctx:agent())
                     assert(pinned:close(ctx))
-                    local current, current_err = maki.agent.current(ctx)
+                    local current, current_err = ctx:agent()
                     assert(current == nil and current_err ~= nil, "closed target stayed current")
                     local spawned, spawn_err = maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }})
                     assert(spawned == nil and spawn_err ~= nil, "spawned under a closed target")
@@ -3010,7 +3010,7 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
             local close_probe
             local function hold(ctx, message)
                 local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                assert(ctx:defer_close(child))
+                assert(child:defer_close(ctx))
                 assert(assert(child:send(ctx, message, { when = "idle" })):wait(ctx))
             end
             maki.api.register_command({
@@ -3031,7 +3031,7 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                     end)))
                     close_subscription = assert(observed:on_close(ctx, guard("close", function(event, callback_ctx)
                         assert(event.data.lifecycle == "closed")
-                        assert(callback_ctx:defer_close(close_probe))
+                        assert(close_probe:defer_close(callback_ctx))
                         assert(assert(close_probe:send(callback_ctx, "close callback delivered", { when = "idle" })):wait(callback_ctx))
                     end)))
                     local turn = assert(observed:send(ctx, "observed turn", { when = "idle" }))
@@ -3143,13 +3143,13 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                     local effects = 0
                     function pr5_timer_escape()
                         effects = effects + 1
-                        assert(maki.api.run_command("/pr5_timer_effect"))
+                        assert(maki.api.run_command(nil, "/pr5_timer_effect"))
                     end
                     maki.api.register_command({ name = "/pr5_timer_effect", tui_only = false,
                         handler = function() effects = effects + 1 end,
                     })
-                    maki.api.create_autocmd("User", { pattern = "pr5_escape", callback = function()
-                        local ran, err = maki.api.run_command("/pr5_timer_effect")
+                    maki.api.create_autocmd("User", { pattern = "pr5_escape", callback = function(_, callback_ctx)
+                        local ran, err = maki.api.run_command(callback_ctx, "/pr5_timer_effect")
                         pr5_autocmd_escape = { ran = ran, err = err }
                     end })
                     maki.api.register_command({ name = "/pr5_timer_check", tui_only = false,
@@ -3181,7 +3181,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 local subscription, err = child[kind](child, ctx, callback)
                 assert(subscription == nil and err == subscription_error, kind .. ": " .. tostring(err))
             end
-            local ran, err = maki.api.run_command("/pr5_timer_effect")
+            local ran, err = maki.api.run_command(ctx, "/pr5_timer_effect")
             assert(ran == nil and err == command_error)
             local function deny_timers()
                 local id, timer_err = maki.timer.set(0.001, pr5_timer_escape)
@@ -3973,10 +3973,10 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
                 name = "/pr5_resource_cycle", tui_only = false,
                 handler = function(_, ctx)
                     local parent = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                    assert(ctx:defer_close(parent))
+                    assert(parent:defer_close(ctx))
                     local subscription = assert(parent:on_turn_start(ctx, function(_, callback_ctx)
                         local child = assert(maki.agent.spawn(callback_ctx, { inherit_provider = true, silent = true, tools = {} }))
-                        assert(callback_ctx:defer_close(child))
+                        assert(child:defer_close(callback_ctx))
                         assert(assert(child:send(callback_ctx, "cycle descendant", { when = "idle" })):wait(callback_ctx))
                     end))
                     assert(assert(parent:send(ctx, "cycle parent", { when = "idle" })):wait(ctx))
@@ -4473,7 +4473,7 @@ fn bundled_task_gates_new_work_on_admitted_mode_across_configuration_changes() {
                 description = "writer", prompt = "edit things", subagent_type = "general",
             }))
             local task = maki.json.decode(text)
-            local parent = assert(maki.agent.current(ctx))
+            local parent = assert(ctx:agent())
             assert(parent:set_mode(ctx, "plan") == "plan")
             assert(ctx:mode() == "build" and assert(parent:config(ctx)).mode == "plan")
             local sent, err = maki.agent.call_tool(ctx, "task_send", {
@@ -4500,7 +4500,7 @@ fn spawn_takes_the_shared_selection_and_rejects_other_options() {
             "pr5_spawn_selection",
             &format!(
                 r#"
-            local parent = assert(maki.agent.current(ctx))
+            local parent = assert(ctx:agent())
             local selection = assert(parent:config(ctx)).model
             local child = assert(maki.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true, tools = {{}}, model = selection,

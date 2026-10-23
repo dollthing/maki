@@ -10,14 +10,13 @@ use maki_storage::sessions::{Prefs, write_prefs};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::{
-    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION,
-    DELEGATED_SESSION_LIFECYCLE, NO_FOCUSED_AGENT, SESSION_REQUIRED_ERR,
+    DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION, DELEGATED_SESSION_LIFECYCLE,
+    SESSION_REQUIRED_ERR,
 };
 use crate::api::env::host_state_dir;
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::orchestration::resolve_target;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// session id from Lua and returns a serialized
@@ -28,7 +27,6 @@ pub type SessionSnapshotFn =
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
-const NO_FOCUSED_SESSION: &str = "the focused agent has no session";
 
 async fn roundtrip(
     lua: Lua,
@@ -97,43 +95,6 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
-/// Returns the id of the focused agent's session; a headless frontend's
-/// focus is its one session.
-///
-/// @return (string|nil, string|nil) Session id, or nil and an error.
-/// @example
-/// local id = maki.session.current()
-#[lua_fn]
-fn current(lua: &Lua) -> LuaResult<Pair<String>> {
-    if crate::runtime::in_delegated_tool(lua) {
-        return Ok(err_pair(DELEGATED_FOCUS));
-    }
-    let target = try_pair!(try_pair!(resolve_target(lua, None)).ok_or(NO_FOCUSED_AGENT));
-    let session = try_pair!(target.template.session_id.ok_or(NO_FOCUSED_SESSION));
-    Ok((Some(session.to_string()), None))
-}
-
-/// Returns a session's token usage without making a network request.
-/// Costs are the values recorded when each turn was billed and remain nil when
-/// no turn for that total or model was priced. Models are sorted by total tokens
-/// descending, then model spec ascending.
-///
-/// @param opts table Required `session` (string) id.
-/// @return (table|nil, string|nil) `{total={input, output, cache_creation,
-///   cache_read, cost}, models}`, where each model has `{model, input, output,
-///   cache_creation, cache_read, cost}`, or nil and an error.
-/// @example
-/// local usage, err = maki.session.usage({ session = ctx:session_id() })
-#[lua_fn]
-async fn usage(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Table,
-) -> LuaResult<Pair<Value>> {
-    let id = try_pair!(required_session(Some(&opts))?);
-    roundtrip(lua, tx, SessionRequest::Usage { id }).await
-}
-
 /// Switches the UI to the session with {id}. The session must belong to
 /// the current directory and must not be open in another terminal.
 ///
@@ -172,37 +133,34 @@ async fn delete(
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
-/// One-call snapshot of a session: queue, usage, context, cost, mode, and
-/// status of the session you name in `session`.
+/// Snapshot of the session you name in `session`.
 ///
 /// The returned table:
 /// ```lua
 /// {
-///   id, cwd, model, fast, thinking,
-///   mode,              -- committed mode id: "build", "plan" or a plugin mode
-///   status = "idle" | "working" | "needs_input",
-///   focused, updated_at,
-///   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
-///   context_size, context_window,
-///   cost,
-///   queue = { count }, -- nil under headless drivers
+///   id,
 ///   title,             -- nil under headless drivers
+///   status = "idle" | "working" | "needs_input",
+///   updated_at,        -- unix seconds
+///   usage = {
+///     total = { input, output, cache_creation, cache_read, cost },
+///     models = { { model, input, output, cache_creation, cache_read, cost }, ... },
+///   },
 /// }
 /// ```
 ///
-/// `usage` and `cost` include subagent spend. `context_size` is the main
-/// session's own, since a subagent runs its own window. There is no
-/// `list_cost` here because `cost` is re-settled from stored usage when a
-/// session resumes and list price is not stored, so per-turn list price
-/// lives on the `TurnEnd` autocmd instead.
+/// `usage` includes subagent spend. Costs are the values recorded when each
+/// turn was billed and stay nil when unpriced. `models` is sorted by total
+/// tokens, descending, then spec; headless drivers do not split usage by
+/// model and leave it empty. Model, mode and options are on the agent:
+/// `Agent:config(ctx)`; per-turn context size and list price are on the
+/// `TurnEnd` autocmd.
 ///
 /// @param opts table Required `session` (string) id.
 /// @return (table|nil, string|nil) Snapshot table, or nil and an error.
 /// @example
 /// local s = maki.session.read({ session = ctx:session_id() })
-/// if s.context_size > s.context_window * 0.8 then
-///   maki.ui.notify("context is nearly full")
-/// end
+/// maki.ui.notify("spent " .. tostring(s.usage.total.cost))
 #[lua_fn]
 async fn read(
     lua: Lua,
@@ -344,10 +302,9 @@ lua_table! {
     /// a session (`set_title`) accept
     /// only the session its own turn belongs to. Every function that reads or
     /// changes one session takes it explicitly; `ctx:session_id()` names the
-    /// invocation's session, and `current` names the focused one. Tool
-    /// handlers cannot read UI focus, so `current` refuses them.
+    /// invocation's session.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
+    DOCS [list(tx), list_all(tx), live(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
@@ -405,47 +362,6 @@ mod tests {
     }
 
     #[test]
-    fn usage_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Usage { .. },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected usage request");
-            };
-            reply_tx
-                .send(Ok(json!({
-                    "total": {
-                        "input": 1,
-                        "output": 2,
-                        "cache_creation": 3,
-                        "cache_read": 4,
-                        "cost": null,
-                    },
-                    "models": [],
-                })))
-                .unwrap();
-        });
-        lua.globals()
-            .set("session_id", MakiId::generate().to_string())
-            .unwrap();
-        let (val, err): (Table, Option<String>) = smol::block_on(
-            lua.load("return session.usage({ session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        let total: Table = val.get("total").unwrap();
-        assert_eq!(total.get::<u32>("input").unwrap(), 1);
-        assert!(total.get::<Value>("cost").unwrap().is_nil());
-        assert_eq!(val.get::<Table>("models").unwrap().raw_len(), 0);
-    }
-
-    #[test]
     fn focus_roundtrips_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
@@ -466,7 +382,6 @@ mod tests {
     }
 
     #[test_case("return session.read({})" ; "read")]
-    #[test_case("return session.usage({})" ; "usage")]
     fn session_target_is_required(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));

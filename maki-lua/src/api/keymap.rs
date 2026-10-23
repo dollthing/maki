@@ -353,7 +353,7 @@ fn loading(lua: &Lua, plugin: &str) -> bool {
 /// @param lhs string Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
 /// @param rhs function Called as `rhs(nil, ctx)` when the key is pressed.
 ///   `ctx` is a trusted invocation-scoped LuaCtx, or nil if the host has no
-///   agent target. Resolve the callback's agent with `maki.agent.current(ctx)`.
+///   agent target. Resolve the callback's agent with `ctx:agent()`.
 ///   Later focus changes do not retarget an already resolved context. Retaining
 ///   the context does not extend its authority beyond the callback.
 /// @param opts table? Options:

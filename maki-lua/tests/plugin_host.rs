@@ -23,7 +23,7 @@ use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
 use maki_lua::agent_errors::{
-    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
+    DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
 };
 use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend, run_command};
 use maki_lua::{
@@ -415,8 +415,8 @@ fn register_echo_tool() {
     assert_eq!(out, "hello");
 }
 
-/// The point of the whole thing: a handler learns who called it without
-/// asking `maki.session.current()`, which answers with whoever is focused.
+/// The point of the whole thing: a handler learns who called it from its ctx,
+/// never from whoever is focused.
 #[test]
 fn handler_reads_the_calling_session() {
     let reg = fresh_registry();
@@ -3813,7 +3813,7 @@ const RUN_COMMAND_EVENT: &str = "RunCommandProbe";
 fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     let (runs_tx, runs) = flume::unbounded();
-    let _root = common::install_command_root(
+    let manager = common::install_command_root(
         &host,
         Arc::new(move |cmdline, depth, _| {
             runs_tx.send((cmdline, depth)).unwrap();
@@ -3825,11 +3825,9 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
         "p",
         &format!(
             r#"
-            maki.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function()
-                maki.async.run(function()
-                    local ok, err = maki.api.run_command("  //cd ~/src  ")
-                    maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
-                end)
+            maki.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "  //cd ~/src  ")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end }})
             "#
         ),
@@ -3837,7 +3835,7 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .fire_autocmd(RUN_COMMAND_EVENT, json!({}));
+        .fire_agent_autocmd(RUN_COMMAND_EVENT, manager.root().unwrap(), json!({}));
 
     let (cmdline, depth) = runs
         .recv_timeout(Duration::from_secs(5))
@@ -3849,7 +3847,7 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
 
-/// `/go` nests `maki.api.run_command("/bogus")` from inside a real command
+/// `/go` nests `maki.api.run_command(ctx, "/bogus")` from inside a real command
 /// invocation (dispatched through the registry, so the handler runs with an
 /// invocation context): the nested dispatch rejects the unknown command
 /// without touching the UI.
@@ -3870,8 +3868,8 @@ fn nested_run_command_strips_extra_leading_slashes() {
         maki.api.register_command({
             name = "/go",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("  //target value  ")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "  //target value  ")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -3911,8 +3909,8 @@ fn nested_run_command_reports_recursion_limit() {
         maki.api.register_command({
             name = "/cycle",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("/cycle")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "/cycle")
                 if not ok then
                     maki.ui.flash(err)
                 end
@@ -3947,8 +3945,8 @@ fn nested_run_command_rejects_unknown_command() {
         maki.api.register_command({
             name = "/go",
             tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("/bogus")
+            handler = function(_, ctx)
+                local ok, err = maki.api.run_command(ctx, "/bogus")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -6320,8 +6318,6 @@ maki.api.register_tool({
             new = function() return maki.session.new() end,
             focus = function() return maki.session.focus(input.session) end,
             delete = function() return maki.session.delete(input.session) end,
-            current = function() return maki.session.current() end,
-            usage = function() return maki.session.usage({}) end,
             read = function() return maki.session.read({}) end,
         }
         local _, err = calls[input.call]()
@@ -6334,8 +6330,6 @@ maki.api.register_tool({
 #[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
 #[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
 #[test_case::test_case("delete", DELEGATED_SESSION_LIFECYCLE ; "delete")]
-#[test_case::test_case("current", DELEGATED_FOCUS ; "current")]
-#[test_case::test_case("usage", SESSION_REQUIRED_ERR ; "usage")]
 #[test_case::test_case("read", SESSION_REQUIRED_ERR ; "read")]
 fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
     let (reg, host) = builtins_host();

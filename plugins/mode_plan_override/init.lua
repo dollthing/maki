@@ -97,7 +97,7 @@ if not ok then
 end
 
 local function set_mode(ctx, name)
-  local agent, err = ctx and maki.agent.current(ctx)
+  local agent, err = ctx and ctx:agent()
   local switched
   if agent then
     switched, err = agent:set_mode(ctx, name)

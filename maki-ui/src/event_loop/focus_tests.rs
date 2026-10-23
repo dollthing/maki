@@ -370,7 +370,7 @@ fn registered_lua_mode_set_uses_its_invocation_agent(restored: bool) {
                 handler = function(_, ctx)
                     assert((ctx ~= nil) == {live})
                     if ctx then
-                        local agent = assert(maki.agent.current(ctx))
+                        local agent = assert(ctx:agent())
                         assert(agent:set_mode(ctx, "plan"))
                     end
                     maki.ui.flash("{DONE}")
@@ -660,7 +660,7 @@ fn lua_mode_command_reaches_the_provider() {
             maki.api.register_command({
                 name = "/plan-now", tui_only = false,
                 handler = function(_, ctx)
-                    assert(assert(maki.agent.current(ctx)):set_mode(ctx, "plan"))
+                    assert(assert(ctx:agent()):set_mode(ctx, "plan"))
                 end,
             })
         "#,

@@ -395,15 +395,6 @@ impl UserData for LuaCtx {
             Ok((Some(agent.mode.id().key().to_string()), None))
         });
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
-        methods.add_function(
-            "defer_close",
-            |lua, (ctx, agent): (mlua::AnyUserData, mlua::AnyUserData)| {
-                let ctx = ctx.borrow::<LuaCtx>()?;
-                try_pair!(ctx.validate_origin(lua));
-                let agent = agent.borrow::<crate::api::agent::LuaAgent>()?;
-                crate::api::agent::agent_defer_close(lua, &agent, ctx)
-            },
-        );
 
         methods.add_method("workflow", |lua, this, ()| {
             let Some(workflow) = this.workflow() else {
@@ -427,7 +418,7 @@ impl UserData for LuaCtx {
         });
 
         // The session that called this tool, which under concurrent
-        // sessions is not always the focused one `maki.session.current()`
+        // sessions is not always the focused one
         // reports. Nil without an error when the run has no session, as in
         // the `maki index` one-shot.
         methods.add_method("session_id", |lua, this, ()| {

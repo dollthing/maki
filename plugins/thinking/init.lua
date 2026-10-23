@@ -40,7 +40,7 @@ local function target(ctx)
   if not ctx then
     return nil, nil, "no agent target"
   end
-  local agent, err = maki.agent.current(ctx)
+  local agent, err = ctx:agent()
   if not agent then
     return nil, nil, err
   end

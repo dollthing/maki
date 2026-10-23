@@ -50,7 +50,7 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
         r#"
         maki.api.register_command({
             name = '/invocation_park', description = 'exercise captured authority', tui_only = false,
-            handler = function()
+            handler = function(_, ctx)
                 maki.async.await(1, function(callback)
                     maki.store.collect('invocation_gate').gate.release = callback
                     maki.ui.flash('invocation parked')
@@ -61,7 +61,7 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
                 })
                 if not ok then
                     assert(err == expected_error)
-                    local ran, run_err = maki.api.run_command('/invocation_release')
+                    local ran, run_err = maki.api.run_command(ctx, '/invocation_release')
                     assert(not ran and run_err == expected_error)
                     local timer, timer_err = maki.timer.set(1, function() end)
                     assert(not timer and timer_err == expected_error)
