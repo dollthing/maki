@@ -15,6 +15,10 @@ use thiserror::Error;
 pub const PROJECT_DIR: &str = ".makima";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 const ENV_FILE: &str = ".env";
+const OLD_MCP_PREFIX: &str = "mcp:";
+const INVALID_TOOL_SECTION: &str = "invalid tool name; a tool section uses only letters, digits, `-` and `_`, and MCP servers go under [mcp.<server>]";
+const OLD_MCP_SECTION: &str =
+    "the `mcp:<server>__<tool>` section form is gone; list the tool under [mcp.<server>] instead";
 pub const NO_PROJECT_HINT: &str = "pass --no-project to start without the project's .makima files";
 pub const UNTRUSTED_PROJECT_WRITE: &str =
     "folder is not trusted, so nothing was saved to .makima/permissions.toml";
@@ -346,6 +350,12 @@ pub enum ConfigError {
     PermissionsFile { path: PathBuf, reason: String },
     #[error("{0}; {NO_PROJECT_HINT}")]
     ProjectPermissions(Box<ConfigError>),
+    #[error(
+        "{} is no longer read, so its rules do not apply; move them to {} and delete it",
+        old.display(),
+        new.display()
+    )]
+    OldHomePermissions { old: PathBuf, new: PathBuf },
     #[error(
         "invalid permissions in {}: {}: {reason}",
         path.display(),
@@ -988,13 +998,13 @@ impl ToolPermissions {
         let table = value
             .as_table()
             .ok_or_else(|| rule_error(path, "", tool, expected("a table", value)))?;
-        if tool.is_empty() || tool.contains('.') {
-            return Err(rule_error(
-                path,
-                "",
-                tool,
-                "invalid tool name; MCP servers go under [mcp.<server>]",
-            ));
+        if tool != "*" && !is_valid_wire_name(tool) {
+            let reason = if tool.starts_with(OLD_MCP_PREFIX) {
+                OLD_MCP_SECTION
+            } else {
+                INVALID_TOOL_SECTION
+            };
+            return Err(rule_error(path, "", tool, reason));
         }
         let mut permissions = Self::default();
         for (key, value) in table {
@@ -2107,7 +2117,32 @@ fn collect_env_vars(path: &Path, vars: &mut HashMap<String, String>) {
 /// Fails on any permission rule that does not parse, so a typo can never
 /// silently drop a deny.
 pub fn load_permissions(project_config: &ProjectConfig) -> Result<PermissionsConfig, ConfigError> {
-    load_permissions_inner(global_config_dir().as_deref(), project_config)
+    let global_dir = global_config_dir();
+    if let Some(global_dir) = &global_dir {
+        refuse_old_home_permissions(paths::home().as_deref(), global_dir, project_config)?;
+    }
+    load_permissions_inner(global_dir.as_deref(), project_config)
+}
+
+/// `~/.makima/permissions.toml` was the global file before the platform
+/// config dir. Ignoring it would drop its denies without a word, so it stops
+/// startup unless `~/.makima` is the project's own directory.
+fn refuse_old_home_permissions(
+    home: Option<&Path>,
+    global_dir: &Path,
+    project_config: &ProjectConfig,
+) -> Result<(), ConfigError> {
+    let Some(home) = home else {
+        return Ok(());
+    };
+    let old = home.join(PROJECT_DIR).join(PERMISSIONS_FILE);
+    if project_config.config_root() == paths::canonicalize_clean(home) || !old.exists() {
+        return Ok(());
+    }
+    Err(ConfigError::OldHomePermissions {
+        old,
+        new: global_dir.join(PERMISSIONS_FILE),
+    })
 }
 
 fn load_permissions_inner(
@@ -3549,6 +3584,8 @@ mod tests {
     #[test_case("bash = 1\n", "", "bash" ; "tool_not_a_table")]
     #[test_case("[\"\"]\ndeny = [\"x\"]\n", "", "" ; "empty_tool_name")]
     #[test_case("[\"a.b\"]\ndeny = [\"x\"]\n", "", "a.b" ; "dotted_tool_name")]
+    #[test_case("[\"ba sh\"]\ndeny = [\"x\"]\n", "", "ba sh" ; "tool_name_with_space")]
+    #[test_case("[\"mcp:github__delete_repo\"]\ndeny = true\n", "", "mcp:github__delete_repo" ; "old_mcp_tool_section")]
     #[test_case("[bash]\ndeny = \"rm *\"\n", "bash", "deny" ; "tool_string_deny")]
     #[test_case("[bash]\ndeny = [1]\n", "bash", "deny" ; "tool_non_string_scope")]
     #[test_case("[bash]\ndefault = \"sometimes\"\n", "bash", "default" ; "tool_invalid_default")]
@@ -3568,6 +3605,47 @@ mod tests {
                 if *p == path && s == section && k == key),
             "{error}"
         );
+    }
+
+    #[test_case("[\"mcp:github__delete_repo\"]\ndeny = true\n" => OLD_MCP_SECTION ; "old_mcp_section_points_at_mcp_server_sections")]
+    #[test_case("[\"b@sh\"]\ndeny = [\"x\"]\n" => INVALID_TOOL_SECTION ; "invalid_tool_section")]
+    fn invalid_tool_section_says_why(content: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), content);
+        match load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())) {
+            Err(ConfigError::PermissionRule { reason, .. }) => reason,
+            other => panic!("expected a rule error, got {other:?}"),
+        }
+    }
+
+    #[test_case(true, false => false ; "old_home_file_refused")]
+    #[test_case(true, true => true ; "home_as_project_reads_it_as_the_project_file")]
+    #[test_case(false, false => true ; "no_old_home_file")]
+    fn old_home_permissions_are_refused(old_file: bool, home_is_project: bool) -> bool {
+        let home = TempDir::new().unwrap();
+        if old_file {
+            let old_dir = home.path().join(PROJECT_DIR);
+            fs::create_dir_all(&old_dir).unwrap();
+            fs::write(
+                old_dir.join(PERMISSIONS_FILE),
+                "[bash]\ndeny = [\"rm *\"]\n",
+            )
+            .unwrap();
+        }
+        let elsewhere = TempDir::new().unwrap();
+        let project = if home_is_project {
+            home.path()
+        } else {
+            elsewhere.path()
+        };
+        let global = global_config_dir(home.path());
+        refuse_old_home_permissions(
+            Some(home.path()),
+            &global,
+            &ProjectConfig::for_project(project),
+        )
+        .is_ok()
     }
 
     #[test_case(true ; "trusted_project")]

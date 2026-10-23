@@ -104,9 +104,11 @@ Each tool gets its own section with `allow` and `deny` arrays. Values are glob-l
 
 > **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take an array of tool names, with `["*"]` for every tool on the server. Use `default = "allow"` or `default = "deny"` for the fallback. Native tool sections (e.g. `[bash]`) take an array of scope patterns, or `allow = true` to cover the whole tool.
 
-A rule that does not parse stops maki from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, tool names that are not valid, and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Maki never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
+A rule that does not parse stops maki from starting, and the error names the file, section and key. This covers unknown keys, a boolean or bare string in an `[mcp.*]` list, section names that are not valid tool names (letters, digits, `-` and `_` only, so the old `["mcp:<server>__<tool>"]` form fails too), and `["*"].default` (use the top-level `default`). It applies to project files too, trusted or not. Maki never skips a rule it cannot read, because a skipped deny would silently allow what it was meant to block.
 
 When the broken file is the project's `.makima/permissions.toml`, the error ends by suggesting `--no-project`. Start with it to work in that repository anyway: maki then reads nothing from the project's `.makima` directory, this file included. See [Folder Trust](/docs/folder-trust/#loading-nothing-from-the-project).
+
+A `~/.makima/permissions.toml` left from the old home layout also stops startup, because maki no longer reads it and its denies would quietly stop applying. Move its rules to the global file above and delete it.
 
 ### The `default` key
 
