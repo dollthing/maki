@@ -23,6 +23,12 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
         Ok(model) => model,
         Err(error) => return Ok(err_pair(error.to_string())),
     };
+    Ok((Some(model_table(lua, &model)?), None))
+}
+
+/// The one Lua shape of a model, shared by `maki.model.info` and
+/// `maki.agent.resolve_model`.
+pub(crate) fn model_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     let table = lua.create_table()?;
     table.set("spec", model.spec())?;
     table.set("provider", model.provider.to_string())?;
@@ -38,7 +44,7 @@ fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     pricing.set("cache_write", model.pricing.cache_write)?;
     pricing.set("cache_read", model.pricing.cache_read)?;
     table.set("pricing", pricing)?;
-    Ok((Some(table), None))
+    Ok(table)
 }
 
 /// Lists the thinking levels a selection accepts, from `off` to `max`. A
@@ -53,7 +59,7 @@ fn thinking_levels(lua: &Lua) -> LuaResult<Table> {
 }
 
 lua_table! {
-    /// Model catalog reads that address no agent. `Agent:model`,
+    /// Model catalog reads that address no agent. `Agent:config`,
     /// `Agent:set_model` and `Agent:available_models` act on an agent.
     "maki.model" => pub(crate) fn create_model_table(),
     DOCS [info, thinking_levels]

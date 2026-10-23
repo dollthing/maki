@@ -17,6 +17,8 @@ use crate::{EventHandle, agent_autocmd};
 pub const STATUS_IDLE: &str = "idle";
 pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
+/// Agents only: a session that closed is no longer live.
+pub const STATUS_CLOSED: &str = "closed";
 
 #[derive(Serialize)]
 pub struct SessionSnapshot {

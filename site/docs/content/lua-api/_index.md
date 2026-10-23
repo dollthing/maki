@@ -1287,8 +1287,7 @@ Look up the model that the current agent is using, or pick a cheaper one.
 You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
-The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+The returned table has the same fields as `maki.model.info`.
 
 **Parameters:**
 
@@ -1654,7 +1653,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `maki.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 
 ---
 
@@ -3889,7 +3888,7 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-Model catalog reads that address no agent. `Agent:model`,
+Model catalog reads that address no agent. `Agent:config`,
 `Agent:set_model` and `Agent:available_models` act on an agent.
 
 ---

@@ -282,7 +282,7 @@ local function spawn_agent(ctx, options)
   end
   function turns:idle(call_ctx)
     local status = agent:status(call_ctx)
-    return status ~= nil and status.status ~= "running" and status.queued == 0
+    return status ~= nil and status.status ~= "working" and status.queued == 0
   end
   return agent, turns
 end

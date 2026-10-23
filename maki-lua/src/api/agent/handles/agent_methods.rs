@@ -37,6 +37,7 @@ use crate::orchestration::{self, plugin_authority};
 use crate::runtime::{
     current_managed_turn, current_plugin, register_defer_close, validate_plugin_effect,
 };
+use crate::session_snapshot::{STATUS_CLOSED, STATUS_IDLE, STATUS_WORKING};
 
 const MODE_KEY: &str = "mode";
 const SEND_WHEN_REQUIRED: &str = "send: opts.when must be \"idle\", \"join\" or \"queue\"";
@@ -54,7 +55,7 @@ fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
 
 /// Read lifecycle, active turn, queue size, and cumulative usage.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Fields: id (string), status ("idle", "running", or "closed"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+/// @return (table?, string?) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `maki.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
 #[lua_fn(name = "status")]
 fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, this));
@@ -70,10 +71,10 @@ fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
         try_pair!(this.manager.actor(this.id)).snapshot()
     };
     let status = match snapshot.lifecycle {
-        ActorLifecycle::Closed | ActorLifecycle::Shutdown => "closed",
+        ActorLifecycle::Closed | ActorLifecycle::Shutdown => STATUS_CLOSED,
         ActorLifecycle::Open => match snapshot.status {
-            ActorStatus::Idle => "idle",
-            _ => "running",
+            ActorStatus::Idle => STATUS_IDLE,
+            _ => STATUS_WORKING,
         },
     };
     table.set("status", status)?;

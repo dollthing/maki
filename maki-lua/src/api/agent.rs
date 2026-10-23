@@ -584,15 +584,6 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         })
 }
 
-fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
-    let tbl = lua.create_table()?;
-    tbl.set("id", model.id.clone())?;
-    tbl.set("tier", model.tier.to_string())?;
-    tbl.set("provider", model.provider.to_string())?;
-    tbl.set("spec", model.spec())?;
-    Ok(tbl)
-}
-
 fn dispatch_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, String> {
     ctx.validate_origin(lua)?;
     ctx.agent()
@@ -644,8 +635,7 @@ async fn relay_session_events(
 /// You might want a cheaper model for simple subtasks (summaries, classification)
 /// without hard-coding a model name.
 ///
-/// The returned table has fields: `id` (string), `tier` (string),
-/// `provider` (string), `spec` (string).
+/// The returned table has the same fields as `maki.model.info`.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table? Optional fields:
@@ -676,7 +666,7 @@ async fn resolve_model(
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
-    Ok((Some(model_to_lua_table(&lua, &model)?), None))
+    Ok((Some(crate::api::model::model_table(&lua, &model)?), None))
 }
 
 /// Build a system prompt from a built-in template. Environment variables like
