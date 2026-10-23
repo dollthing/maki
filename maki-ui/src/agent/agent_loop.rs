@@ -668,6 +668,7 @@ mod tests {
         ReasonedCancelToken, RunSettings, TurnAdmissionOptions,
     };
     use maki_config::PermissionsConfig;
+    use maki_lua::test_support::run_command;
     use maki_providers::ContentBlock;
     use test_case::test_case;
 
@@ -1824,13 +1825,7 @@ mod tests {
             assert_eq!(app.run_id, submitted_run);
             host.wait_for_worker_barrier_for_test();
             assert_eq!(
-                host.event_handle()
-                    .run_command_for_test(
-                        Arc::from("turn_start_count"),
-                        Arc::from("/assert_single_start"),
-                        String::new(),
-                        0,
-                    )
+                run_command(&host.command_registry(), "/assert_single_start", 0, None)
                     .recv_timeout(TEST_TIMEOUT)
                     .unwrap(),
                 Ok(())

@@ -18,6 +18,7 @@ use maki_commands::CommandInvocation;
 use maki_lua::{
     PluginHost,
     orchestration::{OrchestrationServices, TrustedTarget},
+    test_support::run_command,
 };
 use maki_providers::{
     AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
@@ -390,11 +391,12 @@ impl Fixture {
     }
 
     fn trusted_submit(&self, actor: &maki_agent::AgentActorHandle, message: &str) {
-        let result = self._host.event_handle().run_command_for_test(
-            Arc::from("runtime_alignment"),
-            Arc::from("/alignment_submit"),
-            json!({ "agent_id": actor.agent_id(), "message": message }).to_string(),
+        let args = json!({ "agent_id": actor.agent_id(), "message": message });
+        let result = run_command(
+            &self._host.command_registry(),
+            &format!("/alignment_submit {args}"),
             0,
+            None,
         );
         assert_eq!(result.recv_timeout(SHUTDOWN_TIMEOUT).unwrap(), Ok(()));
     }

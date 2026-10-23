@@ -3,8 +3,9 @@ mod common;
 use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
+use maki_commands::ResolutionError;
 use maki_lua::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
-use maki_lua::test_support::InMemoryFs;
+use maki_lua::test_support::{InMemoryFs, run_command};
 use maki_lua::{PluginHost, UiAction};
 use test_case::test_case;
 
@@ -14,7 +15,6 @@ const PARK: &str = "/invocation_park";
 const RELEASE: &str = "/invocation_release";
 const PUBLISHED: &str = "/invocation_published";
 const READY: &str = "invocation parked";
-const UNAVAILABLE: &str = "command handler is unavailable";
 
 fn host(registry: Arc<ToolRegistry>) -> PluginHost {
     PluginHost::with_session_provider_preparer(
@@ -89,12 +89,7 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
     )
     .unwrap();
     smol::block_on(common::bounded(async {
-        let parked = host.event_handle().run_command_for_test(
-            Arc::from(OWNER),
-            Arc::from(PARK),
-            String::new(),
-            0,
-        );
+        let parked = run_command(&host.command_registry(), PARK, 0, None);
         assert!(
             matches!(host.ui_action_rx().recv_async().await.unwrap(), UiAction::Flash(text) if text == READY)
         );
@@ -106,22 +101,12 @@ fn suspended_command_effects_use_captured_owner(accepted: bool) {
                     .is_err()
             );
         }
-        let release = host.event_handle().run_command_for_test(
-            Arc::from(CONTROLLER),
-            Arc::from(RELEASE),
-            String::new(),
-            0,
-        );
+        let release = run_command(&host.command_registry(), RELEASE, 0, None);
         assert_eq!(release.recv_async().await.unwrap(), Ok(()));
         assert_eq!(parked.recv_async().await.unwrap(), Ok(()));
-        let published = host.event_handle().run_command_for_test(
-            Arc::from(OWNER),
-            Arc::from(PUBLISHED),
-            String::new(),
-            0,
-        );
+        let published = run_command(&host.command_registry(), PUBLISHED, 0, None);
         let expected = if accepted {
-            Err(UNAVAILABLE.to_string())
+            Err(ResolutionError::UnknownCommand(Arc::from(PUBLISHED)).to_string())
         } else {
             Ok(())
         };

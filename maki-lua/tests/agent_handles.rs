@@ -31,7 +31,7 @@ use maki_lua::{
         AgentOrchestration, ConfigMutationReserver, OrchestrationServices, TrustedTarget,
         TurnCompletion, TurnCompletionFuture, nonpersistent_config_mutation,
     },
-    test_support::InMemoryFs,
+    test_support::{InMemoryFs, run_command},
 };
 use maki_providers::{
     AgentError, ContentBlock, Effort, Message, Model, ModelInfo, ObservationSource, ProviderEvent,
@@ -1096,15 +1096,14 @@ fn trusted_model_catalog_filters_destination_policy_and_preserves_error_pair() {
             }})
         "#)).unwrap();
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr7_catalog"),
-                    Arc::from("/pr7_catalog_error"),
-                    String::new(),
-                    0
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr7_catalog_error",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         let (mut template, _events, _cancel) = common::ctx_with_canned_provider();
@@ -1124,15 +1123,14 @@ fn trusted_model_catalog_filters_destination_policy_and_preserves_error_pair() {
         handle.install_orchestration_services(Arc::new(services));
         fixture._host.wait_for_worker_barrier_for_test();
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr7_catalog"),
-                    Arc::from("/pr7_catalog_filtered"),
-                    String::new(),
-                    0
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr7_catalog_filtered",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         shutdown_manager(&fixture.manager).await;
@@ -1161,7 +1159,6 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
             bounded(fixture.root_ticket.wait(), "root settlement").await,
             TurnOutcome::Completed { .. }
         ));
-        let handle = fixture._host.event_handle();
         fixture._host.load_source("pr7_gc_config", &format!(r#"
             maki.api.register_command({{
                 name = "/pr7_gc_config", tui_only = false,
@@ -1208,19 +1205,14 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                 end,
             }})
         "#)).unwrap();
-        let setup = handle.run_command_for_test(
-            Arc::from("pr7_gc_config"),
-            Arc::from("/pr7_gc_config"),
-            String::new(),
-            0,
-        );
+        let setup = run_command(&fixture._host.command_registry(), "/pr7_gc_config", 0, None);
         assert_eq!(setup.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
         fixture._host.collect_garbage_for_test().unwrap();
-        let command = handle.run_command_for_test(
-            Arc::from("pr7_gc_config"),
-            Arc::from("/pr7_gc_deliver"),
-            String::new(),
+        let command = run_command(
+            &fixture._host.command_registry(),
+            "/pr7_gc_deliver",
             0,
+            None,
         );
         let callback = request_with_command_diagnostics(
             &fixture.requests,
@@ -1433,12 +1425,7 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
                 end,
             }})
         "#)).unwrap();
-        let command = fixture._host.event_handle().run_command_for_test(
-            Arc::from(OWNER),
-            Arc::from(COMMAND),
-            String::new(),
-            0,
-        );
+        let command = run_command(&fixture._host.command_registry(), COMMAND, 0, None);
         for (prompt, reply) in [
             (OLD_PROMPT, FIRST_REPLY),
             (OLD_PROMPT, SECOND_REPLY),
@@ -1528,12 +1515,7 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
                 end,
             }})
         "#)).unwrap();
-        let command = fixture._host.event_handle().run_command_for_test(
-            Arc::from(OWNER),
-            Arc::from(COMMAND),
-            String::new(),
-            0,
-        );
+        let command = run_command(&fixture._host.command_registry(), COMMAND, 0, None);
         let request =
             request_with_command_diagnostics(&fixture.requests, &command, "allowed schema request")
                 .await;
@@ -1755,12 +1737,7 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
             }})
         "#)).unwrap();
         for command in ["/pr5_capture", "/pr5_verify"] {
-            let completion = handle.run_command_for_test(
-                Arc::from("pr5_trusted_command"),
-                Arc::from(command),
-                String::new(),
-                0,
-            );
+            let completion = run_command(&fixture._host.command_registry(), command, 0, None);
             let result = futures_lite::future::race(
                 async { completion.recv_async().await.unwrap() },
                 async {
@@ -1818,17 +1795,14 @@ fn trusted_command_handler_resolves_weaker_model_tier() {
         "#,
             )
             .unwrap();
-        let result = fixture
-            ._host
-            .event_handle()
-            .run_command_for_test(
-                Arc::from("resolve_model_tier_command"),
-                Arc::from("/resolve_model_tier"),
-                String::new(),
-                0,
-            )
-            .recv_timeout(TEST_TIMEOUT)
-            .expect("trusted command never completed");
+        let result = run_command(
+            &fixture._host.command_registry(),
+            "/resolve_model_tier",
+            0,
+            None,
+        )
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("trusted command never completed");
         assert_eq!(result, Ok(()));
         shutdown_manager(&fixture.manager).await;
     });
@@ -1987,12 +1961,11 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
             }})
         "#)).unwrap();
         fixture._host.wait_for_worker_barrier_for_test();
-        let handle = fixture._host.event_handle();
-        let command = handle.run_command_for_test(
-            Arc::from("pr5_spawn_config"),
-            Arc::from("/pr5_spawn_config"),
-            String::new(),
+        let command = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_spawn_config",
             0,
+            None,
         );
         let request = request_with_command_diagnostics(
             &fixture.requests,
@@ -2101,13 +2074,7 @@ fn trusted_context_controls_another_registered_graph_with_fresh_authority() {
                 .selected
                 .store(usize::from(index == 0), Ordering::SeqCst);
             assert_eq!(
-                handle
-                    .run_command_for_test(
-                        Arc::from("pr5_registered_graphs"),
-                        Arc::from(command),
-                        String::new(),
-                        0,
-                    )
+                run_command(&first._host.command_registry(), command, 0, None)
                     .recv_timeout(TEST_TIMEOUT)
                     .unwrap(),
                 Ok(())
@@ -2200,15 +2167,14 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
             }})
         "#)).unwrap();
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr5_foreign_scope"),
-                    Arc::from("/pr5_foreign_capture"),
-                    String::new(),
-                    0,
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &owner._host.command_registry(),
+                "/pr5_foreign_capture",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         assert!(matches!(
@@ -2368,13 +2334,7 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
         ] {
             services.selected.store(selected, Ordering::SeqCst);
             assert_eq!(
-                handle
-                    .run_command_for_test(
-                        Arc::from("pr5_destination_policy"),
-                        Arc::from(command),
-                        String::new(),
-                        0
-                    )
+                run_command(&owner._host.command_registry(), command, 0, None)
                     .recv_timeout(TEST_TIMEOUT)
                     .unwrap(),
                 Ok(())
@@ -2456,8 +2416,7 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
         for (selected, command) in [(0, "/pr5_focus_capture"), (1, "/pr5_focus_check")] {
             services.selected.store(selected, Ordering::SeqCst);
             assert_eq!(
-                handle
-                    .run_command_for_test(Arc::from(PLUGIN), Arc::from(command), String::new(), 0)
+                run_command(&focused._host.command_registry(), command, 0, None)
                     .recv_timeout(TEST_TIMEOUT)
                     .unwrap(),
                 Ok(())
@@ -2733,15 +2692,7 @@ fn turn_waits_and_focus_reads_refuse_without_a_valid_subject() {
             )
             .unwrap();
         assert_eq!(
-            fixture
-                ._host
-                .event_handle()
-                .run_command_for_test(
-                    Arc::from(PLUGIN),
-                    Arc::from("/pr5_no_focus"),
-                    String::new(),
-                    0
-                )
+            run_command(&fixture._host.command_registry(), "/pr5_no_focus", 0, None)
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap(),
             Ok(())
@@ -2812,8 +2763,7 @@ fn trusted_ctx_keeps_authority_after_its_pinned_target_closes() {
             )
             .unwrap();
         let run = |command: &str| {
-            handle
-                .run_command_for_test(Arc::from(PLUGIN), Arc::from(command), String::new(), 0)
+            run_command(&fixture._host.command_registry(), command, 0, None)
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap()
         };
@@ -2873,8 +2823,7 @@ fn bundled_thinking_command_updates_only_its_target_agent() {
             .unwrap();
         let flashes = target._host.ui_action_rx();
         assert_eq!(
-            handle
-                .run_command_for_test(Arc::from(PLUGIN), Arc::from("/thinking"), "low".into(), 0)
+            run_command(&target._host.command_registry(), "/thinking low", 0, None)
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap(),
             Ok(())
@@ -2964,11 +2913,11 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
                 end,
             })
         "#).unwrap();
-        let begin = handle.run_command_for_test(
-            Arc::from("pr5_retained_ticket"),
-            Arc::from("/pr5_retained_begin"),
-            String::new(),
+        let begin = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_retained_begin",
             0,
+            None,
         );
         let terminal = request_with_command_diagnostics(&rx, &begin, "terminal request").await;
         terminal
@@ -2977,11 +2926,11 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             .unwrap();
         let active = request_with_command_diagnostics(&rx, &begin, "active request").await;
         assert_eq!(begin.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
-        let inspect = handle.run_command_for_test(
-            Arc::from("pr5_retained_ticket"),
-            Arc::from("/pr5_retained_inspect"),
-            String::new(),
+        let inspect = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_retained_inspect",
             0,
+            None,
         );
         let checkpoint =
             request_with_command_diagnostics(&rx, &inspect, "checkpoint request").await;
@@ -3000,15 +2949,14 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             .unwrap();
         assert_eq!(inspect.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr5_retained_ticket"),
-                    Arc::from("/pr5_retained_verify"),
-                    String::new(),
-                    0
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr5_retained_verify",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         shutdown_manager(&fixture.manager).await;
@@ -3094,23 +3042,22 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                 end,
             })
         "#).unwrap();
-        let command = handle.run_command_for_test(
-            Arc::from("pr5_event_callbacks"),
-            Arc::from("/pr5_event_begin"),
-            String::new(),
+        let command = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_event_begin",
             0,
+            None,
         );
         let receive = || {
             futures_lite::future::race(async { requests.recv_async().await.unwrap() }, async {
                 smol::Timer::after(TEST_TIMEOUT).await;
-                let diagnostics = handle
-                    .run_command_for_test(
-                        Arc::from("pr5_event_callbacks"),
-                        Arc::from("/pr5_event_diagnostics"),
-                        String::new(),
-                        0,
-                    )
-                    .recv_timeout(SHUTDOWN_TIMEOUT);
+                let diagnostics = run_command(
+                    &fixture._host.command_registry(),
+                    "/pr5_event_diagnostics",
+                    0,
+                    None,
+                )
+                .recv_timeout(SHUTDOWN_TIMEOUT);
                 panic!(
                     "event callback request never arrived; callbacks: {diagnostics:?}; command: {:?}",
                     command.try_recv()
@@ -3148,15 +3095,14 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
         );
         assert_eq!(command.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr5_event_callbacks"),
-                    Arc::from("/pr5_event_revoke"),
-                    String::new(),
-                    0
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr5_event_revoke",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         let close = receive().await;
@@ -3281,11 +3227,11 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
         );
         bounded(fixture.root_ticket.wait(), "delegated turn settlement").await;
         fixture._host.wait_for_worker_barrier_for_test();
-        let check = fixture._host.event_handle().run_command_for_test(
-            Arc::from("pr5_tool_events"),
-            Arc::from("/pr5_timer_check"),
-            String::new(),
+        let check = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_timer_check",
             0,
+            None,
         );
         assert_eq!(
             bounded(check.recv_async(), "timer effects and registration check")
@@ -3373,11 +3319,11 @@ fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit:
             }})
         "#)).unwrap();
         fixture._host.wait_for_worker_barrier_for_test();
-        let command = handle.run_command_for_test(
-            Arc::from("pr5_trusted_bindings"),
-            Arc::from("/pr5_trusted_bindings"),
-            String::new(),
+        let command = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_trusted_bindings",
             0,
+            None,
         );
         let first = fixture.request().await;
         assert_eq!(first.tools, json!([definitions[0].clone()]));
@@ -3880,7 +3826,6 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
                 .unwrap(),
             Ok(())
         );
-        let handle = fixture._host.event_handle();
         fixture._host.load_source(OWNER, r#"
             local child, observer, subscription, ticket, observer_ticket
             maki.api.register_command({
@@ -3905,9 +3850,7 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
                 end,
             })
         "#).unwrap();
-        let run = |command: &str| {
-            handle.run_command_for_test(Arc::from(OWNER), Arc::from(command), String::new(), 0)
-        };
+        let run = |command: &str| run_command(&fixture._host.command_registry(), command, 0, None);
         assert_eq!(run(BEGIN).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
         let first = bounded(fixture.requests.recv_async(), "persistent reload request")
             .await
@@ -4035,11 +3978,11 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
             })
         "#).unwrap();
         for _ in 0..4 {
-            let command = handle.run_command_for_test(
-                Arc::from("pr5_resource_cycles"),
-                Arc::from("/pr5_resource_cycle"),
-                String::new(),
+            let command = run_command(
+                &fixture._host.command_registry(),
+                "/pr5_resource_cycle",
                 0,
+                None,
             );
             let a = request_with_command_diagnostics(&rx, &command, "cycle first provider request")
                 .await;
@@ -4251,11 +4194,11 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
         }]));
         handle.install_orchestration_services(services.clone());
         fixture._host.wait_for_worker_barrier_for_test();
-        let command = handle.run_command_for_test(
-            Arc::from("pr5_saturation"),
-            Arc::from("/pr5_saturation_begin"),
-            String::new(),
+        let command = run_command(
+            &fixture._host.command_registry(),
+            "/pr5_saturation_begin",
             0,
+            None,
         );
         let received = Mutex::new(Vec::<String>::new());
         let receive = || {
@@ -4272,14 +4215,13 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
                 },
                 async {
                     smol::Timer::after(TEST_TIMEOUT).await;
-                    let diagnostic = handle
-                        .run_command_for_test(
-                            Arc::from("pr5_saturation"),
-                            Arc::from("/pr5_saturation_diagnostic"),
-                            String::new(),
-                            0,
-                        )
-                        .recv_timeout(TEST_TIMEOUT);
+                    let diagnostic = run_command(
+                        &fixture._host.command_registry(),
+                        "/pr5_saturation_diagnostic",
+                        0,
+                        None,
+                    )
+                    .recv_timeout(TEST_TIMEOUT);
                     panic!(
                         "saturated callback timeout: command={:?}, diagnostic={diagnostic:?}, received={:?}",
                         command.try_recv(),
@@ -4348,15 +4290,14 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
         );
         assert_eq!(command.try_recv(), Err(flume::TryRecvError::Empty));
         assert_eq!(
-            handle
-                .run_command_for_test(
-                    Arc::from("pr5_saturation"),
-                    Arc::from("/pr5_saturation_close"),
-                    String::new(),
-                    0
-                )
-                .recv_timeout(TEST_TIMEOUT)
-                .unwrap(),
+            run_command(
+                &fixture._host.command_registry(),
+                "/pr5_saturation_close",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
             Ok(())
         );
         drop(after_tool);
@@ -5097,8 +5038,7 @@ fn trusted_command_wait_keeps_child_delivery() {
                 ),
             )
             .unwrap();
-        let command =
-            handle.run_command_for_test(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
+        let command = run_command(&fixture._host.command_registry(), COMMAND, 0, None);
         bounded(fixture.requests.recv_async(), "trusted child request")
             .await
             .unwrap()

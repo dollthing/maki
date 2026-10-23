@@ -795,7 +795,7 @@ mod tests {
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const PRINT_MODEL: &str = "anthropic/claude-opus-4-8";
-    const PRINT_RUNNER: &str = "print_runner";
+    const PRINT_RUNNER_AUTOCMD: &str = "PrintRunnerAutocmd";
     const RUNNER_DISPATCHED: &str = "true|nil";
     const MODE_AUTOCMD: &str = "PrintModeAutocmd";
     const MODES_SET: &str = "plan|build";
@@ -1555,14 +1555,15 @@ mod tests {
             "#)).unwrap();
         }
         host.load_source(
-            PRINT_RUNNER,
+            PRINT_RUNNER_AUTOCMD,
             &format!(
                 r#"
-                maki.api.register_command({{
-                    name = "/{PRINT_RUNNER}", tui_only = false,
-                    handler = function()
-                        local ok, err = maki.api.run_command("/cd {cwd}")
-                        maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                maki.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
+                    callback = function()
+                        maki.async.run(function()
+                            local ok, err = maki.api.run_command("/cd {cwd}")
+                            maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                        end)
                     end,
                 }})
             "#,
@@ -1671,12 +1672,8 @@ mod tests {
                 serde_json::json!({ "session_id": session_id.to_string() }),
             );
             assert_eq!(notices.recv_timeout(GATE_TIMEOUT).unwrap(), MODES_SET);
-            host.event_handle().run_command(
-                Arc::from(PRINT_RUNNER),
-                Arc::from(format!("/{PRINT_RUNNER}").as_str()),
-                String::new(),
-                0,
-            );
+            host.event_handle()
+                .fire_autocmd(PRINT_RUNNER_AUTOCMD, serde_json::json!({}));
             assert_eq!(
                 notices.recv_timeout(GATE_TIMEOUT).unwrap(),
                 RUNNER_DISPATCHED

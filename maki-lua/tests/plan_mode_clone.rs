@@ -5,6 +5,7 @@
 //! These run on the real plugin sources so a byte-level edit to any of the
 //! three files is caught here, not just at runtime.
 
+use maki_lua::test_support::run_command;
 use test_case::test_case;
 
 const MODE_OVERRIDE_SRC: &str = include_str!("../../plugins/mode_plan_override/init.lua");
@@ -170,14 +171,7 @@ fn mode_command_failure_reaches_the_caller(command: &str) {
             .unwrap();
     host.load_source(MODE_OVERRIDE_PLUGIN, MODE_OVERRIDE_SRC)
         .unwrap();
-    let result = host
-        .event_handle()
-        .run_command_for_test(
-            MODE_OVERRIDE_PLUGIN.into(),
-            command.into(),
-            String::new(),
-            0,
-        )
+    let result = run_command(&host.command_registry(), command, 0, None)
         .recv_timeout(COMMAND_TIMEOUT)
         .unwrap();
     let error = result.unwrap_err();

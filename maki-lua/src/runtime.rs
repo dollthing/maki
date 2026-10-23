@@ -37,11 +37,11 @@ use crate::splash::SplashFrame;
 use serde_json::Value;
 
 use maki_commands::{
-    ArgumentValue, CommandArguments, CommandBehavior, CommandCompletion, CommandDocs, CommandError,
-    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec,
-    CompletionContext, CompletionError, CompletionItem, CompletionLifecycleEvent,
-    CompletionSessionId, ParsedArgument, ParsedArguments, Producer, ProducerPrecedence,
-    Registration, RegistrationError, TargetCapabilities, TargetCapability,
+    ArgumentValue, CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
+    CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, ParsedArgument,
+    Producer, ProducerPrecedence, Registration, RegistrationError, TargetCapabilities,
+    TargetCapability,
 };
 use maki_config::RawConfig;
 use maki_storage::id::{MakiId, SessionRef};
@@ -265,14 +265,6 @@ pub enum Request {
         owner: Arc<str>,
         plugin_dir: Option<PathBuf>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
-    },
-    RunCommand {
-        plugin: Arc<str>,
-        command: Arc<str>,
-        generation: u64,
-        args: String,
-        depth: u8,
-        completion: Option<flume::Sender<Result<(), String>>>,
     },
     AgentEvent(Box<crate::orchestration::AgentEventRequest>),
     ExecuteCommand {
@@ -1206,21 +1198,6 @@ async fn run_awaited<F: Future>(
 
 /// [`run_detached`] for a slash-command handler, seeding the hop count that
 /// `maki.api.run_command` checks before extending the chain.
-pub(crate) async fn run_command_legacy_scoped<F: Future>(
-    lua: &Lua,
-    depth: u8,
-    target: Option<TrustedTarget>,
-    fut: F,
-) -> F::Output {
-    let scope = TaskScope::detached(lua);
-    {
-        let mut cell = lock_cell(scope.handle());
-        cell.command_depth = depth;
-        cell.pinned_target = target;
-    }
-    run_scoped(lua, scope, fut).await
-}
-
 pub(crate) async fn run_command_scoped<F: Future>(
     lua: &Lua,
     invocation: CommandInvocation,
@@ -1242,27 +1219,10 @@ fn set_lua_command_options(
     opts: &mlua::Table,
     invocation: &CommandInvocation,
 ) -> mlua::Result<()> {
-    set_lua_command_options_from_parsed(
-        lua,
-        opts,
-        invocation.arguments.as_ref(),
-        invocation.parsed_arguments.as_ref(),
-        invocation.parsed_arguments.is_some(),
-    )
-}
-
-fn set_lua_command_options_from_parsed(
-    lua: &Lua,
-    opts: &mlua::Table,
-    arguments: &str,
-    parsed: Option<&ParsedArguments>,
-    typed: bool,
-) -> mlua::Result<()> {
-    opts.set("args", arguments)?;
-    if !typed {
+    opts.set("args", invocation.arguments.as_ref())?;
+    let Some(parsed) = invocation.parsed_arguments.as_ref() else {
         return Ok(());
-    }
-    let parsed = parsed.expect("typed command invocation must have parsed arguments");
+    };
     let fargs = parsed
         .tokens()
         .iter()
@@ -2194,11 +2154,11 @@ struct PluginOwner {
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
 
 #[derive(Clone)]
-struct LuaCommandBehavior {
-    plugin: Arc<str>,
-    command: Arc<str>,
-    generation: u64,
-    tx: flume::Sender<Request>,
+pub(crate) struct LuaCommandBehavior {
+    pub(crate) plugin: Arc<str>,
+    pub(crate) command: Arc<str>,
+    pub(crate) generation: u64,
+    pub(crate) tx: flume::Sender<Request>,
 }
 
 impl CommandBehavior for LuaCommandBehavior {
@@ -5142,68 +5102,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 }
                             }
                         }
-                        Request::RunCommand {
-                            plugin,
-                            command,
-                            generation,
-                            args,
-                            depth,
-                            completion,
-                        } => {
-                            let command_data = rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
-                                let entry = m.get(&plugin)?.get(&command)?;
-                                if entry.generation != generation {
-                                    return None;
-                                }
-                                let function = rt.lua.registry_value::<Function>(&entry.handler).ok()?;
-                                let typed = matches!(entry.arguments, CommandArguments::Positional(_));
-                                let parsed = entry.arguments.parse_invocation(args.trim());
-                                Some((function, typed, parsed))
-                            });
-                            if let Some((func, typed, parsed)) = command_data {
-                                let args = args.trim().to_owned();
-                                let target = crate::orchestration::resolve_target(&rt.lua, None);
-                                let pinned = target.as_ref().ok().cloned().flatten();
-                                let owner = crate::orchestration::plugin_authority(&rt.lua, plugin.clone());
-                                let lua = rt.lua.clone();
-                                ex.spawn(async move {
-                                    let run = async {
-                                        bind_plugin_owner(&lua, plugin.clone(), owner)?;
-                                        let parsed = match parsed {
-                                            Ok(parsed) => parsed,
-                                            Err(error) => {
-                                                return Err(mlua::Error::runtime(error.to_string()));
-                                            }
-                                        };
-                                        let opts = lua.create_table()?;
-                                        set_lua_command_options_from_parsed(
-                                            &lua,
-                                            &opts,
-                                            &args,
-                                            parsed.as_ref(),
-                                            typed,
-                                        )?;
-                                        let ctx = target
-                                            .map_err(mlua::Error::runtime)?
-                                            .map(|target| LuaCtx::trusted_context(&lua, target, plugin.clone()));
-                                        let thread = lua.create_thread(func)?;
-                                        thread.into_async::<()>((opts, ctx))?.await
-                                    };
-                                    let result = run_command_legacy_scoped(&lua, depth, pinned, run)
-                                        .await
-                                        .map_err(|error| error.to_string());
-                                    if let Err(error) = &result {
-                                        tracing::warn!(plugin = %plugin, command = %command, error, "command handler failed");
-                                    }
-                                    if let Some(completion) = completion {
-                                        let _ = completion.send(result);
-                                    }
-                                })
-                                .detach();
-                            } else if let Some(completion) = completion {
-                                let _ = completion.send(Err(COMMAND_HANDLER_UNAVAILABLE.to_owned()));
-                            }
-                        }
                         #[cfg(feature = "test-support")]
                         Request::TestPause { ready, release } => {
                             let _ = ready.send(());
@@ -5715,6 +5613,7 @@ mod tests {
     use crate::api::tool::ToolCallReply;
     use futures_lite::future::poll_once;
     use maki_agent::cancel::CancelTrigger;
+    use maki_commands::CommandArguments;
     use std::future::poll_fn;
     use std::task::Poll;
     use test_case::test_case;

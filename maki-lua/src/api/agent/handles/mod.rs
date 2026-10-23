@@ -520,11 +520,11 @@ mod tests {
         });
     }
 
-    #[test_case(false, false ; "legacy_focus_changes_after_dispatch")]
-    #[test_case(false, true ; "legacy_target_closes_after_dispatch")]
-    #[test_case(true, false ; "registry_focus_changes_after_dispatch")]
-    #[test_case(true, true ; "registry_target_closes_after_dispatch")]
-    fn editor_request_retains_the_invocation_agent(registry_dispatch: bool, close_target: bool) {
+    #[test_case("/editor", false ; "direct_focus_changes_after_dispatch")]
+    #[test_case("/editor", true ; "direct_target_closes_after_dispatch")]
+    #[test_case("/edit", false ; "nested_focus_changes_after_dispatch")]
+    #[test_case("/edit", true ; "nested_target_closes_after_dispatch")]
+    fn editor_request_retains_the_invocation_agent(cmdline: &'static str, close_target: bool) {
         smol::block_on(async {
             let context = stub_ctx(&AgentMode::Build);
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -566,17 +566,10 @@ mod tests {
                     "#,
                 )
                 .unwrap();
-            let dispatch = if registry_dispatch {
-                let commands = host.host().command_registry();
-                let target =
-                    commands.bind_target(TargetCapabilities::ALL, Arc::new(EditorCommandHost));
-                Some(smol::spawn(async move {
-                    commands.dispatch_input(&target, "/edit".into()).await
-                }))
-            } else {
-                handle.run_command(Arc::from(PLUGIN), Arc::from("/editor"), String::new(), 0);
-                None
-            };
+            let commands = host.host().command_registry();
+            let target = commands.bind_target(TargetCapabilities::ALL, Arc::new(EditorCommandHost));
+            let dispatch =
+                smol::spawn(async move { commands.dispatch_input(&target, cmdline.into()).await });
             let actions = host.host().ui_action_rx();
             let UiAction::OpenEditor {
                 target,
@@ -605,9 +598,7 @@ mod tests {
                 panic!("expected editor result");
             };
             assert_eq!(message, format!("{}|{code}", original.id()));
-            if let Some(dispatch) = dispatch {
-                dispatch.await;
-            }
+            dispatch.await;
             manager.shutdown(RETIRE_TIMEOUT).await;
             replacement_manager.shutdown(RETIRE_TIMEOUT).await;
             drop(fixtures);

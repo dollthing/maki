@@ -374,17 +374,20 @@ pub fn bind_parked_root(
     install_root(host, root, with_request_tools(reg, ctx));
 }
 
-/// Installs {root} as {host}'s orchestration root.
-pub fn install_root(host: &PluginHost, root: AgentRef, template: ToolContext) {
+/// Installs {root} as {host}'s orchestration root, returning it as the
+/// target a command dispatched on it pins.
+pub fn install_root(host: &PluginHost, root: AgentRef, template: ToolContext) -> TrustedTarget {
+    let target = TrustedTarget {
+        target: root,
+        template,
+    };
     host.event_handle()
         .install_orchestration_services(Arc::new(AgentOrchestration::bind_root(
             Arc::default(),
-            TrustedTarget {
-                target: root,
-                template,
-            },
+            target.clone(),
         )));
     host.wait_for_worker_barrier_for_test();
+    target
 }
 
 /// Installs an idle root as {host}'s orchestration root whose plugin-requested

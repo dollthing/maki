@@ -23,15 +23,15 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCance
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
-use maki_agent::session_coordinator::SessionCoordinatorError;
+use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
-    AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, InputDispatch,
-    PresentedCommand, TargetHandle,
+    AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
+    InputDispatch, PresentedCommand, TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{
@@ -970,18 +970,8 @@ async fn install_session_with_lock(
         observer,
     );
     let command_registry = params.command_registry.clone();
-    let command_target = command_registry.bind_target_with_presentation(
-        maki_agent::command::session_capabilities(),
-        maki_agent::command::portable_capabilities(),
-        Arc::new(
-            maki_agent::command::SessionCommandHost::new(
-                handle.control_tx.clone(),
-                coordinator.clone(),
-            )
-            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
-            .with_admission_context(trusted_root.clone()),
-        ),
-    );
+    let command_target =
+        session_command_target(&command_registry, &handle, &coordinator, &trusted_root);
     orchestration.bind_commands(
         &trusted_root.target,
         maki_lua::orchestration::command_runner(
@@ -1025,6 +1015,28 @@ async fn install_session_with_lock(
         lock: Some(lock),
     });
     Ok(option_snapshot)
+}
+
+/// The target a session's prompts dispatch on: commands control {handle}'s
+/// session and run on {root}.
+fn session_command_target(
+    registry: &CommandRegistry,
+    handle: &InteractiveHandle,
+    coordinator: &SessionCoordinatorHandle,
+    root: &TrustedTarget,
+) -> TargetHandle {
+    registry.bind_target_with_presentation(
+        maki_agent::command::session_capabilities(),
+        maki_agent::command::portable_capabilities(),
+        Arc::new(
+            maki_agent::command::SessionCommandHost::new(
+                handle.control_tx.clone(),
+                coordinator.clone(),
+            )
+            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
+            .with_admission_context(root.clone()),
+        ),
+    )
 }
 
 fn emit_current_commands(srv: &Server) {
@@ -2736,11 +2748,18 @@ mod tests {
             .with_completion(completion)
         });
         let observer = HeadlessObserver::new(host.event_handle(), id.id());
-        observer.install(root.target);
+        observer.install(root.target.clone());
         host.event_handle().install_orchestration_services(services);
         let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
         previous.task.cancel().await;
+        session.command_registry = host.command_registry();
+        session.command_target = session_command_target(
+            &session.command_registry,
+            &session.handle,
+            &coordinator,
+            &root,
+        );
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {
             out_tx: srv.out_tx.clone(),
@@ -5909,13 +5928,17 @@ mod tests {
                 .options()
                 .version;
             if lua_root_option {
-                let changed = _host.event_handle().run_command_for_test(
-                    Arc::from("acp_options"),
-                    Arc::from("/acp_fast"),
-                    String::new(),
-                    0,
+                handle_prompt(
+                    &mut srv,
+                    &prompt_request(&session_id, "/acp_fast", false),
+                    &RequestId::Number(93),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    prompt_terminal(&out_rx, 93).await["result"]["stopReason"],
+                    "end_turn"
                 );
-                changed.recv_async().await.unwrap().unwrap();
             } else {
                 handle_set_config(&mut srv, &serde_json::json!({ "params": {
                     "sessionId": session_id, "configId": maki_agent::session_options::FAST_OPTION_ID,

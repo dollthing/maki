@@ -52,9 +52,75 @@ pub mod test_support {
         HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
         StatusContentWriter,
     };
+    use crate::orchestration::TrustedTarget;
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
+    use maki_commands::{
+        CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
+        HostRequest, HostResponse, TargetCapabilities,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
 
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
+
+    pub const COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct DetachedCommandHost;
+
+    impl CommandHost for DetachedCommandHost {
+        fn request(&self, _: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
+        }
+    }
+
+    /// Dispatches {cmdline} through {registry} at {depth}, the way a frontend
+    /// runs a typed command, with {admission} as the agent the handler's `ctx`
+    /// belongs to. The dispatch runs in the background so a test can drive
+    /// whatever the handler waits on; the receiver yields the handler's result.
+    pub fn run_command(
+        registry: &CommandRegistry,
+        cmdline: &str,
+        depth: usize,
+        admission: Option<TrustedTarget>,
+    ) -> flume::Receiver<Result<(), String>> {
+        let registry = registry.clone();
+        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(DetachedCommandHost));
+        let dispatch = registry
+            .resolve_input_for(&target, cmdline)
+            .map_err(|error| error.to_string())
+            .map(|resolved| match admission {
+                Some(admission) => registry.dispatch_command_with_admission(
+                    &target,
+                    resolved.command,
+                    resolved.arguments,
+                    CommandContent::default(),
+                    depth,
+                    Arc::new(admission),
+                ),
+                None => registry.dispatch_command_with_depth(
+                    &target,
+                    resolved.command,
+                    resolved.arguments,
+                    CommandContent::default(),
+                    depth,
+                ),
+            });
+        let (result, finished) = flume::bounded(1);
+        smol::spawn(async move {
+            let _target = target;
+            let outcome = match dispatch {
+                Ok(dispatch) => match dispatch.await {
+                    CommandOutcome::Completed => Ok(()),
+                    CommandOutcome::Failed(error) => Err(error.to_string()),
+                    outcome => Err(format!("unexpected Lua command outcome: {outcome:?}")),
+                },
+                Err(error) => Err(error),
+            };
+            let _ = result.send(outcome);
+        })
+        .detach();
+        finished
+    }
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
     pub struct HintWriterHandle(HintWriter);
@@ -102,22 +168,30 @@ pub mod test_support {
             })
         }
 
-        /// Next dispatched slash command as `(command, args, depth)`, skipping
-        /// other requests.
-        pub fn try_recv_command(&self) -> Option<(String, String, u8)> {
+        /// Next Lua command the registry executed, as `(command, args, depth)`,
+        /// skipping other requests. The handler is reported as finished, so
+        /// the frontend sees the command complete. Frontends dispatch in the
+        /// background, so this waits up to [`COMMAND_PROBE_TIMEOUT`].
+        pub fn recv_command(&self) -> Option<(String, String, usize)> {
             use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
-                if let Request::RunCommand {
+            let deadline = std::time::Instant::now() + COMMAND_PROBE_TIMEOUT;
+            loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+                if let Request::ExecuteCommand {
                     command,
-                    args,
-                    depth,
+                    invocation,
+                    completion,
                     ..
-                } = req
+                } = self.0.recv_timeout(remaining).ok()?
                 {
-                    return Some((command.to_string(), args, depth));
+                    let _ = completion.send(Ok(()));
+                    return Some((
+                        command.to_string(),
+                        invocation.arguments.to_string(),
+                        invocation.depth,
+                    ));
                 }
             }
-            None
         }
 
         /// Next fired autocmd as `(event, data)`, skipping other requests.

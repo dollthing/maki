@@ -99,30 +99,6 @@ fn build_app_with_registry(
 }
 
 #[derive(Clone)]
-struct TestLuaBehavior {
-    handle: maki_lua::EventHandle,
-    plugin: Arc<str>,
-    name: Arc<str>,
-}
-
-impl maki_commands::CommandBehavior for TestLuaBehavior {
-    fn execute(
-        &self,
-        invocation: maki_commands::CommandInvocation,
-    ) -> maki_commands::CommandFuture<
-        Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
-    > {
-        self.handle.run_command(
-            Arc::clone(&self.plugin),
-            Arc::clone(&self.name),
-            invocation.arguments.to_string(),
-            invocation.depth as u8,
-        );
-        Box::pin(async { Ok(maki_commands::CommandOutcome::Completed) })
-    }
-}
-
-#[derive(Clone)]
 struct TestLuaCompletion {
     handle: maki_lua::EventHandle,
     plugin: Arc<str>,
@@ -284,11 +260,9 @@ fn register_test_lua_command(
                 },
                 required_capabilities: maki_commands::TargetCapabilities::default(),
             },
-            behavior: Arc::new(TestLuaBehavior {
-                handle: command.handle,
-                plugin: command.plugin,
-                name: command.name,
-            }),
+            behavior: command
+                .handle
+                .command_behavior_for_test(&command.plugin, &command.name),
             argument_completions: if command.completion {
                 vec![completion]
             } else if command.max_args == Some(1) {
@@ -334,11 +308,9 @@ fn lua_registry_with_commands(
                     },
                     required_capabilities: maki_commands::TargetCapabilities::default(),
                 },
-                behavior: Arc::new(TestLuaBehavior {
-                    handle: command.handle,
-                    plugin: command.plugin,
-                    name: command.name,
-                }),
+                behavior: command
+                    .handle
+                    .command_behavior_for_test(&command.plugin, &command.name),
                 argument_completions: if command.completion {
                     vec![completion]
                 } else if command.max_args == Some(1) {
@@ -2042,7 +2014,7 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
     assert!(actions.is_empty());
     assert!(app.input_box.buffer.value().is_empty());
     assert_eq!(
-        probe.try_recv_command(),
+        probe.recv_command(),
         Some(("/rename".into(), "final tail".into(), 0))
     );
 }
@@ -2121,7 +2093,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
     );
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
-        probe.try_recv_command(),
+        probe.recv_command(),
         Some(("/deployer".into(), "candidate-7".into(), 0))
     );
 }
@@ -2207,7 +2179,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
-        probe.try_recv_command(),
+        probe.recv_command(),
         Some(("/deployer".into(), "candidate-0x".into(), 0))
     );
 }
@@ -2247,7 +2219,7 @@ fn argument_completion_enter_on_exact_match_executes_immediately() {
     assert!(app.input_box.buffer.value().is_empty());
     assert!(!app.command_palette.is_active());
     assert_eq!(
-        probe.try_recv_command(),
+        probe.recv_command(),
         Some(("/rename".into(), "final".into(), 0))
     );
 }
@@ -5385,7 +5357,7 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
     };
 
     assert!(err.contains("/nope"), "err={err:?}");
-    assert!(probe.try_recv_command().is_none(), "{RUN_CMDLINE_REJECTED}");
+    assert!(probe.recv_command().is_none(), "{RUN_CMDLINE_REJECTED}");
 }
 
 #[test]
@@ -5430,7 +5402,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     app.run_cmdline("/sessions", 3).unwrap();
 
     assert_eq!(
-        probe.try_recv_command(),
+        probe.recv_command(),
         Some(("/Sessions".to_string(), String::new(), 3))
     );
 }
@@ -8865,11 +8837,8 @@ fn at_completion_insertion_synchronizes_argument_completion() {
                 },
                 required_capabilities: maki_commands::TargetCapabilities::default(),
             },
-            behavior: Arc::new(TestLuaBehavior {
-                handle: maki_lua::EventHandle::disconnected_for_test(),
-                plugin: Arc::from("deploy"),
-                name: Arc::from("/deploy"),
-            }),
+            behavior: maki_lua::EventHandle::disconnected_for_test()
+                .command_behavior_for_test("deploy", "/deploy"),
             argument_completions: vec![Some(Arc::new(TestLuaCompletion {
                 handle: maki_lua::EventHandle::disconnected_for_test(),
                 plugin: Arc::from("deploy"),

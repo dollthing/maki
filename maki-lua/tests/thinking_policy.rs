@@ -9,6 +9,8 @@ use std::time::Duration;
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{ActorBackend, AgentLimits, AgentManagerHandle};
 use maki_lua::PluginHost;
+use maki_lua::orchestration::TrustedTarget;
+use maki_lua::test_support::run_command;
 use maki_providers::{Effort, Model, ThinkingConfig};
 use serde_json::{Value, json};
 
@@ -38,7 +40,7 @@ maki.api.register_command({
 })
 "#;
 
-fn load_thinking_host(ctx: &mut ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
+fn load_thinking_host(ctx: &mut ToolContext) -> (PluginHost, TrustedTarget) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("thinking_policy", PROBE_SRC).unwrap();
@@ -54,8 +56,8 @@ fn load_thinking_host(ctx: &mut ToolContext) -> (Arc<ToolRegistry>, PluginHost) 
     ctx.execution_agent_id = Some(root.id());
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);
-    common::install_root(&host, root, template);
-    (reg, host)
+    let target = common::install_root(&host, root, template);
+    (host, target)
 }
 
 fn wait_capture(provider: &CannedProvider) -> ThinkingConfig {
@@ -77,18 +79,18 @@ fn thinking_effort_reaches_the_model(thinking: Value, expected: ThinkingConfig) 
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
     ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
-    let (_reg, host) = load_thinking_host(&mut ctx);
+    let (host, target) = load_thinking_host(&mut ctx);
 
-    host.event_handle()
-        .run_command_for_test(
-            Arc::from("thinking_policy"),
-            Arc::from("/probe_thinking"),
-            json!({ "thinking": thinking }).to_string(),
-            0,
-        )
-        .recv_timeout(TURN_TIMEOUT)
-        .unwrap()
-        .unwrap();
+    let args = json!({ "thinking": thinking });
+    run_command(
+        &host.command_registry(),
+        &format!("/probe_thinking {args}"),
+        0,
+        Some(target),
+    )
+    .recv_timeout(TURN_TIMEOUT)
+    .unwrap()
+    .unwrap();
     assert_eq!(wait_capture(&provider), expected);
 }
 
@@ -103,18 +105,18 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
         "fixture model must not support thinking"
     );
     ctx.model = non_thinking;
-    let (_reg, host) = load_thinking_host(&mut ctx);
+    let (host, target) = load_thinking_host(&mut ctx);
 
-    host.event_handle()
-        .run_command_for_test(
-            Arc::from("thinking_policy"),
-            Arc::from("/probe_thinking"),
-            json!({ "thinking": "high" }).to_string(),
-            0,
-        )
-        .recv_timeout(TURN_TIMEOUT)
-        .unwrap()
-        .unwrap();
+    let args = json!({ "thinking": "high" });
+    run_command(
+        &host.command_registry(),
+        &format!("/probe_thinking {args}"),
+        0,
+        Some(target),
+    )
+    .recv_timeout(TURN_TIMEOUT)
+    .unwrap()
+    .unwrap();
     assert_eq!(
         wait_capture(&provider),
         ThinkingConfig::Off,

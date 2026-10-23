@@ -25,7 +25,7 @@ use maki_config::{
 use maki_lua::agent_errors::{
     DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
 };
-use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
+use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend, run_command};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
@@ -3574,13 +3574,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     );
 
     let flashes = host.ui_action_rx();
-    handle
-        .run_command_for_test(
-            Arc::from("slow_completion"),
-            Arc::from("/slow"),
-            String::new(),
-            0,
-        )
+    run_command(&host.command_registry(), "/slow", 0, None)
         .recv_timeout(Duration::from_secs(5))
         .expect("timed-out completion stopped the Lua host")
         .expect("command handler should succeed");
@@ -3620,6 +3614,8 @@ fn required_raw_arguments_reject_empty_dispatch() {
         Arc::new(FakeCommandHost),
     );
 
+    let actions = host.ui_action_rx();
+
     let outcome = smol::block_on(commands.dispatch_input(&target, "/required".into()));
 
     assert!(matches!(
@@ -3631,22 +3627,6 @@ fn required_raw_arguments_reject_empty_dispatch() {
             }
         ))
     ));
-
-    let actions = host.ui_action_rx();
-    let result = host
-        .event_handle()
-        .run_command_for_test(
-            Arc::from("required_raw"),
-            Arc::from("/required"),
-            String::new(),
-            0,
-        )
-        .recv_timeout(Duration::from_secs(5))
-        .expect("required raw RunCommand completion was not sent");
-    assert!(
-        result.is_err(),
-        "required raw RunCommand unexpectedly succeeded"
-    );
     assert!(matches!(
         actions.try_recv(),
         Err(flume::TryRecvError::Empty)
@@ -3672,13 +3652,13 @@ fn command_handler_receives_raw_args_without_typed_fields(args: &str, expected_f
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
+    let echoed = run_command(&host.command_registry(), &format!("/echo {args}"), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("command handler did not run");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+    assert_eq!(echoed.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
 }
 
 const COPY_COMMAND_PLUGIN: &str = r#"
@@ -3823,10 +3803,11 @@ fn invalid_typed_copy_input_does_not_execute(input: &str) {
 }
 
 const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the frontend runner";
+const RUN_COMMAND_EVENT: &str = "RunCommandProbe";
 
-/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair the frontend's
-/// runner gives back. A handler reached at depth 0 asks for depth 1 so a
-/// chain of aliases keeps counting toward the cap.
+/// An autocmd asks for `/cd ~/src` and flashes the `ok, err` pair the
+/// frontend's runner gives back. A callback outside any command runs at depth
+/// 0 and asks for depth 1, so a chain of aliases keeps counting toward the cap.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_flash: &str) {
@@ -3842,21 +3823,21 @@ fn run_command_goes_to_the_frontend_runner(reply: Result<(), String>, expected_f
     );
     host.load_source(
         "p",
-        r#"
-        maki.api.register_command({
-            name = "/go",
-            tui_only = false,
-            handler = function()
-                local ok, err = maki.api.run_command("  //cd ~/src  ")
-                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
-            end,
-        })
-        "#,
+        &format!(
+            r#"
+            maki.api.create_autocmd("{RUN_COMMAND_EVENT}", {{ callback = function()
+                maki.async.run(function()
+                    local ok, err = maki.api.run_command("  //cd ~/src  ")
+                    maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                end)
+            end }})
+            "#
+        ),
     )
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+        .fire_autocmd(RUN_COMMAND_EVENT, json!({}));
 
     let (cmdline, depth) = runs
         .recv_timeout(Duration::from_secs(5))
@@ -5483,8 +5464,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
+    let _parked = run_command(&host.command_registry(), "/park", 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -5515,8 +5495,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     )
     .unwrap();
     let rx = host.ui_action_rx();
-    let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
+    let _parked = run_command(&host.command_registry(), "/stream", 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -5564,8 +5543,7 @@ fn host_list_picker_roundtrip() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    let completion =
-        handle.run_command_for_test(Arc::from("p"), Arc::from("/pick"), String::new(), 0);
+    let completion = run_command(&host.command_registry(), "/pick", 0, None);
 
     let UiAction::OpenListPicker {
         id,
@@ -5668,8 +5646,7 @@ fn host_list_picker_ui_drop_drains_callbacks() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    let completion =
-        handle.run_command_for_test(Arc::from("p"), Arc::from("/pick"), String::new(), 0);
+    let completion = run_command(&host.command_registry(), "/pick", 0, None);
 
     let UiAction::OpenListPicker { id, reply_tx, .. } = rx
         .recv_timeout(Duration::from_secs(5))

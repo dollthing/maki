@@ -9,7 +9,7 @@ use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::session_coordinator::SessionOptionCatalog;
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_commands::CommandRegistry;
+use maki_commands::{CommandBehavior, CommandRegistry};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
@@ -24,8 +24,8 @@ use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
-    CommandArgumentLifecycleRequest, CommandArgumentRequest, LuaThread, Request, RestoreItem,
-    SplashFrameRequest, lifecycle_superseded,
+    CommandArgumentLifecycleRequest, CommandArgumentRequest, LuaCommandBehavior, LuaThread,
+    Request, RestoreItem, SplashFrameRequest, lifecycle_superseded,
 };
 use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
 use crate::ui_sink::HostUi;
@@ -943,22 +943,34 @@ impl EventHandle {
             .map_err(|_| crate::SessionOptionMutationError::HostDead)?
     }
 
-    fn command_generation(&self, plugin: &Arc<str>, command: &Arc<str>) -> u64 {
+    #[doc(hidden)]
+    pub fn command_generation_for_test(&self, plugin: &str, command: &str) -> u64 {
         self.command_generations
             .as_ref()
             .and_then(|generations| {
                 generations
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .get(&(Arc::clone(plugin), Arc::clone(command)))
+                    .get(&(Arc::from(plugin), Arc::from(command)))
                     .copied()
             })
             .unwrap_or_default()
     }
 
+    /// The behavior the registry runs for {plugin}'s {command}, sending its
+    /// `ExecuteCommand` request down this handle.
     #[doc(hidden)]
-    pub fn command_generation_for_test(&self, plugin: &str, command: &str) -> u64 {
-        self.command_generation(&Arc::from(plugin), &Arc::from(command))
+    pub fn command_behavior_for_test(
+        &self,
+        plugin: &str,
+        command: &str,
+    ) -> Arc<dyn CommandBehavior> {
+        Arc::new(LuaCommandBehavior {
+            plugin: Arc::from(plugin),
+            command: Arc::from(command),
+            generation: self.command_generation_for_test(plugin, command),
+            tx: self.tx.clone(),
+        })
     }
 
     #[doc(hidden)]
@@ -1044,39 +1056,6 @@ impl EventHandle {
                 shared.send(Request::SplashFrame(work)).is_ok()
             }),
         }
-    }
-
-    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
-        let generation = self.command_generation(&plugin, &command);
-        let _ = self.prio_tx.try_send(Request::RunCommand {
-            plugin,
-            command,
-            generation,
-            args,
-            depth,
-            completion: None,
-        });
-    }
-
-    #[doc(hidden)]
-    pub fn run_command_for_test(
-        &self,
-        plugin: Arc<str>,
-        command: Arc<str>,
-        args: String,
-        depth: u8,
-    ) -> flume::Receiver<Result<(), String>> {
-        let (completion, rx) = flume::bounded(1);
-        let generation = self.command_generation(&plugin, &command);
-        let _ = self.prio_tx.try_send(Request::RunCommand {
-            plugin,
-            command,
-            generation,
-            args,
-            depth,
-            completion: Some(completion),
-        });
-        rx
     }
 
     /// Install explicit agent target and discovery services supplied by the host.
@@ -1352,6 +1331,7 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::run_command;
     use maki_agent::SessionMailbox;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::session_coordinator::{
@@ -2030,51 +2010,6 @@ mod tests {
     }
 
     #[test]
-    fn run_command_sends_correct_request() {
-        let (prio_tx, prio_rx) = flume::bounded(8);
-        let (tx, _rx) = flume::bounded(8);
-        let handle = EventHandle {
-            tx,
-            shutdown: Arc::default(),
-            prio_tx: prio_tx.clone(),
-            modes: Arc::new(maki_agent::ModeRegistry::builtin()),
-            session_options: SessionOptionCatalog::default(),
-            completion: None,
-            command_generations: None,
-            command_arguments: CoalescedLatest::new(|_| false),
-            command_argument_lifecycle: CoalescedLatest::new(|_| false),
-            splash_frames: CoalescedLatest::new(move |work| {
-                prio_tx.send(Request::SplashFrame(work)).is_ok()
-            }),
-        };
-        handle.run_command(
-            Arc::from("myplugin"),
-            Arc::from("/greet"),
-            "world".into(),
-            2,
-        );
-        let req = prio_rx.try_recv().unwrap();
-        match req {
-            Request::RunCommand {
-                plugin,
-                command,
-                generation,
-                args,
-                depth,
-                completion,
-            } => {
-                assert_eq!(plugin.as_ref(), "myplugin");
-                assert_eq!(generation, 0);
-                assert_eq!(command.as_ref(), "/greet");
-                assert_eq!(args, "world");
-                assert_eq!(depth, 2);
-                assert!(completion.is_none());
-            }
-            _ => panic!("expected RunCommand"),
-        }
-    }
-
-    #[test]
     fn command_argument_requests_keep_only_latest_pending() {
         let (tx, rx) = flume::unbounded();
         let handle = EventHandle::probed_for_test(tx);
@@ -2690,9 +2625,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = host
-            .event_handle()
-            .run_command_for_test(Arc::from("late"), Arc::from("/late"), String::new(), 0)
+        let result = run_command(&host.command_registry(), "/late", 0, None)
             .recv()
             .unwrap();
         let error = result.unwrap_err();
