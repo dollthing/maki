@@ -4,10 +4,9 @@ use crate::agent_errors::{
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
 use maki_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use maki_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
+use maki_agent::command::command_input;
 use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
-use maki_agent::headless::{
-    InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding,
-};
+use maki_agent::headless::{InteractiveControl, InteractiveHandle, RootBinding};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
 use maki_agent::session_coordinator::{
@@ -214,26 +213,43 @@ pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> 
 
 /// Runs a slash command a plugin asked for outside a command invocation,
 /// pinned to the given target, at the given hop depth. Resolves once the
-/// frontend has taken the command; a long one such as `/compact` may still be
-/// running.
+/// handler has finished and the frontend has taken its outcome; a model turn
+/// or `/compact` it started may still be running.
 pub type CommandRunner =
     Arc<dyn Fn(String, u8, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
 
-pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
+/// Runs the outcome of a plugin-run command that is neither finished nor
+/// failed: a model turn, compaction, an isolated turn or feedback.
+pub type OutcomeExecutor =
+    Arc<dyn Fn(String, CommandOutcome, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
 
-/// A runner for a frontend that hands no outcome back to a frontend loop:
-/// commands run through {target} on the agent the caller pinned, at its hop
-/// depth, like the TUI's; compaction is queued on the root through
-/// {control}, feedback has nowhere to show, and the outcomes that still need
-/// a frontend loop are errors.
-pub fn detached_command_runner(
+pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
+pub const CLOSED_TARGET_ERR: &str = "the agent this command was pinned to has closed";
+
+/// The one runner every frontend binds: {cmdline} resolves through {target},
+/// runs on the agent the caller pinned at its hop depth, and waits for the
+/// handler; a handler error fails the call, and every other outcome goes to
+/// the frontend's {execute}.
+pub fn command_runner(
     registry: CommandRegistry,
     target: TargetHandle,
-    control: InteractiveControlSender,
+    execute: OutcomeExecutor,
 ) -> CommandRunner {
     Arc::new(move |cmdline, depth, admission| {
-        let dispatch = registry
-            .resolve_input_for(&target, &cmdline)
+        let dispatch = admission
+            .target
+            .validate_live()
+            .map_err(|_| CLOSED_TARGET_ERR.to_owned())
+            .and_then(|()| {
+                registry
+                    .resolve_input_for(&target, &cmdline)
+                    .map_err(|error| match error {
+                        ResolutionError::UnknownCommand(name) => {
+                            format!("unknown command '{name}'")
+                        }
+                        ResolutionError::StaleTarget => error.to_string(),
+                    })
+            })
             .map(|resolved| {
                 registry.dispatch_command_with_admission(
                     &target,
@@ -241,18 +257,40 @@ pub fn detached_command_runner(
                     resolved.arguments,
                     CommandContent::default(),
                     depth.into(),
-                    Arc::new(admission),
+                    Arc::new(admission.clone()),
                 )
             });
+        let execute = Arc::clone(&execute);
+        Box::pin(async move {
+            match dispatch?.await {
+                CommandOutcome::Completed => Ok(()),
+                CommandOutcome::Failed(error) => detached_outcome(
+                    &cmdline,
+                    InputDispatch::Dispatched(CommandOutcome::Failed(error)),
+                ),
+                outcome => execute(cmdline, outcome, admission).await,
+            }
+        })
+    })
+}
+
+/// How print, SDK and ACP run a plugin-run command's outcome: model turns are
+/// admitted on the root, compaction is queued on it, and feedback has nowhere
+/// to show. An isolated turn's answer belongs to the prompt that asked for
+/// it, and a plugin-run one has no prompt to answer.
+pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
+    let admitter = handle.input_tx.admitter();
+    let control = handle.control_tx.clone();
+    Arc::new(move |cmdline, outcome, _| {
+        let admitter = admitter.clone();
         let control = control.clone();
         Box::pin(async move {
-            let dispatch = dispatch.map_err(|error| match error {
-                ResolutionError::UnknownCommand(name) => format!("unknown command '{name}'"),
-                ResolutionError::StaleTarget => error.to_string(),
-            })?;
-            match InputDispatch::Dispatched(dispatch.await) {
-                InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(_)) => Ok(()),
-                InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
+            match outcome {
+                CommandOutcome::FrontendFeedback(_) => Ok(()),
+                CommandOutcome::AgentTurn(turn) => {
+                    admitter.admit(command_input(turn)?).await.map(|_| ())
+                }
+                CommandOutcome::ManualCompaction(instructions) => {
                     let (output, _) = flume::unbounded();
                     control
                         .send(InteractiveControl::ManualCompaction {
@@ -262,7 +300,7 @@ pub fn detached_command_runner(
                         })
                         .await
                 }
-                result => detached_outcome(&cmdline, result),
+                outcome => detached_outcome(&cmdline, InputDispatch::Dispatched(outcome)),
             }
         })
     })

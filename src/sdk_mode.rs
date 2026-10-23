@@ -756,10 +756,10 @@ pub fn run(params: SdkParams) -> Result<()> {
     );
     orchestration.bind_commands(
         &root,
-        maki_lua::orchestration::detached_command_runner(
+        maki_lua::orchestration::command_runner(
             sdk_commands.registry.clone(),
             sdk_commands.target.clone(),
-            handle.control_tx.clone(),
+            maki_lua::orchestration::headless_outcomes(&handle),
         ),
     );
     lua_handle.install_orchestration_services(orchestration.clone());
@@ -2295,7 +2295,7 @@ mod tests {
     /// A plugin's run_command reaches the agent it pinned, at its hop depth,
     /// as in the TUI, rather than the root at depth zero.
     #[test]
-    fn detached_command_runner_runs_on_the_pinned_agent_at_its_depth() {
+    fn command_runner_runs_on_the_pinned_agent_at_its_depth() {
         struct Pinned(Sender<(Option<AgentId>, usize)>);
         impl maki_commands::CommandBehavior for Pinned {
             fn execute(
@@ -2318,10 +2318,10 @@ mod tests {
         let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         plugin.replace(vec![pinned]).unwrap();
         let commands = sdk_commands(registry.clone());
-        let runner = maki_lua::orchestration::detached_command_runner(
+        let runner = maki_lua::orchestration::command_runner(
             registry,
             commands.target.clone(),
-            session.handle.control_tx.clone(),
+            maki_lua::orchestration::headless_outcomes(&session.handle),
         );
         smol::block_on(runner(
             PINNED_COMMAND.into(),
@@ -2336,6 +2336,53 @@ mod tests {
             seen.try_recv().unwrap(),
             (Some(root.id()), usize::from(PINNED_DEPTH))
         );
+        session.end_input();
+    }
+
+    #[test_case(true ; "model_turn_is_admitted_on_the_root")]
+    #[test_case(false ; "handler_error_fails_the_call")]
+    fn command_runner_runs_the_outcome_or_fails_with_the_handler(turn: bool) {
+        let session = pending_sdk_session();
+        let root = smol::block_on(session.handle.initialized_root()).unwrap();
+        let actor = root.actor().unwrap();
+        let running = actor.latest_ticket().unwrap().turn_id();
+        let failure = CommandError::Producer(Arc::from(HANDLER_ERR));
+        let outcome = if turn {
+            CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+                content: CommandContent::from(SDK_ROOT_PROMPT),
+                prompt: None,
+            })
+        } else {
+            CommandOutcome::Failed(failure.clone())
+        };
+        let registry = CommandRegistry::new();
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        plugin
+            .replace(vec![registration(PINNED_COMMAND, outcome)])
+            .unwrap();
+        let commands = sdk_commands(registry.clone());
+        let runner = maki_lua::orchestration::command_runner(
+            registry,
+            commands.target.clone(),
+            maki_lua::orchestration::headless_outcomes(&session.handle),
+        );
+        let result = smol::block_on(runner(
+            PINNED_COMMAND.into(),
+            PINNED_DEPTH,
+            TrustedTarget {
+                target: root.clone(),
+                template: maki_agent::tools::cli_tool_ctx(std::env::temp_dir()),
+            },
+        ));
+        let queued = actor.latest_ticket().unwrap().turn_id();
+        if turn {
+            assert_eq!(result, Ok(()));
+            assert_ne!(queued, running);
+            session.release.send(()).unwrap();
+        } else {
+            assert_eq!(result, Err(failure.to_string()));
+            assert_eq!(queued, running);
+        }
         session.end_input();
     }
 
@@ -2413,6 +2460,7 @@ mod tests {
     }
 
     const PINNED_COMMAND: &str = "/pinned";
+    const HANDLER_ERR: &str = "the handler gave up";
     const PINNED_DEPTH: u8 = 3;
     const OTHER_CWD: &str = "/elsewhere";
     const THIS_CWD: &str = "/here";

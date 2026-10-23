@@ -1,4 +1,4 @@
-use maki_lua::orchestration::TrustedTarget;
+use maki_lua::orchestration::{self, CommandRunner, TrustedTarget};
 use std::{
     any::Any,
     collections::HashMap,
@@ -9,8 +9,7 @@ use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgS
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
     CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
-    HostRequest, HostResponse, PreparedTarget, ResolutionError, ResolvedCommand,
-    TargetCapabilities, TargetHandle,
+    HostRequest, HostResponse, PreparedTarget, ResolvedCommand, TargetCapabilities, TargetHandle,
 };
 
 pub(crate) const CLOSED_TARGET_ERR: &str = "the selected agent has closed; switch to a live chat";
@@ -228,37 +227,27 @@ impl CommandRuntime {
         self.send_outcome(target.id(), admission, future);
     }
 
-    /// Runs {cmdline} on {target} with an admission pinned before the request
-    /// arrived; the outcome reaches the event loop like a typed command's.
-    /// Answers once the name resolves, not when the command finishes.
-    pub(crate) fn run_pinned(
-        &self,
-        target: &TargetHandle,
-        cmdline: &str,
-        depth: u8,
-        admission: TrustedTarget,
-    ) -> Result<(), String> {
-        admission
-            .target
-            .validate_live()
-            .map_err(|_| CLOSED_TARGET_ERR.to_owned())?;
-        let resolved =
-            self.registry
-                .resolve_input_for(target, cmdline)
-                .map_err(|error| match error {
-                    ResolutionError::UnknownCommand(name) => format!("unknown command '{name}'"),
-                    ResolutionError::StaleTarget => error.to_string(),
-                })?;
-        let future = self.registry.dispatch_command_with_admission(
-            target,
-            resolved.command,
-            resolved.arguments,
-            CommandContent::default(),
-            depth.into(),
-            Arc::new(admission.clone()),
-        );
-        self.send_outcome(target.id(), Some(admission), future);
-        Ok(())
+    /// The plugin command runner for {target}: the shared runner, whose
+    /// unfinished outcomes reach the event loop like a typed command's.
+    pub(crate) fn command_runner(&self, target: &TargetHandle) -> CommandRunner {
+        let tx = self.event_tx.clone();
+        let id = target.id();
+        orchestration::command_runner(
+            self.registry.clone(),
+            target.clone(),
+            Arc::new(move |_, outcome, admission| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    tx.send_async(CommandEvent::Outcome {
+                        target: id,
+                        outcome,
+                        admission: Some(Box::new(admission)),
+                    })
+                    .await
+                    .map_err(|_| CLOSED_TARGET_ERR.to_owned())
+                })
+            }),
+        )
     }
 
     pub(crate) fn dispatch_input(&self, target: &TargetHandle, content: CommandContent) {
@@ -344,7 +333,8 @@ mod tests {
         ActorBackend, AgentInput, AgentManagerHandle, BackendResult, ControlWork, History,
         TurnContext, WorkKind,
     };
-    use std::{future::Future, pin::Pin};
+    use maki_lua::orchestration;
+    use std::{future::Future, pin::Pin, time::Duration};
     use test_case::test_case;
 
     const COMMAND: &str = "/user:pinned";
@@ -382,12 +372,8 @@ mod tests {
         }
     }
 
-    #[test_case(false, false; "input_focus_switch")]
-    #[test_case(true, false; "resolved_focus_switch")]
-    #[test_case(false, true; "input_closed_original")]
-    #[test_case(true, true; "resolved_closed_original")]
-    fn outcome_keeps_original_admission(resolved: bool, close: bool) {
-        let runtime = CommandRuntime::new_for_test(
+    fn pinned_runtime() -> CommandRuntime {
+        CommandRuntime::new_for_test(
             &[command::CustomCommand {
                 name: "pinned".into(),
                 description: CONTENT.into(),
@@ -401,7 +387,55 @@ mod tests {
             Arc::new(ThemeArgSource::new(Arc::new(
                 crate::theme::InMemoryThemesProvider::bundled(),
             ))),
-        );
+        )
+    }
+
+    #[test_case(false; "live_target")]
+    #[test_case(true; "closed_target")]
+    fn plugin_run_command_hands_its_turn_to_the_loop(close: bool) {
+        let runtime = pinned_runtime();
+        let handle = runtime.bind_target();
+        let root = AgentManagerHandle::new(Default::default())
+            .unwrap()
+            .create_root(Vec::new(), None, Box::new(IdleBackend))
+            .unwrap();
+        if close {
+            root.close_subtree().unwrap();
+        }
+        let admission = TrustedTarget {
+            target: root.clone(),
+            template: maki_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
+        };
+        let result = smol::block_on(runtime.command_runner(&handle)(
+            COMMAND.into(),
+            0,
+            admission,
+        ));
+        if close {
+            assert_eq!(result, Err(orchestration::CLOSED_TARGET_ERR.to_owned()));
+            assert!(runtime.recv_timeout_for_test(Duration::ZERO).is_none());
+            return;
+        }
+        assert_eq!(result, Ok(()));
+        let Some(CommandEvent::Outcome {
+            outcome: CommandOutcome::AgentTurn(turn),
+            admission: Some(admission),
+            ..
+        }) = runtime.recv_timeout_for_test(Duration::ZERO)
+        else {
+            panic!("the command's turn must reach the loop");
+        };
+        assert_eq!(turn.content.text.as_ref(), CONTENT);
+        assert_eq!(admission.target.id(), root.id());
+        root.close_subtree().unwrap();
+    }
+
+    #[test_case(false, false; "input_focus_switch")]
+    #[test_case(true, false; "resolved_focus_switch")]
+    #[test_case(false, true; "input_closed_original")]
+    #[test_case(true, true; "resolved_closed_original")]
+    fn outcome_keeps_original_admission(resolved: bool, close: bool) {
+        let runtime = pinned_runtime();
         let handle = runtime.bind_target();
         let manager = AgentManagerHandle::new(Default::default()).unwrap();
         let first = manager

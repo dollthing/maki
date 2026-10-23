@@ -1126,25 +1126,26 @@ fn register_command(
 /// reports an error instead of running the closest command, and a cycle of
 /// aliases stops with one too.
 ///
-/// This returns as soon as the command has been dispatched, not when it
-/// finishes, so aliasing something long-running like `/compact` does not
-/// block your handler.
+/// The call waits for the command's handler and returns its error when it
+/// fails. A model turn, `/compact` or another long command it starts keeps
+/// running after the call returns, so aliasing `/compact` does not block
+/// your handler.
 ///
 /// Delegated tool handlers cannot call this trusted command executor. Nested
 /// trusted command calls retain the invoking command's pinned agent target.
 ///
 /// Outside a command handler the command runs on the frontend's own command
-/// target for the keymap's pinned agent, or the focused agent. Inside another
-/// command's handler there is no frontend loop waiting on the result, so a
-/// command that needs one to run it -- a model turn, a custom Markdown
-/// command, `/compact`, `/btw` -- reports an error instead of pretending it
-/// ran. Print, SDK and ACP have no such loop either: there `/compact` is
-/// queued on the agent and `/cd` succeeds, but a model turn or `/btw` still
-/// reports an error. Call it from a TUI keybinding or an autocmd if you need
+/// target for the keymap's pinned agent, or the focused agent, the same way
+/// in every frontend: a model turn starts on that session. Only `/btw` needs
+/// the TUI, because its answer has nowhere else to show. Inside another
+/// command's handler the nested command shares that handler's invocation,
+/// so one that needs more than its handler -- a model turn, a custom
+/// Markdown command, `/compact`, `/btw` -- reports an error instead of
+/// pretending it ran. Call it from a keybinding or an autocmd if you need
 /// those.
 ///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.
+/// @return (boolean|nil, string|nil) `true` once the command ran, or nil and an error message if it is unknown, failed or cannot run here.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
 /// maki.api.register_command({

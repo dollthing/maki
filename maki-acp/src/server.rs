@@ -984,10 +984,10 @@ async fn install_session_with_lock(
     );
     orchestration.bind_commands(
         &trusted_root.target,
-        maki_lua::orchestration::detached_command_runner(
+        maki_lua::orchestration::command_runner(
             command_registry.clone(),
             command_target.clone(),
-            handle.control_tx.clone(),
+            maki_lua::orchestration::headless_outcomes(&handle),
         ),
     );
     let session_id = SessionId::from(handle.session_id.to_string());

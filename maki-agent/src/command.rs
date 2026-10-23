@@ -8,19 +8,20 @@ use std::{
 
 use maki_commands::{
     AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
-    CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
-    CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
-    CompletionItem, FrontendFeedback, HostContextRequest, HostContextResponse, HostRequest,
-    HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
+    CommandAttachment, CommandBehavior, CommandCompletion, CommandContent, CommandError,
+    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext,
+    CompletionError, CompletionItem, FrontendFeedback, HostContextRequest, HostContextResponse,
+    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
     TargetCapabilities, TargetCapability, resolve_path,
 };
 use maki_config::ProjectConfig;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
-use maki_providers::Model;
+use maki_providers::{ImageMediaType, ImageSource, Model};
 
 use crate::headless::{InteractiveControl, InteractiveControlSender};
 use crate::session_coordinator::SessionCoordinatorHandle;
 use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+use crate::{AgentInput, McpPromptRef};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -34,6 +35,41 @@ const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text 
 pub const NONINTERACTIVE_MODEL_USAGE: &str =
     "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
+
+pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let media_type =
+                ImageMediaType::from_mime(&attachment.media_type).ok_or_else(|| {
+                    format!(
+                        "unsupported command attachment media type: {}",
+                        attachment.media_type
+                    )
+                })?;
+            Ok(ImageSource::new(media_type, Arc::clone(&attachment.data)))
+        })
+        .collect()
+}
+
+/// The turn a command asked for, as the actor admits it.
+pub fn command_input(turn: AgentTurn) -> Result<AgentInput, String> {
+    let mut input = AgentInput::new(
+        turn.content.text.to_string(),
+        command_images(&turn.content.attachments)?,
+    );
+    input.prompt = turn.prompt.map(|prompt| {
+        Box::new(McpPromptRef {
+            qualified_name: prompt.qualified_name.to_string(),
+            arguments: prompt
+                .arguments
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        })
+    });
+    Ok(input)
+}
 
 pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[

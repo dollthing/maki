@@ -1935,14 +1935,11 @@ impl<'t> EventLoop<'t> {
                     Arc::clone(&self.orchestration),
                 )),
             );
-            let commands = Arc::clone(&self.ctx.command_runtime);
-            let command_target = runtime.app.command_target.clone();
             self.orchestration.bind_commands(
                 &root,
-                Arc::new(move |cmdline, depth, admission| {
-                    let ran = commands.run_pinned(&command_target, &cmdline, depth, admission);
-                    Box::pin(async move { ran })
-                }),
+                self.ctx
+                    .command_runtime
+                    .command_runner(&runtime.app.command_target),
             );
             if let Some(target) = selected_agent(runtime) {
                 if let Ok(template) = OrchestrationServices::template(&*self.orchestration, &target)

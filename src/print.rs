@@ -368,10 +368,10 @@ fn start_print_session(
     );
     orchestration.bind_commands(
         &root.target,
-        orchestration::detached_command_runner(
+        orchestration::command_runner(
             registry.clone(),
             commands.clone(),
-            handle.control_tx.clone(),
+            orchestration::headless_outcomes(&handle),
         ),
     );
     lua_handle.install_orchestration_services(orchestration);

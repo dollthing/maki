@@ -273,15 +273,16 @@ impl InteractiveControlSender {
     }
 }
 
+/// Admits turns on the root like the frontend's input does, without keeping
+/// the session alive: plugin-run commands hold one past the frontend's input.
 #[derive(Clone)]
-pub struct InteractiveInputSender {
+pub struct TurnAdmitter {
     root: RootReadiness,
     events: flume::Sender<Envelope>,
     next: Arc<AtomicU64>,
-    _lifetime: flume::Sender<()>,
 }
 
-impl InteractiveInputSender {
+impl TurnAdmitter {
     pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
         let root = self.root.get().await?;
         let actor = root.actor().map_err(|error| error.to_string())?;
@@ -294,13 +295,29 @@ impl InteractiveInputSender {
             )
             .map_err(|error| error.to_string())
     }
+}
+
+#[derive(Clone)]
+pub struct InteractiveInputSender {
+    admitter: TurnAdmitter,
+    _lifetime: flume::Sender<()>,
+}
+
+impl InteractiveInputSender {
+    pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
+        self.admitter.admit(input).await
+    }
+
+    pub fn admitter(&self) -> TurnAdmitter {
+        self.admitter.clone()
+    }
 
     /// Cancels {ticket}'s turn alone; the rest of the session keeps running.
     /// Holds no part of the sender, so it never keeps the session alive.
     pub fn turn_cancel(&self, ticket: TurnTicket) -> WorkCancel {
         WorkCancel::Turn {
             ticket,
-            root: self.root.clone(),
+            root: self.admitter.root.clone(),
         }
     }
 }
@@ -882,9 +899,11 @@ pub fn spawn_interactive_with_binding(
     let raw_tx = guard.tx().clone();
     let (lifetime_tx, lifetime_rx) = flume::unbounded();
     let input_tx = InteractiveInputSender {
-        root: root.clone(),
-        events: raw_tx.clone(),
-        next: Arc::new(AtomicU64::new(0)),
+        admitter: TurnAdmitter {
+            root: root.clone(),
+            events: raw_tx.clone(),
+            next: Arc::new(AtomicU64::new(0)),
+        },
         _lifetime: lifetime_tx,
     };
     let control_tx = InteractiveControlSender {
