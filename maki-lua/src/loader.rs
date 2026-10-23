@@ -1088,6 +1088,14 @@ impl EventHandle {
         ));
     }
 
+    /// Drop the services of a host whose session closed, so Lua stops
+    /// resolving targets against it and its resources are released.
+    pub fn clear_orchestration_services(&self) {
+        let _ = self.tx.try_send(Request::InstallOrchestrationServices(
+            crate::orchestration::OrchestrationServicesSlot(None),
+        ));
+    }
+
     /// Supply session snapshots for hosts without an interactive event loop.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self

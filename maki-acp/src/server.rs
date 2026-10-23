@@ -724,6 +724,7 @@ async fn close_session(srv: &mut Server) {
     let Some(mut state) = srv.session.take() else {
         return;
     };
+    srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
     let (operation, permission_answers, elicitation) = {
@@ -3711,6 +3712,49 @@ mod tests {
 
     const GHOST_MODE: &str = "ghost";
     const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+
+    #[test]
+    fn closing_a_session_releases_its_orchestration() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let host = maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new()))
+                .unwrap();
+            let mut params = test_params(
+                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            params.lua_event_handle = host.event_handle();
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: host.event_handle(),
+            };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let orchestration = Arc::clone(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .orchestration
+                    .as_ref()
+                    .unwrap(),
+            );
+            close_session(&mut srv).await;
+            host.wait_for_worker_barrier_for_test();
+            assert_eq!(Arc::strong_count(&orchestration), 1);
+        });
+    }
 
     #[test_case("plan", false ; "plan_lands_in_the_state_dir")]
     #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
