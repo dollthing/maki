@@ -4254,7 +4254,8 @@ maki.session.set_default_thinking({mode})
 Persists the default thinking setting for new sessions without changing
 any live session. Every frontend starts a blank session on it, ahead of
 `always_thinking`. `mode` is a thinking setting as `Agent:set_model`
-accepts it.
+accepts it. Print saves nothing, so there it returns an error and leaves
+the saved default alone.
 
 **Parameters:**
 

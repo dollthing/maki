@@ -29,7 +29,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -53,6 +53,7 @@ const SWITCH_COMMAND: &str = "/parity_switch";
 const PLAN_COMMAND: &str = "/parity_plan";
 const UI_COMMAND: &str = "/parity_ui";
 const THINKING_COMMAND: &str = "/thinking high";
+const BAD_THINKING_COMMAND: &str = "/thinking bogus";
 const PARITY_THINKING_COMMAND: &str = "/parity_thinking";
 const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
@@ -358,8 +359,63 @@ fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
     }
     if let Some(output) = print_output {
         assert_eq!(output.join().unwrap(), REPLY, "{log}");
+        assert!(
+            !prefs_path(home.path()).exists(),
+            "print saves no preferences"
+        );
     }
     scenario.check(&bodies.try_iter().collect::<Vec<_>>(), home.path());
+}
+
+/// `/thinking` with a level the model cannot take fails the command in every
+/// frontend, rather than only flashing the reason.
+#[test_case(Frontend::Print ; "print_fails_a_bad_thinking_level")]
+#[test_case(Frontend::Sdk ; "sdk_fails_a_bad_thinking_level")]
+#[test_case(Frontend::Acp ; "acp_fails_a_bad_thinking_level")]
+fn bad_thinking_level_fails_the_command(frontend: Frontend) {
+    let (base_url, _bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let args = match frontend {
+        Frontend::Print => print_args(BAD_THINKING_COMMAND),
+        _ => frontend_args(frontend),
+    };
+    let mut child = spawn_makima(home.path(), &work, args);
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    match frontend {
+        Frontend::Print => {
+            drop(stdin);
+            assert!(!wait_exit(child).success(), "{}", stderr.join().unwrap());
+            return;
+        }
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(BAD_THINKING_COMMAND));
+            let result = expect(&output, |message| message["type"] == "result");
+            assert_eq!(result["is_error"], true, "{result}");
+        }
+        Frontend::Acp => {
+            let (output, session) = acp_session(&mut child, &mut stdin, &work);
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+                       "params": {"sessionId": session,
+                                  "prompt": [{"type": "text", "text": BAD_THINKING_COMMAND}]}}),
+            );
+            let response = expect(&output, |message| message["id"] == PROMPT_ID);
+            assert!(response.get("error").is_some(), "{response}");
+        }
+    }
+    drop(stdin);
+    assert!(wait_exit(child).success(), "{}", stderr.join().unwrap());
+    assert!(!prefs_path(home.path()).exists());
+}
+
+fn prefs_path(home: &Path) -> PathBuf {
+    home.join(".local/state").join(APP_DIR).join(PREFS_FILE)
 }
 
 /// `echo prompt | makima`: input ends right after the prompt, yet the turn

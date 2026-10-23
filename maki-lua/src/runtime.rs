@@ -208,6 +208,8 @@ pub enum Request {
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
     /// `--no-project`: plugins leave the project's `.makima` directory alone.
     IgnoreProject,
+    /// Print saves nothing, saved preferences included.
+    SaveNoPreferences,
     SetClockFormat(maki_config::ClockFormat),
     LoadSource {
         name: Arc<str>,
@@ -5102,6 +5104,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         }
                         Request::IgnoreProject => {
                             rt.lua.set_app_data(crate::api::env::NoProject);
+                        }
+                        Request::SaveNoPreferences => {
+                            rt.lua.set_app_data(crate::api::session::NoPreferences);
                         }
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua

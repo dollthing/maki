@@ -379,6 +379,7 @@ fn start_print_session(
         ),
     );
     lua_handle.install_orchestration_services(orchestration);
+    lua_handle.save_no_preferences();
     Ok(PrintSession {
         handle,
         coordinator,

@@ -2,7 +2,8 @@
 -- confirm with Enter. Any argument passes straight through to the target
 -- agent's set_model, and choosing a level (or passing an argument) saves it as
 -- the default for new sessions. Without an interactive UI the selector has
--- nowhere to open, so only the argument form works there.
+-- nowhere to open, so only the argument form works there. A level that cannot
+-- be set fails the command; the M-t keymap flashes the reason instead.
 
 local NO_SELECTOR = "the selector needs the TUI; pass a level, e.g. /thinking high"
 
@@ -30,8 +31,8 @@ local function render_ladder(active, levels)
   return spans
 end
 
-local function flash_error(err)
-  maki.ui.flash("Thinking: " .. tostring(err))
+local function fail(err)
+  error("Thinking: " .. tostring(err), 0)
 end
 
 -- Resolves the agent this invocation targets: the command's pinned target or
@@ -54,8 +55,7 @@ end
 local function set_thinking(ctx, agent, mode)
   local committed, err = agent:set_model(ctx, { thinking = mode })
   if not committed then
-    flash_error(err)
-    return
+    fail(err)
   end
   local _, default_err = maki.session.set_default_thinking(committed.thinking)
   if default_err then
@@ -65,20 +65,17 @@ local function set_thinking(ctx, agent, mode)
   end
 end
 
-local function open_selector(_, ctx)
+local function open_selector(ctx)
   local agent, selection, err = target(ctx)
   if not agent then
-    flash_error(err)
-    return
+    fail(err)
   end
   local info, info_err = maki.model.info(selection.spec)
   if not info then
-    flash_error(info_err)
-    return
+    fail(info_err)
   end
   if not info.supports_thinking then
-    maki.ui.flash("Thinking requires a model that supports it")
-    return
+    fail("requires a model that supports it")
   end
 
   local levels = maki.model.thinking_levels()
@@ -148,16 +145,20 @@ maki.api.register_command({
   handler = function(opts, ctx)
     local effort = opts.values.effort
     if not effort then
-      open_selector(nil, ctx)
+      open_selector(ctx)
       return
     end
     local agent, _, err = target(ctx)
     if not agent then
-      flash_error(err)
-      return
+      fail(err)
     end
     set_thinking(ctx, agent, effort)
   end,
 })
 
-maki.keymap.set("n", "<M-t>", open_selector, { desc = "Thinking effort" })
+maki.keymap.set("n", "<M-t>", function(_, ctx)
+  local ok, err = pcall(open_selector, ctx)
+  if not ok then
+    maki.ui.flash(tostring(err))
+  end
+end, { desc = "Thinking effort" })

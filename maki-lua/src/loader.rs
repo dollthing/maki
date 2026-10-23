@@ -1104,6 +1104,12 @@ impl EventHandle {
         ));
     }
 
+    /// Makes `maki.session.set_default_thinking` refuse, for print, which
+    /// saves nothing.
+    pub fn save_no_preferences(&self) {
+        let _ = self.tx.try_send(Request::SaveNoPreferences);
+    }
+
     /// Drop the services of a host whose session closed, so Lua stops
     /// resolving targets against it and its resources are released.
     pub fn clear_orchestration_services(&self) {

@@ -90,7 +90,7 @@ A `user` message sent while a turn runs joins that turn, as typing does in the T
 
 SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
-One caveat: one-shot `--print` always starts a **new** session in **build** mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
+One caveat: one-shot `--print` always starts a **new** session in **build** mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). It saves no preferences either: `/thinking high` sets the level for the run, not the saved default for new sessions. Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
 
 SDK `set_permission_mode` commits plan mode for `plan` and build mode for any other value, as durable session config, the same way `/mode` does in the TUI.
 

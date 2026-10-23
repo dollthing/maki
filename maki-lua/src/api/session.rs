@@ -26,7 +26,11 @@ pub type SessionSnapshotFn =
 
 pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
+/// Present in print, which saves nothing.
+pub(crate) struct NoPreferences;
+
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
+const NO_PREFERENCES_ERR: &str = "print saves no preferences";
 
 async fn roundtrip(
     lua: Lua,
@@ -261,7 +265,8 @@ async fn set_title(
 /// Persists the default thinking setting for new sessions without changing
 /// any live session. Every frontend starts a blank session on it, ahead of
 /// `always_thinking`. `mode` is a thinking setting as `Agent:set_model`
-/// accepts it.
+/// accepts it. Print saves nothing, so there it returns an error and leaves
+/// the saved default alone.
 ///
 /// @param mode string The thinking setting.
 /// @return (table|nil, string|nil) `{mode}` with the normalized setting, or nil and an error.
@@ -273,6 +278,9 @@ fn set_default_thinking(lua: &Lua, mode: String) -> LuaResult<Pair<Table>> {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
     try_pair!(crate::runtime::validate_plugin_effect(lua));
+    if lua.app_data_ref::<NoPreferences>().is_some() {
+        return Ok(err_pair(NO_PREFERENCES_ERR));
+    }
     let thinking = try_pair!(parse_thinking(mode.trim()));
     let state_dir = try_pair!(host_state_dir(lua));
     try_pair!(write_prefs(
