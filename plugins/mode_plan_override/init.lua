@@ -103,7 +103,7 @@ local function set_mode(ctx, name)
     switched, err = agent:set_mode(ctx, name)
   end
   if not switched then
-    maki.log.warn("mode_plan_override: set(" .. name .. ") failed: " .. tostring(err or "no agent target"))
+    error("cannot switch to " .. name .. " mode: " .. tostring(err or "no agent target"), 0)
   end
 end
 
