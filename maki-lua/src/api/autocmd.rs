@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::{AgentId, AgentManagerHandle, AgentRef};
@@ -68,7 +68,15 @@ pub(crate) struct AutocmdEntry {
 /// Taken by `del_autocmd` and plugin unload to cancel running callbacks.
 /// Each callback holds a clone, so an entry leaving the store on its own
 /// (`once`, or its agent closing) never cuts short a callback it started.
-type Revocation = Arc<Mutex<Option<CancelTrigger>>>;
+type Revocation = Arc<RevocationSlot>;
+type RevocationSlot = Mutex<Option<CancelTrigger>>;
+
+fn revoke_now(revocation: &Revocation) {
+    revocation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+}
 
 impl AutocmdEntry {
     pub(crate) fn new(
@@ -100,6 +108,9 @@ pub(crate) fn next_autocmd_id() -> u64 {
 #[derive(Clone, Default)]
 pub(crate) struct AutocmdStore {
     pub(crate) listeners: HashMap<String, Vec<AutocmdEntry>>,
+    /// Entries that left on their own while callbacks they started may still
+    /// run, by plugin, so unloading the plugin still cancels those callbacks.
+    retired: Vec<(Arc<str>, Weak<RevocationSlot>)>,
 }
 
 pub(crate) type PendingAutocmdStore = Arc<Mutex<AutocmdStore>>;
@@ -113,9 +124,41 @@ impl AutocmdStore {
         self.revoke(|e| e.id == id);
     }
 
-    /// Unload or replacement: also cancels the plugin's running callbacks.
+    /// Unload or replacement: also cancels the plugin's running callbacks,
+    /// those of entries that already left included.
     pub fn revoke_plugin(&mut self, plugin: &str) {
         self.revoke(|e| e.plugin.as_ref() == plugin);
+        self.retired.retain(|(owner, revocation)| {
+            if owner.as_ref() != plugin {
+                return true;
+            }
+            if let Some(revocation) = revocation.upgrade() {
+                revoke_now(&revocation);
+            }
+            false
+        });
+    }
+
+    fn retire(&mut self, entry: &AutocmdEntry) {
+        self.retired
+            .retain(|(_, revocation)| revocation.strong_count() > 0);
+        self.retired
+            .push((entry.plugin.clone(), Arc::downgrade(&entry.revocation)));
+    }
+
+    /// {agent} closed, so the entries listening to it leave.
+    fn retire_agent(&mut self, agent: AgentFilter) {
+        let mut retired = Vec::new();
+        self.retain(|entry| {
+            let keep = entry.agent != Some(agent);
+            if !keep {
+                retired.push(entry.clone());
+            }
+            keep
+        });
+        for entry in &retired {
+            self.retire(entry);
+        }
     }
 
     pub fn clear_plugin(&mut self, plugin: &str) {
@@ -126,11 +169,7 @@ impl AutocmdStore {
         self.retain(|entry| {
             let keep = !revoked(entry);
             if !keep {
-                entry
-                    .revocation
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take();
+                revoke_now(&entry.revocation);
             }
             keep
         });
@@ -187,8 +226,7 @@ pub(crate) fn dispatch(
         if let Some(agent) = agent
             && event == AGENT_CLOSED_EVENT
         {
-            let closed = AgentFilter::of(agent);
-            store.retain(|entry| entry.agent != Some(closed));
+            store.retire_agent(AgentFilter::of(agent));
         }
         snapshot
     };
@@ -218,6 +256,9 @@ fn snapshot(
         }
         !(fires && e.once)
     });
+    for entry in snapshot.iter().filter(|entry| entry.once) {
+        store.retire(entry);
+    }
     snapshot
 }
 
@@ -495,6 +536,44 @@ lua_table! {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const PLUGIN: &str = "owner";
+    const EVENT: &str = "TurnEnd";
+
+    /// A `once` entry fired, or an agent-filtered one whose agent closed,
+    /// leaves the store while its callback still runs; unloading its plugin
+    /// still cancels that callback.
+    #[test_case(true ; "once_entry")]
+    #[test_case(false ; "closed_agent_entry")]
+    fn unload_cancels_callbacks_of_entries_that_left(once: bool) {
+        let lua = Lua::new();
+        let agent = AgentFilter {
+            manager: 0,
+            agent: AgentId::generate(),
+        };
+        let entry = AutocmdEntry::new(
+            next_autocmd_id(),
+            lua.create_function(|_, ()| Ok(())).unwrap(),
+            Arc::from(PLUGIN),
+            once,
+            None,
+            (!once).then_some(agent),
+        );
+        let running = entry.cancel.clone();
+        let mut store = AutocmdStore::default();
+        store.register(EVENT.into(), entry);
+        let started = if once {
+            snapshot(&mut store, EVENT, None, None)
+        } else {
+            let started = store.listeners[EVENT].clone();
+            store.retire_agent(agent);
+            started
+        };
+        assert!(store.listeners.values().all(Vec::is_empty));
+        store.revoke_plugin(PLUGIN);
+        assert!(running.is_cancelled());
+        drop(started);
+    }
 
     #[test_case(None, None => true ; "no_patterns_no_fired")]
     #[test_case(None, Some("x") => true ; "no_patterns_with_fired")]
