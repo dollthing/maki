@@ -50,7 +50,7 @@ A change never touches a turn that has already started. The running turn finishe
 
 Makima saves the change with the session before it applies it. If the save fails, nothing changes and you see an error. A change a plugin requested is also dropped when the plugin reloads or its call ends before the save starts. Once the save has started, the change always applies.
 
-The TUI, print, SDK, ACP and Lua agent sessions all follow these rules. One-shot print runs apply changes the same way but do not save the session. YOLO and plugin options sit outside this, and a YOLO change applies to permission checks right away.
+The TUI, print, SDK, ACP and Lua agent sessions all follow these rules. One-shot print runs apply changes the same way but do not save the session. YOLO and plugin options belong to the session, not to one agent: they sit outside this, `Agent:set_option` sets them only through the root agent and refuses them on a subagent, and a YOLO change applies to permission checks right away.
 
 ## What a mode is
 

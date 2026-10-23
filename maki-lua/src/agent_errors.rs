@@ -27,6 +27,8 @@ pub const UNKNOWN_SPAWN_OPTION: &str = "unknown spawn option";
 pub const TYPED_OPTION_SETTER: &str =
     "model, thinking, fast and mode have typed setters: use Agent:set_model or Agent:set_mode";
 pub const AGENT_BUSY: &str = "agent has pending work";
+pub const SESSION_LEVEL_OPTION: &str =
+    "yolo and plugin options belong to the session; set them on its root agent";
 pub const STALE_TURN: &str = "after_turn is not the agent's latest settled turn";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
 pub const NOT_DESCENDANT_OF_CALLER: &str = "agent is not a descendant of the caller";

@@ -1633,6 +1633,11 @@ mod tests {
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
+                        local refused, refused_err = child:set_option(ctx, "yolo", "enabled")
+                        assert(refused == nil and refused_err == "{session_level}", refused_err)
+                        assert(child:set_option(ctx, "workflow", "disabled"))
+                        assert(assert(child:config(ctx)).options.workflow == "disabled")
+                        assert(assert(root:config(ctx)).options.workflow == "enabled")
                         assert(assert(assert(child:send(ctx, "{COMMAND_CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)).text == "{PRINT_RESPONSE}")
                         assert(child:close(ctx))
                         maki.ui.flash("{COMMAND_FINISHED}")
@@ -1640,6 +1645,7 @@ mod tests {
                 }})
             "#,
                 typed_setter = maki_lua::agent_errors::TYPED_OPTION_SETTER,
+                session_level = maki_lua::agent_errors::SESSION_LEVEL_OPTION,
                 no_ui = maki_lua::ui_sink::NO_UI_ERR,
             ),
         ).unwrap();

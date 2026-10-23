@@ -1676,7 +1676,7 @@ Read the committed configuration.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. Options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
+**Returns:** (`table?`, `string?`) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. workflow is the agent's own; yolo and plugin options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
 
 ---
 
@@ -1793,9 +1793,11 @@ Switch mode through the actor configuration FIFO.
 Agent:set_option({ctx}, {id}, {value})
 ```
 
-Set one session option: workflow, yolo or a plugin option. Model,
-thinking, fast and mode have typed setters (`set_model`, `set_mode`) and
-are refused here. Plugin options run their owner's validator first.
+Set one option: workflow, yolo or a plugin option. Model, thinking, fast
+and mode have typed setters (`set_model`, `set_mode`) and are refused
+here. workflow applies to this agent. yolo and plugin options belong to
+the session, so they are set on its root and refused on a child. Plugin
+options run their owner's validator first.
 See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**

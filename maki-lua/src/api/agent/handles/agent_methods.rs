@@ -4,10 +4,13 @@ use maki_agent::actor::{
     ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel,
 };
 use maki_agent::session_coordinator::SessionCoordinatorHandle;
-use maki_agent::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, THINKING_OPTION_ID};
+use maki_agent::session_options::{
+    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionError,
+    THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+};
 use maki_agent::{
-    AgentInput, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId, TurnOrigin,
-    TurnProvenance,
+    AgentInput, AgentRef, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId,
+    TurnOrigin, TurnProvenance,
 };
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
@@ -22,7 +25,7 @@ use super::subscriptions::{
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
-    RESTRICTED_MODE_CHANGE, STALE_TURN, TYPED_OPTION_SETTER,
+    RESTRICTED_MODE_CHANGE, SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
@@ -95,7 +98,7 @@ fn session_coordinator(lua: &Lua, agent: &LuaAgent) -> Result<SessionCoordinator
 
 /// Read the committed configuration.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. Options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
+/// @return (table?, string?) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. workflow is the agent's own; yolo and plugin options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
 #[lua_fn(name = "config")]
 fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(lua, &ctx, this));
@@ -110,6 +113,10 @@ fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
             }
         }
     }
+    options.set(
+        WORKFLOW_OPTION_ID,
+        toggle_value(commit.config.settings.workflow),
+    )?;
     let config = lua.create_table()?;
     config.set("version", commit.generation)?;
     config.set("model", selection_table(lua, &commit.config)?)?;
@@ -118,9 +125,11 @@ fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
     Ok((Some(config), None))
 }
 
-/// Set one session option: workflow, yolo or a plugin option. Model,
-/// thinking, fast and mode have typed setters (`set_model`, `set_mode`) and
-/// are refused here. Plugin options run their owner's validator first.
+/// Set one option: workflow, yolo or a plugin option. Model, thinking, fast
+/// and mode have typed setters (`set_model`, `set_mode`) and are refused
+/// here. workflow applies to this agent. yolo and plugin options belong to
+/// the session, so they are set on its root and refused on a child. Plugin
+/// options run their owner's validator first.
 /// See [Configuration changes](/docs/modes/#configuration-changes).
 /// @param ctx LuaCtx Invocation context.
 /// @param id string Option id.
@@ -140,6 +149,14 @@ async fn agent_set_option(
     try_pair!(authorize(&lua, &ctx, &this));
     try_pair!(validate_plugin_effect(&lua));
     try_pair!(ensure_validation_not_in_progress(&lua));
+    let target = try_pair!(this.manager.lookup(this.id));
+    if try_pair!(target.snapshot()).parent_id.is_some() {
+        if id != WORKFLOW_OPTION_ID {
+            return Ok(err_pair(SESSION_LEVEL_OPTION));
+        }
+        try_pair!(set_child_workflow(&lua, this, ctx, &target, value).await);
+        return Ok((Some(true), None));
+    }
     let coordinator = try_pair!(session_coordinator(&lua, &this));
     drop(this);
     drop(ctx);
@@ -157,6 +174,52 @@ async fn agent_set_option(
             .await
     );
     Ok((Some(true), None))
+}
+
+fn toggle_value(enabled: bool) -> &'static str {
+    if enabled {
+        ENABLED_VALUE
+    } else {
+        DISABLED_VALUE
+    }
+}
+
+/// A child's workflow is its own config, committed through its config FIFO
+/// like `set_model`.
+async fn set_child_workflow(
+    lua: &Lua,
+    this: UserDataRef<LuaAgent>,
+    ctx: UserDataRef<LuaCtx>,
+    target: &AgentRef,
+    value: String,
+) -> Result<(), String> {
+    let enabled = match value.as_str() {
+        ENABLED_VALUE => true,
+        DISABLED_VALUE => false,
+        _ => {
+            return Err(SessionOptionError::InvalidValue {
+                id: WORKFLOW_OPTION_ID.into(),
+                value: value.into(),
+            }
+            .to_string());
+        }
+    };
+    let services = orchestration::services(lua).ok_or(NO_ORCHESTRATION_SERVICES)?;
+    services.validate_target(target)?;
+    orchestration::commit_config_change(&*services, target, async |publication, _| {
+        let claim = ctx.agent_publication_claim(lua, target, &publication)?;
+        authorize(lua, &ctx, &this)?;
+        drop(this);
+        drop(ctx);
+        let patch = ConfigPatch {
+            workflow: Some(enabled),
+            ..Default::default()
+        };
+        Ok((claim, ConfigChange::Patch(patch)))
+    })
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// List authenticated, policy-filtered model spec strings without changing focus.
