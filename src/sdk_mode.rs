@@ -20,6 +20,7 @@ use event_listener::Event;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
+use maki_agent::agent::PromptSlotSource;
 use maki_agent::cancel::CancelToken;
 use maki_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
@@ -31,7 +32,6 @@ use maki_agent::headless::{
 };
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
-use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::session_defaults;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
@@ -516,7 +516,7 @@ pub struct SdkParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: ResolvedSlots,
+    pub prompt_slots: PromptSlotSource,
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -671,7 +671,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             config,
             permissions_config,
             timeouts,
-            prompt_slots: Arc::new(prompt_slots),
+            prompt_slots,
             excluded_tools: vec![QUESTION_TOOL_NAME],
             question_mode: QuestionMode::Headless,
             mcp_handle,
@@ -2039,7 +2039,7 @@ mod tests {
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Default::default(),
-            prompt_slots: Arc::default(),
+            prompt_slots: Default::default(),
             excluded_tools: Vec::new(),
             mcp_handle: None,
             initial_wd: cwd.clone(),
@@ -2789,7 +2789,7 @@ mod tests {
                 },
                 permissions_config: PermissionsConfig::default(),
                 timeouts: Default::default(),
-                prompt_slots: Arc::new(lua_handle.collect_prompt_slots()),
+                prompt_slots: lua_handle.prompt_slot_source(),
                 excluded_tools: vec![QUESTION_TOOL_NAME],
                 mcp_handle: None,
                 initial_wd: cwd.clone(),

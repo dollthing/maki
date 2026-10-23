@@ -361,7 +361,6 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     }
 
     if cli.is_sdk_mode() {
-        let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
@@ -371,7 +370,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,
-            prompt_slots,
+            prompt_slots: stack.plugin_host.event_handle().prompt_slot_source(),
             defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),

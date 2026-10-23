@@ -23,11 +23,9 @@ use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
     ActorBackend, AdmissionPreparation, AgentContextSnapshot, BackendResult, EffectiveAgentConfig,
-    ModeCeiling, PreparedModel, TurnContext, WorkKind,
+    ModeCeiling, PreparedModel, PreparedReadiness, TurnContext, WorkKind,
 };
-use maki_agent::agent::{
-    Instructions, ResolvedPromptInputs, TurnPromptInputs, build_mode_system_prompt, tool_dispatch,
-};
+use maki_agent::agent::{PromptSlotSource, TurnSetup, build_mode_system_prompt, tool_dispatch};
 use maki_agent::cancel::CancelMap;
 use maki_agent::config_change::prepare_model;
 use maki_agent::headless::default_model_preparer;
@@ -76,7 +74,6 @@ const COMPACT_PARAMS_MISSING_ERR: &str = "compaction requires initialized agent 
 const COMPACT_CONFIG_MISSING_ERR: &str =
     "compaction was admitted without an effective agent configuration";
 const INVALID_SHOW_OPTION: &str = "show must be a boolean or string";
-const PROMPT_SLOTS_CLOSED: &str = "prompt slots channel closed";
 const UNNAMED_AGENT_LABEL: &str = "agent";
 const SPAWN_OPTIONS: &[&str] = &[
     "audience",
@@ -136,12 +133,10 @@ async fn build_session_provider(
 struct LuaActorState {
     template: OnceLock<ToolContext>,
     params: OnceLock<AgentParams>,
-    prompt_requests: Option<flume::Sender<Request>>,
+    prompt_slots: PromptSlotSource,
     custom_system: String,
     tools: RequestTools,
     opts: RequestOptions,
-    mode: AgentMode,
-    mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     /// `None` when the parent has no answer channel either (print), so the
@@ -298,75 +293,32 @@ impl ActorBackend for LuaActorBackend {
 
     fn admission_preparation(&self) -> Option<AdmissionPreparation> {
         let state = Arc::clone(&self.state);
-        Some(Arc::new(move |_input, config| {
+        Some(Arc::new(move |input, config| {
             let params = state
                 .params
                 .get()
                 .expect("session parameters initialized before admission");
-            let mode_def = match config {
-                Some(config) => config.mode_def.clone().map(Arc::new),
-                None if state.mode == AgentMode::Build => state
-                    .mode_def
-                    .clone()
-                    .or_else(|| Some(Arc::new(params.modes.current(&AgentMode::Build)))),
-                None => None,
-            };
-            let cwd = config
-                .map(|config| config.context.cwd().to_path_buf())
-                .or_else(|| state.template.get().map(|template| template.cwd.clone()));
-            let (resolved, ready) = if let Some(requests) = &state.prompt_requests {
-                let (slot_tx, slot_rx) = flume::bounded(1);
-                let _ = requests.send(Request::CollectPromptSlots { reply: slot_tx });
-                let (tx, rx) = flume::bounded(1);
-                smol::spawn(async move {
-                    let (slots, slots_error) = match slot_rx.recv_async().await {
-                        Ok(slots) => (Arc::new(slots), None),
-                        Err(_) => (Arc::default(), Some(PROMPT_SLOTS_CLOSED.into())),
-                    };
-                    let _ = tx.send(Ok(ResolvedPromptInputs {
-                        slots,
-                        slots_error,
-                        mcp_messages: None,
-                    }));
-                })
-                .detach();
-                (Some(rx), None)
-            } else {
-                (
-                    None,
-                    Some(ResolvedPromptInputs {
-                        slots: Arc::clone(&params.prompt_slots),
-                        slots_error: None,
-                        mcp_messages: None,
-                    }),
-                )
-            };
-            maki_agent::agent::TurnAdmissionSnapshot {
-                mode_def,
-                prompt_inputs: cwd.map(|cwd| {
-                    Arc::new(TurnPromptInputs {
-                        cwd,
-                        instructions: Instructions::default(),
-                        mcp_prompt: None,
-                        resolved,
-                        ready,
-                    })
-                }),
-                bindings: Arc::new(TurnToolBindings::capture(
-                    &params.registry,
-                    &state.local_tools,
-                    state.mcp.as_ref(),
-                )),
-                mcp_startup_notice: None,
+            TurnSetup {
+                registry: Arc::clone(&params.registry),
+                local_tools: Arc::clone(&state.local_tools),
+                mcp: state.mcp.clone(),
+                slots: state.prompt_slots.clone(),
+                modes: Arc::clone(&params.modes),
+                instructions: false,
             }
+            .snapshot(input, config)
         }))
+    }
+
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        Some(TurnSetup::readiness())
     }
 
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        input: AgentInput,
+        mut input: AgentInput,
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
@@ -412,36 +364,38 @@ impl ActorBackend for LuaActorBackend {
                 .as_ref()
                 .and_then(|admission| admission.prompt_inputs.as_ref());
             if let Some(inputs) = prompt_inputs {
-                let resolved = if let Some(ready) = &inputs.ready {
-                    Some(ready.clone())
-                } else if let Some(receiver) = &inputs.resolved {
-                    match context.cancel.race(receiver.recv_async()).await {
-                        Ok(Ok(Ok(resolved))) => Some(resolved),
-                        Ok(_) => {
-                            warn!("Lua actor prompt inputs unavailable");
-                            None
-                        }
-                        Err(_) => {
-                            return BackendResult::EnteredRun(TurnOutcome::cancelled(
-                                context.agent_id,
-                                turn_id,
-                                TokenUsage::default(),
-                                0,
-                                context
-                                    .cancel_reason
-                                    .reason()
-                                    .unwrap_or(TurnCancellationReason::User),
-                            ));
-                        }
+                match context
+                    .cancel
+                    .race(inputs.resolve(&mut input, state.mcp.as_ref()))
+                    .await
+                {
+                    Ok(Ok(slots)) => params.prompt_slots = slots,
+                    Ok(Err(error)) => {
+                        return BackendResult::EnteredRun(TurnOutcome::failed(
+                            context.agent_id,
+                            turn_id,
+                            TokenUsage::default(),
+                            0,
+                            TurnFailure {
+                                kind: TurnFailureKind::Internal,
+                                diagnostic: error.to_string(),
+                                user_message: error.user_message(),
+                                retryable: false,
+                            },
+                        ));
                     }
-                } else {
-                    None
-                };
-                if let Some(resolved) = resolved {
-                    if let Some(error) = resolved.slots_error {
-                        warn!(%error, "Lua actor prompt slots unavailable");
+                    Err(_) => {
+                        return BackendResult::EnteredRun(TurnOutcome::cancelled(
+                            context.agent_id,
+                            turn_id,
+                            TokenUsage::default(),
+                            0,
+                            context
+                                .cancel_reason
+                                .reason()
+                                .unwrap_or(TurnCancellationReason::User),
+                        ));
                     }
-                    params.prompt_slots = resolved.slots;
                 }
             }
             let mut system = context
@@ -1784,14 +1738,20 @@ async fn build_session(
     let state = Arc::new(LuaActorState {
         template: OnceLock::new(),
         params: OnceLock::new(),
-        prompt_requests: lua
+        prompt_slots: lua
             .app_data_ref::<crate::runtime::RequestTx>()
-            .map(|requests| requests.0.clone()),
+            .map(|requests| {
+                let requests = requests.0.clone();
+                PromptSlotSource::new(move || {
+                    let (reply, slots) = flume::bounded(1);
+                    let _ = requests.send(Request::CollectPromptSlots { reply });
+                    slots
+                })
+            })
+            .unwrap_or_default(),
         custom_system: options.system.take().unwrap_or_default(),
         tools: tools.request,
         opts: child.opts,
-        mode: child.mode,
-        mode_def: parent.context.mode_def.clone(),
         mcp: parent
             .context
             .mcp
@@ -2538,15 +2498,13 @@ mod tests {
         let state = Arc::new(LuaActorState {
             template: OnceLock::from(stub_ctx(&AgentMode::Build)),
             params: OnceLock::from(params),
-            prompt_requests: None,
+            prompt_slots: PromptSlotSource::default(),
             custom_system: String::new(),
             tools: RequestTools::default(),
             opts: maki_providers::RequestOptions {
                 thinking: ThinkingConfig::Off,
                 fast: false,
             },
-            mode: AgentMode::Build,
-            mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx),
             answer_rx: Some(Arc::new(AsyncMutex::new(answer_rx))),
@@ -2601,6 +2559,16 @@ mod tests {
             })
             .detach();
         }
+        let settings = {
+            let params = state.params.get().unwrap();
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: params.model.clone(),
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            }
+        };
         let (actor, task) = AgentActorHandle::spawn(
             agent_id,
             Vec::new(),
@@ -2608,6 +2576,12 @@ mod tests {
             Box::new(LuaActorBackend::new(Arc::clone(&state))),
         );
         task.detach();
+        actor
+            .initialize_config(
+                EffectiveAgentConfig::new(settings, AgentMode::Build)
+                    .with_context(AgentContextSnapshot::new(ctx.cwd.clone())),
+            )
+            .unwrap();
         let actor = Arc::new(actor);
         let sess = BackendFixture {
             actor: Arc::clone(&actor),
@@ -3256,10 +3230,6 @@ mod tests {
         .with_admission(Some(admitted.clone()));
         let inherited = AgentContext::from(&agent.tool_context().unwrap());
         assert_eq!(inherited.cwd, directory.path());
-        assert!(Arc::ptr_eq(
-            &inherited.prompt_slots,
-            &inputs.ready.as_ref().unwrap().slots
-        ));
         drop(session);
         actor.shutdown();
     }

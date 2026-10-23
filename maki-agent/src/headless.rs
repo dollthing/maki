@@ -17,9 +17,9 @@ use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel};
+use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel, PreparedReadiness};
 use crate::agent::isolated_turn::IsolatedTurnEvent;
-use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
+use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
@@ -87,7 +87,7 @@ pub struct InteractiveParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt_slots: Arc<ResolvedSlots>,
+    pub prompt_slots: PromptSlotSource,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
@@ -397,6 +397,7 @@ struct HeadlessBackend {
     excluded_tools: Vec<&'static str>,
     system_override: Option<String>,
     append_system: Option<String>,
+    setup: TurnSetup,
     local_tools: LocalTools,
     mcp: Option<McpSession>,
     answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
@@ -421,7 +422,12 @@ impl HeadlessBackend {
             .ok_or_else(|| HEADLESS_CONFIG_UNAVAILABLE.to_owned())
     }
 
-    fn system(&self, config: &EffectiveAgentConfig, instructions: &agent::Instructions) -> String {
+    fn system(
+        &self,
+        config: &EffectiveAgentConfig,
+        instructions: &agent::Instructions,
+        slots: &ResolvedSlots,
+    ) -> String {
         let vars = template::env_vars_for(config.context.cwd());
         let definition = config
             .mode_def
@@ -433,7 +439,7 @@ impl HeadlessBackend {
                 &definition,
                 &config.mode,
                 &instructions.text,
-                &self.params.prompt_slots,
+                slots,
             )
         });
         if let Some(append) = &self.append_system {
@@ -546,51 +552,18 @@ impl ActorBackend for HeadlessBackend {
     }
 
     fn admission_preparation(&self) -> Option<AdmissionPreparation> {
-        let params = self.params.clone();
-        let local_tools = Arc::clone(&self.local_tools);
-        let mcp = self.mcp.clone();
-        Some(Arc::new(move |_, config| {
-            let mode = config.map_or(&AgentMode::Build, |config| &config.mode);
-            agent::TurnAdmissionSnapshot {
-                mode_def: config
-                    .and_then(|config| config.mode_def.clone())
-                    .or_else(|| match mode {
-                        AgentMode::Custom(id) => params.modes.get(id),
-                        _ => Some(params.modes.current(mode)),
-                    })
-                    .map(Arc::new),
-                prompt_inputs: config.map(|config| {
-                    let cwd = config.context.cwd().to_path_buf();
-                    Arc::new(TurnPromptInputs {
-                        instructions: agent::load_instructions(&cwd.to_string_lossy()),
-                        cwd,
-                        mcp_prompt: None,
-                        resolved: None,
-                        ready: Some(ResolvedPromptInputs {
-                            slots: Arc::clone(&params.prompt_slots),
-                            slots_error: None,
-                            mcp_messages: None,
-                        }),
-                    })
-                }),
-                bindings: Arc::new(TurnToolBindings::capture(
-                    &params.registry,
-                    &local_tools,
-                    mcp.as_ref(),
-                )),
-                mcp_startup_notice: mcp.as_ref().and_then(|mcp| {
-                    let count = mcp.connecting_count();
-                    (count > 0).then_some(count)
-                }),
-            }
-        }))
+        Some(self.setup.clone().preparation())
+    }
+
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        Some(TurnSetup::readiness())
     }
 
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        input: AgentInput,
+        mut input: AgentInput,
         _work: WorkKind,
     ) -> BoxFuture<'a, BackendResult> {
         Box::pin(async move {
@@ -607,24 +580,40 @@ impl ActorBackend for HeadlessBackend {
                     }));
                 }
             };
-            let instructions = context
+            let prompt_inputs = context
                 .admission
                 .as_ref()
-                .and_then(|admission| admission.prompt_inputs.as_ref())
+                .and_then(|admission| admission.prompt_inputs.clone());
+            let slots = match &prompt_inputs {
+                Some(inputs) => match inputs.resolve(&mut input, self.mcp.as_ref()).await {
+                    Ok(slots) => slots,
+                    Err(error) => {
+                        warn!(%turn_id, %error, "headless turn inputs failed");
+                        return BackendResult::SetupFailed(Some(TurnFailure {
+                            kind: TurnFailureKind::Internal,
+                            diagnostic: error.to_string(),
+                            user_message: error.user_message(),
+                            retryable: false,
+                        }));
+                    }
+                },
+                None => Arc::default(),
+            };
+            let instructions = prompt_inputs
                 .map(|inputs| inputs.instructions.clone())
-                .unwrap_or_else(|| {
-                    agent::load_instructions(&config.context.cwd().to_string_lossy())
-                });
+                .unwrap_or_default();
             let event_tx = self.event_sender(&context);
             context.output.set_terminal_sender(event_tx.clone());
             if let Some(answer_rx) = &self.answer_rx {
                 while answer_rx.lock().await.try_recv().is_ok() {}
             }
+            let mut params = self.params.clone();
+            params.prompt_slots = Arc::clone(&slots);
             let mut agent = Agent::for_actor_turn(
-                self.params.clone(),
+                params,
                 AgentRunParams {
                     history,
-                    system: self.system(&config, &instructions),
+                    system: self.system(&config, &instructions, &slots),
                     event_tx: event_tx.clone(),
                     tools: self.tools(&config),
                 },
@@ -726,6 +715,7 @@ impl ActorBackend for HeadlessBackend {
                     };
                     let instructions =
                         agent::load_instructions(&config.context.cwd().to_string_lossy());
+                    let slots = self.setup.slots.current().await;
                     let (trigger, combined) = CancelToken::new();
                     let cancellation = smol::spawn({
                         let actor_cancel = context.cancel.clone();
@@ -739,7 +729,7 @@ impl ActorBackend for HeadlessBackend {
                             provider: Arc::clone(&config.provider),
                             model: config.model.clone(),
                             history: history.as_slice().to_vec(),
-                            system: self.system(&config, &instructions),
+                            system: self.system(&config, &instructions, &slots),
                             question,
                             images,
                             session_id: self.params.session_id.clone(),
@@ -974,8 +964,8 @@ pub fn spawn_interactive_with_binding(
                         mailbox: Some(mailbox),
                         timeouts: params.timeouts,
                         file_tracker: FileReadTracker::fresh(),
-                        prompt_slots: params.prompt_slots,
-                        modes: params.modes,
+                        prompt_slots: Arc::default(),
+                        modes: Arc::clone(&params.modes),
                         subagent_cancels: children,
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
@@ -988,6 +978,14 @@ pub fn spawn_interactive_with_binding(
                     excluded_tools: params.excluded_tools,
                     system_override: params.system_prompt_override,
                     append_system: params.append_system_prompt,
+                    setup: TurnSetup {
+                        registry: Arc::clone(ToolRegistry::global_arc()),
+                        local_tools: Arc::clone(&params.local_tools),
+                        mcp: mcp.clone(),
+                        slots: params.prompt_slots,
+                        modes: Arc::clone(&params.modes),
+                        instructions: true,
+                    },
                     local_tools: params.local_tools,
                     mcp,
                     answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
@@ -1217,7 +1215,7 @@ pub(crate) mod tests {
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
-            prompt_slots: Arc::default(),
+            prompt_slots: PromptSlotSource::default(),
             excluded_tools: Vec::new(),
             mcp_handle: None,
             initial_wd: PathBuf::from(TEST_CWD),

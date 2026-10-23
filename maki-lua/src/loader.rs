@@ -29,6 +29,7 @@ use crate::runtime::{
 };
 use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
 use crate::ui_sink::HostUi;
+use maki_agent::agent::PromptSlotSource;
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1191,11 +1192,9 @@ impl EventHandle {
         rx
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
-        self.request_prompt_slots()
-            .recv_async()
-            .await
-            .unwrap_or_default()
+    pub fn prompt_slot_source(&self) -> PromptSlotSource {
+        let handle = self.clone();
+        PromptSlotSource::new(move || handle.request_prompt_slots())
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {

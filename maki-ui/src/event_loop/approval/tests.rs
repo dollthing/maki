@@ -1051,7 +1051,7 @@ fn assert_preserved(
 /// under `prefix`.
 fn observed(event_loop: &EventLoop<'_>, index: usize, prefix: &str) -> Vec<(String, String)> {
     let app = &event_loop.sessions[index].app;
-    smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
+    app.lua_event_handle.collect_prompt_slots();
     event_loop
         .ctx
         .command_runtime

@@ -485,7 +485,6 @@ pub fn run(
     let literal = AgentInput::new(prompt, images);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
-    let prompt_slots = lua_handle.collect_prompt_slots();
     let session_options = lua_handle.session_option_catalog();
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) = maki_agent::mcp::start_with_commands(
@@ -512,7 +511,7 @@ pub fn run(
                 config,
                 permissions_config,
                 timeouts,
-                prompt_slots: Arc::new(prompt_slots),
+                prompt_slots: lua_handle.prompt_slot_source(),
                 excluded_tools: vec![QUESTION_TOOL_NAME],
                 mcp_handle,
                 initial_wd: cwd,
@@ -1030,7 +1029,7 @@ mod tests {
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Default::default(),
-            prompt_slots: Arc::default(),
+            prompt_slots: Default::default(),
             excluded_tools: Vec::new(),
             mcp_handle: None,
             initial_wd: cwd.to_path_buf(),
@@ -1633,7 +1632,7 @@ mod tests {
         let mut params = print_params(&cwd, Some(state_dir.path().to_path_buf()));
         params.config.max_concurrent_agent_turns = 1;
         params.permissions_config.yolo = true;
-        params.prompt_slots = Arc::new(lua_handle.collect_prompt_slots());
+        params.prompt_slots = lua_handle.prompt_slot_source();
         params.system_prompt_override = Some(SYSTEM.into());
         params.defaults.fast = true;
         let session = start_print_session(

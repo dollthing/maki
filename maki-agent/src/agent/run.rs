@@ -35,7 +35,7 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
-const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
+pub const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
 const MAX_COMPLETION_RECOVERY_ATTEMPTS: u32 = 2;
 const COMPLETION_RECOVERY_EXHAUSTED: &str =
     "required output recovery exhausted before output was reported";
