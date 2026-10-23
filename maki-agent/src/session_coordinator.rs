@@ -37,6 +37,7 @@ static DIRECTORY: LazyLock<Mutex<HashMap<MakiId, DirectoryEntry>>> =
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 const ACK_MISMATCH: &str = "checkpoint acknowledgement did not match request";
 const CHECKPOINT_CANCELLED: &str = "checkpoint cancelled";
+const STALE_SNAPSHOT: &str = "session option snapshot changed during validation";
 const PARTICIPANT_CLOSED_MESSAGE: &str =
     "session option participant closed before the catalog decision";
 
@@ -439,7 +440,7 @@ impl SessionOptionCatalog {
                         if handle.generation != generation {
                             return Err(SessionCoordinatorError::StaleSession(session_id));
                         }
-                        handle.reserve_options(None)
+                        handle.reserve_options()
                     });
                 let reservation = match reservation {
                     Ok(reservation) => Arc::new(reservation),
@@ -617,7 +618,7 @@ impl SessionCoordinatorHandle {
         let config = agent.actor()?.config_snapshot().ok_or_else(|| {
             ActorError::InvalidConfig("actor configuration is not initialized".into())
         })?;
-        let reservation = self.reserve_options(None)?;
+        let reservation = self.reserve_options()?;
         let candidate = actor_options(&self.read, &config.config)?;
         let mut binding = lock(&self.read.binding);
         if binding.is_some() {
@@ -639,11 +640,8 @@ impl SessionCoordinatorHandle {
             .ok_or(SessionCoordinatorError::ActorUnbound(self.session_id))
     }
 
-    fn reserve_options(
-        &self,
-        version: Option<u64>,
-    ) -> Result<SessionOptionsReservation, SessionCoordinatorError> {
-        self.read.options.try_reserve(version).map_err(|error| {
+    fn reserve_options(&self) -> Result<SessionOptionsReservation, SessionCoordinatorError> {
+        self.read.options.try_reserve(None).map_err(|error| {
             if matches!(error, SessionOptionError::Busy) {
                 SessionCoordinatorError::SessionBusy(self.session_id)
             } else {
@@ -656,16 +654,8 @@ impl SessionCoordinatorHandle {
         &self,
         publication: CheckpointPublication,
     ) -> Result<SessionTransactionReservation, SessionCoordinatorError> {
-        self.reserve_transaction_if_version(publication, None)
-    }
-
-    fn reserve_transaction_if_version(
-        &self,
-        publication: CheckpointPublication,
-        version: Option<u64>,
-    ) -> Result<SessionTransactionReservation, SessionCoordinatorError> {
         self.actor_binding()?;
-        let reservation = self.reserve_options(version)?;
+        let reservation = self.reserve_options()?;
         let registration = self.register_publication(&publication)?;
         Ok(SessionTransactionReservation {
             coordinator: self.clone(),
@@ -697,31 +687,62 @@ impl SessionCoordinatorHandle {
         Ok(verify_ack(self.session_id, version, checkpoint).await?)
     }
 
-    /// Reserves a change on the bound actor; `version` fences the option lease.
     fn reserve_actor_change(
         &self,
         publication: CheckpointPublication,
-        version: Option<u64>,
     ) -> Result<(ActorBinding, ConfigChangeTicket<'_>), ConfigChangeError> {
         let binding = self.actor_binding()?;
         let ticket =
             ConfigChangeTicket::reserve(&binding.agent, publication, move |publication| {
                 Ok(self
-                    .reserve_transaction_if_version(publication, version)?
+                    .reserve_transaction(publication)?
                     .into_config_mutation())
             })?;
         Ok((binding, ticket))
+    }
+
+    /// The option lease, in the bound actor's config FIFO when there is one.
+    async fn reserve_options_in_turn(
+        &self,
+    ) -> Result<SessionOptionsReservation, ConfigChangeError> {
+        let binding = lock(&self.read.binding).clone();
+        Ok(match binding {
+            Some(binding) => {
+                reserve_in_turn(&binding.agent, || Ok(self.reserve_options()?)).await?
+            }
+            None => self.reserve_options()?,
+        })
+    }
+
+    async fn send_set_option(
+        &self,
+        id: Arc<str>,
+        value: Arc<str>,
+        reservation: SessionOptionsReservation,
+    ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send(Operation::SetOption {
+                id,
+                value,
+                reservation,
+                reply,
+            })
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        Ok(response
+            .recv_async()
+            .await
+            .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))?)
     }
 
     async fn commit_patch(
         &self,
         spec: Option<Arc<str>>,
         patch: ConfigPatch,
-        version: Option<u64>,
         publication: CheckpointPublication,
         claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
-        let (binding, ticket) = self.reserve_actor_change(publication, version)?;
+        let (binding, ticket) = self.reserve_actor_change(publication)?;
         let policy = &self.read.model_policy;
         ticket
             .commit(async |_, _| {
@@ -741,6 +762,9 @@ impl SessionCoordinatorHandle {
         self.set_option_if_version(id, value, None).await
     }
 
+    /// {version} fences the snapshot the caller validated against at
+    /// dispatch. A set that then waits behind other changes applies to the
+    /// state it lands on, checked against the definitions there.
     pub async fn set_option_if_version(
         &self,
         id: impl Into<Arc<str>>,
@@ -748,6 +772,9 @@ impl SessionCoordinatorHandle {
         version: Option<u64>,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
         self.ensure_live()?;
+        if version.is_some_and(|version| version != self.read.options().version) {
+            return Err(SessionOptionError::StaleHandle(Arc::from(STALE_SNAPSHOT)).into());
+        }
         let id = id.into();
         let value = value.into();
         let enabled = value.as_ref() == ENABLED_VALUE;
@@ -776,68 +803,64 @@ impl SessionCoordinatorHandle {
                 (None, patch)
             }
             _ => {
-                let binding = lock(&self.read.binding).clone();
-                let reservation = match binding {
-                    Some(binding) => {
-                        reserve_in_turn(&binding.agent, || Ok(self.reserve_options(version)?))
-                            .await?
-                    }
-                    None => self.reserve_options(version)?,
-                };
-                let (reply, response) = flume::bounded(1);
-                self.tx
-                    .send(Operation::SetOption {
-                        id,
-                        value,
-                        reservation,
-                        reply,
-                    })
-                    .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-                return Ok(response
-                    .recv_async()
-                    .await
-                    .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))?);
+                let reservation = self.reserve_options_in_turn().await?;
+                return self.send_set_option(id, value, reservation).await;
             }
         };
         self.commit_patch(
             spec,
             patch,
-            version,
             CheckpointPublication::default(),
             publication_claim(),
         )
         .await
     }
 
+    /// Flips {id} on the state the toggle lands on, so a toggle queued behind
+    /// other changes flips their result, and two quick toggles cancel out.
+    /// Returns whether it is now enabled.
     pub async fn toggle_boolean_option(
         &self,
         id: impl Into<Arc<str>>,
     ) -> Result<(bool, SessionOptionsSnapshot), ConfigChangeError> {
         let id = id.into();
-        if !matches!(
-            id.as_ref(),
-            YOLO_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID
-        ) {
-            return Err(SessionOptionError::InvalidValue {
-                id,
-                value: Arc::from("toggle"),
+        let change = match id.as_ref() {
+            FAST_OPTION_ID => ConfigChange::ToggleFast,
+            WORKFLOW_OPTION_ID => ConfigChange::ToggleWorkflow,
+            YOLO_OPTION_ID => {
+                self.ensure_live()?;
+                let reservation = self.reserve_options_in_turn().await?;
+                let enabled = self
+                    .read
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id == id)
+                    .is_some_and(|option| option.current_value.as_ref() == DISABLED_VALUE);
+                let value = if enabled {
+                    ENABLED_VALUE
+                } else {
+                    DISABLED_VALUE
+                };
+                let snapshot = self.send_set_option(id, value.into(), reservation).await?;
+                return Ok((enabled, snapshot));
             }
-            .into());
-        }
-        let snapshot = self.read.options();
-        let enabled = snapshot
-            .options
-            .iter()
-            .find(|option| option.definition.id == id)
-            .is_some_and(|option| option.current_value.as_ref() == DISABLED_VALUE);
-        let value = if enabled {
-            ENABLED_VALUE
-        } else {
-            DISABLED_VALUE
+            _ => {
+                return Err(SessionOptionError::InvalidValue {
+                    id,
+                    value: Arc::from("toggle"),
+                }
+                .into());
+            }
         };
-        self.set_option_if_version(id, value, Some(snapshot.version))
-            .await
-            .map(|snapshot| (enabled, snapshot))
+        self.ensure_live()?;
+        let (_, ticket) = self.reserve_actor_change(CheckpointPublication::default())?;
+        let config = ticket.commit_change(change).await?.config;
+        let enabled = match id.as_ref() {
+            FAST_OPTION_ID => config.settings.fast,
+            _ => config.settings.workflow,
+        };
+        Ok((enabled, self.read.options()))
     }
 
     pub async fn set_model(
@@ -869,12 +892,11 @@ impl SessionCoordinatorHandle {
             thinking,
             ..Default::default()
         };
-        self.commit_patch(spec, patch, None, publication, claim)
-            .await
+        self.commit_patch(spec, patch, publication, claim).await
     }
 
     pub async fn change_directory(&self, path: PathBuf) -> Result<PathBuf, ConfigChangeError> {
-        let (_, ticket) = self.reserve_actor_change(CheckpointPublication::default(), None)?;
+        let (_, ticket) = self.reserve_actor_change(CheckpointPublication::default())?;
         let commit = ticket
             .commit(async |_, predecessor| {
                 let canonical = canonical_directory(predecessor.context.cwd(), path).await?;
@@ -892,7 +914,7 @@ impl SessionCoordinatorHandle {
         specs: Vec<Arc<str>>,
     ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
         self.ensure_live()?;
-        let reservation = self.reserve_options(None)?;
+        let reservation = self.reserve_options()?;
         let (reply, response) = flume::bounded(1);
         self.tx
             .send(Operation::UpdateModelValues {
@@ -2619,7 +2641,7 @@ mod tests {
             ))
             .unwrap();
             let _agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
-            let lease = coordinator.reserve_options(None).unwrap();
+            let lease = coordinator.reserve_options().unwrap();
             let mut set = std::pin::pin!(coordinator.set_option(YOLO_OPTION_ID, ENABLED_VALUE));
             assert!(futures_lite::future::poll_once(&mut set).await.is_none());
             drop(lease);
@@ -2965,6 +2987,74 @@ mod tests {
             second.unwrap();
             assert_eq!(lock(&installed).as_slice(), &[NEW, OLD]);
             assert_eq!(coordinator.read().model().unwrap().as_ref(), OLD);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    fn option_value(coordinator: &SessionCoordinatorHandle, id: &str) -> Arc<str> {
+        coordinator
+            .read()
+            .options()
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == id)
+            .map(|option| Arc::clone(&option.current_value))
+            .unwrap()
+    }
+
+    #[test_case::test_case(WORKFLOW_OPTION_ID; "workflow")]
+    #[test_case::test_case(YOLO_OPTION_ID; "yolo")]
+    fn queued_toggles_apply_to_the_state_they_land_on(id: &str) {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(false)))
+                    .unwrap();
+            let agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
+            let initial = option_value(&coordinator, id);
+            let guard = agent.actor().unwrap().prepare_idle().unwrap();
+            let mut model = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut first = Box::pin(coordinator.toggle_boolean_option(id));
+            let mut second = Box::pin(coordinator.toggle_boolean_option(id));
+            assert!(futures_lite::future::poll_once(&mut model).await.is_none());
+            assert!(futures_lite::future::poll_once(&mut first).await.is_none());
+            assert!(futures_lite::future::poll_once(&mut second).await.is_none());
+            drop(guard);
+            let (model, (first, second)) =
+                futures_lite::future::zip(model, futures_lite::future::zip(first, second)).await;
+            model.unwrap();
+            let (first, _) = first.unwrap();
+            let (second, _) = second.unwrap();
+            assert_ne!(first, second);
+            assert_eq!(option_value(&coordinator, id), initial);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fenced_set_that_waits_applies_after_the_holder_commits() {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(false)))
+                    .unwrap();
+            let agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
+            let guard = agent.actor().unwrap().prepare_idle().unwrap();
+            let version = coordinator.read().options().version;
+            let mut model = Box::pin(coordinator.set_model(Some(Arc::from(NEW)), None, None));
+            let mut set = Box::pin(coordinator.set_option_if_version(
+                WORKFLOW_OPTION_ID,
+                ENABLED_VALUE,
+                Some(version),
+            ));
+            assert!(futures_lite::future::poll_once(&mut model).await.is_none());
+            assert!(futures_lite::future::poll_once(&mut set).await.is_none());
+            drop(guard);
+            let (model, set) = futures_lite::future::zip(model, set).await;
+            model.unwrap();
+            set.unwrap();
+            assert_eq!(
+                option_value(&coordinator, WORKFLOW_OPTION_ID).as_ref(),
+                ENABLED_VALUE
+            );
             coordinator.close().await.unwrap();
         });
     }
