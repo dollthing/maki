@@ -59,6 +59,7 @@ use crate::cli::Cli;
 use crate::command_attachments;
 
 const TURN_ALREADY_ACTIVE: &str = "a turn is already active";
+const OUTPUT_CLOSED: &str = "the SDK output is closed";
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
@@ -535,6 +536,8 @@ struct Shared {
     active_cancel: Option<WorkCancel>,
     /// Stdin ended, so no answer to a new permission ask can arrive.
     input_closed: bool,
+    /// The event pump stopped, so nothing reports or ends SDK work any more.
+    output_closed: bool,
     idle: Event,
 }
 
@@ -546,6 +549,7 @@ impl Shared {
             turn_active: false,
             active_cancel: None,
             input_closed: false,
+            output_closed: false,
             idle: Event::new(),
         }
     }
@@ -1401,6 +1405,9 @@ async fn admit_sdk_turn(
 
 fn begin_sdk_work(shared: &Mutex<Shared>) -> Result<(), &'static str> {
     let mut shared = shared.lock().unwrap();
+    if shared.output_closed {
+        return Err(OUTPUT_CLOSED);
+    }
     if shared.turn_active {
         return Err(TURN_ALREADY_ACTIVE);
     }
@@ -1413,6 +1420,20 @@ fn end_sdk_work(shared: &Mutex<Shared>) {
     shared.turn_active = false;
     shared.active_cancel.take();
     shared.idle.notify(usize::MAX);
+}
+
+/// The pump stopped (stdout broke): the work in flight can no longer report,
+/// so it is cancelled and no new work starts.
+fn close_output(shared: &Mutex<Shared>) {
+    let cancel = {
+        let mut shared = shared.lock().unwrap();
+        shared.output_closed = true;
+        shared.active_cancel.take()
+    };
+    if let Some(cancel) = cancel {
+        cancel.cancel();
+    }
+    end_sdk_work(shared);
 }
 
 /// Stdin ended but stdout is still read: the user messages already read are
@@ -1579,6 +1600,7 @@ impl EventPump {
                     break;
                 }
             }
+            close_output(&self.shared);
         })
     }
 
@@ -2223,6 +2245,38 @@ mod tests {
             answer_rx.try_recv().unwrap(),
             TaggedAnswer::new(ASK_ID, PermissionAnswer::Deny).encode()
         );
+    }
+
+    /// The parent died mid-turn: stdout broke and the pump stopped before the
+    /// turn's outcome, yet input end must not wait on work nobody reports.
+    #[test]
+    fn input_end_exits_once_the_output_is_gone() {
+        let PendingSdkSession {
+            handle,
+            coordinator,
+            shared,
+            pump,
+            out_rx,
+            release,
+            ..
+        } = pending_sdk_session();
+        drop(out_rx);
+        release.send(()).unwrap();
+        let InteractiveHandle { input_tx, task, .. } = handle;
+        smol::block_on(futures_lite::future::or(
+            async {
+                pump.await;
+                finish_in_flight(&shared, async { Ok(()) }).await.unwrap();
+                drop(input_tx);
+                task.await;
+            },
+            async {
+                smol::Timer::after(SDK_GATE_TIMEOUT).await;
+                panic!("{SDK_SETTLEMENT_TIMEOUT}");
+            },
+        ));
+        assert_eq!(begin_sdk_work(&shared), Err(OUTPUT_CLOSED));
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
