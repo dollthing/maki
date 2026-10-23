@@ -112,7 +112,7 @@ function M.classify_verdict(command, cwd, opts, ctx, spawn)
     return "error", nil, tostring(result)
   end
   if prompt_err then
-    return "error", nil, type(prompt_err) == "table" and prompt_err.message or prompt_err
+    return "error", nil, prompt_err
   end
   if not result or result.status ~= "completed" then
     return "error", nil, result and (result.error or result.cancellation_reason) or "classifier returned no result"

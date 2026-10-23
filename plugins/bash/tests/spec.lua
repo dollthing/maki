@@ -7,7 +7,7 @@ local eq = th.eq
 local CLASSIFIER_SYSTEM = require("auto_classifier_prompt")
 local SPAWN_ERROR = "stub spawn failed"
 local PROMPT_ERROR = "prompt boom"
-local TIMEOUT_ERROR = "turn wait timed out"
+local TIMEOUT_ERROR = "agent turn wait timed out"
 local NO_VERDICT_ERROR = "classifier returned no verdict"
 local VERDICT_INPUT_ERROR = "classifier_verdict input must be { approved: boolean }"
 
@@ -20,14 +20,14 @@ local function fake_agent(spawn_log, result, prompt_err, throws)
       return {
         wait = function(_turn, _wait_ctx, wait_opts)
           spawn_log.prompt_opts = wait_opts
+          spawn_log.live_ticket = true
           if throws then
             error(prompt_err, 0)
           end
-          if type(prompt_err) == "table" and prompt_err.kind == "timeout" then
-            spawn_log.live_ticket = true
+          if prompt_err then
             return nil, prompt_err
           end
-          return result, prompt_err
+          return result
         end,
       }
     end,
@@ -150,7 +150,7 @@ case("classify_verdict_prompt_error_falls_back", function()
   for _, row in ipairs({
     { name = "returned", error = PROMPT_ERROR },
     { name = "thrown", error = PROMPT_ERROR, throws = true },
-    { name = "timeout_live_ticket", error = { kind = "timeout", message = TIMEOUT_ERROR, ticket = {} } },
+    { name = "timeout", error = TIMEOUT_ERROR },
     { name = "failed_result", status = "failed", result_error = PROMPT_ERROR },
     { name = "cancelled_result", status = "cancelled", cancellation_reason = "cancelled" },
   }) do
@@ -165,8 +165,7 @@ case("classify_verdict_prompt_error_falls_back", function()
     local verdict, reason, err = bh.classify_verdict("echo hi", "/tmp", OPT, ctx, spawn)
     eq(verdict, "error", row.name)
     eq(reason, nil, row.name .. " must not use a stale verdict")
-    local expected_error = type(row.error) == "table" and row.error.message or row.error
-    eq(err, expected_error or row.result_error or row.cancellation_reason, row.name)
+    eq(err, row.error or row.result_error or row.cancellation_reason, row.name)
     eq(log.close_calls, 1, row.name)
     eq(log.cancel_calls, 0, row.name)
     eq(log.close_ctx, ctx, row.name)
