@@ -4701,19 +4701,15 @@ fn dispatch_option_toggle(
     let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
     smol::spawn(async move {
-        let result = bounded_session_op(
-            async {
-                coordinator
-                    .toggle_boolean_option(id)
-                    .await
-                    .map(|(enabled, _)| {
-                        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
-                    })
-                    .map_err(|error| error.to_string())
-            },
-            SESSION_OP_TIMEOUT,
-        )
-        .await;
+        // A toggle prepares nothing, so it has no preparation to bound; it
+        // waits its turn behind other changes like any config change.
+        let result = coordinator
+            .toggle_boolean_option(id)
+            .await
+            .map(|(enabled, _)| {
+                *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+            })
+            .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
