@@ -517,7 +517,7 @@ impl PreparedOperation {
                 state,
                 ActorOperation::Turn {
                     id: self.id,
-                    input: turn.input,
+                    input: Box::new(turn.input),
                     event_sender: turn.event_sender,
                     correlation: turn.correlation,
                     ticket: ticket.clone(),

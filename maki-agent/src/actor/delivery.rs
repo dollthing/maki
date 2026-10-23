@@ -486,7 +486,11 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     );
     state.operations.push_back(ActorOperation::Turn {
         id,
-        input: AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
+        input: Box::new(AgentInput::from_defaults(
+            String::new(),
+            Vec::new(),
+            Default::default(),
+        )),
         event_sender: None,
         correlation: "child-results".into(),
         ticket,

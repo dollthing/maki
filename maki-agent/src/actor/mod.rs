@@ -369,10 +369,6 @@ pub(crate) struct ActorState {
     settled: Option<ActorWorkIdentity>,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "queued turns keep their input inline until they start"
-)]
 enum ActorOperation {
     Prepared(Box<prepared::PreparedOperation>),
     Control {
@@ -381,7 +377,7 @@ enum ActorOperation {
     },
     Turn {
         id: u64,
-        input: AgentInput,
+        input: Box<AgentInput>,
         event_sender: Option<EventSender>,
         correlation: String,
         ticket: TurnTicket,
@@ -453,7 +449,7 @@ fn settle_deferred(
             let outcome = cancelled_outcome(inner.agent_id, turn_id, reason);
             let admission = TurnAdmission {
                 turn_id,
-                input: Some(input),
+                input: Some(*input),
                 event_sender,
                 correlation,
                 work: identity,
@@ -640,7 +636,7 @@ fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, 
         let turn_id = ticket.turn_id();
         let admission = TurnAdmission {
             turn_id,
-            input: Some(input),
+            input: Some(*input),
             event_sender,
             correlation,
             work: identity,
@@ -740,7 +736,7 @@ fn materialize(
             }
             inner.queue.push(ActorWork::Turn(Box::new(TurnAdmission {
                 turn_id: ticket.turn_id(),
-                input: Some(input),
+                input: Some(*input),
                 event_sender,
                 correlation,
                 work: identity,
@@ -1733,7 +1729,7 @@ impl AgentActorHandle {
             let replacement = if let Some(ActorOperation::Turn { input, .. }) = state.operations.iter_mut()
                 .find(|work| matches!(work, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id))
             {
-                *input = entry.input;
+                **input = entry.input;
                 Ok(())
             } else {
                 self.inner.queue.replace_turn_input(turn_id, entry.input)
@@ -2187,7 +2183,7 @@ impl AgentActorHandle {
             let reason = state.cancelled_correlations.get(&correlation).copied();
             let work = ActorOperation::Turn {
                 id,
-                input,
+                input: Box::new(input),
                 event_sender,
                 correlation,
                 ticket: ticket.clone(),
@@ -2272,7 +2268,7 @@ impl AgentActorHandle {
         let reason = state.cancelled_correlations.get(&correlation).copied();
         let work = ActorOperation::Turn {
             id: after,
-            input,
+            input: Box::new(input),
             event_sender,
             correlation,
             ticket: ticket.clone(),
