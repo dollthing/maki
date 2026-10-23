@@ -4256,6 +4256,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> ShutdownReport {
+        self.model_discovery = Discovery::idle();
         let outputs = self.provider_usage.handle(ProviderUsageInput::Shutdown);
         self.handle_provider_usage_outputs(outputs);
         let started = Instant::now();

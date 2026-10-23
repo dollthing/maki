@@ -2711,18 +2711,6 @@ impl App {
         let operation = match request {
             HostRequest::Context(request) => {
                 let response = match request {
-                    HostContextRequest::ModelSpecs => HostContextResponse::Values(
-                        self.available_models
-                            .load_full()
-                            .map(|models| {
-                                models
-                                    .iter()
-                                    .map(|spec| Arc::from(spec.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .into()
-                            })
-                            .unwrap_or_else(|| Arc::from([])),
-                    ),
                     HostContextRequest::ThemeNames => HostContextResponse::Values(
                         self.theme_provider
                             .names()
@@ -2731,7 +2719,8 @@ impl App {
                             .collect::<Vec<_>>()
                             .into(),
                     ),
-                    HostContextRequest::WorkingDirectory
+                    HostContextRequest::ModelSpecs
+                    | HostContextRequest::WorkingDirectory
                     | HostContextRequest::FastModeSupported => {
                         return Err(CommandError::StaleTarget);
                     }

@@ -32,8 +32,7 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    /// A discovery that fetches nothing, for a frontend under test.
-    #[cfg(feature = "test-support")]
+    /// A discovery that fetches nothing.
     pub fn idle() -> Self {
         Self {
             _task: smol::spawn(async {}),

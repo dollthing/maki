@@ -45,9 +45,7 @@ const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "zai/glm-5";
 const MODEL_SPEC_GLM4: &str = "zai/glm-4";
-const MODEL_SPEC_OPUS: &str = "anthropic/claude-opus-4-5";
 const MODEL_SPEC_GPT9: &str = "openai/gpt-9";
-const MODEL_SPEC_CLAUDE: &str = "anthropic/claude-sonnet-4-20250514";
 const HINT_PLUGIN: &str = "statusline";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -3571,96 +3569,6 @@ fn model_arg_spec_emits_change_model() {
     );
     assert!(matches!(&actions[..], [Action::ChangeModel(spec)] if spec == MODEL_SPEC_GPT9));
     assert!(!app.model_picker.is_open());
-}
-
-/// `/model <fragment>` that fuzzy-resolves to a unique spec emits
-/// `ChangeModel(resolved)` without the picker.
-#[test]
-fn model_arg_fuzzy_unique_emits_change_model() {
-    let (mut app, models) = app_with_model_slot();
-    models.store(Some(Arc::new(vec![
-        LATE_MODEL_SPEC.into(),
-        MODEL_SPEC_OPUS.into(),
-    ])));
-
-    let actions = app.execute_command(
-        ParsedCommand {
-            name: "/model".into(),
-            args: "glm".into(),
-        },
-        0,
-    );
-    assert!(matches!(&actions[..], [Action::ChangeModel(spec)] if spec == LATE_MODEL_SPEC));
-    assert!(!app.model_picker.is_open());
-}
-
-/// `/model <fragment>` with 2+ fuzzy matches flashes, emits nothing, and leaves
-/// the session model unchanged with the picker closed.
-#[test]
-fn model_arg_ambiguous_flashes() {
-    let (mut app, models) = app_with_model_slot();
-    models.store(Some(Arc::new(vec![
-        MODEL_SPEC_GLM4.into(),
-        LATE_MODEL_SPEC.into(),
-    ])));
-    let before = app.root_config().model.spec();
-
-    let actions = app.execute_command(
-        ParsedCommand {
-            name: "/model".into(),
-            args: "glm".into(),
-        },
-        0,
-    );
-    assert!(actions.is_empty());
-    assert!(!app.model_picker.is_open());
-    assert_eq!(app.root_config().model.spec(), before);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        "command failed: ambiguous model: glm"
-    );
-}
-
-/// `/model <fragment>` with zero fuzzy matches flashes, emits nothing, and
-/// leaves the session model unchanged with the picker closed.
-#[test]
-fn model_arg_no_match_flashes() {
-    let (mut app, models) = app_with_model_slot();
-    models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
-    let before = app.root_config().model.spec();
-
-    let actions = app.execute_command(
-        ParsedCommand {
-            name: "/model".into(),
-            args: "xyz".into(),
-        },
-        0,
-    );
-    assert!(actions.is_empty());
-    assert!(!app.model_picker.is_open());
-    assert_eq!(app.root_config().model.spec(), before);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        "command failed: no model matches: xyz"
-    );
-}
-
-#[test]
-fn model_arg_matches_provider_section() {
-    let (mut app, models) = app_with_model_slot();
-    models.store(Some(Arc::new(vec![
-        MODEL_SPEC_CLAUDE.into(),
-        LATE_MODEL_SPEC.into(),
-    ])));
-
-    let actions = app.execute_command(
-        ParsedCommand {
-            name: "/model".into(),
-            args: "anthropic".into(),
-        },
-        0,
-    );
-    assert!(matches!(&actions[..], [Action::ChangeModel(spec)] if spec == MODEL_SPEC_CLAUDE));
 }
 
 #[test]

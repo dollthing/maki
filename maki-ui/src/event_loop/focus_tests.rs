@@ -580,3 +580,44 @@ fn idle_session_prompt_starts_on_root_and_preserves_shell_preamble() {
         }
     });
 }
+
+const GLM_4: &str = "ollama/glm-4";
+const GLM_5: &str = "ollama/glm-5";
+const OTHER_PROVIDER: &str = "zai/glm-5";
+const UNREACHABLE_OLLAMA_HOST: &str = "http://127.0.0.1:1";
+
+#[test_case(&[GLM_5, OTHER_PROVIDER], "ollama", Ok(GLM_5) ; "provider_section_switches")]
+#[test_case(&[GLM_5], "glm", Ok(GLM_5) ; "unique_fragment_switches")]
+#[test_case(&[GLM_4, GLM_5], "glm", Err("command failed: ambiguous model: glm") ; "ambiguous_fragment_fails")]
+#[test_case(&[GLM_5], "xyz", Err("command failed: no model matches: xyz") ; "unknown_fragment_fails")]
+fn model_argument_resolves_against_the_catalog(
+    catalog: &[&str],
+    argument: &str,
+    expected: Result<&str, &str>,
+) {
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+    with_event_loop(|event_loop| {
+        event_loop.ctx.catalog.specs().store(Some(Arc::new(
+            catalog.iter().map(|spec| spec.to_string()).collect(),
+        )));
+        event_loop.sync_orchestration();
+        let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let commits = actor.subscribe_config_commits();
+        let outcome = dispatch_slash(event_loop, &format!("/model {argument}"));
+        match expected {
+            Ok(spec) => {
+                assert!(matches!(outcome, CommandOutcome::Completed), "{outcome:?}");
+                let commit = commits.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+                assert_eq!(commit.config.model.spec(), spec);
+            }
+            Err(message) => {
+                let CommandOutcome::Failed(error) = outcome else {
+                    panic!("expected a failure, got {outcome:?}");
+                };
+                assert_eq!(error.to_string(), message);
+            }
+        }
+    });
+}
