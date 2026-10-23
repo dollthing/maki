@@ -541,6 +541,20 @@ struct Shared {
     /// The event pump stopped, so nothing reports or ends SDK work any more.
     output_closed: bool,
     idle: Event,
+    /// A user message is dispatching: the results of root turns it did not
+    /// start, such as the ones a command's handler runs, are held until it
+    /// ends, so the message gets one result.
+    dispatching: bool,
+    held: Vec<ResultPayload>,
+    /// Tells the pump a dispatch ended (and whether as a completed command),
+    /// and hears back once it reported. The pump reports after the events
+    /// already queued, so the turns a handler waited for are held by then.
+    dispatch_end: (Sender<DispatchEnd>, Receiver<DispatchEnd>),
+}
+
+struct DispatchEnd {
+    completed: bool,
+    reported: Sender<()>,
 }
 
 impl Shared {
@@ -552,6 +566,9 @@ impl Shared {
             input_closed: false,
             output_closed: false,
             idle: Event::new(),
+            dispatching: false,
+            held: Vec::new(),
+            dispatch_end: flume::unbounded(),
         }
     }
 }
@@ -996,7 +1013,9 @@ impl UserDispatch {
         let (user_tx, user_rx) = flume::unbounded::<UserInput>();
         let task = smol::spawn(async move {
             while let Ok((prompt, images)) = user_rx.recv_async().await {
-                if !self.dispatch(&prompt, &images).await? {
+                let dispatched = self.dispatch(&prompt, &images).await;
+                end_dispatch(&self.shared, false).await;
+                if !dispatched? {
                     break;
                 }
             }
@@ -1019,6 +1038,7 @@ impl UserDispatch {
             if shared.work.is_empty() {
                 shared.turn_start = Instant::now();
             }
+            shared.dispatching = true;
         }
         let input = match commands.dispatch_input(prompt, images).await {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
@@ -1029,7 +1049,7 @@ impl UserDispatch {
                 command_attachments::into_images(&content.attachments)?,
             ),
             InputDispatch::Dispatched(CommandOutcome::Completed) => {
-                emit_command_result(writer, shared, false, String::new())?;
+                end_dispatch(shared, true).await;
                 return Ok(true);
             }
             InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
@@ -1433,12 +1453,15 @@ fn end_sdk_work(shared: &Mutex<Shared>) {
     shared.idle.notify(usize::MAX);
 }
 
-fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) {
+/// Returns whether {turn_id}'s result waits for the dispatch in flight.
+fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
     let mut shared = shared.lock().unwrap();
+    let tracked = shared.work.len();
     shared.work.retain(|work| work.turn_id() != Some(turn_id));
     if shared.work.is_empty() {
         shared.idle.notify(usize::MAX);
     }
+    shared.dispatching && shared.work.len() == tracked
 }
 
 /// Cancels all SDK work in flight; the turns still report their results.
@@ -1450,10 +1473,31 @@ fn cancel_sdk_work(shared: &Mutex<Shared>) {
     end_sdk_work(shared);
 }
 
+/// Waits for the pump to report the dispatch in flight, unless it has
+/// stopped or already reported it.
+async fn end_dispatch(shared: &Mutex<Shared>, completed: bool) {
+    let (reported, done) = flume::bounded(1);
+    {
+        let shared = shared.lock().unwrap();
+        if shared.output_closed || !shared.dispatching {
+            return;
+        }
+        let _ = shared.dispatch_end.0.send(DispatchEnd {
+            completed,
+            reported,
+        });
+    }
+    let _ = done.recv_async().await;
+}
+
 /// The pump stopped (stdout broke): the work in flight can no longer report,
 /// so it is cancelled and no new work starts.
 fn close_output(shared: &Mutex<Shared>) {
-    shared.lock().unwrap().output_closed = true;
+    {
+        let mut shared = shared.lock().unwrap();
+        shared.output_closed = true;
+        while shared.dispatch_end.1.try_recv().is_ok() {}
+    }
     cancel_sdk_work(shared);
 }
 
@@ -1614,19 +1658,69 @@ struct EventPump {
 
 impl EventPump {
     fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
+        let dispatch_end = self.shared.lock().unwrap().dispatch_end.1.clone();
         smol::spawn(async move {
-            while let Ok(envelope) = event_rx.recv_async().await {
-                if matches!(envelope.event, AgentEvent::StreamClosed) {
-                    break;
-                }
-                self.observer.observe(&envelope);
-                if let Err(e) = self.handle(envelope) {
-                    warn!(error = %e, "sdk event pump stopped");
-                    break;
+            loop {
+                let next =
+                    smol::future::or(async { event_rx.recv_async().await.map(Ok).ok() }, async {
+                        dispatch_end.recv_async().await.map(Err).ok()
+                    })
+                    .await;
+                let pumped = match next {
+                    Some(Ok(envelope)) => self.pump(envelope),
+                    Some(Err(end)) => self.report_dispatch(&event_rx, end),
+                    None => break,
+                };
+                match pumped {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!(error = %e, "sdk event pump stopped");
+                        break;
+                    }
                 }
             }
             close_output(&self.shared);
         })
+    }
+
+    /// Handles {envelope}; `Ok(false)` means the stream ended.
+    fn pump(&mut self, envelope: Envelope) -> Result<bool> {
+        if matches!(envelope.event, AgentEvent::StreamClosed) {
+            return Ok(false);
+        }
+        self.observer.observe(&envelope);
+        self.handle(envelope)?;
+        Ok(true)
+    }
+
+    /// A dispatch ended. The turns a command's handler waited for are queued
+    /// by now, so they are held first; a completed command reports the last
+    /// of them as its result, like print does, or an empty one. Any other
+    /// dispatch reported for itself, and what was held goes out as it came.
+    fn report_dispatch(&mut self, event_rx: &Receiver<Envelope>, end: DispatchEnd) -> Result<bool> {
+        while let Ok(envelope) = event_rx.try_recv() {
+            if !self.pump(envelope)? {
+                return Ok(false);
+            }
+        }
+        let mut held = {
+            let mut shared = self.shared.lock().unwrap();
+            shared.dispatching = false;
+            mem::take(&mut shared.held)
+        };
+        if end.completed {
+            match held.pop() {
+                Some(result) => self.writer.emit(WireInner::Result(result))?,
+                None => emit_command_result(&self.writer, &self.shared, false, String::new())?,
+            }
+        } else {
+            for result in held {
+                self.writer.emit(WireInner::Result(result))?;
+            }
+        }
+        let _ = end.reported.send(());
+        Ok(true)
     }
 
     fn model_id(&self) -> String {
@@ -1652,8 +1746,10 @@ impl EventPump {
         self.shared.lock().unwrap().pending.clear();
     }
 
+    /// Emits a turn's result, or holds it for the dispatch in flight.
     fn emit_turn_result(
         &mut self,
+        hold: bool,
         is_error: bool,
         result: String,
         num_turns: u32,
@@ -1662,7 +1758,7 @@ impl EventPump {
         let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
-        self.writer.emit(WireInner::Result(ResultPayload {
+        let payload = ResultPayload {
             subtype: if is_error {
                 "error_during_execution"
             } else {
@@ -1676,7 +1772,12 @@ impl EventPump {
             total_cost_usd,
             usage,
             permission_denials: Vec::new(),
-        }))?;
+        };
+        if hold {
+            self.shared.lock().unwrap().held.push(payload);
+        } else {
+            self.writer.emit(WireInner::Result(payload))?;
+        }
         self.reset_turn();
         Ok(())
     }
@@ -1839,19 +1940,20 @@ impl EventPump {
             }
             AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
-                finish_sdk_turn(&self.shared, outcome.turn_id());
+                let hold = finish_sdk_turn(&self.shared, outcome.turn_id());
                 self.terminal_run_id = envelope.presentation();
                 let result = mem::take(&mut self.result_text);
                 match outcome {
                     TurnOutcome::Completed {
                         usage, num_turns, ..
-                    } => self.emit_turn_result(false, result, *num_turns, *usage)?,
+                    } => self.emit_turn_result(hold, false, result, *num_turns, *usage)?,
                     TurnOutcome::Failed {
                         usage,
                         num_turns,
                         failure,
                         ..
                     } => self.emit_turn_result(
+                        hold,
                         true,
                         if result.is_empty() {
                             failure.user_message.clone()
@@ -1863,7 +1965,7 @@ impl EventPump {
                     )?,
                     TurnOutcome::Cancelled {
                         usage, num_turns, ..
-                    } => self.emit_turn_result(true, result, *num_turns, *usage)?,
+                    } => self.emit_turn_result(hold, true, result, *num_turns, *usage)?,
                 }
             }
             AgentEvent::ControlComplete { .. } | AgentEvent::StreamClosed => {}
@@ -1874,7 +1976,7 @@ impl EventPump {
                     self.writer
                         .emit_system("warning", serde_json::json!({ "message": message }))?;
                 } else {
-                    self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                    self.emit_turn_result(false, true, message.clone(), 0, TokenUsage::default())?;
                 }
             }
         }

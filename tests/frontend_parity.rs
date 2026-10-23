@@ -295,15 +295,20 @@ fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
     };
     let stderr = drain(child.stderr.take().unwrap());
     let mut stdin = child.stdin.take().unwrap();
+    let mut sdk_output = None;
+    let mut print_output = None;
     match frontend {
-        Frontend::Print => drop(stdin),
+        Frontend::Print => {
+            print_output = Some(drain(child.stdout.take().unwrap()));
+            drop(stdin);
+        }
         Frontend::Sdk => {
-            let output = json_lines(child.stdout.take().unwrap());
+            let output = sdk_output.insert(json_lines(child.stdout.take().unwrap()));
             for step in &steps {
                 match step {
                     Step::Prompt(text) => {
                         send(&mut stdin, sdk_user(text));
-                        let result = expect(&output, |message| message["type"] == "result");
+                        let result = expect(output, |message| message["type"] == "result");
                         assert_eq!(result["is_error"], false, "{result}");
                     }
                     Step::SwitchModel => {
@@ -313,7 +318,7 @@ fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
                                    "request": {"subtype": "set_model",
                                                "model": format!("{PROVIDER}/{OTHER_MODEL}")}}),
                         );
-                        let response = expect(&output, |message| {
+                        let response = expect(output, |message| {
                             message["response"]["request_id"] == SWITCH_REQUEST
                         });
                         assert_eq!(response["response"]["subtype"], "success", "{response}");
@@ -348,6 +353,12 @@ fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
     let status = wait_exit(child);
     let log = stderr.join().unwrap();
     assert!(status.success(), "{log}");
+    if let Some(output) = sdk_output {
+        assert_one_result_per_message(&output);
+    }
+    if let Some(output) = print_output {
+        assert_eq!(output.join().unwrap(), REPLY, "{log}");
+    }
     scenario.check(&bodies.try_iter().collect::<Vec<_>>(), home.path());
 }
 
@@ -392,6 +403,30 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
     assert!(wait_exit(child).success());
 }
 
+/// A command whose handler runs two turns gets one result, the last turn's
+/// reply, as print prints it.
+#[test]
+fn sdk_command_running_turns_reports_once() {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut child = spawn_makima(home.path(), &work, frontend_args(Frontend::Sdk));
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    let output = json_lines(child.stdout.take().unwrap());
+    send(&mut stdin, sdk_user(SWITCH_COMMAND));
+    let result = expect(&output, |message| message["type"] == "result");
+    assert_eq!(result["is_error"], false, "{result}");
+    assert_eq!(result["result"], REPLY, "{result}");
+    drop(stdin);
+    let status = wait_exit(child);
+    assert!(status.success(), "{}", stderr.join().unwrap());
+    assert_one_result_per_message(&output);
+    assert_eq!(bodies.try_iter().count(), 2);
+}
+
 /// A Lua command whose turn asks the client for permission: the input loop
 /// keeps reading while the handler waits, so the answer gets through, the
 /// turn ends and the command reports.
@@ -406,6 +441,7 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     let mut child = spawn_makima(home.path(), &work, asking_args(frontend, PROMPT));
     let stderr = drain(child.stderr.take().unwrap());
     let mut stdin = child.stdin.take().unwrap();
+    let mut sdk_output = None;
     match frontend {
         Frontend::Sdk => {
             let output = json_lines(child.stdout.take().unwrap());
@@ -420,6 +456,7 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
             );
             let result = expect(&output, |message| message["type"] == "result");
             assert_eq!(result["is_error"], false, "{result}");
+            sdk_output = Some(output);
         }
         Frontend::Acp => {
             let (output, session) = acp_session(&mut child, &mut stdin, &work);
@@ -446,6 +483,9 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     let status = wait_exit(child);
     let log = stderr.join().unwrap();
     assert!(status.success(), "{log}");
+    if let Some(output) = sdk_output {
+        assert_one_result_per_message(&output);
+    }
     let bodies: Vec<_> = bodies.try_iter().collect();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
     assert_eq!(
@@ -645,6 +685,16 @@ fn wait_exit(mut child: Child) -> ExitStatus {
     }
 }
 
+/// Every SDK result was already read, one per user message, so none is left
+/// once the process has exited.
+fn assert_one_result_per_message(output: &Receiver<Value>) {
+    let extra: Vec<_> = output
+        .iter()
+        .filter(|message| message["type"] == "result")
+        .collect();
+    assert!(extra.is_empty(), "{extra:?}");
+}
+
 /// The first message on {output} that {matches}.
 fn expect(output: &Receiver<Value>, matches: impl Fn(&Value) -> bool) -> Value {
     loop {
@@ -789,11 +839,11 @@ fn send(stdin: &mut ChildStdin, message: Value) {
     stdin.flush().unwrap();
 }
 
-/// Reads all of {stderr} so the child never blocks on a full pipe.
-fn drain(mut stderr: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+/// Reads all of {pipe} so the child never blocks on a full pipe.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut log = String::new();
-        let _ = stderr.read_to_string(&mut log);
+        let _ = pipe.read_to_string(&mut log);
         log
     })
 }

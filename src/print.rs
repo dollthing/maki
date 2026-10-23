@@ -8,6 +8,7 @@
 //! Check their docs before changing anything here.
 
 use std::io::{self, Read};
+use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,6 +188,9 @@ enum VerboseOutput {
 /// What a print run's input asks for once its command, if any, has run.
 enum PrintWork {
     Turn(AgentInput),
+    /// A command that finished at dispatch; the turns its handler ran and
+    /// waited for are already queued, and the last one is the reply.
+    Completed,
     /// A command that finished at dispatch, with the text it reported.
     Reply(String),
     IsolatedTurn(IsolatedTurn),
@@ -207,7 +211,7 @@ fn dispatch_print(
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                 PrintWork::Turn(command_attachments::agent_input(turn)?)
             }
-            InputDispatch::Dispatched(CommandOutcome::Completed) => PrintWork::Reply(String::new()),
+            InputDispatch::Dispatched(CommandOutcome::Completed) => PrintWork::Completed,
             InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
                 PrintWork::Reply(feedback.to_string())
             }
@@ -545,9 +549,23 @@ pub fn run(
             let session_id = &handle.session_id;
             let start = Instant::now();
             let (mut result, verbose_out) = match work {
-                PrintWork::Turn(input) => {
-                    smol::block_on(handle.input_tx.admit(input)).map_err(|error| eyre!(error))?;
+                PrintWork::Turn(_) | PrintWork::Completed => {
+                    let wait = match work {
+                        PrintWork::Turn(input) => {
+                            smol::block_on(handle.input_tx.admit(input))
+                                .map_err(|error| eyre!(error))?;
+                            true
+                        }
+                        _ => false,
+                    };
                     let event_rx = &handle.event_rx;
+                    let next = || {
+                        if wait {
+                            smol::block_on(event_rx.recv_async()).ok()
+                        } else {
+                            event_rx.try_recv().ok()
+                        }
+                    };
                     let tool_names = &handle.tool_names;
                     let config = session
                         .root
@@ -575,11 +593,12 @@ pub fn run(
                         }
 
                         let mut state = PrintTurnState::default();
+                        let mut finished = None;
                         // Summed as the turns land: rates move mid-run, and only a turn knows the
                         // rate it paid.
                         let mut cost = None;
 
-                        while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+                        while let Some(envelope) = next() {
                             if matches!(envelope.event, AgentEvent::StreamClosed) {
                                 break;
                             }
@@ -672,7 +691,10 @@ pub fn run(
                                 }
                                 AgentEvent::TurnOutcome(_) => {
                                     if state.accept_outcome(&envelope) {
-                                        break;
+                                        if wait {
+                                            break;
+                                        }
+                                        finished = Some(mem::take(&mut state));
                                     }
                                 }
                                 AgentEvent::ControlComplete { .. } => break,
@@ -683,6 +705,7 @@ pub fn run(
                                 }
                             }
                         }
+                        let state = finished.unwrap_or(state);
                         Ok((
                             PrintResult {
                                 result_type: "result",
@@ -1945,7 +1968,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             dispatch_idle(&registry, input("/done")).unwrap(),
-            PrintWork::Reply(reply) if reply.is_empty()
+            PrintWork::Completed
         ));
     }
 
