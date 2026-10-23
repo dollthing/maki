@@ -17,17 +17,21 @@ use agent_client_protocol_schema::{
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
 use flume::{Receiver, Sender};
+use maki_agent::actor::ConfigChange;
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
+use maki_agent::modes;
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::SessionCoordinatorError;
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
+use maki_agent::{
+    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, ModeError, ModeId, ModeRegistry,
+};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
     TargetHandle,
@@ -43,7 +47,7 @@ use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
+use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredMode, StoredTokenUsage, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -506,6 +510,17 @@ async fn load_session(
     )
     .await
     .map_err(session_registration_error)?;
+    if let Some(session) = &srv.session
+        && let Err(error) = restore_mode(
+            session,
+            &srv.lua_event_handle.mode_registry(),
+            &restored.meta,
+            &params.storage,
+        )
+        .await
+    {
+        warn!(%error, "saved mode not restored; the session resumes in build mode");
+    }
     for update in translate::replay_history(&replay_history, &session_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
@@ -516,6 +531,39 @@ async fn load_session(
             srv.supports_boolean,
         ));
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// Puts a loaded session back in the mode it was saved in, keeping a plan's
+/// file while it still exists.
+async fn restore_mode(
+    session: &SessionState,
+    registry: &ModeRegistry,
+    meta: &SessionMeta,
+    storage: &StateDir,
+) -> Result<(), ConfigChangeError> {
+    let key = match &meta.mode {
+        Some(StoredMode::Plan) => ModeId::Plan.key(),
+        Some(StoredMode::Custom(name)) => name.as_str(),
+        Some(StoredMode::Build) | None => return Ok(()),
+    };
+    let Some(orchestration) = &session.orchestration else {
+        return Ok(());
+    };
+    let root = session.handle.initialized_root().await?;
+    let saved_plan = meta
+        .plan_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .map_or(AgentMode::Build, AgentMode::Plan);
+    let (mode, mode_def) = modes::resolve(registry, key, &saved_plan, storage)?;
+    maki_lua::orchestration::reserve_config_change(&**orchestration, &root)?
+        .commit_change(ConfigChange::Mode {
+            mode,
+            mode_def: Some(mode_def),
+        })
+        .await?;
+    Ok(())
 }
 
 fn spawn_session(
@@ -2120,7 +2168,7 @@ mod tests {
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
-    use maki_storage::sessions::Session;
+    use maki_storage::sessions::{Effort, Session, StoredThinking};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -2131,6 +2179,8 @@ mod tests {
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
     const FAST_SPEC: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
+    const SAVED_PLAN_FILE: &str = "saved-plan.md";
+    const THINKING_MODEL_ID: &str = "acp-load-thinker";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
     const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
@@ -6258,6 +6308,67 @@ mod tests {
 
         assert_eq!(effective_session_cwd(Some(&restored), &client), restored);
         assert_eq!(effective_session_cwd(None, &client), client);
+    }
+
+    /// A loaded session comes back in the mode and thinking it was saved
+    /// with, even when `always_thinking` says otherwise.
+    #[test]
+    fn load_restores_saved_mode_and_thinking_over_config() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("OLLAMA_HOST", UNREACHABLE_OLLAMA_HOST) };
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
+            let plan = tmp.path().join(SAVED_PLAN_FILE);
+            std::fs::write(&plan, "").unwrap();
+            maki_providers::model_registry::set_known_models(
+                DISCOVERY_PROVIDER,
+                vec![maki_providers::ModelInfo {
+                    supports_thinking: Some(true),
+                    ..maki_providers::ModelInfo::id_only(THINKING_MODEL_ID.into())
+                }],
+            );
+            let spec = format!("{DISCOVERY_PROVIDER}/{THINKING_MODEL_ID}");
+            let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+                Session::new(&spec, &tmp.path().to_string_lossy());
+            session.replace_messages(vec![Message::user("planned".into())]);
+            session.meta.mode = Some(StoredMode::Plan);
+            session.meta.plan_path = Some(plan.to_string_lossy().into_owned());
+            session.meta.thinking = Some(StoredThinking::Off);
+            let storage = StateDir::from_path(tmp.path().to_path_buf());
+            session.save(&storage).unwrap();
+            let model = Model::from_spec(&spec).unwrap();
+            assert!(model.supports_thinking());
+            let mut params = test_params(model, tmp.path().to_path_buf());
+            params.defaults.thinking = Some(StoredThinking::Effort {
+                level: Effort::High,
+            });
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                defaults: params.defaults,
+            };
+            let raw = serde_json::json!({
+                "params": {
+                    "sessionId": session.id.to_string(),
+                    "cwd": tmp.path(),
+                    "mcpServers": []
+                }
+            });
+
+            load_session(&mut srv, &raw, &params).await.unwrap();
+
+            let root = srv.session.as_ref().unwrap().handle.manager.root().unwrap();
+            let config = root.actor().unwrap().effective_config().unwrap();
+            assert_eq!(config.mode, AgentMode::Plan(plan));
+            assert_eq!(config.thinking, maki_agent::ThinkingConfig::Off);
+            close_session(&mut srv).await;
+        });
     }
 
     #[test]
