@@ -2196,7 +2196,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::AgentMode;
+    use maki_agent::{AgentMode, TurnTicket};
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
@@ -2225,6 +2225,10 @@ mod tests {
     const NEW_SESSION_REQUEST: i64 = 91;
     static MANAGED_PLUGIN_TEST: Mutex<()> = Mutex::new(());
     const ACP_TURN_END: &str = "turn end ";
+    const PARKED_THOUGHT: &str = "parked thought";
+    const PARKED_REPLY: &str = "parked reply";
+    const SAVE_FAILED: &str = "save failed";
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYIIA";
 
     fn test_observer() -> HeadlessObserver {
         HeadlessObserver::new(
@@ -2671,6 +2675,148 @@ mod tests {
         }
     }
 
+    /// Records the last user message of every request and parks it until
+    /// the test releases it, then thinks and answers.
+    struct ParkedProvider {
+        requests: Sender<Message>,
+        release: Receiver<()>,
+    }
+
+    impl maki_providers::provider::Provider for ParkedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+        > {
+            Box::pin(async move {
+                let asked = messages
+                    .iter()
+                    .rev()
+                    .find(|message| matches!(message.role, Role::User))
+                    .cloned()
+                    .unwrap_or_default();
+                let _ = self.requests.send(asked);
+                let _ = self.release.recv_async().await;
+                for event in [
+                    maki_providers::ProviderEvent::ThinkingDelta {
+                        text: PARKED_THOUGHT.into(),
+                    },
+                    maki_providers::ProviderEvent::TextDelta {
+                        text: PARKED_REPLY.into(),
+                    },
+                ] {
+                    let _ = events.send(event);
+                }
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![MsgBlock::Text {
+                            text: PARKED_REPLY.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// The fixture root's real actor, and what its provider was asked.
+    struct RootTurns {
+        actor: maki_agent::AgentActorHandle,
+        requests: Receiver<Message>,
+        release: Sender<()>,
+    }
+
+    impl RootTurns {
+        async fn next(&self) -> Message {
+            within(
+                self.requests.recv_async(),
+                "no request reached the provider",
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn next_text(&self) -> String {
+            text_of(&self.next().await)
+        }
+
+        /// Lets the oldest parked request answer.
+        fn release(&self) {
+            self.release.send(()).unwrap();
+        }
+
+        fn latest(&self) -> TurnTicket {
+            self.actor.latest_ticket().expect("a turn was admitted")
+        }
+
+        /// Nothing was admitted or queued on the actor, and nothing reached
+        /// the provider.
+        fn assert_untouched(&self) {
+            let snapshot = self.actor.snapshot();
+            assert!(self.actor.latest_ticket().is_none(), "a turn was admitted");
+            assert_eq!(snapshot.queued, 0);
+            assert!(self.requests.is_empty(), "the provider was asked");
+        }
+
+        async fn assert_cancelled(&self, ticket: &TurnTicket) {
+            let outcome = within(ticket.wait(), "the turn never settled").await;
+            assert!(
+                matches!(outcome, maki_agent::TurnOutcome::Cancelled { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    fn images_of(message: &Message) -> Vec<&ImageSource> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MsgBlock::Image { source } => Some(source),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_of(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MsgBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn within<T>(work: impl std::future::Future<Output = T>, failure: &str) -> T {
+        smol::future::or(work, async {
+            smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+            panic!("{failure}");
+        })
+        .await
+    }
+
     fn take_operation(
         pending: &PendingState,
         operation_id: u64,
@@ -2838,12 +2984,7 @@ mod tests {
         supports_boolean_config(&raw)
     }
 
-    fn server_awaiting_answer() -> (
-        Server,
-        Receiver<String>,
-        Receiver<Value>,
-        Receiver<AgentInput>,
-    ) {
+    fn server_awaiting_answer() -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
         server_awaiting_answer_with_checkpoint(successful_checkpoint())
     }
 
@@ -2853,15 +2994,16 @@ mod tests {
                     maki_agent::session_coordinator::SessionCheckpoint,
                 >,
         >,
-    ) -> (
-        Server,
-        Receiver<String>,
-        Receiver<Value>,
-        Receiver<AgentInput>,
-    ) {
+    ) -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
-        let (input_tx, input_rx) = flume::unbounded();
+        let (requests, requests_rx) = flume::unbounded();
+        let (release, released) = flume::unbounded();
+        let provider: Arc<dyn maki_providers::provider::Provider> = Arc::new(ParkedProvider {
+            requests,
+            release: released,
+        });
+        let prepared = Arc::clone(&provider);
         let session_id = MakiId::generate();
         let mut handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
@@ -2888,21 +3030,17 @@ mod tests {
                 state_dir: None,
                 answers: true,
             },
-            Box::new(|model, _| {
-                Box::pin(async {
-                    let provider: Arc<dyn maki_providers::provider::Provider> =
-                        Arc::new(EndTurnProvider);
-                    Ok((model, provider))
-                })
-            }),
+            Box::new(move |model, _| Box::pin(async move { Ok((model, prepared)) })),
             None,
             None,
         );
         let root = smol::block_on(handle.initialized_root()).unwrap();
-        handle.event_rx = flume::unbounded().1;
-        handle.input_tx = handle.input_tx.with_input_mirror(input_tx);
         handle.answer_tx = answer_tx.clone();
-        handle.control_tx = flume::unbounded().0.into();
+        let turns = RootTurns {
+            actor: root.actor().unwrap(),
+            requests: requests_rx,
+            release,
+        };
         let coordinator = test_coordinator_with(
             handle.session_id.id(),
             OFFLINE_SPEC,
@@ -2912,13 +3050,11 @@ mod tests {
         coordinator
             .bind_actor(
                 root.clone(),
-                Arc::new(|model| {
-                    Box::pin(async move {
-                        Ok(maki_agent::actor::PreparedModel {
-                            model,
-                            provider: Arc::new(EndTurnProvider),
-                        })
-                    })
+                Arc::new(move |model| {
+                    let provider = Arc::clone(&provider);
+                    Box::pin(
+                        async move { Ok(maki_agent::actor::PreparedModel { model, provider }) },
+                    )
                 }),
                 Arc::new({
                     let model = handle.model.clone();
@@ -2976,7 +3112,7 @@ mod tests {
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             defaults: SessionDefaults::default(),
         };
-        (server, answer_rx, out_rx, input_rx)
+        (server, answer_rx, out_rx, turns)
     }
 
     #[test]
@@ -3258,7 +3394,7 @@ mod tests {
     #[test]
     fn primary_prompt_retains_pending_operation_until_terminal() {
         smol::block_on(async {
-            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let (mut srv, _, _, turns) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.id();
             let coordinator = srv
                 .session
@@ -3276,7 +3412,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(input_rx.try_recv().is_ok());
+            assert_eq!(turns.next_text().await, "hello");
 
             let pending = &srv.session.as_ref().unwrap().pending;
             assert!(pending.lock().unwrap().operation.is_some());
@@ -3662,7 +3798,7 @@ mod tests {
 
     #[test]
     fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
-        let (mut srv, answer_rx, _, input_rx) = server_awaiting_answer();
+        let (mut srv, answer_rx, _, turns) = server_awaiting_answer();
         let stale = MakiId::generate().to_string();
         let prompt_error = smol::block_on(handle_prompt(
             &mut srv,
@@ -3671,7 +3807,7 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(prompt_error.code, AcpError::resource_not_found(None).code);
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
 
         let config_error = smol::block_on(handle_set_config(
             &mut srv,
@@ -3790,7 +3926,7 @@ mod tests {
     #[test]
     fn cancel_during_permission_allows_the_next_prompt() {
         smol::block_on(async {
-            let (mut srv, answer_rx, out_rx, input_rx) = server_awaiting_answer();
+            let (mut srv, answer_rx, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
             session.pending.lock().unwrap().permissions.clear();
@@ -3817,7 +3953,8 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(input_rx.recv_async().await.unwrap().message, "first");
+            assert_eq!(turns.next_text().await, "first");
+            let first = turns.latest();
             event_tx
                 .send_async(Envelope {
                     event: AgentEvent::PermissionRequest {
@@ -3848,6 +3985,7 @@ mod tests {
                 answer_rx.is_empty(),
                 "the late permission answer must be dropped"
             );
+            turns.assert_cancelled(&first).await;
 
             event_tx
                 .send_async(Envelope {
@@ -3880,8 +4018,9 @@ mod tests {
             );
             assert_eq!(error.message, CANCELLATION_IN_PROGRESS_MESSAGE);
             assert_eq!(error.data, Some(serde_json::json!({ "retryable": true })));
-            assert!(
-                input_rx.is_empty(),
+            assert_eq!(
+                turns.latest().turn_id(),
+                first.turn_id(),
                 "successor must not enter the active turn"
             );
 
@@ -3901,7 +4040,7 @@ mod tests {
             handle_prompt(&mut srv, &second, &RequestId::Number(43))
                 .await
                 .unwrap();
-            assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
+            assert_eq!(turns.next_text().await, "second");
         });
     }
 
@@ -3941,7 +4080,7 @@ mod tests {
     #[test]
     fn cancelled_prompt_rejects_follow_up_and_processes_new_session() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let old_session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             let params = test_params(
                 Model::from_spec(OFFLINE_SPEC).unwrap(),
@@ -3954,7 +4093,8 @@ mod tests {
             )
             .await
             .unwrap();
-            input_rx.recv_async().await.unwrap();
+            turns.next().await;
+            let first = turns.latest();
 
             handle_line(
                 &mut srv,
@@ -3990,6 +4130,7 @@ mod tests {
                 CANCELLATION_IN_PROGRESS_MESSAGE
             );
             assert_eq!(rejected["error"]["data"]["retryable"], true);
+            turns.assert_cancelled(&first).await;
 
             let cwd = TempDir::new().unwrap();
             let params = test_params(
@@ -4032,7 +4173,7 @@ mod tests {
     fn primary_completion_with_reusable_subagent_activity_survives_cancellation_stress() {
         smol::block_on(async {
             for iteration in 0..LIFECYCLE_STRESS_ITERATIONS {
-                let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+                let (mut srv, _, out_rx, turns) = server_awaiting_answer();
                 let (event_tx, event_rx) = flume::unbounded::<Envelope>();
                 let session = srv.session.as_ref().unwrap();
                 session.pending.lock().unwrap().permissions.clear();
@@ -4060,7 +4201,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                input_rx.recv_async().await.unwrap();
+                turns.next().await;
                 for _ in 0..2 {
                     event_tx
                         .send_async(subagent_activity(AgentEvent::ControlComplete {
@@ -4148,6 +4289,8 @@ mod tests {
         smol::block_on(async {
             let (checkpoint_started_tx, checkpoint_started_rx) = flume::bounded(1);
             let (checkpoint_release_tx, checkpoint_release_rx) = flume::bounded(1);
+            // Holds the test's own checkpoint; the cancelled turn's passes.
+            let gated = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let checkpoint: Arc<
                 dyn maki_storage::checkpoint::CheckpointWriter<
                         maki_agent::session_coordinator::SessionCheckpoint,
@@ -4156,16 +4299,19 @@ mod tests {
                 move |request: maki_storage::checkpoint::CheckpointRequest<_>| {
                     let checkpoint_started_tx = checkpoint_started_tx.clone();
                     let checkpoint_release_rx = checkpoint_release_rx.clone();
+                    let gate = gated.swap(false, Ordering::Relaxed);
                     Box::pin(async move {
-                        checkpoint_started_tx.send_async(()).await.unwrap();
-                        checkpoint_release_rx.recv_async().await.unwrap();
+                        if gate {
+                            checkpoint_started_tx.send_async(()).await.unwrap();
+                            checkpoint_release_rx.recv_async().await.unwrap();
+                        }
                         Ok(maki_storage::checkpoint::CheckpointAck::for_request(
                             &request,
                         ))
                     }) as maki_storage::checkpoint::CheckpointFuture
                 },
             );
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer_with_checkpoint(checkpoint);
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer_with_checkpoint(checkpoint);
             let session = srv.session.as_ref().unwrap();
             let pending = Arc::clone(&session.pending);
             let session_id = session.handle.session_id.to_string();
@@ -4192,7 +4338,8 @@ mod tests {
             )
             .await
             .unwrap();
-            let _first = input_rx.recv_async().await.unwrap();
+            turns.next().await;
+            let first = turns.latest();
             let coordinator = srv
                 .session
                 .as_ref()
@@ -4231,6 +4378,7 @@ mod tests {
             let terminal = out_rx.recv_async().await.unwrap();
             assert_eq!(terminal["id"], 41);
             assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            turns.assert_cancelled(&first).await;
 
             handle_prompt(
                 &mut srv,
@@ -4239,8 +4387,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let second = input_rx.recv_async().await.unwrap();
-            assert_eq!(second.message, "second");
+            assert_eq!(turns.next_text().await, "second");
             assert!(operation_state(&pending).is_some_and(|(cancelling, _)| !cancelling));
             take_active_operation(&pending, OperationKind::PrimaryTurn).unwrap();
         });
@@ -4261,7 +4408,7 @@ mod tests {
     #[test]
     fn input_end_waits_for_the_prompt_in_flight() {
         smol::block_on(async {
-            let (mut srv, answer_rx, _, input_rx) = server_awaiting_answer();
+            let (mut srv, answer_rx, _, turns) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             handle_prompt(
                 &mut srv,
@@ -4270,7 +4417,7 @@ mod tests {
             )
             .await
             .unwrap();
-            input_rx.recv_async().await.unwrap();
+            turns.next().await;
             let session = srv.session.as_ref().unwrap();
             let mut finishing = Box::pin(finish_in_flight(session));
             assert!(smol::future::poll_once(&mut finishing).await.is_none());
@@ -4287,7 +4434,7 @@ mod tests {
     #[test]
     fn idle_and_duplicate_cancel_do_not_poison_the_next_prompt() {
         smol::block_on(async {
-            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let (mut srv, _, _, turns) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             let cancel = serde_json::json!({ "params": { "sessionId": session_id } });
 
@@ -4299,8 +4446,8 @@ mod tests {
             )
             .await
             .unwrap();
-            let first = input_rx.recv_async().await.unwrap();
-            assert_eq!(first.message, "first");
+            assert_eq!(turns.next_text().await, "first");
+            let first = turns.latest();
 
             handle_notification(&srv, "session/cancel", &cancel);
             handle_notification(&srv, "session/cancel", &cancel);
@@ -4310,6 +4457,7 @@ mod tests {
                 Some((true, false)),
                 "active operation must be cancelled, and its cancel fired once"
             );
+            turns.assert_cancelled(&first).await;
             take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
 
             handle_prompt(
@@ -4319,8 +4467,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let second = input_rx.recv_async().await.unwrap();
-            assert_eq!(second.message, "second");
+            assert_eq!(turns.next_text().await, "second");
             assert!(
                 operation_state(&srv.session.as_ref().unwrap().pending)
                     .is_some_and(|(cancelling, _)| !cancelling),
@@ -4892,9 +5039,15 @@ mod tests {
 
     #[test]
     fn available_command_projection_tracks_registry_generation() {
+        let (srv, ..) = server_awaiting_answer();
+        let session = srv.session.as_ref().unwrap();
+        let coordinator = session.coordinator.clone().unwrap();
         let registry = test_registry(&[]);
-        let coordinator = test_coordinator(MakiId::generate(), OFFLINE_SPEC);
-        let target = test_target(&registry, flume::unbounded().0.into(), coordinator.clone());
+        let target = test_target(
+            &registry,
+            session.handle.control_tx.clone(),
+            coordinator.clone(),
+        );
         let initial = registry.snapshot_for(&target).unwrap();
         let commands = available_commands(&registry.presented_commands(&target).unwrap());
         assert_eq!(
@@ -4997,7 +5150,7 @@ mod tests {
         if image {
             prompt.push(serde_json::json!({
                 "type": "image",
-                "data": "aGVsbG8=",
+                "data": TINY_PNG,
                 "mimeType": "image/png",
             }));
         }
@@ -5033,32 +5186,17 @@ mod tests {
     #[test]
     fn compact_tool_progress_success_sequence() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
-            let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             install_registry(&mut srv, test_registry(&[]));
-            let request_id = RequestId::Number(30);
 
-            dispatch_prompt(&mut srv, "/compact", false, &request_id)
+            dispatch_prompt(&mut srv, "/compact", false, &RequestId::Number(30))
                 .await
                 .unwrap();
-            assert!(input_rx.is_empty(), "compaction bypasses primary input");
             let pending = out_rx.recv_async().await.unwrap();
             assert_eq!(pending["params"]["update"]["sessionUpdate"], "tool_call");
             assert_eq!(pending["params"]["update"]["title"], "Compact context");
-            let control = control_rx.recv_async().await.unwrap();
-            let maki_agent::headless::InteractiveControl::ManualCompaction { output, .. } = control
-            else {
-                panic!("expected manual compaction control");
-            };
-            output
-                .send_async(maki_agent::headless::ManualCompactionEvent::Started)
-                .await
-                .unwrap();
-            output
-                .send_async(maki_agent::headless::ManualCompactionEvent::Completed)
-                .await
-                .unwrap();
+            turns.next().await;
+            turns.release();
 
             let started = out_rx.recv_async().await.unwrap();
             let completed = out_rx.recv_async().await.unwrap();
@@ -5068,15 +5206,17 @@ mod tests {
             assert_eq!(terminal["id"], 30);
             assert_eq!(terminal["result"]["stopReason"], "end_turn");
             assert!(out_rx.is_empty(), "compaction prompt completes once");
+            assert!(
+                turns.actor.latest_ticket().is_none(),
+                "compaction bypasses primary input"
+            );
         });
     }
 
     #[test]
     fn compact_prompt_cancellation_completes_once() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             install_registry(&mut srv, test_registry(&[]));
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
 
@@ -5084,69 +5224,63 @@ mod tests {
                 .await
                 .unwrap();
             let _pending = out_rx.recv_async().await.unwrap();
-            let control = control_rx.recv_async().await.unwrap();
-            let maki_agent::headless::InteractiveControl::ManualCompaction {
-                output, cancel, ..
-            } = control
-            else {
-                panic!("expected manual compaction control");
-            };
+            let _started = out_rx.recv_async().await.unwrap();
+            turns.next().await;
             handle_notification(
                 &srv,
                 "session/cancel",
                 &serde_json::json!({ "params": { "sessionId": session_id } }),
             );
-            cancel.cancelled().await;
-            output
-                .send_async(maki_agent::headless::ManualCompactionEvent::Cancelled)
-                .await
-                .unwrap();
 
             let failed = out_rx.recv_async().await.unwrap();
             let terminal = out_rx.recv_async().await.unwrap();
             assert_eq!(failed["params"]["update"]["status"], "failed");
             assert_eq!(terminal["id"], 33);
             assert_eq!(terminal["result"]["stopReason"], "cancelled");
-            let _ = output
-                .send_async(maki_agent::headless::ManualCompactionEvent::Completed)
-                .await;
-            smol::future::yield_now().await;
-            assert!(
-                out_rx.is_empty(),
-                "late completion must not terminate twice"
-            );
+            turns.release();
+            within(turns.actor.runtime_barrier(), "the actor never settled")
+                .await
+                .unwrap();
+            assert!(turns.requests.is_empty(), "cancelled compaction retried");
+            assert!(out_rx.is_empty(), "cancelled compaction terminated twice");
         });
     }
 
     #[test]
     fn compact_tool_progress_failure_sequence() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
+            let checkpoint: Arc<
+                dyn maki_storage::checkpoint::CheckpointWriter<
+                        maki_agent::session_coordinator::SessionCheckpoint,
+                    >,
+            > = Arc::new(|request: maki_storage::checkpoint::CheckpointRequest<_>| {
+                Box::pin(async move {
+                    Err(maki_storage::checkpoint::CheckpointError::Save {
+                        session_id: request.session_id,
+                        message: Arc::from(SAVE_FAILED),
+                    })
+                }) as maki_storage::checkpoint::CheckpointFuture
+            });
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer_with_checkpoint(checkpoint);
             install_registry(&mut srv, test_registry(&[]));
 
             dispatch_prompt(&mut srv, "/compact", false, &RequestId::Number(32))
                 .await
                 .unwrap();
             let _pending = out_rx.recv_async().await.unwrap();
-            let control = control_rx.recv_async().await.unwrap();
-            let maki_agent::headless::InteractiveControl::ManualCompaction { output, .. } = control
-            else {
-                panic!("expected manual compaction control");
-            };
-            output
-                .send_async(maki_agent::headless::ManualCompactionEvent::Failed(
-                    "save failed".into(),
-                ))
-                .await
-                .unwrap();
+            let _started = out_rx.recv_async().await.unwrap();
+            turns.release();
 
             let failed = out_rx.recv_async().await.unwrap();
             let terminal = out_rx.recv_async().await.unwrap();
             assert_eq!(failed["params"]["update"]["status"], "failed");
             assert_eq!(terminal["id"], 32);
-            assert_eq!(terminal["error"]["data"], "save failed");
+            assert!(
+                terminal["error"]["data"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(SAVE_FAILED)),
+                "{terminal}"
+            );
             assert!(out_rx.is_empty(), "failed compaction completes once");
         });
     }
@@ -5154,39 +5288,16 @@ mod tests {
     #[test]
     fn btw_streams_and_completes_active_prompt() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
-            let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             install_registry(&mut srv, test_registry(&[]));
-            let request_id = RequestId::Number(31);
 
-            dispatch_prompt(&mut srv, "/btw why?", true, &request_id)
+            dispatch_prompt(&mut srv, "/btw why?", true, &RequestId::Number(31))
                 .await
                 .unwrap();
-            assert!(input_rx.is_empty(), "isolated turns bypass primary input");
-            let control = control_rx.recv_async().await.unwrap();
-            let maki_agent::headless::InteractiveControl::IsolatedTurn {
-                question,
-                images,
-                output,
-                ..
-            } = control
-            else {
-                panic!("expected isolated turn control");
-            };
-            assert_eq!(question, "why?");
-            assert_eq!(images.len(), 1);
-
-            use maki_agent::agent::isolated_turn::IsolatedTurnEvent;
-            output
-                .send_async(IsolatedTurnEvent::ThinkingDelta("thought".into()))
-                .await
-                .unwrap();
-            output
-                .send_async(IsolatedTurnEvent::TextDelta("answer".into()))
-                .await
-                .unwrap();
-            output.send_async(IsolatedTurnEvent::Done).await.unwrap();
+            let asked = turns.next().await;
+            assert!(text_of(&asked).ends_with("\n\nwhy?"), "{asked:?}");
+            assert_eq!(images_of(&asked).len(), 1);
+            turns.release();
 
             let thought = out_rx.recv_async().await.unwrap();
             let answer = out_rx.recv_async().await.unwrap();
@@ -5199,9 +5310,14 @@ mod tests {
                 answer["params"]["update"]["sessionUpdate"],
                 "agent_message_chunk"
             );
+            assert_eq!(answer["params"]["update"]["content"]["text"], PARKED_REPLY);
             assert_eq!(terminal["id"], 31);
             assert_eq!(terminal["result"]["stopReason"], "end_turn");
             assert!(out_rx.is_empty(), "operation terminates exactly once");
+            assert!(
+                turns.actor.latest_ticket().is_none(),
+                "isolated turns bypass primary input"
+            );
         });
     }
 
@@ -5753,7 +5869,7 @@ mod tests {
             unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let old = srv.session.as_ref().unwrap();
             old.pending.lock().unwrap().permissions.clear();
@@ -5780,7 +5896,7 @@ mod tests {
             )
             .await
             .unwrap();
-            input_rx.recv_async().await.unwrap();
+            turns.next().await;
             event_tx
                 .send_async(subagent_activity(AgentEvent::ControlComplete {
                     usage: TokenUsage::default(),
@@ -5937,7 +6053,7 @@ mod tests {
 
     #[test]
     fn unknown_slash_prompt_is_rejected() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
         let error = smol::block_on(dispatch_prompt(
             &mut srv,
             "/does-not-exist value",
@@ -5947,12 +6063,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, AcpError::invalid_params().code);
         assert_eq!(error.message, "unknown command /does-not-exist");
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
     fn escaped_slash_prompt_is_sent_literal() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
 
         smol::block_on(dispatch_prompt(
             &mut srv,
@@ -5961,22 +6077,18 @@ mod tests {
             &RequestId::Number(2),
         ))
         .unwrap();
-        let input = input_rx.try_recv().unwrap();
-        assert_eq!(input.message, "/does-not-exist value");
-        assert_eq!(input.images.len(), 1);
-        assert_eq!(
-            input.images[0].media_type,
-            maki_providers::ImageMediaType::Png
-        );
-        assert_eq!(input.images[0].data.as_ref(), "aGVsbG8=");
+        let asked = smol::block_on(turns.next());
+        assert_eq!(text_of(&asked), "/does-not-exist value");
+        let images = images_of(&asked);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, maki_providers::ImageMediaType::Png);
+        assert_eq!(images[0].data.as_ref(), TINY_PNG);
     }
 
     #[test]
     fn new_and_clear_are_hidden_but_return_local_guidance() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
-            let (control_tx, control_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.control_tx = control_tx.into();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             install_registry(&mut srv, test_registry(&[]));
             let target = &srv.session.as_ref().unwrap().command_target;
             let presented = srv
@@ -6013,15 +6125,14 @@ mod tests {
                 );
                 let response = out_rx.recv_async().await.unwrap();
                 assert_eq!(response["result"]["stopReason"], "end_turn");
-                assert!(input_rx.is_empty());
-                assert!(control_rx.is_empty());
+                turns.assert_untouched();
             }
         });
     }
 
     #[test]
     fn custom_slash_prompt_dispatches_rendered_agent_input() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
         let registry = test_registry(&[maki_agent::command::CustomCommand {
             name: "review".into(),
             description: "review code".into(),
@@ -6039,12 +6150,12 @@ mod tests {
             &RequestId::Number(2),
         ))
         .unwrap();
-        assert_eq!(input_rx.try_recv().unwrap().message, "Review src");
+        assert_eq!(smol::block_on(turns.next_text()), "Review src");
     }
 
     #[test]
     fn unavailable_interactive_command_is_rejected() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
 
         let error = smol::block_on(dispatch_prompt(
             &mut srv,
@@ -6055,12 +6166,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, AcpError::invalid_params().code);
         assert_eq!(error.message, "unknown command /help");
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
     fn consecutive_model_errors_follow_each_prompt() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
 
         let first = smol::block_on(dispatch_prompt(
             &mut srv,
@@ -6085,13 +6196,13 @@ mod tests {
             second.message,
             "command failed: unsupported provider 'codex'"
         );
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
     fn portable_model_options_commit_atomically_without_an_agent_turn() {
         smol::block_on(async {
-            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let (mut srv, _, _, turns) = server_awaiting_answer();
             let coordinator = srv
                 .session
                 .as_ref()
@@ -6174,7 +6285,7 @@ mod tests {
                 value(&repeated, maki_agent::session_options::THINKING_OPTION_ID),
                 "off"
             );
-            assert!(input_rx.is_empty());
+            turns.assert_untouched();
             coordinator.close().await.unwrap();
         });
     }
@@ -6184,7 +6295,7 @@ mod tests {
     #[test_case("/model thinking=toggle" ; "thinking_toggle")]
     fn portable_invalid_model_options_leave_session_options_unchanged(input: &str) {
         smol::block_on(async {
-            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let (mut srv, _, _, turns) = server_awaiting_answer();
             let coordinator = srv
                 .session
                 .as_ref()
@@ -6198,14 +6309,14 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(coordinator.read().options(), before);
-            assert!(input_rx.is_empty());
+            turns.assert_untouched();
             coordinator.close().await.unwrap();
         });
     }
 
     #[test]
     fn portable_bare_model_returns_shared_usage_error() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
 
         let error = smol::block_on(dispatch_prompt(
             &mut srv,
@@ -6223,12 +6334,12 @@ mod tests {
                 maki_agent::command::NONINTERACTIVE_MODEL_USAGE
             )
         );
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
     fn portable_local_builtin_rejects_non_text_content() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
 
         let error = smol::block_on(dispatch_prompt(
             &mut srv,
@@ -6239,12 +6350,12 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, AcpError::invalid_params().code);
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
     fn agent_turn_preserves_image_content() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
         let registry = test_registry(&[maki_agent::command::CustomCommand {
             name: "review".into(),
             description: "review code".into(),
@@ -6262,9 +6373,9 @@ mod tests {
             &RequestId::Number(3),
         ))
         .unwrap();
-        let input = input_rx.try_recv().unwrap();
-        assert_eq!(input.message, "Review src");
-        assert_eq!(input.images.len(), 1);
+        let asked = smol::block_on(turns.next());
+        assert_eq!(text_of(&asked), "Review src");
+        assert_eq!(images_of(&asked).len(), 1);
     }
 
     #[test]
@@ -6313,7 +6424,7 @@ mod tests {
 
     #[test]
     fn completed_lua_slash_prompt_returns_without_agent_input() {
-        let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+        let (mut srv, _, out_rx, turns) = server_awaiting_answer();
         let registry = test_registry(&[]);
         let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         producer
@@ -6341,14 +6452,14 @@ mod tests {
             &RequestId::Number(4),
         ))
         .unwrap();
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
         let response = out_rx.try_recv().unwrap();
         assert_eq!(response["result"]["stopReason"], "end_turn");
     }
 
     #[test]
     fn portable_bare_btw_is_rejected_by_registry() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let (mut srv, _, _, turns) = server_awaiting_answer();
         let error = smol::block_on(dispatch_prompt(
             &mut srv,
             "/btw",
@@ -6361,21 +6472,7 @@ mod tests {
             error.message,
             "invalid typed arguments for /btw: raw arguments are required"
         );
-        assert!(input_rx.is_empty());
-    }
-
-    #[test]
-    fn isolated_btw_is_not_forwarded_to_primary_agent() {
-        let (mut srv, _, _, input_rx) = server_awaiting_answer();
-        let error = smol::block_on(dispatch_prompt(
-            &mut srv,
-            "/btw explain this",
-            false,
-            &RequestId::Number(4),
-        ))
-        .unwrap_err();
-        assert_eq!(error.code, AcpError::internal_error().code);
-        assert!(input_rx.is_empty());
+        turns.assert_untouched();
     }
 
     #[test]
@@ -6637,7 +6734,7 @@ mod tests {
     #[test]
     fn auth_required_ends_the_prompt_instead_of_parking_the_session() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let (session_id, pending) = {
                 let session = srv.session.as_mut().unwrap();
@@ -6677,7 +6774,8 @@ mod tests {
             )
             .await
             .unwrap();
-            input_rx.recv_async().await.unwrap();
+            turns.next().await;
+            let first = turns.latest();
 
             event_tx
                 .send_async(Envelope {
@@ -6698,6 +6796,7 @@ mod tests {
                 response["error"]["data"], AUTH_FAILED_MSG,
                 "the client is told why the turn ended: {response}"
             );
+            turns.assert_cancelled(&first).await;
             assert!(pending.lock().unwrap().operation.is_none());
         });
     }
@@ -6735,7 +6834,7 @@ mod tests {
     #[test]
     fn permission_request_carries_file_context_and_diff() {
         smol::block_on(async {
-            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
             start_event_pump(
@@ -6761,7 +6860,7 @@ mod tests {
             )
             .await
             .unwrap();
-            input_rx.recv_async().await.unwrap();
+            turns.next().await;
 
             event_tx
                 .send_async(Envelope {

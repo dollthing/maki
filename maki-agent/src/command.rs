@@ -63,11 +63,11 @@ pub struct SessionCommandHost {
 
 impl SessionCommandHost {
     pub fn new(
-        control_tx: impl Into<InteractiveControlSender>,
+        control_tx: InteractiveControlSender,
         coordinator: SessionCoordinatorHandle,
     ) -> Self {
         Self {
-            control_tx: control_tx.into(),
+            control_tx,
             coordinator,
             reset_session_guidance: None,
             admission: None,
@@ -1196,12 +1196,11 @@ mod tests {
 
     #[test]
     fn session_host_dispatches_portable_state_operations() {
-        let (control_tx, _control_rx) = flume::unbounded();
         let (coordinator, handle) = test_coordinator(
             FAST_MODEL,
             [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
         );
-        let host = SessionCommandHost::new(control_tx, coordinator.clone());
+        let host = SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone());
         let request = |operation| HostRequest::Builtin(operation);
         assert!(matches!(
             smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleYolo))),
@@ -1306,7 +1305,7 @@ mod tests {
             StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
         let (coordinator, handle) = test_coordinator(OFFLINE_MODEL, [Arc::from(OFFLINE_MODEL)]);
         let host = Arc::new(SessionCommandHost::new(
-            flume::unbounded().0,
+            handle.control_tx.clone(),
             coordinator.clone(),
         ));
         let target = registry.bind_target(portable_capabilities(), host);

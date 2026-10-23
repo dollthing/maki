@@ -42,8 +42,6 @@ const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_CLOSED: &str = "session ended before initialization";
 const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 const OPERATION_CANCELLED: &str = "operation cancelled";
-#[cfg(any(test, feature = "test-util"))]
-const SESSION_ENDED: &str = "session ended";
 const ROOT_NOT_READY: &str = "session root is not initialized yet";
 const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
 const COMPACTION_CANCELLED: &str = "compaction cancelled";
@@ -139,19 +137,6 @@ pub enum InteractiveControl {
 pub struct InteractiveControlSender {
     root: RootReadiness,
     next: Arc<AtomicU64>,
-    #[cfg(any(test, feature = "test-util"))]
-    channel: Option<flume::Sender<InteractiveControl>>,
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<flume::Sender<InteractiveControl>> for InteractiveControlSender {
-    fn from(sender: flume::Sender<InteractiveControl>) -> Self {
-        Self {
-            root: RootReadiness::default(),
-            next: Arc::default(),
-            channel: Some(sender),
-        }
-    }
 }
 
 /// A control the actor owns until it runs. Dropping it unrun, because it was
@@ -187,13 +172,6 @@ impl Drop for PendingControl {
 
 impl InteractiveControlSender {
     pub async fn send(&self, control: InteractiveControl) -> Result<(), String> {
-        #[cfg(any(test, feature = "test-util"))]
-        if let Some(channel) = &self.channel {
-            return channel
-                .send_async(control)
-                .await
-                .map_err(|_| SESSION_ENDED.to_owned());
-        }
         let actor = self
             .root
             .get()
@@ -301,28 +279,11 @@ pub struct InteractiveInputSender {
     events: flume::Sender<Envelope>,
     next: Arc<AtomicU64>,
     _lifetime: flume::Sender<()>,
-    #[cfg(any(test, feature = "test-util"))]
-    mirror: Option<flume::Sender<AgentInput>>,
 }
 
 impl InteractiveInputSender {
-    /// Diverts sent input to {mirror} instead of admitting it.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn with_input_mirror(mut self, mirror: flume::Sender<AgentInput>) -> Self {
-        self.mirror = Some(mirror);
-        self
-    }
-
     pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
         let root = self.root.get().await?;
-        #[cfg(any(test, feature = "test-util"))]
-        if let Some(mirror) = &self.mirror {
-            mirror
-                .send_async(input)
-                .await
-                .map_err(|_| SESSION_ENDED.to_owned())?;
-            return Ok(TurnTicket::new(TurnId::generate(), Arc::new(())));
-        }
         let actor = root.actor().map_err(|error| error.to_string())?;
         let run = self.next.fetch_add(1, Ordering::Relaxed);
         actor
@@ -935,14 +896,10 @@ pub fn spawn_interactive_with_binding(
         events: raw_tx.clone(),
         next: Arc::new(AtomicU64::new(0)),
         _lifetime: lifetime_tx,
-        #[cfg(any(test, feature = "test-util"))]
-        mirror: None,
     };
     let control_tx = InteractiveControlSender {
         root: root.clone(),
         next: Arc::new(AtomicU64::new(0)),
-        #[cfg(any(test, feature = "test-util"))]
-        channel: None,
     };
     let (answer_tx, answer_rx) = flume::unbounded();
     let mut permission_config = params.permissions_config.clone();
