@@ -17,8 +17,8 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 |---------|-------------|------|-----------|-----------|
 | `/tasks` | Browse and search tasks | none |  | TUI only |
 | `/compact` | Summarize and compact conversation history | raw (optional) | <instructions> | all |
-| `/new` | Start a new session | none |  | TUI only |
-| `/clear` | Alias for `/new` | none |  | TUI only |
+| `/new` | Start a new session | none |  | all |
+| `/clear` | Alias for `/new` | none |  | all |
 | `/help` | Show keybindings | none |  | TUI only |
 | `/queue` | Remove items from queue | none |  | TUI only |
 | `/model` | Switch model | typed | [spec] [thinking=value] [fast=true\|false] | all |

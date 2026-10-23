@@ -55,7 +55,7 @@ fn argument_hint(arguments: &CommandArguments, explicit_hint: Option<&str>) -> S
 }
 
 fn frontends(required: TargetCapabilities) -> &'static str {
-    if maki_agent::command::portable_capabilities().contains_all(required) {
+    if maki_agent::command::session_capabilities().contains_all(required) {
         "all"
     } else {
         "TUI only"

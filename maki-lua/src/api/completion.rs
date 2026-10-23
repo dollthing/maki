@@ -57,7 +57,7 @@ pub struct ItemSpec {
 /// Context handed to a source's `get_items` at popup-open time. `mode` is the
 /// active mode id ("build"/"plan"/custom); `models` is the available-models
 /// list the caller already loaded. Both are passed in by value so sources stay
-/// synchronous and never need the async `mode.get()` round-trip.
+/// synchronous and never wait on the agent.
 #[derive(Debug, Clone, Default)]
 pub struct CompletionCtx {
     pub mode: String,

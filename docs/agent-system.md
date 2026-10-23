@@ -119,7 +119,7 @@ The actor returns to `Idle` before publishing the retained outcome and resolving
 
 ### Shared ordinary-message submission
 
-TUI main input, child input, headless prompts, and Lua `Agent:submit` use `AgentActorHandle::submit`. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn; each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal.
+TUI main input, child input, and Lua `Agent:submit` use `AgentActorHandle::submit`. Headless prompts (print, SDK, ACP) admit a distinct turn each with `admit_turn`, and SDK and ACP refuse a prompt while their turn runs. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn; each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal.
 
 The actor orders submissions with configuration, working-directory changes, controls, and explicit turns. Those operations prevent later messages from joining earlier work across the operation. Every backend consumes pending inputs before an eligible model request, preserving separate messages, images, preambles, and presentation metadata. Admission and finish share actor-state synchronization so an input joins the open turn or receives a new ticket.
 

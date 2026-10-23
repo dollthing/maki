@@ -14,7 +14,7 @@ pub const TRUSTED_SUBSCRIPTION_REQUIRED: &str = "agent subscriptions require tru
 pub const TRUSTED_RUN_COMMAND_REQUIRED: &str = "run_command requires trusted authority";
 pub const TRUSTED_TIMER_REQUIRED: &str = "timers and deferred callbacks require trusted authority";
 pub const DELEGATED_REGISTRATION: &str = "delegated tool handlers cannot register host callbacks";
-pub const DELEGATED_HOST_MUTATION: &str = "delegated tool handlers cannot change the focused session or global modes; name the tool's own session or address an agent explicitly";
+pub const DELEGATED_HOST_MUTATION: &str = "delegated tool handlers cannot change session modes, global modes or preferences; address the tool's own agent through ctx instead";
 pub const DELEGATED_FOREIGN_SESSION: &str =
     "delegated tool handlers can only change the session their turn belongs to";
 pub const DELEGATED_SESSION_LIFECYCLE: &str =
