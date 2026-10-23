@@ -570,7 +570,7 @@ pub fn run(
                                 cwd,
                                 session_id,
                                 tools: tool_names,
-                                model: &model.id,
+                                model: &config.model.id,
                             })?;
                         }
 

@@ -32,8 +32,9 @@ use maki_agent::headless::{
 };
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
-use maki_agent::session_coordinator::SessionReadHandle;
+use maki_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use maki_agent::session_defaults;
+use maki_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, YOLO_OPTION_ID};
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
@@ -721,7 +722,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         )
         .map_err(|error| eyre!(error))?,
     );
-    let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+    let coordinator = SessionCoordinatorHandle::register(
         maki_agent::session_coordinator::SessionCoordinatorParams {
             session_id: handle.session_id.id(),
             catalog: session_options.clone(),
@@ -1137,15 +1138,15 @@ fn restored_permission_mode(
 /// build, both through {set_mode}; only `bypassPermissions` turns YOLO on.
 fn set_permission_mode(
     mode: PermissionMode,
-    coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
+    coordinator: &SessionCoordinatorHandle,
     set_mode: &ModeSetter<'_>,
 ) -> Result<(), ConfigChangeError> {
     let value = if mode == PermissionMode::BypassPermissions {
-        maki_agent::session_options::ENABLED_VALUE
+        ENABLED_VALUE
     } else {
-        maki_agent::session_options::DISABLED_VALUE
+        DISABLED_VALUE
     };
-    smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
+    smol::block_on(coordinator.set_option(YOLO_OPTION_ID, value))?;
     set_mode(if mode == PermissionMode::Plan {
         ModeId::Plan.key()
     } else {
@@ -1370,7 +1371,7 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
 
 struct ControlRequestContext<'a> {
     writer: &'a SdkWriter,
-    coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
+    coordinator: &'a SessionCoordinatorHandle,
     shared: &'a Mutex<Shared>,
     commands: &'a SdkCommands,
     set_mode: &'a ModeSetter<'a>,
@@ -1519,9 +1520,7 @@ fn handle_control_request(
         InboundControlRequestType::SetModel => {
             let current_model = coordinator.read().model().unwrap_or_default();
             match resolve_set_model(cr.request.extra.get("model"), &current_model) {
-                Some(spec) => match smol::block_on(
-                    coordinator.set_option(maki_agent::session_options::MODEL_OPTION_ID, spec),
-                ) {
+                Some(spec) => match smol::block_on(coordinator.set_option(MODEL_OPTION_ID, spec)) {
                     Ok(_) => writer.emit_control_response(&cr.request_id, ok, None),
                     Err(error) => {
                         writer.emit_control_response(&cr.request_id, None, Some(error.to_string()))
