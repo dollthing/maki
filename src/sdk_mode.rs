@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use event_listener::Event;
+
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
@@ -528,6 +530,22 @@ struct Shared {
     pending: HashMap<String, (String, Sender<String>)>,
     turn_active: bool,
     active_cancel: Option<WorkCancel>,
+    /// Stdin ended, so no answer to a new permission ask can arrive.
+    input_closed: bool,
+    idle: Event,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            turn_start: Instant::now(),
+            pending: HashMap::new(),
+            turn_active: false,
+            active_cancel: None,
+            input_closed: false,
+            idle: Event::new(),
+        }
+    }
 }
 
 struct SdkCommands {
@@ -790,12 +808,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         sdk_commands.target.clone(),
     );
 
-    let shared = Arc::new(Mutex::new(Shared {
-        turn_start: Instant::now(),
-        pending: HashMap::new(),
-        turn_active: false,
-        active_cancel: None,
-    }));
+    let shared = Arc::new(Mutex::new(Shared::new()));
 
     let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
     observer.install(root.clone());
@@ -965,6 +978,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         Ok(())
     })();
 
+    smol::block_on(finish_in_flight(&shared));
     drop(sdk_commands);
     drop(model_discovery);
     smol::block_on(projection_watcher.cancel());
@@ -1333,6 +1347,30 @@ fn end_sdk_work(shared: &Mutex<Shared>) {
     let mut shared = shared.lock().unwrap();
     shared.turn_active = false;
     shared.active_cancel.take();
+    shared.idle.notify(usize::MAX);
+}
+
+/// Stdin ended but stdout is still read: the work in flight runs to its end
+/// and reports, while permission asks nobody can answer any more are denied.
+async fn finish_in_flight(shared: &Mutex<Shared>) {
+    let unanswered = {
+        let mut shared = shared.lock().unwrap();
+        shared.input_closed = true;
+        mem::take(&mut shared.pending)
+    };
+    for (ask_id, answer_tx) in unanswered.into_values() {
+        let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
+    }
+    loop {
+        let idle = {
+            let shared = shared.lock().unwrap();
+            if !shared.turn_active {
+                return;
+            }
+            shared.idle.listen()
+        };
+        idle.await;
+    }
 }
 
 fn handle_control_request(
@@ -1658,11 +1696,18 @@ impl EventPump {
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                self.shared
-                    .lock()
-                    .unwrap()
-                    .pending
-                    .insert(req_id.clone(), (id.clone(), answer_tx));
+                {
+                    let mut shared = self.shared.lock().unwrap();
+                    if shared.input_closed {
+                        drop(shared);
+                        let _ =
+                            answer_tx.send(TaggedAnswer::new(id, PermissionAnswer::Deny).encode());
+                        return Ok(());
+                    }
+                    shared
+                        .pending
+                        .insert(req_id.clone(), (id.clone(), answer_tx));
+                }
 
                 self.writer
                     .emit(WireInner::ControlRequest(ControlRequestPayload {
@@ -1677,10 +1722,7 @@ impl EventPump {
             }
             AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
-                let mut shared = self.shared.lock().unwrap();
-                shared.turn_active = false;
-                shared.active_cancel.take();
-                drop(shared);
+                end_sdk_work(&self.shared);
                 self.terminal_run_id = envelope.presentation();
                 let result = mem::take(&mut self.result_text);
                 match outcome {
@@ -1710,10 +1752,7 @@ impl EventPump {
             AgentEvent::ControlComplete { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::ControlError { .. } if envelope.subagent.is_some() => {}
             AgentEvent::ControlError { message } => {
-                let mut shared = self.shared.lock().unwrap();
-                shared.turn_active = false;
-                shared.active_cancel.take();
-                drop(shared);
+                end_sdk_work(&self.shared);
                 if self.terminal_run_id == envelope.presentation() {
                     self.writer
                         .emit_system("warning", serde_json::json!({ "message": message }))?;
@@ -1777,6 +1816,7 @@ mod tests {
     const SDK_CHILD_RESPONSE: &str = "sdk child response";
     const SDK_GRANDCHILD_RESPONSE: &str = "sdk grandchild response";
     const SDK_SETTLEMENT_TIMEOUT: &str = "SDK managed turn did not settle";
+    const SDK_GATED_REPLY: &str = "released reply";
     const CHECKPOINT_FAILED: &str = "checkpoint failed";
 
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
@@ -1923,22 +1963,39 @@ mod tests {
         }
     }
 
-    struct PendingProvider(Sender<()>);
+    /// Parks every request until the test releases it, then answers.
+    struct GatedProvider {
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
 
-    impl Provider for PendingProvider {
+    impl Provider for GatedProvider {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a Sender<ProviderEvent>,
+            events: &'a Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                self.0.send_async(()).await.unwrap();
-                std::future::pending().await
+                self.entered.send_async(()).await.unwrap();
+                self.release.recv_async().await.unwrap();
+                let text = SDK_GATED_REPLY.to_owned();
+                events
+                    .send(ProviderEvent::TextDelta { text: text.clone() })
+                    .unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text { text }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                })
             })
         }
 
@@ -1954,13 +2011,18 @@ mod tests {
         pump: smol::Task<()>,
         out_rx: Receiver<String>,
         entering: Receiver<()>,
+        release: Sender<()>,
     }
 
-    /// An SDK session whose provider parks every request, with one turn
-    /// admitted and already streaming.
+    /// An SDK session whose provider parks every request until released,
+    /// with one turn admitted and already streaming.
     fn pending_sdk_session() -> PendingSdkSession {
         let (entered, entering) = flume::bounded(1);
-        let provider: Arc<dyn Provider> = Arc::new(PendingProvider(entered));
+        let (release, released) = flume::unbounded();
+        let provider: Arc<dyn Provider> = Arc::new(GatedProvider {
+            entered,
+            release: released,
+        });
         let handle = headless::spawn_interactive_with_binding(
             idle_params(),
             Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) })),
@@ -1969,12 +2031,7 @@ mod tests {
         );
         smol::block_on(handle.initialized_root()).unwrap();
         let coordinator = unbound_coordinator(handle.session_id.id());
-        let shared = Arc::new(Mutex::new(Shared {
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        }));
+        let shared = Arc::new(Mutex::new(Shared::new()));
         let (out_tx, out_rx) = flume::unbounded();
         let pump = EventPump {
             writer: SdkWriter {
@@ -2005,6 +2062,7 @@ mod tests {
             pump,
             out_rx,
             entering,
+            release,
         };
         session.admit();
         session
@@ -2034,8 +2092,16 @@ mod tests {
             }
         }
 
-        /// Ends input the way stdin EOF does and waits for the session to end.
+        /// Ends input the way stdin EOF does: the turn in flight must hold
+        /// the session open until the provider is released, then report.
         fn end_input(self) -> Vec<Value> {
+            let mut finishing = Box::pin(finish_in_flight(&self.shared));
+            assert!(
+                smol::block_on(futures_lite::future::poll_once(&mut finishing)).is_none(),
+                "input end must wait for the turn in flight"
+            );
+            self.release.send(()).unwrap();
+            smol::block_on(finishing);
             let PendingSdkSession {
                 handle,
                 coordinator,
@@ -2066,13 +2132,28 @@ mod tests {
         }
     }
 
-    /// Like ACP, the end of input cancels the turn still running instead of
-    /// waiting for it, reports it once and lets the session end.
+    /// `echo prompt | maki` must work: the end of input waits for the turn
+    /// in flight, reports it, then lets the session end. A permission ask
+    /// left open is denied, since no answer can arrive any more.
     #[test]
-    fn input_end_cancels_in_flight_turn_and_exits() {
-        let results = pending_sdk_session().end_input();
+    fn input_end_finishes_in_flight_turn_then_exits() {
+        const ASK_ID: &str = "open ask";
+        let session = pending_sdk_session();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        session
+            .shared
+            .lock()
+            .unwrap()
+            .pending
+            .insert(ASK_ID.into(), (ASK_ID.into(), answer_tx));
+        let results = session.end_input();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["is_error"], true);
+        assert_eq!(results[0]["is_error"], false);
+        assert_eq!(results[0]["result"], SDK_GATED_REPLY);
+        assert_eq!(
+            answer_rx.try_recv().unwrap(),
+            TaggedAnswer::new(ASK_ID, PermissionAnswer::Deny).encode()
+        );
     }
 
     #[test]
@@ -2083,17 +2164,14 @@ mod tests {
         assert_eq!(session.next_result()["is_error"], true);
         assert!(!session.shared.lock().unwrap().turn_active);
         session.admit();
-        assert_eq!(session.end_input().len(), 1);
+        let results = session.end_input();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], false);
     }
 
     #[test]
     fn sdk_work_runs_one_at_a_time() {
-        let shared = Mutex::new(Shared {
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        });
+        let shared = Mutex::new(Shared::new());
         assert_eq!(begin_sdk_work(&shared), Ok(()));
         assert_eq!(begin_sdk_work(&shared), Err(TURN_ALREADY_ACTIVE));
         end_sdk_work(&shared);
@@ -2597,12 +2675,7 @@ mod tests {
             },
         )
         .unwrap();
-        let shared = Arc::new(Mutex::new(Shared {
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        }));
+        let shared = Arc::new(Mutex::new(Shared::new()));
         let trusted_root = smol::block_on(maki_lua::orchestration::bind_frontend_root(
             &handle,
             &coordinator,
@@ -3476,12 +3549,7 @@ mod tests {
     #[test]
     fn subagent_outcome_does_not_retire_sdk_turn() {
         let (out_tx, out_rx) = flume::unbounded();
-        let shared = Arc::new(Mutex::new(Shared {
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        }));
+        let shared = Arc::new(Mutex::new(Shared::new()));
         begin_sdk_work(&shared).unwrap();
         let (trigger, cancel) = CancelToken::new();
         shared.lock().unwrap().active_cancel = Some(WorkCancel::Control(trigger));
@@ -3564,12 +3632,7 @@ mod tests {
                 session_id: SessionRef::generate(),
                 out_tx,
             },
-            shared: Arc::new(Mutex::new(Shared {
-                turn_start: Instant::now(),
-                pending: HashMap::new(),
-                turn_active: false,
-                active_cancel: None,
-            })),
+            shared: Arc::new(Mutex::new(Shared::new())),
             read: unbound_coordinator(MakiId::generate()).read(),
             permissions: Arc::new(test_permissions()),
             answer_tx: flume::unbounded().0,

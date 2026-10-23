@@ -1,7 +1,8 @@
 //! Every headless frontend (`--print`, SDK stream-json, ACP) must start a
 //! session on the same defaults: `always_thinking` from `maki.setup`, and the
 //! saved `/thinking` preference ahead of it. Runs the real binary against a
-//! loopback OpenAI-compatible server and inspects the request body.
+//! loopback OpenAI-compatible server and inspects the request body. SDK and
+//! ACP must also finish a turn whose input ended right after the prompt.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
 //! temp dir, which is not how Windows finds its config.
@@ -10,7 +11,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -35,6 +36,10 @@ const LOOPBACK: &str = "127.0.0.1,localhost";
 /// A failure bound only: every case answers as soon as the request lands.
 const TIMEOUT: Duration = Duration::from_secs(60);
 const NO_REQUEST: &str = "no chat request reached the mock server";
+const NO_RESULT: &str = "the turn's result never arrived";
+const NO_EXIT: &str = "makima did not exit after its input ended";
+const REPLY: &str = "ok";
+const PROMPT_ID: u64 = 3;
 const SSE_REPLY: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
     "\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
@@ -112,7 +117,7 @@ fn first_request(frontend: Frontend, setup: Setup) -> Value {
             &mut stdin,
             json!({"type": "user", "message": {"role": "user", "content": PROMPT}}),
         ),
-        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work),
+        Frontend::Acp => drop(acp_prompt(&mut child, &mut stdin, &work)),
     }
     let body = bodies.recv_timeout(TIMEOUT);
     let _ = child.kill();
@@ -123,6 +128,58 @@ fn first_request(frontend: Frontend, setup: Setup) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// `echo prompt | makima`: input ends right after the prompt, yet the turn
+/// runs to its end, its result arrives, and only then does the process exit.
+#[test_case(Frontend::Sdk ; "sdk_finishes_a_piped_turn")]
+#[test_case(Frontend::Acp ; "acp_finishes_a_piped_turn")]
+fn closed_input_still_delivers_the_turn(frontend: Frontend) {
+    let (base_url, _bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut child = spawn_makima(home.path(), &work, frontend_args(frontend));
+    let mut stdin = child.stdin.take().unwrap();
+    let output = match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(
+                &mut stdin,
+                json!({"type": "user", "message": {"role": "user", "content": PROMPT}}),
+            );
+            output
+        }
+        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work),
+        Frontend::Print => unreachable!("print reads its whole input before it starts"),
+    };
+    drop(stdin);
+    let result = loop {
+        let message = output.recv_timeout(TIMEOUT).expect(NO_RESULT);
+        match frontend {
+            Frontend::Sdk if message["type"] == "result" => break message,
+            Frontend::Acp if message["id"] == PROMPT_ID => break message,
+            _ => {}
+        }
+    };
+    match frontend {
+        Frontend::Sdk => {
+            assert_eq!(result["subtype"], "success", "{result}");
+            assert_eq!(result["result"], REPLY);
+        }
+        _ => assert_eq!(result["result"]["stopReason"], "end_turn", "{result}"),
+    }
+    assert!(wait_exit(child).success());
+}
+
+fn wait_exit(mut child: Child) -> ExitStatus {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    rx.recv_timeout(TIMEOUT).expect(NO_EXIT).unwrap()
 }
 
 fn frontend_args(frontend: Frontend) -> Vec<String> {
@@ -156,7 +213,8 @@ fn frontend_args(frontend: Frontend) -> Vec<String> {
 }
 
 /// `initialize`, `session/new`, then `session/prompt` on the new session id.
-fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) {
+/// Returns the rest of the server's output.
+fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> Receiver<Value> {
     let responses = json_lines(child.stdout.take().unwrap());
     send(
         stdin,
@@ -178,9 +236,10 @@ fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) {
     };
     send(
         stdin,
-        json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+        json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
                "params": {"sessionId": session, "prompt": [{"type": "text", "text": PROMPT}]}}),
     );
+    responses
 }
 
 fn send(stdin: &mut ChildStdin, message: Value) {

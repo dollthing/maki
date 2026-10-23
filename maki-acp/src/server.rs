@@ -16,6 +16,7 @@ use agent_client_protocol_schema::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
+use event_listener::Event;
 use flume::{Receiver, Sender};
 use maki_agent::actor::ConfigChange;
 use maki_agent::config_change::ConfigChangeError;
@@ -98,6 +99,26 @@ struct Pending {
     retired_primary_run: Option<u64>,
     permissions: HashMap<i64, (String, Sender<String>)>,
     elicitation: Option<i64>,
+    /// The client closed its input, so no answer to a new ask can arrive.
+    input_closed: bool,
+    settled: Event,
+}
+
+impl Pending {
+    fn refuses_asks(&self) -> bool {
+        self.input_closed
+            || self
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.cancelling)
+    }
+
+    fn settle(&mut self) -> PendingOperation {
+        self.permissions.clear();
+        self.elicitation = None;
+        self.settled.notify(usize::MAX);
+        self.operation.take().unwrap()
+    }
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -151,6 +172,9 @@ struct SessionState {
     command_registry: maki_commands::CommandRegistry,
     command_target: TargetHandle,
     command_projection_task: smol::Task<()>,
+    /// The Lua host can outlive the session holding an event sender, so the
+    /// pump is stopped explicitly rather than by its stream closing.
+    event_pump_task: smol::Task<()>,
     option_projection: Option<Arc<OptionProjection>>,
     option_projection_task: smol::Task<()>,
     lock: Option<session_lock::LockHeartbeat>,
@@ -232,6 +256,9 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         handle_line(&mut server, &line, &params).await;
     }
 
+    if let Some(session) = &server.session {
+        finish_in_flight(session).await;
+    }
     close_session(&mut server).await;
     drop(server);
     writer_task.await;
@@ -699,6 +726,31 @@ async fn start_mcp(
     handle
 }
 
+/// The client closed its input but still reads the output: the work in
+/// flight runs to its end and reports, while the asks it can no longer get
+/// answered are refused.
+async fn finish_in_flight(session: &SessionState) {
+    let (permission_answers, elicitation) = {
+        let mut pending = session.pending.lock().unwrap();
+        pending.input_closed = true;
+        (
+            std::mem::take(&mut pending.permissions),
+            pending.elicitation.take(),
+        )
+    };
+    answer_cancelled_requests(&session.handle, permission_answers, elicitation);
+    loop {
+        let settled = {
+            let pending = session.pending.lock().unwrap();
+            if pending.operation.is_none() {
+                return;
+            }
+            pending.settled.listen()
+        };
+        settled.await;
+    }
+}
+
 /// Stop the old session before the next one starts, so two generations of the
 /// same MCP servers never fight over a port or a lock file.
 async fn close_session(srv: &mut Server) {
@@ -737,6 +789,7 @@ async fn close_session(srv: &mut Server) {
         warn!(%error, "failed to drain session checkpoint");
     }
     state.command_projection_task.cancel().await;
+    state.event_pump_task.cancel().await;
     state.option_projection_task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -882,7 +935,7 @@ async fn install_session_with_lock(
     let project_trusted = handle.permissions.project_is_trusted();
     let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
     observer.install(trusted_root.target.clone());
-    start_event_pump(
+    let event_pump_task = start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
         srv.out_tx.clone(),
@@ -945,6 +998,7 @@ async fn install_session_with_lock(
         command_registry,
         command_target,
         command_projection_task,
+        event_pump_task,
         option_projection: Some(option_projection),
         option_projection_task,
         lock: Some(lock),
@@ -1556,9 +1610,7 @@ fn finish_operation(
         {
             return false;
         }
-        pending.permissions.clear();
-        pending.elicitation = None;
-        pending.operation.take().unwrap()
+        pending.settle()
     };
     let request_id = operation.request_id.clone();
     drop(operation);
@@ -1591,9 +1643,7 @@ fn finish_primary_run(
             Some(_) => {}
         }
         pending.retired_primary_run = Some(run_id);
-        pending.permissions.clear();
-        pending.elicitation = None;
-        pending.operation.take().unwrap()
+        pending.settle()
     };
     let request_id = operation.request_id.clone();
     drop(operation);
@@ -1886,14 +1936,13 @@ fn start_event_pump(
     project_trusted: bool,
     initial_cost: Option<f64>,
     observer: HeadlessObserver,
-) {
+) -> smol::Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Ok(envelope) = event_rx.recv_async().await
-        {
+        while let Ok(envelope) = event_rx.recv_async().await {
             observer.observe(&envelope);
             // ACP fences on the presentation the actor stamped, which is the
             // same identity the rest of the frontend uses.
@@ -1921,7 +1970,8 @@ fn start_event_pump(
                 AgentEvent::ThinkingBlockEnd => translate::thinking_block_end(),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    let update = translate::tool_start(&event, session.cwd().as_deref(), home.as_deref());
+                    let update =
+                        translate::tool_start(&event, session.cwd().as_deref(), home.as_deref());
                     if let Some(raw_input) = &event.raw_input {
                         tool_inputs.insert(event.id.clone(), raw_input.clone());
                     }
@@ -1934,8 +1984,10 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
-                    let raw_input =
-                        permission_answer_tx.is_none().then(|| tool_inputs.get(&id)).flatten();
+                    let raw_input = permission_answer_tx
+                        .is_none()
+                        .then(|| tool_inputs.get(&id))
+                        .flatten();
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
@@ -1946,17 +1998,13 @@ fn start_event_pump(
                                 raw_input,
                                 session.cwd().as_deref(),
                                 home.as_deref(),
-                    ),
+                            ),
                             permissions::permission_options(project_trusted),
-                ));
+                        ));
                     let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
                     let should_send = {
                         let mut pending = pending.lock().unwrap();
-                        if pending
-                            .operation
-                            .as_ref()
-                            .is_some_and(|operation| operation.cancelling)
-                        {
+                        if pending.refuses_asks() {
                             false
                         } else {
                             pending.permissions.insert(
@@ -1966,8 +2014,8 @@ fn start_event_pump(
                                     permission_answer_tx
                                         .clone()
                                         .unwrap_or_else(|| answer_tx.clone()),
-                        ),
-                    );
+                                ),
+                            );
                             true
                         }
                     };
@@ -1980,10 +2028,11 @@ fn start_event_pump(
                                 params: Some(request),
                             },
                             "/params/toolCall",
-                );
+                        );
                     } else {
                         let answer_tx = permission_answer_tx.unwrap_or_else(|| answer_tx.clone());
-                        let _ = answer_tx.send(TaggedAnswer::new(&id, PermissionAnswer::Deny).encode());
+                        let _ =
+                            answer_tx.send(TaggedAnswer::new(&id, PermissionAnswer::Deny).encode());
                     }
                     continue;
                 }
@@ -1996,8 +2045,12 @@ fn start_event_pump(
                         .as_mut()
                         .and_then(|operation| operation.cancel.take());
                     finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
-                        let error = AcpError::auth_required().data(Value::String(AUTH_FAILED_MSG.into()));
-                        send(&out_tx, Response::<AgentResponse>::new(request_id, Err(error)));
+                        let error =
+                            AcpError::auth_required().data(Value::String(AUTH_FAILED_MSG.into()));
+                        send(
+                            &out_tx,
+                            Response::<AgentResponse>::new(request_id, Err(error)),
+                        );
                     });
                     if let Some(cancel) = cancel {
                         cancel.cancel();
@@ -2012,11 +2065,7 @@ fn start_event_pump(
                         let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
                         let should_send = {
                             let mut pending = pending.lock().unwrap();
-                            if pending
-                                .operation
-                                .as_ref()
-                                .is_some_and(|operation| operation.cancelling)
-                            {
+                            if pending.refuses_asks() {
                                 false
                             } else {
                                 pending.elicitation = Some(request_id);
@@ -2031,7 +2080,7 @@ fn start_event_pump(
                                     method: Arc::from(request.method()),
                                     params: Some(request),
                                 },
-                    );
+                            );
                         } else {
                             let _ = answer_tx
                                 .send(serde_json::json!({ "dismissed": true }).to_string());
@@ -2048,29 +2097,24 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
-                    finish_primary_run(&pending, run_id, |request_id| {
-                        match outcome {
-                            maki_agent::TurnOutcome::Completed { reason, .. } => {
-                                let resp = PromptResponse::new(translate::map_done_reason(reason));
-                                send(
-                                    &out_tx,
-                                    Response::new(
-                                        request_id,
-                                        Ok(AgentResponse::PromptResponse(resp)),
-                            ),
-                        );
-                            }
-                            maki_agent::TurnOutcome::Cancelled { .. } => {
-                                respond_prompt(&out_tx, request_id, StopReason::Cancelled);
-                            }
-                            maki_agent::TurnOutcome::Failed { failure, .. } => {
-                                let error = AcpError::internal_error()
-                                    .data(Value::String(failure.user_message));
-                                send(
-                                    &out_tx,
-                                    Response::<AgentResponse>::new(request_id, Err(error)),
-                        );
-                            }
+                    finish_primary_run(&pending, run_id, |request_id| match outcome {
+                        maki_agent::TurnOutcome::Completed { reason, .. } => {
+                            let resp = PromptResponse::new(translate::map_done_reason(reason));
+                            send(
+                                &out_tx,
+                                Response::new(request_id, Ok(AgentResponse::PromptResponse(resp))),
+                            );
+                        }
+                        maki_agent::TurnOutcome::Cancelled { .. } => {
+                            respond_prompt(&out_tx, request_id, StopReason::Cancelled);
+                        }
+                        maki_agent::TurnOutcome::Failed { failure, .. } => {
+                            let error = AcpError::internal_error()
+                                .data(Value::String(failure.user_message));
+                            send(
+                                &out_tx,
+                                Response::<AgentResponse>::new(request_id, Err(error)),
+                            );
                         }
                     });
                     continue;
@@ -2089,7 +2133,7 @@ fn start_event_pump(
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(request_id, Err(error)),
-                );
+                        );
                     });
                     continue;
                 }
@@ -2106,7 +2150,6 @@ fn start_event_pump(
             );
         });
     })
-    .detach();
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -2588,7 +2631,8 @@ mod tests {
             PUMP_TRUSTED,
             None,
             observer,
-        );
+        )
+        .detach();
         srv.lua_event_handle = host.event_handle();
         (host, received, root_answers, state, notices)
     }
@@ -2952,6 +2996,7 @@ mod tests {
                 command_registry,
                 command_target,
                 command_projection_task: smol::spawn(async {}),
+                event_pump_task: smol::spawn(async {}),
                 option_projection_task: smol::spawn(async {}),
                 lock: None,
             }),
@@ -3790,7 +3835,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
             let session_id = session.handle.session_id.to_string();
 
             handle_prompt(
@@ -4031,7 +4077,8 @@ mod tests {
                     PUMP_TRUSTED,
                     None,
                     test_observer(),
-                );
+                )
+                .detach();
                 let session_id = session.handle.session_id.to_string();
                 let request_id = RequestId::Number(iteration as i64 + 1);
 
@@ -4164,7 +4211,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
 
             handle_prompt(
                 &mut srv,
@@ -4235,6 +4283,34 @@ mod tests {
             .operation
             .as_ref()
             .map(|operation| (operation.cancelling, operation.cancel.is_some()))
+    }
+
+    /// stdin closed: the prompt in flight still runs to its end, while the
+    /// ask nobody can answer any more is denied and new asks are refused.
+    #[test]
+    fn input_end_waits_for_the_prompt_in_flight() {
+        smol::block_on(async {
+            let (mut srv, answer_rx, _, input_rx) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            input_rx.recv_async().await.unwrap();
+            let session = srv.session.as_ref().unwrap();
+            let mut finishing = Box::pin(finish_in_flight(session));
+            assert!(smol::future::poll_once(&mut finishing).await.is_none());
+            assert_eq!(
+                answer_rx.try_recv().unwrap(),
+                TaggedAnswer::new("toolu_1", PermissionAnswer::Deny).encode()
+            );
+            assert!(session.pending.lock().unwrap().refuses_asks());
+            take_active_operation(&session.pending, OperationKind::PrimaryTurn).unwrap();
+            finishing.await;
+        });
     }
 
     #[test]
@@ -4366,7 +4442,8 @@ mod tests {
             PUMP_TRUSTED,
             None,
             test_observer(),
-        );
+        )
+        .detach();
         event_tx
             .send(Envelope {
                 event: AgentEvent::Question {
@@ -4417,7 +4494,8 @@ mod tests {
             PUMP_TRUSTED,
             None,
             test_observer(),
-        );
+        )
+        .detach();
 
         event_tx
             .send(Envelope {
@@ -4488,7 +4566,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
 
             let completed = |run_id| Envelope {
                 event: AgentEvent::TurnOutcome(maki_agent::TurnOutcome::completed(
@@ -4566,7 +4645,8 @@ mod tests {
             PUMP_TRUSTED,
             None,
             test_observer(),
-        );
+        )
+        .detach();
 
         for event in [
             AgentEvent::ToolPending {
@@ -4647,7 +4727,8 @@ mod tests {
             PUMP_TRUSTED,
             Some(INITIAL_COST),
             test_observer(),
-        );
+        )
+        .detach();
         let turn_complete = |cost| {
             AgentEvent::TurnComplete(Box::new(maki_agent::TurnCompleteEvent {
                 message: Message::default(),
@@ -4790,7 +4871,8 @@ mod tests {
             PUMP_TRUSTED,
             None,
             test_observer(),
-        );
+        )
+        .detach();
 
         event_tx
             .send(Envelope {
@@ -5240,7 +5322,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
             let session_id = session.handle.session_id.to_string();
             let request_id = RequestId::Number(71);
 
@@ -5715,7 +5798,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
             let old_id = old.handle.session_id.to_string();
 
             handle_prompt(
@@ -6610,7 +6694,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
             let session_id_str = session_id.to_string();
             let request_id = RequestId::Number(41);
 
@@ -6694,7 +6779,8 @@ mod tests {
                 PUMP_TRUSTED,
                 None,
                 test_observer(),
-            );
+            )
+            .detach();
             let session_id = session.handle.session_id.to_string();
 
             handle_prompt(

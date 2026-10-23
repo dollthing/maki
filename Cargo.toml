@@ -40,6 +40,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
+event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]

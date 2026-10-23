@@ -2724,6 +2724,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
+ "event-listener",
  "flume 0.11.1",
  "futures-lite",
  "isahc",
@@ -2756,6 +2757,7 @@ version = "0.5.5-makima"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
+ "event-listener",
  "flume 0.11.1",
  "maki-agent",
  "maki-commands",
