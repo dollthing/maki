@@ -439,7 +439,7 @@ mod tests {
             "| `/sessions` | Browse and switch sessions | typed | [query] | TUI only |",
             "| `/splash` | Preview and select a splash renderer | typed | [splash] | TUI only |",
             "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |",
-            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | TUI only |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | all |",
             "| `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |",
         ] {
             assert!(plugins.contains(row), "{row}");

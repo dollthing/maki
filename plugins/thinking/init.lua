@@ -1,7 +1,10 @@
 -- /thinking selector: pick an effort level by navigating left/right and
 -- confirm with Enter. Any argument passes straight through to the target
 -- agent's set_model, and choosing a level (or passing an argument) saves it as
--- the default for new sessions.
+-- the default for new sessions. Without an interactive UI the selector has
+-- nowhere to open, so only the argument form works there.
+
+local NO_SELECTOR = "the selector needs the TUI; pass a level, e.g. /thinking high"
 
 local function index_of(list, value)
   for i, v in ipairs(list) do
@@ -93,8 +96,13 @@ local function open_selector(_, ctx)
     },
   })
 
+  local opened = false
   while true do
     local ev = win:recv()
+    if not ev and not opened then
+      error(NO_SELECTOR)
+    end
+    opened = true
     if not ev or ev.type == "close" then
       break
     end
@@ -120,7 +128,7 @@ end
 maki.api.register_command({
   name = "/thinking",
   description = "Set thinking effort (bare opens a selector)",
-  tui_only = true,
+  tui_only = false,
   arguments = {
     {
       name = "effort",

@@ -49,6 +49,8 @@ const SECOND: &str = "second turn";
 const SWITCH_COMMAND: &str = "/parity_switch";
 const PLAN_COMMAND: &str = "/parity_plan";
 const UI_COMMAND: &str = "/parity_ui";
+const THINKING_COMMAND: &str = "/thinking high";
+const PARITY_THINKING_COMMAND: &str = "/parity_thinking";
 const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
 const ASK_PROMPT: &str = "run the asking tool";
@@ -192,6 +194,7 @@ enum Scenario {
     ModelSwitch,
     LuaMode,
     LuaUiRoundTrip,
+    ThinkingCommand,
 }
 
 enum Step {
@@ -210,6 +213,8 @@ impl Scenario {
             (Self::LuaMode, Frontend::Print) => vec![prompt(&format!("{PLAN_COMMAND} {PROMPT}"))],
             (Self::LuaMode, _) => vec![prompt(PLAN_COMMAND), prompt(PROMPT)],
             (Self::LuaUiRoundTrip, _) => vec![prompt(UI_COMMAND)],
+            (Self::ThinkingCommand, Frontend::Print) => vec![prompt(PARITY_THINKING_COMMAND)],
+            (Self::ThinkingCommand, _) => vec![prompt(THINKING_COMMAND), prompt(PROMPT)],
         }
     }
 
@@ -245,6 +250,13 @@ impl Scenario {
                 };
                 assert_eq!(last_user_text(body), format!("{UI_ANSWER}{NO_UI_ERR}"));
             }
+            Self::ThinkingCommand => {
+                let [body] = bodies else {
+                    panic!("expected one request: {bodies:?}")
+                };
+                assert_eq!(last_user_text(body), PROMPT);
+                assert_eq!(body["reasoning_effort"], HIGH, "{body}");
+            }
         }
     }
 }
@@ -258,6 +270,9 @@ impl Scenario {
 #[test_case(Frontend::Print, Scenario::LuaUiRoundTrip ; "print_lua_ui_round_trip_answers_no_ui")]
 #[test_case(Frontend::Sdk, Scenario::LuaUiRoundTrip ; "sdk_lua_ui_round_trip_answers_no_ui")]
 #[test_case(Frontend::Acp, Scenario::LuaUiRoundTrip ; "acp_lua_ui_round_trip_answers_no_ui")]
+#[test_case(Frontend::Print, Scenario::ThinkingCommand ; "print_thinking_command_sets_the_level")]
+#[test_case(Frontend::Sdk, Scenario::ThinkingCommand ; "sdk_thinking_command_sets_the_level")]
+#[test_case(Frontend::Acp, Scenario::ThinkingCommand ; "acp_thinking_command_sets_the_level")]
 fn scenario_reaches_the_provider_alike(frontend: Frontend, scenario: Scenario) {
     let (base_url, bodies) = mock_server();
     let home = TempDir::new().unwrap();
@@ -798,6 +813,13 @@ maki.api.register_command({{
   handler = function(_, ctx)
     local child = assert(maki.agent.spawn(ctx, {{}}))
     assert(child:submit(ctx, "{BACKGROUND_PROMPT}"))
+  end,
+}})
+maki.api.register_command({{
+  name = "{PARITY_THINKING_COMMAND}", tui_only = false,
+  handler = function(_, ctx)
+    assert(maki.api.run_command("{THINKING_COMMAND}"))
+    prompt(ctx, "{PROMPT}")
   end,
 }})
 maki.api.register_command({{

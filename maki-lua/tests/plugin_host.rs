@@ -1279,7 +1279,7 @@ fn bundled_commands_project_complete_metadata() {
                 "Set thinking effort (bare opens a selector)".into(),
                 None,
                 Some("[effort]".into()),
-                true
+                false
             ),
             (
                 "/usage".into(),
