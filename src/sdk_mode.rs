@@ -40,12 +40,12 @@ use maki_agent::{
 };
 use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::orchestration::{AgentOrchestration, ModelCatalog};
+use maki_lua::orchestration::ModelCatalog;
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::SessionRef;
 use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1807,6 +1807,9 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use maki_lua::orchestration::AgentOrchestration;
+    use maki_storage::id::MakiId;
+
     use super::*;
     use maki_agent::actor::{ConfigChange, ConfigPatch};
     use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
