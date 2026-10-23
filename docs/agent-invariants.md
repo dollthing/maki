@@ -29,7 +29,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 18. Explicit admission allocates and registers the ticket before work can finalize. Exact waits must handle both finalization-before-wait and wait-before-finalization.
 19. Removing, clearing, closing, or shutting down must terminalize every affected queued explicit admission and resolve its waiter. Never drop accepted turn work silently.
-20. TUI main input, child input, and Lua ordinary submissions use `AgentActorHandle::submit`; headless prompts (print, SDK, ACP) admit one distinct turn each with `admit_turn`. Compatible submissions share the ticket for their execution; a closed admission or intervening operation requires a new turn.
+20. TUI main input, child input, Lua `when = "join"` sends and headless prompts (print, SDK, ACP) use `AgentActorHandle::submit`, so input sent while a turn runs joins it in every frontend. Compatible submissions share the ticket for their execution; a closed admission or intervening operation requires a new turn.
 21. A pending ordinary message has a stable `SubmissionId` distinct from its `TurnId`. Consumption or removal addresses that submission without changing another message or creating an extra terminal result for a shared turn.
 22. Controls and compaction are not turns. They have no `TurnId`, no managed turn admission, and no retained `TurnOutcome`.
 23. `AgentInput` has one ownership transfer from queue to backend. Do not clone input payloads to avoid fixing ownership or lifetime design.

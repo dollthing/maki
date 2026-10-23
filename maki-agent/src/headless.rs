@@ -17,7 +17,10 @@ use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel, PreparedReadiness};
+use crate::actor::{
+    ActorError, AdmissionPreparation, AgentActorHandle, AgentContextSnapshot, PreparedModel,
+    PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
+};
 use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
@@ -284,16 +287,48 @@ pub struct TurnAdmitter {
 
 impl TurnAdmitter {
     pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
-        let root = self.root.get().await?;
-        let actor = root.actor().map_err(|error| error.to_string())?;
-        let run = self.next.fetch_add(1, Ordering::Relaxed);
-        actor
-            .admit_turn(
-                input,
-                Some(EventSender::new(self.events.clone())),
-                format!("run:{run}"),
-            )
+        self.ready()
+            .await?
+            .submit(input)
+            .map(|(ticket, _)| ticket)
             .map_err(|error| error.to_string())
+    }
+
+    /// Waits for the root, so a frontend can then submit synchronously and
+    /// record the turn under its own lock before the turn's events reach it.
+    pub async fn ready(&self) -> Result<RootSubmission, String> {
+        let root = self.root.get().await?;
+        Ok(RootSubmission {
+            actor: root.actor().map_err(|error| error.to_string())?,
+            events: self.events.clone(),
+            run: self.next.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+}
+
+/// One submission to a ready root, made the way the TUI's input makes it.
+pub struct RootSubmission {
+    actor: AgentActorHandle,
+    events: flume::Sender<Envelope>,
+    run: u64,
+}
+
+impl RootSubmission {
+    /// Joins the root's compatible turn in flight, or starts one, and returns
+    /// the ticket and presentation of the turn that carries {input}.
+    pub fn submit(self, input: AgentInput) -> Result<(TurnTicket, u64), ActorError> {
+        self.actor.submit_presented(
+            input,
+            Some(EventSender::new(self.events)),
+            format!("run:{}", self.run),
+            TurnAdmissionOptions {
+                provenance: TurnProvenance {
+                    origin: TurnOrigin::User,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -333,6 +368,13 @@ pub enum WorkCancel {
 }
 
 impl WorkCancel {
+    pub fn turn_id(&self) -> Option<TurnId> {
+        match self {
+            Self::Control(_) => None,
+            Self::Turn { ticket, .. } => Some(ticket.turn_id()),
+        }
+    }
+
     pub fn cancel(self) {
         match self {
             Self::Control(trigger) => trigger.cancel(),

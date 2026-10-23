@@ -38,7 +38,7 @@ use maki_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
-    PermissionsConfig, ToolOutput, TurnOutcome,
+    PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
 };
 use maki_commands::{
     CommandContent, CommandFuture, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle,
@@ -59,7 +59,7 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::command_attachments;
 
-const TURN_ALREADY_ACTIVE: &str = "a turn is already active";
+const WORK_ACTIVE: &str = "a command is already running";
 const OUTPUT_CLOSED: &str = "the SDK output is closed";
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
@@ -533,8 +533,9 @@ pub struct SdkParams {
 struct Shared {
     turn_start: Instant,
     pending: HashMap<String, (String, Sender<String>)>,
-    turn_active: bool,
-    active_cancel: Option<WorkCancel>,
+    /// The SDK work in flight: one local operation, or the turns carrying
+    /// user messages. A message sent while a turn runs joins it.
+    work: Vec<WorkCancel>,
     /// Stdin ended, so no answer to a new permission ask can arrive.
     input_closed: bool,
     /// The event pump stopped, so nothing reports or ends SDK work any more.
@@ -547,8 +548,7 @@ impl Shared {
         Self {
             turn_start: Instant::now(),
             pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
+            work: Vec::new(),
             input_closed: false,
             output_closed: false,
             idle: Event::new(),
@@ -1014,7 +1014,12 @@ impl UserDispatch {
             writer,
             shared,
         } = self;
-        shared.lock().unwrap().turn_start = Instant::now();
+        {
+            let mut shared = shared.lock().unwrap();
+            if shared.work.is_empty() {
+                shared.turn_start = Instant::now();
+            }
+        }
         let input = match commands.dispatch_input(prompt, images).await {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                 command_attachments::agent_input(turn)?
@@ -1164,11 +1169,10 @@ fn spawn_sdk_operation<F>(
 where
     F: Future<Output = Result<String, String>> + Send + 'static,
 {
-    if let Err(error) = begin_sdk_work(shared) {
+    let (trigger, cancel) = CancelToken::new();
+    if let Err(error) = begin_sdk_work(shared, WorkCancel::Control(trigger)) {
         return emit_command_result(writer, shared, true, error.into());
     }
-    let (trigger, cancel) = CancelToken::new();
-    shared.lock().unwrap().active_cancel = Some(WorkCancel::Control(trigger));
     let writer = writer.clone();
     let shared = Arc::clone(shared);
     smol::spawn(async move {
@@ -1379,56 +1383,78 @@ struct ControlRequestContext<'a> {
 
 type ModeSetter<'a> = dyn Fn(&str) -> Result<(), ConfigChangeError> + 'a;
 
-/// Admits {input} as the one piece of SDK work in flight; `Ok(false)` means
-/// the session has ended. An interrupt then cancels this turn on the actor.
+/// Submits {input} like the TUI's input does: it joins the turn in flight or
+/// starts one, which an interrupt then cancels. `Ok(false)` means the session
+/// has ended.
 async fn admit_sdk_turn(
     shared: &Mutex<Shared>,
     input_tx: &InteractiveInputSender,
     input: AgentInput,
 ) -> Result<bool, &'static str> {
-    begin_sdk_work(shared)?;
-    let Ok(ticket) = input_tx.admit(input).await else {
-        end_sdk_work(shared);
+    let Ok(submission) = input_tx.admitter().ready().await else {
         return Ok(false);
     };
     let mut shared = shared.lock().unwrap();
-    if shared.turn_active {
-        shared.active_cancel = Some(input_tx.turn_cancel(ticket));
+    check_sdk_work(&shared, |work| work.turn_id().is_none())?;
+    let Ok((ticket, _)) = submission.submit(input) else {
+        return Ok(false);
+    };
+    if !shared
+        .work
+        .iter()
+        .any(|work| work.turn_id() == Some(ticket.turn_id()))
+    {
+        shared.work.push(input_tx.turn_cancel(ticket));
     }
     Ok(true)
 }
 
-fn begin_sdk_work(shared: &Mutex<Shared>) -> Result<(), &'static str> {
+/// Starts a local operation as the SDK's only work in flight.
+fn begin_sdk_work(shared: &Mutex<Shared>, cancel: WorkCancel) -> Result<(), &'static str> {
     let mut shared = shared.lock().unwrap();
+    check_sdk_work(&shared, |_| true)?;
+    shared.work.push(cancel);
+    Ok(())
+}
+
+fn check_sdk_work(shared: &Shared, conflicts: fn(&WorkCancel) -> bool) -> Result<(), &'static str> {
     if shared.output_closed {
         return Err(OUTPUT_CLOSED);
     }
-    if shared.turn_active {
-        return Err(TURN_ALREADY_ACTIVE);
+    if shared.work.iter().any(conflicts) {
+        return Err(WORK_ACTIVE);
     }
-    shared.turn_active = true;
     Ok(())
 }
 
 fn end_sdk_work(shared: &Mutex<Shared>) {
     let mut shared = shared.lock().unwrap();
-    shared.turn_active = false;
-    shared.active_cancel.take();
+    shared.work.clear();
     shared.idle.notify(usize::MAX);
+}
+
+fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) {
+    let mut shared = shared.lock().unwrap();
+    shared.work.retain(|work| work.turn_id() != Some(turn_id));
+    if shared.work.is_empty() {
+        shared.idle.notify(usize::MAX);
+    }
+}
+
+/// Cancels all SDK work in flight; the turns still report their results.
+fn cancel_sdk_work(shared: &Mutex<Shared>) {
+    let work = mem::take(&mut shared.lock().unwrap().work);
+    for work in work {
+        work.cancel();
+    }
+    end_sdk_work(shared);
 }
 
 /// The pump stopped (stdout broke): the work in flight can no longer report,
 /// so it is cancelled and no new work starts.
 fn close_output(shared: &Mutex<Shared>) {
-    let cancel = {
-        let mut shared = shared.lock().unwrap();
-        shared.output_closed = true;
-        shared.active_cancel.take()
-    };
-    if let Some(cancel) = cancel {
-        cancel.cancel();
-    }
-    end_sdk_work(shared);
+    shared.lock().unwrap().output_closed = true;
+    cancel_sdk_work(shared);
 }
 
 /// Stdin ended but stdout is still read: the user messages already read are
@@ -1462,7 +1488,7 @@ async fn finish_in_flight(
             idle.await;
         }
     };
-    until(|shared| !shared.turn_active).await;
+    until(|shared| shared.work.is_empty()).await;
     smol::future::or(graph.wait_settled(), until(|shared| shared.output_closed)).await;
     dispatched
 }
@@ -1493,9 +1519,7 @@ fn handle_control_request(
             )
         }
         InboundControlRequestType::Interrupt => {
-            if let Some(cancel) = shared.lock().unwrap().active_cancel.take() {
-                cancel.cancel();
-            }
+            cancel_sdk_work(shared);
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         InboundControlRequestType::SetPermissionMode => {
@@ -1815,7 +1839,7 @@ impl EventPump {
             }
             AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
-                end_sdk_work(&self.shared);
+                finish_sdk_turn(&self.shared, outcome.turn_id());
                 self.terminal_run_id = envelope.presentation();
                 let result = mem::take(&mut self.result_text);
                 match outcome {
@@ -2218,7 +2242,7 @@ mod tests {
                     panic!("{SDK_SETTLEMENT_TIMEOUT}");
                 },
             ));
-            assert!(!shared.lock().unwrap().turn_active);
+            assert!(shared.lock().unwrap().work.is_empty());
             smol::block_on(coordinator.close()).unwrap();
             out_rx
                 .try_iter()
@@ -2287,7 +2311,7 @@ mod tests {
                 panic!("{SDK_SETTLEMENT_TIMEOUT}");
             },
         ));
-        assert_eq!(begin_sdk_work(&shared), Err(OUTPUT_CLOSED));
+        assert_eq!(begin_sdk_work(&shared, local_work()), Err(OUTPUT_CLOSED));
         smol::block_on(coordinator.close()).unwrap();
     }
 
@@ -2338,7 +2362,7 @@ mod tests {
         session.end_input();
     }
 
-    #[test_case(true ; "model_turn_is_admitted_on_the_root")]
+    #[test_case(true ; "model_turn_joins_the_root_turn")]
     #[test_case(false ; "handler_error_fails_the_call")]
     fn command_runner_runs_the_outcome_or_fails_with_the_handler(turn: bool) {
         let session = pending_sdk_session();
@@ -2373,38 +2397,74 @@ mod tests {
                 template: maki_agent::tools::cli_tool_ctx(std::env::temp_dir()),
             },
         ));
-        let queued = actor.latest_ticket().unwrap().turn_id();
+        assert_eq!(actor.latest_ticket().unwrap().turn_id(), running);
         if turn {
             assert_eq!(result, Ok(()));
-            assert_ne!(queued, running);
             session.release.send(()).unwrap();
+            session.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
         } else {
             assert_eq!(result, Err(failure.to_string()));
-            assert_eq!(queued, running);
         }
-        session.end_input();
+        assert_eq!(session.end_input().len(), 1);
     }
 
     #[test]
     fn interrupt_cancels_only_the_admitted_turn() {
         let session = pending_sdk_session();
-        let cancel = session.shared.lock().unwrap().active_cancel.take().unwrap();
-        cancel.cancel();
+        cancel_sdk_work(&session.shared);
         assert_eq!(session.next_result()["is_error"], true);
-        assert!(!session.shared.lock().unwrap().turn_active);
+        assert!(session.shared.lock().unwrap().work.is_empty());
         session.admit();
         let results = session.end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], false);
     }
 
+    /// A message sent while a turn runs joins it, as typing does in the TUI,
+    /// so the one result covers both messages.
     #[test]
-    fn sdk_work_runs_one_at_a_time() {
+    fn message_sent_mid_turn_joins_the_running_turn() {
+        const FOLLOW_UP: &str = "sdk follow-up";
+        let session = pending_sdk_session();
+        let running = tracked_turns(&session.shared);
+        let input = AgentInput::new(FOLLOW_UP.into(), Vec::new());
+        assert_eq!(
+            smol::block_on(admit_sdk_turn(
+                &session.shared,
+                &session.handle.input_tx,
+                input
+            )),
+            Ok(true)
+        );
+        assert_eq!(tracked_turns(&session.shared), running);
+        session.release.send(()).unwrap();
+        session.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        let results = session.end_input();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], false);
+    }
+
+    #[test]
+    fn local_operations_run_one_at_a_time() {
         let shared = Mutex::new(Shared::new());
-        assert_eq!(begin_sdk_work(&shared), Ok(()));
-        assert_eq!(begin_sdk_work(&shared), Err(TURN_ALREADY_ACTIVE));
+        assert_eq!(begin_sdk_work(&shared, local_work()), Ok(()));
+        assert_eq!(begin_sdk_work(&shared, local_work()), Err(WORK_ACTIVE));
         end_sdk_work(&shared);
-        assert_eq!(begin_sdk_work(&shared), Ok(()));
+        assert_eq!(begin_sdk_work(&shared, local_work()), Ok(()));
+    }
+
+    fn local_work() -> WorkCancel {
+        WorkCancel::Control(CancelToken::new().0)
+    }
+
+    fn tracked_turns(shared: &Mutex<Shared>) -> Vec<TurnId> {
+        shared
+            .lock()
+            .unwrap()
+            .work
+            .iter()
+            .filter_map(WorkCancel::turn_id)
+            .collect()
     }
 
     fn test_permissions() -> PermissionManager {
@@ -3079,9 +3139,15 @@ mod tests {
             observer: HeadlessObserver::new(lua_handle, handle.session_id.id()),
         }
         .spawn(handle.event_rx.clone());
-        begin_sdk_work(&shared).unwrap();
         let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
-        let ticket = smol::block_on(handle.input_tx.admit(input)).unwrap();
+        assert_eq!(
+            smol::block_on(admit_sdk_turn(&shared, &handle.input_tx, input)),
+            Ok(true)
+        );
+        let ticket = match &shared.lock().unwrap().work[..] {
+            [WorkCancel::Turn { ticket, .. }] => ticket.clone(),
+            _ => panic!("one SDK turn in flight"),
+        };
         let permission = loop {
             let line = out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
             let message: Value = serde_json::from_str(&line).unwrap();
@@ -3206,7 +3272,7 @@ mod tests {
                 .map(|line| serde_json::from_str::<Value>(&line).unwrap()),
         );
         assert!(output.iter().all(|message| message["type"] != "result"));
-        assert!(shared.lock().unwrap().turn_active);
+        assert!(!shared.lock().unwrap().work.is_empty());
         assert_eq!(checkpointed.lock().unwrap().len(), 1);
         terminal_release.send(()).unwrap();
         loop {
@@ -3222,7 +3288,7 @@ mod tests {
             smol::block_on(ticket.wait()),
             TurnOutcome::Completed { .. }
         ));
-        assert!(!shared.lock().unwrap().turn_active);
+        assert!(shared.lock().unwrap().work.is_empty());
         let before_version = coordinator.read().options().version;
         let selected_thinking =
             maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High);
@@ -3779,9 +3845,8 @@ mod tests {
     fn subagent_outcome_does_not_retire_sdk_turn() {
         let (out_tx, out_rx) = flume::unbounded();
         let shared = Arc::new(Mutex::new(Shared::new()));
-        begin_sdk_work(&shared).unwrap();
         let (trigger, cancel) = CancelToken::new();
-        shared.lock().unwrap().active_cancel = Some(WorkCancel::Control(trigger));
+        begin_sdk_work(&shared, WorkCancel::Control(trigger)).unwrap();
         let mut pump = EventPump {
             writer: SdkWriter {
                 session_id: SessionRef::generate(),
@@ -3830,8 +3895,7 @@ mod tests {
         .unwrap();
 
         assert!(!cancel.is_cancelled());
-        assert!(shared.lock().unwrap().turn_active);
-        assert!(shared.lock().unwrap().active_cancel.is_some());
+        assert_eq!(shared.lock().unwrap().work.len(), 1);
         assert!(out_rx.is_empty());
         assert_eq!(pump.terminal_run_id, None);
 
@@ -3841,8 +3905,6 @@ mod tests {
             identity: None,
         })
         .unwrap();
-        assert!(cancel.is_cancelled());
-        assert!(!shared.lock().unwrap().turn_active);
         assert_eq!(
             out_rx
                 .try_iter()

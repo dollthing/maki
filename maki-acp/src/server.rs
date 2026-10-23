@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,7 @@ const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
 const SESSION_ENDED_MESSAGE: &str = "session ended";
+const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
@@ -86,6 +87,19 @@ struct PendingOperation {
     run_id: Option<u64>,
     cancelling: bool,
     cancel: Option<WorkCancel>,
+    /// Prompts whose message joined this turn, answered with it.
+    joined: Vec<RequestId>,
+}
+
+impl PendingOperation {
+    fn requests(&self) -> impl Iterator<Item = RequestId> + '_ {
+        iter::once(&self.request_id).chain(&self.joined).cloned()
+    }
+
+    fn start_cancelling(&mut self) -> Option<WorkCancel> {
+        self.cancelling = true;
+        self.cancel.take()
+    }
 }
 
 /// What the client still owes us. Subagents have independent answer channels,
@@ -93,7 +107,9 @@ struct PendingOperation {
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
-    retired_primary_run: Option<u64>,
+    /// Prompts whose message started a turn of its own behind the running
+    /// one, as typing does in the TUI when it cannot join.
+    queued: VecDeque<PendingOperation>,
     permissions: HashMap<i64, (String, Sender<String>)>,
     elicitation: Option<i64>,
     /// The client closed its input, so no answer to a new ask can arrive.
@@ -102,6 +118,21 @@ struct Pending {
 }
 
 impl Pending {
+    /// Whether a prompt may start now; `true` when it starts beside a turn
+    /// its message may join.
+    fn admits_prompt(&self) -> Result<bool, AcpError> {
+        match &self.operation {
+            None => Ok(false),
+            Some(operation) if operation.cancelling => Err(AcpError::new(
+                CANCELLATION_IN_PROGRESS_CODE,
+                CANCELLATION_IN_PROGRESS_MESSAGE,
+            )
+            .data(serde_json::json!({ "retryable": true }))),
+            Some(operation) if operation.kind == OperationKind::PrimaryTurn => Ok(true),
+            Some(_) => Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE)),
+        }
+    }
+
     fn refuses_asks(&self) -> bool {
         self.input_closed
             || self
@@ -114,7 +145,19 @@ impl Pending {
         self.permissions.clear();
         self.elicitation = None;
         self.settled.notify(usize::MAX);
-        self.operation.take().unwrap()
+        let settled = self.operation.take().unwrap();
+        self.operation = self.queued.pop_front();
+        settled
+    }
+
+    /// Every operation the client still waits on, the running one first.
+    fn take_all(&mut self) -> Vec<PendingOperation> {
+        self.settled.notify(usize::MAX);
+        self.operation
+            .take()
+            .into_iter()
+            .chain(self.queued.drain(..))
+            .collect()
     }
 }
 
@@ -216,7 +259,9 @@ struct Server {
 }
 
 struct PendingDispatch {
-    operation_id: u64,
+    /// The prompt's own operation; `None` while it dispatches beside a
+    /// running turn its message may join.
+    operation_id: Option<u64>,
     request_id: RequestId,
     future: CommandFuture<InputDispatch>,
 }
@@ -780,21 +825,16 @@ async fn close_session(srv: &mut Server) {
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
-    let (operation, permission_answers, elicitation) = {
+    let (operations, permission_answers, elicitation) = {
         let mut pending = state.pending.lock().unwrap();
         (
-            pending.operation.as_mut().map(|operation| {
-                operation.cancelling = true;
-                (operation.id, operation.kind)
-            }),
+            pending.take_all(),
             std::mem::take(&mut pending.permissions),
             pending.elicitation.take(),
         )
     };
-    if let Some((operation_id, kind)) = operation {
-        finish_operation(&state.pending, operation_id, kind, |request_id| {
-            respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
-        });
+    for request_id in operations.iter().flat_map(PendingOperation::requests) {
+        respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
     }
     answer_cancelled_requests(&state.handle, permission_answers, elicitation);
     state.handle.manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
@@ -1196,16 +1236,24 @@ fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Acp
     let req: PromptRequest = parse_params(raw)?;
     let session = validate_session(srv, req.session_id.0.as_ref())?;
     let content = extract_prompt_content(&req.prompt)?;
-    admit_prompt(&session.pending)?;
-    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
-    session.pending.lock().unwrap().operation = Some(PendingOperation {
-        id: operation_id,
-        request_id: id.clone(),
-        kind: OperationKind::Command,
-        run_id: None,
-        cancelling: false,
-        cancel: None,
+    if srv.dispatch.is_some() {
+        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
+    }
+    let mut pending = session.pending.lock().unwrap();
+    let operation_id = (!pending.admits_prompt()?).then(|| {
+        let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+        pending.operation = Some(PendingOperation {
+            id: operation_id,
+            request_id: id.clone(),
+            kind: OperationKind::Command,
+            run_id: None,
+            cancelling: false,
+            cancel: None,
+            joined: Vec::new(),
+        });
+        operation_id
     });
+    drop(pending);
     let future = session
         .command_registry
         .dispatch_input(&session.command_target, content);
@@ -1241,19 +1289,21 @@ async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<()
     let Some(session) = srv.session.as_ref() else {
         return Ok(());
     };
-    let cancelling = {
-        let mut pending = session.pending.lock().unwrap();
-        let Some(operation) = pending.operation.take_if(|operation| {
-            operation.id == operation_id && operation.kind == OperationKind::Command
-        }) else {
-            return Ok(());
+    if let Some(operation_id) = operation_id {
+        let cancelling = {
+            let mut pending = session.pending.lock().unwrap();
+            let Some(operation) = pending.operation.take_if(|operation| {
+                operation.id == operation_id && operation.kind == OperationKind::Command
+            }) else {
+                return Ok(());
+            };
+            pending.settled.notify(usize::MAX);
+            operation.cancelling
         };
-        pending.settled.notify(usize::MAX);
-        operation.cancelling
-    };
-    if cancelling {
-        respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
-        return Ok(());
+        if cancelling {
+            respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
+            return Ok(());
+        }
     }
     run_dispatch(srv, &request_id, dispatched).await
 }
@@ -1328,6 +1378,7 @@ async fn send_manual_compaction(
             run_id: None,
             cancelling: false,
             cancel: Some(WorkCancel::Control(trigger)),
+            joined: Vec::new(),
         });
     }
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -1408,7 +1459,8 @@ async fn send_manual_compaction(
                                 &sid,
                                 translate::local_operation_terminal(&tool_id, Some(&error)),
                             );
-                            let error = AcpError::internal_error().data(Value::String(error));
+                            let error =
+                                AcpError::internal_error().data(Value::String(error.clone()));
                             send(
                                 &out_tx,
                                 Response::new(request_id, Err::<AgentResponse, _>(error)),
@@ -1477,6 +1529,7 @@ async fn send_isolated_turn(
             run_id: None,
             cancelling: false,
             cancel: Some(WorkCancel::Control(trigger)),
+            joined: Vec::new(),
         });
     }
     let (output, events) = flume::unbounded();
@@ -1533,7 +1586,8 @@ async fn send_isolated_turn(
                         operation_id,
                         OperationKind::IsolatedTurn,
                         |request_id| {
-                            let error = AcpError::internal_error().data(Value::String(message));
+                            let error =
+                                AcpError::internal_error().data(Value::String(message.clone()));
                             send(
                                 &out_tx,
                                 Response::new(request_id, Err::<AgentResponse, _>(error)),
@@ -1588,46 +1642,43 @@ async fn send_command_turn(
         .collect();
     let mut input = AgentInput::new(turn.content.text.to_string(), images);
     input.prompt = prompt.map(Box::new);
-    if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
-    }
     session.coordinator.as_ref().ok_or_else(no_session)?;
-    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    let session_ended = || AcpError::new(-32603, SESSION_ENDED_MESSAGE);
+    let submission = session
+        .handle
+        .input_tx
+        .admitter()
+        .ready()
+        .await
+        .map_err(|_| session_ended())?;
+    // Submitting under the lock records the turn before its events can
+    // reach the pump.
+    let mut pending = session.pending.lock().unwrap();
+    pending.admits_prompt()?;
+    let (ticket, run_id) = submission.submit(input).map_err(|_| session_ended())?;
+    let pending = &mut *pending;
+    if let Some(operation) = pending
+        .operation
+        .iter_mut()
+        .chain(&mut pending.queued)
+        .find(|operation| operation.run_id == Some(run_id))
     {
-        let mut pending = session.pending.lock().unwrap();
-        if pending.operation.is_some() {
-            return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
-        }
-        pending.operation = Some(PendingOperation {
-            id: operation_id,
-            request_id: id.clone(),
-            kind: OperationKind::PrimaryTurn,
-            run_id: None,
-            cancelling: false,
-            cancel: None,
-        });
+        operation.joined.push(id.clone());
+        return Ok(());
     }
-    let Ok(ticket) = session.handle.input_tx.admit(input).await else {
-        release_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
-        return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
+    let operation = PendingOperation {
+        id: NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed),
+        request_id: id.clone(),
+        kind: OperationKind::PrimaryTurn,
+        run_id: Some(run_id),
+        cancelling: false,
+        cancel: Some(session.handle.input_tx.turn_cancel(ticket)),
+        joined: Vec::new(),
     };
-    let cancelled = {
-        let mut pending = session.pending.lock().unwrap();
-        match pending
-            .operation
-            .as_mut()
-            .filter(|operation| operation.id == operation_id)
-        {
-            Some(operation) if !operation.cancelling => {
-                operation.cancel = Some(session.handle.input_tx.turn_cancel(ticket.clone()));
-                false
-            }
-            Some(_) => true,
-            None => false,
-        }
-    };
-    if cancelled {
-        session.handle.input_tx.turn_cancel(ticket).cancel();
+    if pending.operation.is_some() {
+        pending.queued.push_back(operation);
+    } else {
+        pending.operation = Some(operation);
     }
     Ok(())
 }
@@ -1660,23 +1711,11 @@ fn config_error(error: ConfigChangeError) -> AcpError {
     }
 }
 
-fn admit_prompt(pending: &PendingState) -> Result<(), AcpError> {
-    match pending.lock().unwrap().operation.as_ref() {
-        None => Ok(()),
-        Some(operation) if operation.cancelling => Err(AcpError::new(
-            CANCELLATION_IN_PROGRESS_CODE,
-            CANCELLATION_IN_PROGRESS_MESSAGE,
-        )
-        .data(serde_json::json!({ "retryable": true }))),
-        Some(_) => Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE)),
-    }
-}
-
 fn finish_operation(
     pending: &PendingState,
     operation_id: u64,
     kind: OperationKind,
-    respond: impl FnOnce(RequestId),
+    respond: impl FnMut(RequestId),
 ) -> bool {
     let operation = {
         let mut pending = pending.lock().unwrap();
@@ -1689,49 +1728,40 @@ fn finish_operation(
         }
         pending.settle()
     };
-    let request_id = operation.request_id.clone();
-    drop(operation);
-    respond(request_id);
+    answer(operation, respond);
     true
 }
 
-fn finish_primary_run(
-    pending: &PendingState,
-    run_id: u64,
-    respond: impl FnOnce(RequestId),
-) -> bool {
+/// Answers the prompts of the turn presented as {run_id}, running or queued.
+fn finish_primary_run(pending: &PendingState, run_id: u64, respond: impl FnMut(RequestId)) -> bool {
     let operation = {
         let mut pending = pending.lock().unwrap();
-        if pending
-            .retired_primary_run
-            .is_some_and(|retired_run| run_id <= retired_run)
-        {
-            return false;
-        }
-        let Some(operation) = pending.operation.as_mut() else {
-            return false;
+        let primary = |operation: &PendingOperation| {
+            operation.kind == OperationKind::PrimaryTurn && operation.run_id == Some(run_id)
         };
-        if operation.kind != OperationKind::PrimaryTurn {
+        if pending.operation.as_ref().is_some_and(primary) {
+            pending.settle()
+        } else if let Some(index) = pending.queued.iter().position(primary) {
+            pending.queued.remove(index).unwrap()
+        } else {
             return false;
         }
-        match operation.run_id {
-            Some(operation_run_id) if operation_run_id != run_id => return false,
-            None => operation.run_id = Some(run_id),
-            Some(_) => {}
-        }
-        pending.retired_primary_run = Some(run_id);
-        pending.settle()
     };
-    let request_id = operation.request_id.clone();
-    drop(operation);
-    respond(request_id);
+    answer(operation, respond);
     true
+}
+
+/// Drops {operation} first, so its cancellation fires before the answers.
+fn answer(operation: PendingOperation, respond: impl FnMut(RequestId)) {
+    let requests: Vec<_> = operation.requests().collect();
+    drop(operation);
+    requests.into_iter().for_each(respond);
 }
 
 fn finish_active_operation(
     pending: &PendingState,
     kind: OperationKind,
-    respond: impl FnOnce(RequestId),
+    respond: impl FnMut(RequestId),
 ) -> bool {
     let operation_id = pending
         .lock()
@@ -1857,8 +1887,9 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 return;
             };
             if let Ok(session) = validate_session(srv, requested) {
-                let (cancellation, permission_answers, elicitation) = {
+                let (cancellations, permission_answers, elicitation) = {
                     let mut pending = session.pending.lock().unwrap();
+                    let pending = &mut *pending;
                     let Some(operation) = pending
                         .operation
                         .as_mut()
@@ -1866,14 +1897,16 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     else {
                         return;
                     };
-                    operation.cancelling = true;
-                    let cancellation = operation.cancel.take();
+                    let cancellations: Vec<_> = iter::once(operation)
+                        .chain(&mut pending.queued)
+                        .filter_map(PendingOperation::start_cancelling)
+                        .collect();
                     let permission_answers = std::mem::take(&mut pending.permissions);
                     let elicitation = pending.elicitation.take();
-                    (cancellation, permission_answers, elicitation)
+                    (cancellations, permission_answers, elicitation)
                 };
                 answer_cancelled_requests(&session.handle, permission_answers, elicitation);
-                if let Some(cancellation) = cancellation {
+                for cancellation in cancellations {
                     cancellation.cancel();
                 }
             }
@@ -2198,9 +2231,9 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
-                    finish_primary_run(&pending, run_id, |request_id| match outcome {
+                    finish_primary_run(&pending, run_id, |request_id| match &outcome {
                         maki_agent::TurnOutcome::Completed { reason, .. } => {
-                            let resp = PromptResponse::new(translate::map_done_reason(reason));
+                            let resp = PromptResponse::new(translate::map_done_reason(*reason));
                             send(
                                 &out_tx,
                                 Response::new(request_id, Ok(AgentResponse::PromptResponse(resp))),
@@ -2211,7 +2244,7 @@ fn start_event_pump(
                         }
                         maki_agent::TurnOutcome::Failed { failure, .. } => {
                             let error = AcpError::internal_error()
-                                .data(Value::String(failure.user_message));
+                                .data(Value::String(failure.user_message.clone()));
                             send(
                                 &out_tx,
                                 Response::<AgentResponse>::new(request_id, Err(error)),
@@ -2230,7 +2263,7 @@ fn start_event_pump(
                 AgentEvent::ControlError { message } => {
                     tool_inputs.clear();
                     finish_primary_run(&pending, run_id, |request_id| {
-                        let error = AcpError::internal_error().data(Value::String(message));
+                        let error = AcpError::internal_error().data(Value::String(message.clone()));
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(request_id, Err(error)),
@@ -2242,14 +2275,25 @@ fn start_event_pump(
             };
             session_update(&out_tx, &sid, update);
         }
-        finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
-            let error =
-                AcpError::internal_error().data(Value::String("session event stream ended".into()));
+        let unanswered = {
+            let mut pending = pending.lock().unwrap();
+            if pending
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.kind == OperationKind::PrimaryTurn)
+            {
+                pending.take_all()
+            } else {
+                Vec::new()
+            }
+        };
+        for request_id in unanswered.iter().flat_map(PendingOperation::requests) {
+            let error = AcpError::internal_error().data(Value::String(EVENT_STREAM_ENDED.into()));
             send(
                 &out_tx,
                 Response::<AgentResponse>::new(request_id, Err(error)),
             );
-        });
+        }
     });
     EventPump { task, stop }
 }
@@ -3508,6 +3552,7 @@ mod tests {
                 run_id: None,
                 cancelling: false,
                 cancel: None,
+                joined: Vec::new(),
             }),
             ..Pending::default()
         }));
@@ -3529,6 +3574,7 @@ mod tests {
                 run_id: None,
                 cancelling: true,
                 cancel: None,
+                joined: Vec::new(),
             }),
             ..Pending::default()
         }));
@@ -3554,6 +3600,7 @@ mod tests {
                 run_id: None,
                 cancelling: false,
                 cancel: None,
+                joined: Vec::new(),
             }),
             ..Pending::default()
         }));
@@ -4112,6 +4159,7 @@ mod tests {
             run_id: None,
             cancelling: false,
             cancel: None,
+            joined: Vec::new(),
         });
         drop(pending);
         handle_notification(
@@ -4150,6 +4198,7 @@ mod tests {
             run_id: None,
             cancelling: false,
             cancel: None,
+            joined: Vec::new(),
         });
         drop(pending);
 
@@ -4270,14 +4319,14 @@ mod tests {
                 "successor must not enter the active turn"
             );
 
+            let pending = &srv.session.as_ref().unwrap().pending;
             event_tx
-                .send_async(Envelope {
-                    event: AgentEvent::ControlComplete {
+                .send_async(primary_envelope(
+                    pending,
+                    AgentEvent::ControlComplete {
                         usage: TokenUsage::default(),
                     },
-                    subagent: None,
-                    identity: None,
-                })
+                ))
                 .await
                 .unwrap();
             let cancelled = out_rx.recv_async().await.unwrap();
@@ -4483,12 +4532,9 @@ mod tests {
                         usage: TokenUsage::default(),
                     }
                 };
+                let pending = &srv.session.as_ref().unwrap().pending;
                 event_tx
-                    .send_async(Envelope {
-                        event,
-                        subagent: None,
-                        identity: None,
-                    })
+                    .send_async(primary_envelope(pending, event))
                     .await
                     .unwrap();
                 let terminal = out_rx.recv_async().await.unwrap();
@@ -4598,6 +4644,12 @@ mod tests {
             // whatever operation is active, so the sender stays alive for
             // the whole test like the session stream does in production.
             let checkpoint_events = event_tx.clone();
+            let checkpoint_complete = primary_envelope(
+                &pending,
+                AgentEvent::ControlComplete {
+                    usage: TokenUsage::default(),
+                },
+            );
             let checkpoint_task = smol::spawn(async move {
                 coordinator
                     .persist_history(maki_agent::agent::HistorySnapshot::new(vec![
@@ -4606,13 +4658,7 @@ mod tests {
                     .await
                     .unwrap();
                 checkpoint_events
-                    .send_async(Envelope {
-                        event: AgentEvent::ControlComplete {
-                            usage: TokenUsage::default(),
-                        },
-                        subagent: None,
-                        identity: None,
-                    })
+                    .send_async(checkpoint_complete)
                     .await
                     .unwrap();
             });
@@ -4845,6 +4891,7 @@ mod tests {
                 run_id: None,
                 cancelling: true,
                 cancel: None,
+                joined: Vec::new(),
             }),
             ..Default::default()
         }));
@@ -4967,9 +5014,10 @@ mod tests {
                     id: 1,
                     request_id: RequestId::Number(41),
                     kind: OperationKind::PrimaryTurn,
-                    run_id: None,
+                    run_id: Some(OLD_RUN_ID),
                     cancelling: false,
                     cancel: None,
+                    joined: Vec::new(),
                 }),
                 ..Default::default()
             }));
@@ -5014,9 +5062,10 @@ mod tests {
                 id: 2,
                 request_id: RequestId::Number(42),
                 kind: OperationKind::PrimaryTurn,
-                run_id: None,
+                run_id: Some(NEXT_RUN_ID),
                 cancelling: false,
                 cancel: None,
+                joined: Vec::new(),
             });
             event_tx
                 .send_async(Envelope {
@@ -5040,6 +5089,148 @@ mod tests {
             assert_eq!(second["id"], 42);
             assert_eq!(second["result"]["stopReason"], "end_turn");
             assert!(out_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    /// A second prompt sent while a turn runs joins it, as typing does in
+    /// the TUI, and both prompts resolve when the turn ends.
+    #[test]
+    fn prompt_sent_mid_turn_joins_it_and_both_resolve_with_it() {
+        const FOLLOW_UP: &str = "follow-up";
+        smol::block_on(async {
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let session = srv.session.as_ref().unwrap();
+            let pending = Arc::clone(&session.pending);
+            start_event_pump(
+                event_rx,
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+                test_observer(),
+            )
+            .detach();
+            let session_id = session.handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turns.next_text().await, "first");
+            let first = turns.latest();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, FOLLOW_UP, false),
+                &RequestId::Number(42),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turns.latest().turn_id(), first.turn_id());
+            turns.release();
+            assert!(turns.next_text().await.contains(FOLLOW_UP));
+            event_tx
+                .send_async(primary_envelope(
+                    &pending,
+                    AgentEvent::TurnOutcome(maki_agent::TurnOutcome::completed(
+                        maki_agent::AgentId::generate(),
+                        first.turn_id(),
+                        TokenUsage::default(),
+                        1,
+                        maki_agent::DoneReason::EndTurn,
+                    )),
+                ))
+                .await
+                .unwrap();
+            for id in [41, 42] {
+                let terminal = out_rx.recv_async().await.unwrap();
+                assert_eq!(terminal["id"], id);
+                assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            }
+            assert!(pending.lock().unwrap().operation.is_none());
+            drop(event_tx);
+        });
+    }
+
+    /// A prompt whose message could not join waits for the turn ahead, then
+    /// resolves with its own turn; a cancel reaches both.
+    #[test]
+    fn queued_prompt_takes_over_when_the_turn_ahead_ends() {
+        const RUNNING: u64 = 7;
+        const QUEUED: u64 = 8;
+        smol::block_on(async {
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let (out_tx, out_rx) = flume::unbounded::<Value>();
+            let primary = |request: i64, run_id: u64| PendingOperation {
+                id: run_id,
+                request_id: RequestId::Number(request),
+                kind: OperationKind::PrimaryTurn,
+                run_id: Some(run_id),
+                cancelling: false,
+                cancel: None,
+                joined: Vec::new(),
+            };
+            let pending = Arc::new(Mutex::new(Pending {
+                operation: Some(PendingOperation {
+                    joined: vec![RequestId::Number(43)],
+                    ..primary(41, RUNNING)
+                }),
+                queued: VecDeque::from([primary(42, QUEUED)]),
+                ..Default::default()
+            }));
+            let session_id = SessionRef::from(MakiId::generate());
+            let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
+            start_event_pump(
+                event_rx,
+                session_id,
+                out_tx,
+                Arc::clone(&pending),
+                false,
+                flume::unbounded().0,
+                coordinator.read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+                test_observer(),
+            )
+            .detach();
+            let ended = |pending: &PendingState| {
+                primary_envelope(
+                    pending,
+                    AgentEvent::TurnOutcome(maki_agent::TurnOutcome::cancelled(
+                        maki_agent::AgentId::generate(),
+                        maki_agent::TurnId::generate(),
+                        TokenUsage::default(),
+                        1,
+                        maki_agent::TurnCancellationReason::User,
+                    )),
+                )
+            };
+            {
+                let mut pending = pending.lock().unwrap();
+                let pending = &mut *pending;
+                for operation in pending.operation.iter_mut().chain(&mut pending.queued) {
+                    operation.start_cancelling();
+                }
+            }
+            event_tx.send_async(ended(&pending)).await.unwrap();
+            for id in [41, 43] {
+                assert_eq!(out_rx.recv_async().await.unwrap()["id"], id);
+            }
+            assert!(operation_state(&pending).is_some_and(|(cancelling, _)| cancelling));
+            event_tx.send_async(ended(&pending)).await.unwrap();
+            let queued = out_rx.recv_async().await.unwrap();
+            assert_eq!(queued["id"], 42);
+            assert_eq!(queued["result"]["stopReason"], "cancelled");
+            assert!(pending.lock().unwrap().operation.is_none());
             coordinator.close().await.unwrap();
         });
     }
@@ -5421,6 +5612,29 @@ mod tests {
             "session={},operation={operation:?},permissions={permissions:?},elicitation={elicitation:?},coordinator={coordinator:?}",
             session.handle.session_id
         )
+    }
+
+    /// {event} stamped with the running primary turn's presentation, the
+    /// way the actor stamps that turn's own events.
+    fn primary_envelope(pending: &PendingState, event: AgentEvent) -> Envelope {
+        let run_id = pending
+            .lock()
+            .unwrap()
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.run_id)
+            .unwrap();
+        Envelope {
+            event,
+            subagent: None,
+            identity: Some(maki_agent::ActorWorkIdentity::new(
+                maki_agent::AgentId::generate(),
+                maki_agent::ActorWorkKind::Control {
+                    operation_id: run_id,
+                },
+                run_id,
+            )),
+        }
     }
 
     fn subagent_activity(event: AgentEvent) -> Envelope {
@@ -6211,13 +6425,12 @@ mod tests {
                 .await
                 .unwrap();
             event_tx
-                .send_async(Envelope {
-                    event: AgentEvent::ControlComplete {
+                .send_async(primary_envelope(
+                    &srv.session.as_ref().unwrap().pending,
+                    AgentEvent::ControlComplete {
                         usage: TokenUsage::default(),
                     },
-                    subagent: None,
-                    identity: None,
-                })
+                ))
                 .await
                 .unwrap();
             let old_terminal = out_rx.recv_async().await.unwrap();

@@ -8,7 +8,8 @@
 //! once. SDK and ACP must also finish a turn whose input ended right after
 //! the prompt, wait for the subagents a command left running and the turns
 //! their results start, keep reading the answer a Lua command's turn waits
-//! on, and a resumed SDK session comes back in the mode it was saved in.
+//! on, and fold a message sent mid-turn into the running turn; a resumed SDK
+//! session comes back in the mode it was saved in.
 //!
 //! The TUI cannot join without a pty. Its in-process tests in maki-ui check
 //! the same scenarios at the provider:
@@ -17,7 +18,9 @@
 //! `event_loop::focus_tests::lua_mode_command_reaches_the_provider` (mode set
 //! by a Lua command) and
 //! `event_loop::focus_tests::blank_session_sends_always_thinking_to_the_provider`
-//! (session defaults). The UI round-trip has no TUI counterpart: the TUI is
+//! (session defaults) and
+//! `agent::agent_loop::tests::ordinary_submission_paths_have_runtime_parity`
+//! (a message sent mid-turn joins it). The UI round-trip has no TUI counterpart: the TUI is
 //! the UI.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
@@ -57,6 +60,8 @@ const ASK_PROMPT: &str = "run the asking tool";
 const CHILD_ASK_COMMAND: &str = "/parity_child_ask";
 const BACKGROUND_COMMAND: &str = "/parity_background";
 const BACKGROUND_PROMPT: &str = "background job";
+const FOLLOW_UP: &str = "and one more thing";
+const FOLLOW_UP_ID: u64 = PROMPT_ID + 1;
 /// The toolset the bundled plan mode swaps in.
 const PLAN_TOOLS: [&str; 11] = [
     "edit",
@@ -488,6 +493,80 @@ fn closed_input_waits_for_background_subagents(frontend: Frontend) {
     let bodies: Vec<_> = bodies.try_iter().collect();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
     assert_eq!(last_user_text(&bodies[0]), BACKGROUND_PROMPT);
+}
+
+/// A message sent while a turn waits on a permission answer joins that turn,
+/// as typing does in the TUI, and the one turn answers both messages.
+#[test_case(Frontend::Sdk ; "sdk_message_joins_the_running_turn")]
+#[test_case(Frontend::Acp ; "acp_prompt_joins_the_running_turn")]
+fn message_sent_mid_turn_joins_it(frontend: Frontend) {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut child = spawn_makima(home.path(), &work, asking_args(frontend, ASK_PROMPT));
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(ASK_PROMPT));
+            let ask = expect(&output, |message| {
+                message["request"]["subtype"] == "can_use_tool"
+            });
+            send(&mut stdin, sdk_user(FOLLOW_UP));
+            send(
+                &mut stdin,
+                json!({"type": "control_response",
+                       "response": {"request_id": ask["request_id"], "behavior": "deny"}}),
+            );
+            let result = expect(&output, |message| message["type"] == "result");
+            assert_eq!(result["result"], REPLY, "{result}");
+            drop(stdin);
+            let results: Vec<_> = output
+                .iter()
+                .filter(|message| message["type"] == "result")
+                .collect();
+            assert!(results.is_empty(), "{results:?}");
+        }
+        Frontend::Acp => {
+            let (output, session) = acp_session(&mut child, &mut stdin, &work);
+            let prompt = |id, text| {
+                json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                       "params": {"sessionId": session,
+                                  "prompt": [{"type": "text", "text": text}]}})
+            };
+            send(&mut stdin, prompt(PROMPT_ID, ASK_PROMPT));
+            let ask = expect(&output, |message| {
+                message["method"] == "session/request_permission"
+            });
+            send(&mut stdin, prompt(FOLLOW_UP_ID, FOLLOW_UP));
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": ask["id"],
+                       "result": {"outcome": {"outcome": "cancelled"}}}),
+            );
+            for id in [PROMPT_ID, FOLLOW_UP_ID] {
+                let response = expect(&output, |message| message["id"] == id);
+                assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+            }
+            drop(stdin);
+        }
+        Frontend::Print => unreachable!("print reads its whole input before it starts"),
+    }
+    let status = wait_exit(child);
+    let log = stderr.join().unwrap();
+    assert!(status.success(), "{log}");
+    // The follow-up reaches the turn's next request, or the one after when
+    // the answer got there first; either way inside the turn, not as a turn
+    // of its own.
+    let bodies: Vec<_> = bodies.try_iter().collect();
+    let follow_up = last_user_text(bodies.last().unwrap());
+    assert!(
+        follow_up.contains(FOLLOW_UP) && follow_up != FOLLOW_UP,
+        "{bodies:?}"
+    );
 }
 
 /// Print answers no questions, for children too: a child's permission ask
