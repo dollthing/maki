@@ -171,7 +171,7 @@ struct SessionState {
     command_projection_task: smol::Task<()>,
     /// The Lua host can outlive the session holding an event sender, so the
     /// pump is stopped explicitly rather than by its stream closing.
-    event_pump_task: smol::Task<()>,
+    event_pump: EventPump,
     option_projection: Option<Arc<OptionProjection>>,
     option_projection_task: smol::Task<()>,
     lock: Option<session_lock::LockHeartbeat>,
@@ -810,7 +810,7 @@ async fn close_session(srv: &mut Server) {
         warn!(%error, "failed to drain session checkpoint");
     }
     state.command_projection_task.cancel().await;
-    state.event_pump_task.cancel().await;
+    state.event_pump.finish().await;
     state.option_projection_task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -956,7 +956,7 @@ async fn install_session_with_lock(
     let project_trusted = handle.permissions.project_is_trusted();
     let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
     observer.install(trusted_root.target.clone());
-    let event_pump_task = start_event_pump(
+    let event_pump = start_event_pump(
         handle.event_rx.clone(),
         handle.session_id.clone(),
         srv.out_tx.clone(),
@@ -1019,7 +1019,7 @@ async fn install_session_with_lock(
         command_registry,
         command_target,
         command_projection_task,
-        event_pump_task,
+        event_pump,
         option_projection: Some(option_projection),
         option_projection_task,
         lock: Some(lock),
@@ -2001,13 +2001,37 @@ fn start_event_pump(
     project_trusted: bool,
     initial_cost: Option<f64>,
     observer: HeadlessObserver,
-) -> smol::Task<()> {
-    smol::spawn(async move {
+) -> EventPump {
+    let (stop, stopped) = flume::bounded(1);
+    let task = smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
+        let mut stopping = false;
 
-        while let Ok(envelope) = event_rx.recv_async().await {
+        loop {
+            let envelope = if stopping {
+                match event_rx.try_recv() {
+                    Ok(envelope) => envelope,
+                    Err(_) => break,
+                }
+            } else {
+                let next = smol::future::or(async { Some(event_rx.recv_async().await) }, async {
+                    match stopped.recv_async().await {
+                        Ok(()) => None,
+                        Err(_) => std::future::pending().await,
+                    }
+                })
+                .await;
+                match next {
+                    Some(Ok(envelope)) => envelope,
+                    Some(Err(_)) => break,
+                    None => {
+                        stopping = true;
+                        continue;
+                    }
+                }
+            };
             observer.observe(&envelope);
             // ACP fences on the presentation the actor stamped, which is the
             // same identity the rest of the frontend uses.
@@ -2214,7 +2238,35 @@ fn start_event_pump(
                 Response::<AgentResponse>::new(request_id, Err(error)),
             );
         });
-    })
+    });
+    EventPump { task, stop }
+}
+
+/// A session's event pump. Finishing it forwards what the session already
+/// emitted, such as a background child's last updates, before it stops.
+struct EventPump {
+    task: smol::Task<()>,
+    stop: Sender<()>,
+}
+
+impl EventPump {
+    #[cfg(test)]
+    fn idle() -> Self {
+        Self {
+            task: smol::spawn(async {}),
+            stop: flume::bounded(1).0,
+        }
+    }
+
+    async fn finish(self) {
+        let _ = self.stop.send(());
+        self.task.await;
+    }
+
+    #[cfg(test)]
+    fn detach(self) {
+        self.task.detach();
+    }
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -3207,7 +3259,7 @@ mod tests {
                 command_registry,
                 command_target,
                 command_projection_task: smol::spawn(async {}),
-                event_pump_task: smol::spawn(async {}),
+                event_pump: EventPump::idle(),
                 option_projection_task: smol::spawn(async {}),
                 lock: None,
             }),
@@ -4707,6 +4759,52 @@ mod tests {
             Some(r#"{"dismissed":true}"#.to_string()),
             "a broken answer must still unblock the waiting tool"
         );
+    }
+
+    /// Closing a session forwards what it already emitted: a background
+    /// child's last update is still in the channel when the session closes.
+    #[test]
+    fn finished_pump_forwards_queued_events() {
+        const QUEUED_TEXT: &str = "late background update";
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
+        let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
+        let pump = start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            Arc::default(),
+            true,
+            answer_tx,
+            coordinator.read(),
+            maki_storage::paths::home(),
+            PUMP_TRUSTED,
+            None,
+            test_observer(),
+        );
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.into(),
+                },
+                subagent: None,
+                identity: None,
+            })
+            .unwrap();
+        smol::block_on(pump.finish());
+        let forwarded = out_rx
+            .drain()
+            .map(|message| message.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            forwarded
+                .iter()
+                .any(|message| message.contains(QUEUED_TEXT)),
+            "{forwarded:?}"
+        );
+        drop(event_tx);
     }
 
     #[test]
