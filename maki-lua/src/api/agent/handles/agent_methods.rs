@@ -481,6 +481,7 @@ async fn agent_set_mode(
             &template.modes,
             &name,
             &state_dir,
+            None,
             async |publication, definition| {
                 validate_required_output_mode(structured, Some(definition))?;
                 let claim = ctx.agent_publication_claim(&lua, &target, &publication)?;

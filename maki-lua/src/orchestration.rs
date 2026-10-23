@@ -8,14 +8,13 @@ use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use maki_agent::headless::{
     InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding,
 };
-use maki_agent::modes;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
 use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_options::YOLO_OPTION_ID;
-use maki_agent::{AgentMode, AgentRef, ModeId, ModeRegistry, tools::ToolContext};
+use maki_agent::{AgentRef, ModeId, ModeRegistry, tools::ToolContext};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, ResolutionError, TargetHandle,
@@ -28,7 +27,7 @@ use mlua::{Function, Lua, RegistryKey};
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
+    path::Path,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -511,7 +510,7 @@ pub async fn set_mode(
     state_dir: &StateDir,
 ) -> Result<ConfigCommit, ConfigChangeError> {
     reserve_config_change(services, target)?
-        .commit_mode(target, registry, key, state_dir, async |_, _| {
+        .commit_mode(target, registry, key, state_dir, None, async |_, _| {
             Ok(publication_claim())
         })
         .await
@@ -534,15 +533,17 @@ pub async fn restore_mode(
     let saved_plan = meta
         .plan_path
         .as_deref()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .map_or(AgentMode::Build, AgentMode::Plan);
-    let (mode, mode_def) = modes::resolve(registry, key, &saved_plan, state_dir)?;
+        .map(Path::new)
+        .filter(|path| path.exists());
     reserve_config_change(services, target)?
-        .commit_change(ConfigChange::Mode {
-            mode,
-            mode_def: Some(mode_def),
-        })
+        .commit_mode(
+            target,
+            registry,
+            key,
+            state_dir,
+            saved_plan,
+            async |_, _| Ok(publication_claim()),
+        )
         .await?;
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! The one sequence every agent config change commits through.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, MutexGuard};
 
 use maki_config::ModelPolicy;
@@ -9,6 +10,7 @@ use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use thiserror::Error;
 
+use crate::AgentMode;
 use crate::actor::{
     ConfigChange, ConfigCommit, ConfigPatch, EffectiveAgentConfig, PreparedModel,
     PreparedOperationTicket,
@@ -256,13 +258,16 @@ impl<'a> ConfigChangeTicket<'a> {
     }
 
     /// The one mode setter: once the predecessor settles, resolves {key} and
-    /// commits it. {claim} sees the definition before it yields the claim.
+    /// commits it. Plan mode keeps {kept_plan} when given (a resumed
+    /// session's file), else the predecessor's. {claim} sees the definition
+    /// before it yields the claim.
     pub async fn commit_mode(
         self,
         target: &AgentRef,
         registry: &ModeRegistry,
         key: &str,
         state_dir: &StateDir,
+        kept_plan: Option<&Path>,
         claim: impl AsyncFnOnce(
             CheckpointPublication,
             &ModeDef,
@@ -270,7 +275,11 @@ impl<'a> ConfigChangeTicket<'a> {
     ) -> Result<ConfigCommit, ConfigChangeError> {
         let actor = target.actor()?;
         self.commit(async |publication, predecessor| {
-            let (mode, mode_def) = modes::resolve(registry, key, &predecessor.mode, state_dir)?;
+            let current = kept_plan.map_or_else(
+                || predecessor.mode.clone(),
+                |plan| AgentMode::Plan(plan.to_path_buf()),
+            );
+            let (mode, mode_def) = modes::resolve(registry, key, &current, state_dir)?;
             actor.validate_mode_change(&mode, &mode_def)?;
             let claim = claim(publication, &mode_def).await?;
             let change = ConfigChange::Mode {

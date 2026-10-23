@@ -631,7 +631,7 @@ fn dispatch_mode_commit(
     smol::spawn(async move {
         let result = match reservation {
             Ok((target, reservation)) => reservation
-                .commit_mode(&target, &modes, &id, &storage, async |_, _| {
+                .commit_mode(&target, &modes, &id, &storage, None, async |_, _| {
                     Ok(publication_claim())
                 })
                 .await
