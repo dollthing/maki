@@ -8,13 +8,14 @@ use maki_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use maki_agent::headless::{
     InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding,
 };
+use maki_agent::modes;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_checkpoint::SessionLogCheckpoint;
 use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_options::YOLO_OPTION_ID;
-use maki_agent::{AgentRef, ModeRegistry, tools::ToolContext};
+use maki_agent::{AgentMode, AgentRef, ModeId, ModeRegistry, tools::ToolContext};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, TargetHandle,
@@ -22,11 +23,12 @@ use maki_commands::{
 use maki_providers::Message;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use maki_storage::sessions::{HistorySnapshot, StoredSubagent};
+use maki_storage::sessions::{HistorySnapshot, SessionMeta, StoredMode, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
 use std::{
     collections::HashMap,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -497,6 +499,36 @@ pub async fn set_mode(
             Ok(publication_claim())
         })
         .await
+}
+
+/// Puts a resumed session's root back in the mode it was saved in, keeping a
+/// plan's file while it still exists. Every frontend that resumes calls it.
+pub async fn restore_mode(
+    services: &(impl OrchestrationServices + ?Sized),
+    target: &AgentRef,
+    registry: &ModeRegistry,
+    meta: &SessionMeta,
+    state_dir: &StateDir,
+) -> Result<(), ConfigChangeError> {
+    let key = match &meta.mode {
+        Some(StoredMode::Plan) => ModeId::Plan.key(),
+        Some(StoredMode::Custom(name)) => name.as_str(),
+        Some(StoredMode::Build) | None => return Ok(()),
+    };
+    let saved_plan = meta
+        .plan_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .map_or(AgentMode::Build, AgentMode::Plan);
+    let (mode, mode_def) = modes::resolve(registry, key, &saved_plan, state_dir)?;
+    reserve_config_change(services, target)?
+        .commit_change(ConfigChange::Mode {
+            mode,
+            mode_def: Some(mode_def),
+        })
+        .await?;
+    Ok(())
 }
 
 pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {

@@ -35,8 +35,8 @@ use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::session_defaults;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, Envelope, ModeId, PermissionsConfig, ToolOutput,
-    TurnOutcome,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
+    ToolOutput, TurnOutcome,
 };
 use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -622,7 +622,7 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let working_dir = cwd.to_string_lossy().into_owned();
     let storage = StateDir::resolve().context("resolve state dir")?;
-    let restored = resolve_session(&cli, &working_dir, &storage)?;
+    let mut restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
     let model = startup_model(model, &restored, explicit_model, &model_policy);
     let permission_mode = restored_permission_mode(
@@ -639,7 +639,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         restored.history.messages.is_empty(),
         &model,
     );
-    let persisted_options = restored.meta.session_options;
+    let persisted_options = mem::take(&mut restored.meta.session_options);
     let session_id = restored.id;
     let initial_history = restored.history;
 
@@ -764,7 +764,26 @@ pub fn run(params: SdkParams) -> Result<()> {
     };
     if permission_mode == PermissionMode::Plan {
         set_mode(ModeId::Plan.key()).map_err(|error| eyre!("enter plan mode: {error}"))?;
+    } else if !explicit_permission_mode
+        && let Err(error) = smol::block_on(maki_lua::orchestration::restore_mode(
+            &*orchestration,
+            &root,
+            &modes,
+            &restored.meta,
+            &storage,
+        ))
+    {
+        warn!(%error, "saved mode not restored; the session resumes in build mode");
     }
+    let committed_plan = root
+        .effective_config()
+        .map_err(|error| eyre!(error))?
+        .is_some_and(|config| matches!(config.mode, AgentMode::Plan(_)));
+    let permission_mode = if committed_plan {
+        PermissionMode::Plan
+    } else {
+        permission_mode
+    };
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {

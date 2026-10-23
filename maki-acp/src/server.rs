@@ -18,21 +18,17 @@ use agent_client_protocol_schema::{
 };
 use event_listener::Event;
 use flume::{Receiver, Sender};
-use maki_agent::actor::ConfigChange;
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCancel};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::modes;
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::SessionCoordinatorError;
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
-use maki_agent::{
-    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, ModeError, ModeId, ModeRegistry,
-};
+use maki_agent::{AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use maki_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
     TargetHandle,
@@ -48,7 +44,7 @@ use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredMode, StoredTokenUsage, read_prefs};
+use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -538,12 +534,18 @@ async fn load_session(
     .await
     .map_err(session_registration_error)?;
     if let Some(session) = &srv.session
-        && let Err(error) = restore_mode(
-            session,
-            &srv.lua_event_handle.mode_registry(),
-            &restored.meta,
-            &params.storage,
-        )
+        && let Some(orchestration) = &session.orchestration
+        && let Err(error) = async {
+            let root = session.handle.initialized_root().await?;
+            maki_lua::orchestration::restore_mode(
+                &**orchestration,
+                &root,
+                &srv.lua_event_handle.mode_registry(),
+                &restored.meta,
+                &params.storage,
+            )
+            .await
+        }
         .await
     {
         warn!(%error, "saved mode not restored; the session resumes in build mode");
@@ -558,39 +560,6 @@ async fn load_session(
             srv.supports_boolean,
         ));
     Ok(AgentResponse::LoadSessionResponse(resp))
-}
-
-/// Puts a loaded session back in the mode it was saved in, keeping a plan's
-/// file while it still exists.
-async fn restore_mode(
-    session: &SessionState,
-    registry: &ModeRegistry,
-    meta: &SessionMeta,
-    storage: &StateDir,
-) -> Result<(), ConfigChangeError> {
-    let key = match &meta.mode {
-        Some(StoredMode::Plan) => ModeId::Plan.key(),
-        Some(StoredMode::Custom(name)) => name.as_str(),
-        Some(StoredMode::Build) | None => return Ok(()),
-    };
-    let Some(orchestration) = &session.orchestration else {
-        return Ok(());
-    };
-    let root = session.handle.initialized_root().await?;
-    let saved_plan = meta
-        .plan_path
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .map_or(AgentMode::Build, AgentMode::Plan);
-    let (mode, mode_def) = modes::resolve(registry, key, &saved_plan, storage)?;
-    maki_lua::orchestration::reserve_config_change(&**orchestration, &root)?
-        .commit_change(ConfigChange::Mode {
-            mode,
-            mode_def: Some(mode_def),
-        })
-        .await?;
-    Ok(())
 }
 
 fn spawn_session(
@@ -2227,11 +2196,13 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::AgentMode;
     use maki_commands::TargetCapabilities;
     use maki_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::checkpoint::{ClaimingWriter, accept_all};
+    use maki_storage::sessions::StoredMode;
     use maki_storage::sessions::{Effort, Session, StoredThinking};
     use tempfile::TempDir;
     use test_case::test_case;

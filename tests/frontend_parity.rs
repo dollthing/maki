@@ -2,7 +2,8 @@
 //! session on the same defaults: `always_thinking` from `maki.setup`, and the
 //! saved `/thinking` preference ahead of it. Runs the real binary against a
 //! loopback OpenAI-compatible server and inspects the request body. SDK and
-//! ACP must also finish a turn whose input ended right after the prompt.
+//! ACP must also finish a turn whose input ended right after the prompt, and
+//! a resumed SDK session comes back in the mode it was saved in.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
 //! temp dir, which is not how Windows finds its config.
@@ -15,7 +16,10 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use maki_storage::sessions::{Effort, Prefs, StoredThinking};
+use maki_agent::ToolOutput;
+use maki_providers::{Message, TokenUsage};
+use maki_storage::StateDir;
+use maki_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -40,6 +44,8 @@ const NO_RESULT: &str = "the turn's result never arrived";
 const NO_EXIT: &str = "makima did not exit after its input ended";
 const REPLY: &str = "ok";
 const PROMPT_ID: u64 = 3;
+const NO_INIT: &str = "the SDK never emitted its init event";
+const PLAN_FILE: &str = "saved-plan.md";
 const SSE_REPLY: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
     "\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
@@ -171,6 +177,39 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
         }
         _ => assert_eq!(result["result"]["stopReason"], "end_turn", "{result}"),
     }
+    assert!(wait_exit(child).success());
+}
+
+/// Like the TUI and ACP, an SDK resume puts the session back in the mode it
+/// was saved in, here plan mode with its plan file.
+#[test]
+fn sdk_resume_restores_the_saved_mode() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), DEAD_PROXY, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state = home.path().join(".local/state").join(APP_DIR);
+    let plan = state.join(PLAN_FILE);
+    std::fs::write(&plan, "").unwrap();
+    let mut session: Session<Message, TokenUsage, ToolOutput> =
+        Session::new(&format!("{PROVIDER}/{MODEL}"), &work.to_string_lossy());
+    session.replace_messages(vec![Message::user(PROMPT.into())]);
+    session.meta.mode = Some(StoredMode::Plan);
+    session.meta.plan_path = Some(plan.to_string_lossy().into_owned());
+    session.save(&StateDir::from_path(state)).unwrap();
+
+    let mut args = frontend_args(Frontend::Sdk);
+    args.extend(["-c".to_owned(), session.id.to_string()]);
+    let mut child = spawn_makima(home.path(), &work, args);
+    let output = json_lines(child.stdout.take().unwrap());
+    let init = loop {
+        let message = output.recv_timeout(TIMEOUT).expect(NO_INIT);
+        if message["subtype"] == "init" {
+            break message;
+        }
+    };
+    drop(child.stdin.take());
+    assert_eq!(init["permissionMode"], "plan", "{init}");
     assert!(wait_exit(child).success());
 }
 
