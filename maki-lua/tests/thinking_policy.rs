@@ -32,7 +32,7 @@ maki.api.register_command({
       model = { thinking = input.thinking },
     })
     assert(child, err)
-    local result, serr = child:prompt(ctx, "hi")
+    local result, serr = assert(child:send(ctx, "hi", { when = "idle" })):wait(ctx)
     assert(result, serr)
     local closed, cerr = child:close(ctx)
     assert(closed, cerr)

@@ -687,10 +687,10 @@ impl Fixture {
                     schema = {{ type = "object", properties = {{}} }}, audiences = {{ "main", "general_sub" }},
                     handler = function(_, child_ctx)
                         local grandchild = assert(maki.agent.spawn(child_ctx, {{ inherit_provider = true, silent = true }}))
-                        local first = assert(grandchild:send(child_ctx, "grandchild capture"))
+                        local first = assert(grandchild:send(child_ctx, "grandchild capture", {{ when = "idle" }}))
                         local result = assert(first:wait(child_ctx))
                         assert(#result.output == 1 and result.output[1].answer == 42 and result.captured.answer == 42)
-                        local second = assert(grandchild:send(child_ctx, "grandchild capture again"))
+                        local second = assert(grandchild:send(child_ctx, "grandchild capture again", {{ when = "idle" }}))
                         local next_result = assert(second:wait(child_ctx))
                         assert(#next_result.output == 1 and next_result.output[1].answer == 7 and next_result.captured.answer == 7)
                         local frozen = assert(first:result(child_ctx))
@@ -971,7 +971,7 @@ fn child_checkpoint_failure_fails_the_child_result() {
             &format!(
                 r#"
             local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            local result = assert(child:prompt(ctx, "persist me"))
+            local result = assert(assert(child:send(ctx, "persist me", {{ when = "idle" }})):wait(ctx))
             assert(result.status == "failed", result.status)
             assert(result.error:find("{CHECKPOINT_ERROR}", 1, true), result.error)
             assert(child:close(ctx))
@@ -990,8 +990,13 @@ fn child_checkpoint_failure_fails_the_child_result() {
 
 #[test_case::test_case(0; "zero_timeout")]
 #[test_case::test_case(1; "positive_timeout")]
-fn public_agent_prompt_timeout_retains_recoverable_ticket(timeout: u64) {
+fn turn_wait_timeout_keeps_the_ticket_recoverable(timeout: u64) {
     smol::block_on(async {
+        let expected_err = if timeout == 0 {
+            "nil".to_owned()
+        } else {
+            format!("{TURN_WAIT_TIMEOUT:?}")
+        };
         let tool = if timeout == 0 {
             "pr7_prompt_zero"
         } else {
@@ -1002,20 +1007,20 @@ fn public_agent_prompt_timeout_retains_recoverable_ticket(timeout: u64) {
             &format!(
                 r#"
             local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            assert(not pcall(child.prompt, child, ctx, "malformed timeout", {{ timeout = -1 }}))
+            assert(not pcall(child.send, child, ctx, "missing when", {{}}))
             local untouched = assert(child:status(ctx))
             assert(untouched.queued == 0 and untouched.active_turn == nil)
-            local result, err = child:prompt(ctx, "held prompt", {{ timeout = {timeout} }})
-            assert(result == nil and type(err) == "table")
-            assert(err.kind == "timeout" and err.message == "{TURN_WAIT_TIMEOUT}")
-            assert(err.ticket:agent_id() == child:id())
-            assert(err.ticket:result(ctx) == nil)
+            local ticket = assert(child:send(ctx, "held prompt", {{ when = "idle" }}))
+            local result, err = ticket:wait(ctx, {{ timeout = {timeout} }})
+            assert(result == nil and err == {expected_err})
+            assert(ticket:agent_id() == child:id())
+            assert(ticket:result(ctx) == nil)
             local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            assert(assert(checkpoint:prompt(ctx, "timeout observed")).text == "{SECOND_REPLY}")
-            local recovered = assert(err.ticket:wait(ctx))
+            assert(assert(assert(checkpoint:send(ctx, "timeout observed", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
+            local recovered = assert(ticket:wait(ctx))
             assert(recovered.text == "{FIRST_REPLY}" and recovered.status == "completed")
-            assert(assert(err.ticket:result(ctx)).text == recovered.text)
-            assert(assert(child:prompt(ctx, "successful prompt")).text == "{SECOND_REPLY}")
+            assert(assert(ticket:result(ctx)).text == recovered.text)
+            assert(assert(assert(child:send(ctx, "successful prompt", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
             assert(child:close(ctx))
             assert(checkpoint:close(ctx))
         "#
@@ -1175,7 +1180,7 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                         assert(assert(root:config(callback_ctx)).mode == "plan")
                         local child = assert(maki.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                         assert(callback_ctx:defer_close(child))
-                        assert(child:prompt(callback_ctx, "callback delivered after GC"))
+                        assert(assert(child:send(callback_ctx, "callback delivered after GC", {{ when = "idle" }})):wait(callback_ctx))
                     end))
                     subscription = nil
                 end,
@@ -1255,10 +1260,10 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
             }}))
             local id = assert(child:id())
             assert(assert(maki.agent.get(ctx, assert(child:ref()))):id() == id)
-            local first = assert(child:send(ctx, "first prompt"))
-            local busy, busy_err = child:send(ctx, "must not run")
+            local first = assert(child:send(ctx, "first prompt", {{ when = "idle" }}))
+            local busy, busy_err = child:send(ctx, "must not run", {{ when = "idle" }})
             assert(busy == nil and busy_err == {busy_error:?}, busy_err)
-            local second = assert(child:enqueue(ctx, "second prompt"))
+            local second = assert(child:send(ctx, "second prompt", {{ when = "queue" }}))
             assert(first:id() ~= second:id())
             assert(first:agent_id() == id and second:agent_id() == id)
             local pending, pending_err = second:result(ctx)
@@ -1266,7 +1271,7 @@ fn public_agent_tickets_retain_exact_results_across_queued_turns() {
             local invalid, invalid_err = first:wait(ctx, {{ timeout = 0 }})
             assert(invalid == nil and invalid_err == nil)
             local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            assert(assert(assert(checkpoint:send(ctx, "checks complete")):wait(ctx)).text == "checks complete")
+            assert(assert(assert(checkpoint:send(ctx, "checks complete", {{ when = "idle" }})):wait(ctx)).text == "checks complete")
             assert(checkpoint:close(ctx))
             assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
             assert(assert(second:wait(ctx)).text == "{SECOND_REPLY}")
@@ -1333,12 +1338,12 @@ fn public_agent_model_change_controls_next_request_without_losing_history() {
             &format!(
                 r#"
             local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            local first = assert(child:send(ctx, "before model change"))
+            local first = assert(child:send(ctx, "before model change", {{ when = "idle" }}))
             assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
             assert(child:set_model(ctx, "{UPDATED_MODEL}"))
-            local second = assert(child:send(ctx, "after model change", {{ after_turn = first:id() }}))
+            local second = assert(child:send(ctx, "after model change", {{ when = "idle", after_turn = first:id() }}))
             assert(assert(second:wait(ctx)).text == "{SECOND_REPLY}")
-            local stale, stale_err = child:send(ctx, "stale checkpoint must not run", {{ after_turn = first:id() }})
+            local stale, stale_err = child:send(ctx, "stale checkpoint must not run", {{ when = "idle", after_turn = first:id() }})
             assert(stale == nil and stale_err == {stale_error:?}, stale_err)
             local transcript = assert(child:transcript(ctx, {{ through_turn = first:id(), last_messages = 100, max_bytes = 65536 }}))
             assert(transcript.through_turn == first:id())
@@ -1413,12 +1418,12 @@ fn public_child_mode_changes_provider_system_after_queued_turns(custom: Option<&
                 name = "{COMMAND}", tui_only = false,
                 handler = function(_, ctx)
                     local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, {system_option} }}))
-                    local first = assert(child:send(ctx, "old mode first"))
-                    local queued = assert(child:enqueue(ctx, "old mode queued"))
+                    local first = assert(child:send(ctx, "old mode first", {{ when = "idle" }}))
+                    local queued = assert(child:send(ctx, "old mode queued", {{ when = "queue" }}))
                     assert(child:set_mode(ctx, "{NEW_MODE}") == "{NEW_MODE}")
                     assert(assert(first:wait(ctx)).text == "{FIRST_REPLY}")
                     assert(assert(queued:wait(ctx)).text == "{SECOND_REPLY}")
-                    local latest = assert(child:send(ctx, "new mode turn"))
+                    local latest = assert(child:send(ctx, "new mode turn", {{ when = "idle" }}))
                     assert(assert(latest:wait(ctx)).text == "{FIRST_REPLY}")
                     assert(assert(first:result(ctx)).text == "{FIRST_REPLY}")
                     assert(child:close(ctx))
@@ -1507,7 +1512,7 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
                     local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
                     assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
                     assert(assert(controlled:config(ctx)).mode == "{ALLOWED_MODE}")
-                    local turn = assert(child:send(ctx, "required schema under allowed mode"))
+                    local turn = assert(child:send(ctx, "required schema under allowed mode", {{ when = "idle" }}))
                     local result = assert(turn:wait(ctx))
                     assert(result.status == "completed" and result.captured.answer == 42)
                     assert(child:close(ctx))
@@ -1608,7 +1613,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                         local denied = not_descendant(target)
                         local status, status_err = target:status(child_ctx)
                         assert(status == nil and status_err == {NOT_DESCENDANT_OF_CALLER:?}, status_err)
-                        local sent, send_err = target:send(child_ctx, "forbidden")
+                        local sent, send_err = target:send(child_ctx, "forbidden", {{ when = "idle" }})
                         assert(sent == nil and send_err == denied, send_err)
                         local cancelled, cancel_err = target:cancel(child_ctx)
                         assert(cancelled == nil and cancel_err == denied, cancel_err)
@@ -1646,7 +1651,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                     {{ name = "{tool}_write", description = "nested write", input_schema = {{ type = "object", properties = {{}} }} }},
                 }},
             }}))
-            local ticket = assert(child:send(ctx, "check authority"))
+            local ticket = assert(child:send(ctx, "check authority", {{ when = "idle" }}))
             assert(assert(ticket:wait(ctx)).text == "{SECOND_REPLY}")
             assert(assert(sibling:status(ctx)).status == "idle")
             assert(child:close(ctx))
@@ -1839,7 +1844,7 @@ fn tool_spawn_preserves_executing_turn_configuration_after_committed_change() {
             assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
             assert(parent:set_mode(ctx, "plan") == "plan")
             local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
-            assert(assert(assert(child:send(ctx, "turn snapshot")):wait(ctx)).text == "{FIRST_REPLY}")
+            assert(assert(assert(child:send(ctx, "turn snapshot", {{ when = "idle" }})):wait(ctx)).text == "{FIRST_REPLY}")
             assert(child:close(ctx))
         "#
             ),
@@ -1955,7 +1960,7 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
                     local selection = assert(child:config(ctx)).model
                     assert(selection.spec == "{FAST_MODEL}")
                     assert(selection.thinking == "low" and selection.fast == true)
-                    assert(assert(assert(child:send(ctx, "inherited configuration")):wait(ctx)).text == "{FIRST_REPLY}")
+                    assert(assert(assert(child:send(ctx, "inherited configuration", {{ when = "idle" }})):wait(ctx)).text == "{FIRST_REPLY}")
                     assert(child:close(ctx))
                 end,
             }})
@@ -2156,7 +2161,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                         local result, err = foreign[operation](foreign, ctx)
                         assert(result == nil and err == {OTHER_RUNTIME:?}, err)
                     end
-                    local sent, send_err = foreign:send(ctx, "foreign must not run")
+                    local sent, send_err = foreign:send(ctx, "foreign must not run", {{ when = "idle" }})
                     assert(sent == nil and send_err == {OTHER_RUNTIME:?}, send_err)
                     local changed, mode_err = foreign:set_mode(ctx, "build")
                     assert(changed == nil and mode_err == {OTHER_RUNTIME:?}, mode_err)
@@ -2883,9 +2888,9 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
                 name = "/pr5_retained_begin", tui_only = false,
                 handler = function(_, ctx)
                     child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                    first = assert(child:send(ctx, "terminal history"))
+                    first = assert(child:send(ctx, "terminal history", { when = "idle" }))
                     assert(assert(first:wait(ctx)).text == "terminal reply")
-                    second = assert(child:send(ctx, "active history"))
+                    second = assert(child:send(ctx, "active history", { when = "idle" }))
                 end,
             })
             maki.api.register_command({
@@ -2895,7 +2900,7 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
                     assert(#transcript.messages == 2)
                     assert(transcript.through_turn == first:id())
                     local checkpoint = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-                    assert(assert(assert(checkpoint:send(ctx, "transcript inspected")):wait(ctx)).text == "inspected")
+                    assert(assert(assert(checkpoint:send(ctx, "transcript inspected", { when = "idle" })):wait(ctx)).text == "inspected")
                     assert(checkpoint:close(ctx))
                     assert(assert(second:wait(ctx)).text == "active reply")
                     assert(child:close(ctx))
@@ -3006,7 +3011,7 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
             local function hold(ctx, message)
                 local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                 assert(ctx:defer_close(child))
-                assert(assert(child:send(ctx, message)):wait(ctx))
+                assert(assert(child:send(ctx, message, { when = "idle" })):wait(ctx))
             end
             maki.api.register_command({
                 name = "/pr5_event_begin", description = "subscribe and run an observed turn", tui_only = false,
@@ -3027,9 +3032,9 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                     close_subscription = assert(observed:on_close(ctx, guard("close", function(event, callback_ctx)
                         assert(event.data.lifecycle == "closed")
                         assert(callback_ctx:defer_close(close_probe))
-                        assert(assert(close_probe:send(callback_ctx, "close callback delivered")):wait(callback_ctx))
+                        assert(assert(close_probe:send(callback_ctx, "close callback delivered", { when = "idle" })):wait(callback_ctx))
                     end)))
-                    local turn = assert(observed:send(ctx, "observed turn"))
+                    local turn = assert(observed:send(ctx, "observed turn", { when = "idle" }))
                     assert(assert(turn:wait(ctx)).text == "observed reply")
                 end,
             })
@@ -3170,7 +3175,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                 r#"
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             local function callback(_, callback_ctx)
-                assert(assert(child:send(callback_ctx, "forbidden callback")):wait(callback_ctx))
+                assert(assert(child:send(callback_ctx, "forbidden callback", { when = "idle" })):wait(callback_ctx))
             end
             for _, kind in ipairs({ "on_turn_start", "on_turn_end", "on_idle", "on_config_change", "on_close" }) do
                 local subscription, err = child[kind](child, ctx, callback)
@@ -3315,7 +3320,7 @@ fn trusted_spawn_restores_host_bindings_without_expanding_capabilities(explicit:
                     local child = assert(maki.agent.spawn(ctx, {{
                         inherit_provider = true, silent = true, audience = "main", {selection}
                     }}))
-                    assert(assert(assert(child:send(ctx, "trusted bindings")):wait(ctx)).text == "{SECOND_REPLY}")
+                    assert(assert(assert(child:send(ctx, "trusted bindings", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
                     assert(child:close(ctx))
                 end,
             }})
@@ -3386,7 +3391,7 @@ fn child_audience_cannot_expand_parent_capabilities(explicit: bool) {
                         handler = function() return "fresh local tool ran" end,
                     }} }},
                 }}))
-                assert(assert(assert(child:send(ctx, "audience ceiling")):wait(ctx)).text == "{SECOND_REPLY}")
+                assert(assert(assert(child:send(ctx, "audience ceiling", {{ when = "idle" }})):wait(ctx)).text == "{SECOND_REPLY}")
                 assert(child:close(ctx))
             "#
             ),
@@ -3432,7 +3437,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
             pr5_schema_children_handler = function(_, parent_ctx)
                 local plain, spawn_err = maki.agent.spawn(parent_ctx, { inherit_provider = true, silent = true })
                 assert(plain, "plain child spawn failed: " .. tostring(spawn_err))
-                local plain_ticket, send_err = plain:send(parent_ctx, "plain inherited child")
+                local plain_ticket, send_err = plain:send(parent_ctx, "plain inherited child", { when = "idle" })
                 assert(plain_ticket, "plain child send failed: " .. tostring(send_err))
                 local plain_result, wait_err = plain_ticket:wait(parent_ctx)
                 assert(plain_result, "plain child wait failed: " .. tostring(wait_err))
@@ -3440,7 +3445,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
                 assert(plain:close(parent_ctx))
                 local own, own_err = maki.agent.spawn(parent_ctx, { inherit_provider = true, silent = true, output_schema = schema })
                 assert(own, "own-schema child spawn failed: " .. tostring(own_err))
-                local own_result = assert(assert(own:send(parent_ctx, "own schema inherited child")):wait(parent_ctx))
+                local own_result = assert(assert(own:send(parent_ctx, "own schema inherited child", { when = "idle" })):wait(parent_ctx))
                 assert(own_result.status == "completed" and #own_result.output == 1 and own_result.output[1].answer == 7)
                 assert(own_result.captured.answer == 7)
                 assert(own:close(parent_ctx))
@@ -3455,7 +3460,7 @@ fn inherited_tools_do_not_leak_parent_structured_output_into_children() {
                     handler = function() return "ordinary inherited handler ran" end,
                 } },
             }))
-            local ticket = assert(parent:send(ctx, "schema parent"))
+            local ticket = assert(parent:send(ctx, "schema parent", { when = "idle" }))
             local result = assert(ticket:wait(ctx))
             assert(result.status == "completed" and #result.output == 1 and result.output[1].answer == 42)
             assert(result.captured.answer == 42)
@@ -3604,11 +3609,11 @@ fn public_output_schema_retries_invalid_reports_and_resets_each_turn() {
                     handler = function() return "ordinary completed" end,
                 } },
             }))
-            local first = assert(child:send(ctx, "first schema turn"))
+            local first = assert(child:send(ctx, "first schema turn", { when = "idle" }))
             local result = assert(first:wait(ctx))
             assert(result.status == "completed" and #result.output == 1 and result.output[1].answer == 42)
             assert(result.captured.answer == result.output[#result.output].answer)
-            local second = assert(child:send(ctx, "second schema turn"))
+            local second = assert(child:send(ctx, "second schema turn", { when = "idle" }))
             local next_result = assert(second:wait(ctx))
             assert(next_result.status == "completed" and #next_result.output == 1 and next_result.output[1].answer == 7)
             assert(next_result.captured.answer == next_result.output[#next_result.output].answer)
@@ -3757,7 +3762,7 @@ fn retained_tool_context_cannot_authorize_another_invocation() {
                     assert(stale == nil and stale_err == {INVOCATION_EXPIRED:?}, stale_err)
                     assert(#assert(maki.agent.list(ctx)) == before)
                     local fresh = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                    local ticket = assert(fresh:send(ctx, "{PROMPT}"))
+                    local ticket = assert(fresh:send(ctx, "{PROMPT}", {{ when = "idle" }}))
                     assert(assert(ticket:wait(ctx)).text == "{REPLY}")
                     assert(fresh:close(ctx))
                 end
@@ -3836,10 +3841,10 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
                     child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     observer = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     subscription = assert(child:on_turn_start(ctx, function(_, callback_ctx)
-                        observer_ticket = assert(observer:send(callback_ctx, "subscription after rejected reload"))
+                        observer_ticket = assert(observer:send(callback_ctx, "subscription after rejected reload", { when = "idle" }))
                         assert(observer_ticket:wait(callback_ctx))
                     end))
-                    ticket = assert(child:send(ctx, "work across rejected reload"))
+                    ticket = assert(child:send(ctx, "work across rejected reload", { when = "idle" }))
                 end,
             })
             maki.api.register_command({
@@ -3847,7 +3852,7 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
                 handler = function(_, ctx)
                     assert(assert(ticket:wait(ctx)).text == "resources survived")
                     assert(observer_ticket:wait(ctx))
-                    local next_ticket = assert(child:send(ctx, "child after rejected reload"))
+                    local next_ticket = assert(child:send(ctx, "child after rejected reload", { when = "idle" }))
                     assert(assert(next_ticket:wait(ctx)).text == "resources survived")
                 end,
             })
@@ -3972,9 +3977,9 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
                     local subscription = assert(parent:on_turn_start(ctx, function(_, callback_ctx)
                         local child = assert(maki.agent.spawn(callback_ctx, { inherit_provider = true, silent = true, tools = {} }))
                         assert(callback_ctx:defer_close(child))
-                        assert(assert(child:send(callback_ctx, "cycle descendant")):wait(callback_ctx))
+                        assert(assert(child:send(callback_ctx, "cycle descendant", { when = "idle" })):wait(callback_ctx))
                     end))
-                    assert(assert(parent:send(ctx, "cycle parent")):wait(ctx))
+                    assert(assert(parent:send(ctx, "cycle parent", { when = "idle" })):wait(ctx))
                     assert(subscription:close())
                 end,
             })
@@ -4026,7 +4031,7 @@ fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {},
                 output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } },
             }))
-            local ticket = assert(child:send(ctx, "never correct report"))
+            local ticket = assert(child:send(ctx, "never correct report", { when = "idle" }))
             local result = assert(ticket:wait(ctx))
             assert(result.status == "failed" and #result.output == 0 and result.captured == nil)
             assert(result.error:find("does not match output_schema", 1, true))
@@ -4041,7 +4046,7 @@ fn public_output_schema_exhaustion_falls_back_bounded(invalid: bool) {
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true,
                 output_schema = { type = "object", properties = {}, additionalProperties = false },
             }))
-            local result, err = child:prompt(ctx, "never report")
+            local result, err = assert(child:send(ctx, "never report", { when = "idle" })):wait(ctx)
             assert(result ~= nil and err == nil)
             assert(result.status == "failed" and #result.output == 0)
             assert(result.error:find("without calling structured_output", 1, true))
@@ -4129,20 +4134,20 @@ fn saturated_event_callbacks_can_dispatch_a_child_lua_tool() {
                         tools = {{{{ name = "{TOOL}", description = "saturation child tool",
                             input_schema = {{ type = "object", properties = {{}} }} }}}} }}))
                     checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-                    worker_turn = assert(worker:send(ctx, "worker callback"))
+                    worker_turn = assert(worker:send(ctx, "worker callback", {{ when = "idle" }}))
                     for i = 1, {CALLBACKS} do
                         subscriptions[i] = assert(observed:on_turn_start(ctx, function(_, callback_ctx)
                             local ok, err = pcall(function()
                                 entered = entered + 1
                                 if entered == {CALLBACKS} then
-                                    assert(assert(checkpoint:send(callback_ctx, "all callbacks entered")):wait(callback_ctx))
+                                    assert(assert(checkpoint:send(callback_ctx, "all callbacks entered", {{ when = "idle" }})):wait(callback_ctx))
                                 end
                                 assert(worker_turn:wait(callback_ctx))
                             end)
                             if not ok then errors[#errors + 1] = tostring(err) end
                         end))
                     end
-                    assert(assert(observed:send(ctx, "observed callback trigger")):wait(ctx))
+                    assert(assert(observed:send(ctx, "observed callback trigger", {{ when = "idle" }})):wait(ctx))
                 end,
             }})
             maki.api.register_command({{
@@ -4329,16 +4334,16 @@ fn public_agent_ticket_cancel_stops_gated_request_and_keeps_actor_reusable() {
             }})
             assert(local_collision == nil and local_err == {STRUCTURED_OUTPUT_CONFLICT:?}, local_err)
             local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}}, output_schema = {{ type = "object", properties = {{ answer = {{ type = "integer" }} }}, required = {{ "answer" }} }} }}))
-            local cancelled = assert(child:send(ctx, "cancel gated request"))
+            local cancelled = assert(child:send(ctx, "cancel gated request", {{ when = "idle" }}))
             local checkpoint = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
-            assert(assert(assert(checkpoint:send(ctx, "ready to cancel")):wait(ctx)).text == "ready to cancel")
+            assert(assert(assert(checkpoint:send(ctx, "ready to cancel", {{ when = "idle" }})):wait(ctx)).text == "ready to cancel")
             assert(cancelled:cancel(ctx))
             local result, err = cancelled:wait(ctx)
             assert(err == nil and result.status == "cancelled" and #result.output == 0)
             local retained, retained_err = cancelled:result(ctx)
             assert(retained_err == nil and retained.status == "cancelled")
             assert(retained.cancellation_reason == result.cancellation_reason)
-            local next = assert(child:send(ctx, "after cancellation"))
+            local next = assert(child:send(ctx, "after cancellation", {{ when = "idle" }}))
             assert(assert(next:wait(ctx)).text == "{SECOND_REPLY}")
             assert(child:close(ctx))
             assert(checkpoint:close(ctx))
@@ -4403,7 +4408,7 @@ fn inherited_local_capture_belongs_to_executing_grandchild() {
                     handler = function() return "captured" end,
                 } },
             }))
-            local result = assert(assert(child:send(ctx, "spawn grandchild")):wait(ctx))
+            local result = assert(assert(child:send(ctx, "spawn grandchild", { when = "idle" })):wait(ctx))
             assert(result.captured == nil and #result.output == 0, "grandchild capture leaked into parent")
             assert(child:close(ctx))
         "#,
@@ -4548,7 +4553,7 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
             local child = assert(maki.agent.spawn(ctx, {
                 inherit_provider = true, tools = {}, output_schema = schema,
             }))
-            local ticket = assert(child:send(ctx, "report answer"))
+            local ticket = assert(child:send(ctx, "report answer", { when = "idle" }))
             "#
         };
         let checkpoint = if !wait {
@@ -4828,7 +4833,7 @@ fn public_agent_ticket_surfaces_captured_local_tool_output() {
                     }},
                 }},
             }}))
-            local ticket = assert(child:send(ctx, "capture a structured answer"))
+            local ticket = assert(child:send(ctx, "capture a structured answer", {{ when = "idle" }}))
             local result = assert(ticket:wait(ctx))
             assert(result.text == "{CAPTURE_REPLY}")
             assert(result.captured.answer == 42)
@@ -4921,8 +4926,8 @@ fn settled_turn_withdraws_delivery_only_when_waited(wait_settled: bool) {
             &format!(
                 r#"
             local spawn = {{ inherit_provider = true, tools = {{}} }}
-            local first = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {FIRST_PROMPT:?}))
-            local second = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {SECOND_PROMPT:?}))
+            local first = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {FIRST_PROMPT:?}, {{ when = "idle" }}))
+            local second = assert(assert(maki.agent.spawn(ctx, spawn)):send(ctx, {SECOND_PROMPT:?}, {{ when = "idle" }}))
             assert(assert(second:wait(ctx)).text == {SECOND_REPLY:?})
             assert(assert(first:result(ctx)).text == {FIRST_REPLY:?})
             if {wait_settled} then
@@ -5032,7 +5037,7 @@ fn trusted_command_wait_keeps_child_delivery() {
                 name = "{COMMAND}", tui_only = false,
                 handler = function(_, ctx)
                     local child = assert(maki.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}} }}))
-                    local ticket = assert(child:send(ctx, "trusted"))
+                    local ticket = assert(child:send(ctx, "trusted", {{ when = "idle" }}))
                     assert(assert(ticket:wait(ctx)).text == {FIRST_REPLY:?})
                 end,
             }})

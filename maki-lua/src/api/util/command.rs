@@ -451,7 +451,6 @@ pub enum SessionRequest {
     Usage { id: MakiId },
     Read { id: MakiId },
     New { prompt: Option<String>, focus: bool },
-    Prompt { id: MakiId, text: String },
     Focus { id: String },
     Delete { id: String },
     SetTitle { id: String, title: String },

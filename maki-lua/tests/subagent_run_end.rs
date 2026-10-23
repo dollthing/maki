@@ -86,7 +86,7 @@ register_probe({
 register_probe({
   name = "probe_send",
   handler = function(input, ctx)
-    local _, err = session_holder.sess:enqueue(ctx, input.message)
+    local _, err = session_holder.sess:send(ctx, input.message, { when = "queue" })
     if err then
       return { llm_output = "send failed: " .. err, is_error = true }
     end
@@ -98,7 +98,7 @@ register_probe({
   name = "probe_prompt",
   handler = function(input, ctx)
     local opts = input.timeout and { timeout = input.timeout } or nil
-    local ticket, admission_err = session_holder.sess:enqueue(ctx, input.message)
+    local ticket, admission_err = session_holder.sess:send(ctx, input.message, { when = "queue" })
     if not ticket then
       return maki.json.encode({ error = admission_err })
     end

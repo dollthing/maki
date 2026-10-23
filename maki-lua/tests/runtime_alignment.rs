@@ -93,7 +93,7 @@ maki.api.register_command({
             if reference:id() == input.agent_id then target = assert(maki.agent.get(ctx, reference)) end
         end
         assert(target:id() == input.agent_id)
-        alignment_trusted = assert(target:submit(ctx, input.message))
+        alignment_trusted = assert(target:send(ctx, input.message, { when = "join" }))
     end,
 })
 maki.api.register_tool({
@@ -123,7 +123,7 @@ maki.api.register_tool({
         local child_reply
         if input.spawn_child then
             local child = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
-            child_reply = assert(child:prompt(ctx, "alignment inherited cwd")).text
+            child_reply = assert(assert(child:send(ctx, "alignment inherited cwd", { when = "idle" })):wait(ctx)).text
             assert(child:close(ctx))
         end
         return maki.json.encode({ cwd = cwd, output = output, child = child_reply })

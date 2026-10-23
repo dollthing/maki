@@ -1611,7 +1611,7 @@ mod tests {
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
-                        assert(assert(child:prompt(ctx, "{COMMAND_CHILD_PROMPT}")).text == "{PRINT_RESPONSE}")
+                        assert(assert(assert(child:send(ctx, "{COMMAND_CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)).text == "{PRINT_RESPONSE}")
                         assert(child:close(ctx))
                         maki.ui.flash("{COMMAND_FINISHED}")
                     end,

@@ -84,7 +84,7 @@ fn child_tool(auto_deliver: bool) -> String {
             local child, err = maki.agent.spawn(ctx, {{ name = "approval child", system = "child", tools = maki.json.decode('[]'), auto_deliver = {auto_deliver} }})
             if err then return {{ llm_output = err, is_error = true }} end
             sessions[#sessions + 1] = child
-            local ticket, send_err = child:prompt(ctx, "{CHILD_PROMPT}")
+            local ticket, send_err = assert(child:send(ctx, "{CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)
             if send_err then return {{ llm_output = send_err, is_error = true }} end
             return "child started"
         end,
@@ -240,7 +240,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
                     }})
                     assert(child, err)
                     sessions[#sessions + 1] = child
-                    local ticket, send_err = child:prompt(ctx, "{CHILD_PROMPT}")
+                    local ticket, send_err = assert(child:send(ctx, "{CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)
                     assert(ticket, send_err)
                 end,
             }})

@@ -13,18 +13,23 @@ local VERDICT_INPUT_ERROR = "classifier_verdict input must be { approved: boolea
 
 local function fake_agent(spawn_log, result, prompt_err, throws)
   return {
-    prompt = function(_self, ctx, message, opts)
+    send = function(_self, ctx, message, opts)
       spawn_log.prompt_ctx = ctx
       spawn_log.message = message
-      spawn_log.prompt_opts = opts
-      if throws then
-        error(prompt_err, 0)
-      end
-      if type(prompt_err) == "table" and prompt_err.kind == "timeout" then
-        spawn_log.live_ticket = true
-        return nil, prompt_err
-      end
-      return result, prompt_err
+      spawn_log.send_opts = opts
+      return {
+        wait = function(_turn, _wait_ctx, wait_opts)
+          spawn_log.prompt_opts = wait_opts
+          if throws then
+            error(prompt_err, 0)
+          end
+          if type(prompt_err) == "table" and prompt_err.kind == "timeout" then
+            spawn_log.live_ticket = true
+            return nil, prompt_err
+          end
+          return result, prompt_err
+        end,
+      }
     end,
     close = function(_self, ctx)
       spawn_log.close_ctx = ctx
@@ -113,6 +118,7 @@ case("classify_verdict_approve_runs_spawn", function()
   eq(log.prompt_ctx, ctx)
   eq(log.close_ctx, ctx)
   eq(log.opts, OPT)
+  eq(log.send_opts.when, "idle")
   eq(log.prompt_opts.timeout, OPT.auto_timeout_secs)
   eq(log.close_calls, 1)
   eq(log.cancel_calls, 0)

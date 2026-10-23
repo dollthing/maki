@@ -1861,7 +1861,7 @@ lua_table! {
     ///   system = "You are a helpful assistant.",
     ///   tools = tools,
     /// }))
-    /// local r = assert(agent:prompt(ctx, "Hello!"))
+    /// local r = assert(assert(agent:send(ctx, "Hello!", { when = "idle" })):wait(ctx))
     /// print(r.text)
     /// agent:close(ctx)
     /// ```

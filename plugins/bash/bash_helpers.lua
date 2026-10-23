@@ -101,7 +101,11 @@ function M.classify_verdict(command, cwd, opts, ctx, spawn)
     return "error", nil, spawn_err
   end
   local prompt_ok, result, prompt_err = pcall(function()
-    return agent:prompt(ctx, M.build_classifier_message(command, cwd), { timeout = opts.auto_timeout_secs })
+    local turn, send_err = agent:send(ctx, M.build_classifier_message(command, cwd), { when = "idle" })
+    if not turn then
+      return nil, send_err
+    end
+    return turn:wait(ctx, { timeout = opts.auto_timeout_secs })
   end)
   agent:close(ctx)
   if not prompt_ok then

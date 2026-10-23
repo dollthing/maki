@@ -248,7 +248,8 @@ local function spawn_agent(ctx, options)
       return nil, auth_err, true
     end
     make_ticket_room(call_ctx)
-    local ticket, send_err = agent:submit(call_ctx, message, { existing_only = #order >= MAX_RETAINED_TURNS })
+    local ticket, send_err =
+      agent:send(call_ctx, message, { when = "join", existing_only = #order >= MAX_RETAINED_TURNS })
     if not ticket then
       return nil, send_err, true
     end

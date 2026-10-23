@@ -777,7 +777,7 @@ fn parity_commands() -> String {
     format!(
         r#"
 local function prompt(ctx, text)
-  local _, err = assert(maki.agent.current(ctx)):prompt(ctx, text)
+  local _, err = assert(assert(maki.agent.current(ctx)):send(ctx, text, {{ when = "idle" }})):wait(ctx)
   assert(err == nil, tostring(err))
 end
 maki.api.register_command({{
@@ -803,7 +803,7 @@ maki.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx)
     local child = assert(maki.agent.spawn(ctx, {{ auto_deliver = false }}))
-    local _, err = child:prompt(ctx, "{ASK_PROMPT}")
+    local _, err = assert(child:send(ctx, "{ASK_PROMPT}", {{ when = "idle" }})):wait(ctx)
     assert(err == nil, tostring(err))
     child:close(ctx)
   end,
@@ -812,7 +812,7 @@ maki.api.register_command({{
   name = "{BACKGROUND_COMMAND}", tui_only = false,
   handler = function(_, ctx)
     local child = assert(maki.agent.spawn(ctx, {{}}))
-    assert(child:submit(ctx, "{BACKGROUND_PROMPT}"))
+    assert(child:send(ctx, "{BACKGROUND_PROMPT}", {{ when = "join" }}))
   end,
 }})
 maki.api.register_command({{

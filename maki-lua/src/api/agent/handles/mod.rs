@@ -387,7 +387,7 @@ mod tests {
                 retained_child = child
                 local reference = assert(child:ref())
                 assert(agent_api.get(ctx, reference):id() == child:id())
-                local ticket = assert(child:send(ctx, "standalone request"))
+                local ticket = assert(child:send(ctx, "standalone request", { when = "idle" }))
                 local result = assert(ticket:wait(ctx))
                 assert(ticket:result(ctx).text == result.text)
                 assert(child:transcript(ctx, { last_messages = 100, max_bytes = 65536 }))
@@ -1021,7 +1021,7 @@ mod tests {
             let result: Table = lua
                 .load(
                     r#"
-                local ticket, err = agent:send(ctx, "hello")
+                local ticket, err = agent:send(ctx, "hello", { when = "idle" })
                 assert(ticket, err)
                 local result, wait_err = ticket:wait(ctx)
                 assert(result, wait_err)

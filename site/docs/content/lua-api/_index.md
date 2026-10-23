@@ -1288,7 +1288,7 @@ local agent = assert(maki.agent.spawn(ctx, {
   system = "You are a helpful assistant.",
   tools = tools,
 }))
-local r = assert(agent:prompt(ctx, "Hello!"))
+local r = assert(assert(agent:send(ctx, "Hello!", { when = "idle" })):wait(ctx))
 print(r.text)
 agent:close(ctx)
 ```
@@ -1760,74 +1760,24 @@ Return another nonowning handle to this agent.
 ### `Agent:send()` {#Agent-send}
 
 ```lua
-Agent:send({ctx}, {message}, {opts?})
+Agent:send({ctx}, {message}, {opts})
 ```
 
-Admit a turn only when this agent has no active, preparing, or queued work.
+Send a user message and get the ticket of the turn that carries it.
+`when` decides how the message meets other work: `"idle"` admits a turn
+only when the agent has no active, preparing or queued work; `"join"`
+joins compatible admitted work, reaching its next safe model request
+without interrupting a provider request or tool, or starts a turn when
+there is none; `"queue"` queues a distinct turn behind admitted work.
+Wait for the result with `AgentTurn:wait`.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{message}` (`string`) User message.
-- `{opts?}` (`table?`) Optional after_turn ID required to match the latest terminal turn, including failure or cancellation.
+- `{message}` (`string`) User message (text only).
+- `{opts}` (`table`) Required `when` ("idle", "join" or "queue"). `existing_only` (join only) joins compatible work or returns busy without starting a turn. `after_turn` (idle only) must match the latest terminal turn, including failure or cancellation.
 
-**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
-
----
-
-### `Agent:submit()` {#Agent-submit}
-
-```lua
-Agent:submit({ctx}, {message}, {opts?})
-```
-
-Submit instructions to open ordinary work, or start a successor when idle or admission is closed.
-Busy and compatible pending submissions return the existing ticket. Instructions reach the next
-safe model request without interrupting a provider request or tool. Bounded inbox rejection does
-not cancel accepted work. Exact enqueue operations remain separate FIFO turns.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{message}` (`string`) User instructions (text only).
-- `{opts?}` (`table?`) existing_only joins compatible admitted work or returns busy without starting a new turn. Defaults to false.
-
-**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Ticket covering these instructions, or an admission error.
-
----
-
-### `Agent:enqueue()` {#Agent-enqueue}
-
-```lua
-Agent:enqueue({ctx}, {message})
-```
-
-Queue a turn behind already admitted work.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{message}` (`string`) User message.
-
-**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
-
----
-
-### `Agent:prompt()` {#Agent-prompt}
-
-```lua
-Agent:prompt({ctx}, {message}, {opts?})
-```
-
-Send an idle-only turn and wait for its exact result.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{message}` (`string`) User message.
-- `{opts?}` (`table?`) timeout is a nonnegative integer number of seconds; zero is nonblocking. after_turn must match the latest terminal turn.
-
-**Returns:** (`table?`, `string|table?`) AgentTurn result, or an admission/wait error. A pending timeout returns nil and {kind = "timeout", message, ticket}; the exact ticket remains usable with current valid authority. Timeout does not cancel execution.
+**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket, or an admission error. Bounded inbox rejection does not cancel accepted work.
 
 ---
 
@@ -4088,7 +4038,7 @@ delete them. Session management returns `nil, "no interactive UI
 attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
-a session (`prompt`, `set_title`) accept
+a session (`set_title`) accept
 only the session its own turn belongs to. Every function that reads or
 changes one session takes it explicitly; `ctx:session_id()` names the
 invocation's session, and `current` names the focused one. Tool
@@ -4321,32 +4271,6 @@ Starts a new session in the current project.
 
 ```lua
 local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
-```
-
----
-
-### `maki.session.prompt()` {#maki-session-prompt}
-
-```lua
-maki.session.prompt({text}, {opts})
-```
-
-Sends {text} as a regular user prompt to a live session. The text is
-never interpreted: slash commands, `exit`, and `!` shell prefixes are
-all sent to the model verbatim. If the session is currently streaming,
-the prompt is queued and picked up when the agent reaches it.
-
-**Parameters:**
-
-- `{text}` (`string`) The prompt to send. Must not be blank.
-- `{opts}` (`table`) Required `session` (string) id of a live session.
-
-**Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
-
-**Example:**
-
-```lua
-local state, err = maki.session.prompt("run the tests", { session = id })
 ```
 
 ---

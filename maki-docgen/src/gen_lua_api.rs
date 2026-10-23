@@ -33,7 +33,7 @@ mod tests {
     #[test_case("Agent:config()", "Agent:config({ctx})"; "agent_config")]
     #[test_case("Agent:available_models()", "Agent:available_models({ctx})"; "agent_available_models")]
     #[test_case("Agent:transcript()", "Agent:transcript({ctx}, {opts})"; "agent_transcript")]
-    #[test_case("Agent:prompt()", "Agent:prompt({ctx}, {message}, {opts?})"; "agent_prompt")]
+    #[test_case("Agent:send()", "Agent:send({ctx}, {message}, {opts})"; "agent_send")]
     #[test_case("Agent:on_turn_start()", "Agent:on_turn_start({ctx}, {handler})"; "agent_on_turn_start")]
     #[test_case("Agent:on_turn_end()", "Agent:on_turn_end({ctx}, {handler})"; "agent_on_turn_end")]
     #[test_case("Agent:on_idle()", "Agent:on_idle({ctx}, {handler})"; "agent_on_idle")]

@@ -19,11 +19,10 @@ use super::subscriptions::{
     on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
-use super::tickets::ticket_wait;
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
-    RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT, TYPED_OPTION_SETTER,
+    RESTRICTED_MODE_CHANGE, STALE_TURN, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
@@ -40,6 +39,9 @@ use crate::runtime::{
 };
 
 const MODE_KEY: &str = "mode";
+const SEND_WHEN_REQUIRED: &str = "send: opts.when must be \"idle\", \"join\" or \"queue\"";
+const EXISTING_ONLY_NEEDS_JOIN: &str = "send: existing_only needs when = \"join\"";
+const AFTER_TURN_NEEDS_IDLE: &str = "send: after_turn needs when = \"idle\"";
 const NO_SESSION_OPTIONS: &str = "agent belongs to no session with options";
 const TYPED_OPTIONS: [&str; 3] = [MODEL_OPTION_ID, THINKING_OPTION_ID, FAST_OPTION_ID];
 
@@ -279,151 +281,73 @@ fn admit(
     })
 }
 
-/// Reads the optional `after_turn` admission guard; the inner error is a parse failure.
-fn after_turn(opts: Option<&Table>) -> mlua::Result<Result<Option<TurnId>, String>> {
-    let after_turn = opts
-        .map(|opts| opts.get::<Option<String>>("after_turn"))
-        .transpose()?
-        .flatten();
-    Ok(after_turn
-        .map(|id| id.parse::<TurnId>())
-        .transpose()
-        .map_err(|error| error.to_string()))
+/// When a turn a plugin sends starts.
+enum When {
+    /// Only when the agent has no active, preparing or queued work.
+    Idle,
+    /// Join compatible admitted work, or start a turn when there is none.
+    Join,
+    /// A distinct FIFO turn behind already admitted work.
+    Queue,
 }
 
-/// Admit a turn only when this agent has no active, preparing, or queued work.
+/// Reads `send`'s options; a malformed table is a programmer error.
+fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
+    let when = match opts.get::<Option<String>>("when")?.as_deref() {
+        Some("idle") => When::Idle,
+        Some("join") => When::Join,
+        Some("queue") => When::Queue,
+        _ => return Err(mlua::Error::runtime(SEND_WHEN_REQUIRED)),
+    };
+    let existing_only = opts.get::<Option<bool>>("existing_only")?;
+    let after_turn = opts
+        .get::<Option<String>>("after_turn")?
+        .map(|id| id.parse::<TurnId>().map_err(mlua::Error::runtime))
+        .transpose()?;
+    if existing_only.is_some() && !matches!(when, When::Join) {
+        return Err(mlua::Error::runtime(EXISTING_ONLY_NEEDS_JOIN));
+    }
+    if after_turn.is_some() && !matches!(when, When::Idle) {
+        return Err(mlua::Error::runtime(AFTER_TURN_NEEDS_IDLE));
+    }
+    let options = TurnAdmissionOptions {
+        idle_only: matches!(when, When::Idle),
+        existing_only: existing_only.unwrap_or_default(),
+        after_turn,
+        ..Default::default()
+    };
+    Ok((when, options))
+}
+
+/// Send a user message and get the ticket of the turn that carries it.
+/// `when` decides how the message meets other work: `"idle"` admits a turn
+/// only when the agent has no active, preparing or queued work; `"join"`
+/// joins compatible admitted work, reaching its next safe model request
+/// without interrupting a provider request or tool, or starts a turn when
+/// there is none; `"queue"` queues a distinct turn behind admitted work.
+/// Wait for the result with `AgentTurn:wait`.
 /// @param ctx LuaCtx Invocation context.
-/// @param message string User message.
-/// @param opts table? Optional after_turn ID required to match the latest terminal turn, including failure or cancellation.
-/// @return (AgentTurn?, string?) Exact-turn ticket.
+/// @param message string User message (text only).
+/// @param opts table Required `when` ("idle", "join" or "queue"). `existing_only` (join only) joins compatible work or returns busy without starting a turn. `after_turn` (idle only) must match the latest terminal turn, including failure or cancellation.
+/// @return (AgentTurn?, string?) Exact-turn ticket, or an admission error. Bounded inbox rejection does not cancel accepted work.
 #[lua_fn(name = "send")]
 fn agent_send(
     lua: &Lua,
     this: &LuaAgent,
     ctx: UserDataRef<LuaCtx>,
     message: String,
-    opts: Option<Table>,
+    opts: Table,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
-    let after_turn = try_pair!(after_turn(opts.as_ref())?);
+    let (when, options) = send_options(&opts)?;
     let turn = try_pair!(admit(
         lua,
         this,
         &ctx,
         message,
-        TurnAdmissionOptions {
-            idle_only: true,
-            after_turn,
-            ..Default::default()
-        },
-        false,
+        options,
+        matches!(when, When::Join),
     ));
     Ok((Some(turn), None))
-}
-
-/// Submit instructions to open ordinary work, or start a successor when idle or admission is closed.
-/// Busy and compatible pending submissions return the existing ticket. Instructions reach the next
-/// safe model request without interrupting a provider request or tool. Bounded inbox rejection does
-/// not cancel accepted work. Exact enqueue operations remain separate FIFO turns.
-/// @param ctx LuaCtx Invocation context.
-/// @param message string User instructions (text only).
-/// @param opts table? existing_only joins compatible admitted work or returns busy without starting a new turn. Defaults to false.
-/// @return (AgentTurn?, string?) Ticket covering these instructions, or an admission error.
-#[lua_fn(name = "submit")]
-fn agent_submit(
-    lua: &Lua,
-    this: &LuaAgent,
-    ctx: UserDataRef<LuaCtx>,
-    message: String,
-    opts: Option<Table>,
-) -> mlua::Result<Pair<LuaAgentTurn>> {
-    let existing_only = opts
-        .map(|opts| opts.get::<Option<bool>>("existing_only"))
-        .transpose()?
-        .flatten()
-        .unwrap_or_default();
-    let turn = try_pair!(admit(
-        lua,
-        this,
-        &ctx,
-        message,
-        TurnAdmissionOptions {
-            existing_only,
-            ..Default::default()
-        },
-        true,
-    ));
-    Ok((Some(turn), None))
-}
-
-/// Queue a turn behind already admitted work.
-/// @param ctx LuaCtx Invocation context.
-/// @param message string User message.
-/// @return (AgentTurn?, string?) Exact-turn ticket.
-#[lua_fn(name = "enqueue")]
-fn agent_enqueue(
-    lua: &Lua,
-    this: &LuaAgent,
-    ctx: UserDataRef<LuaCtx>,
-    message: String,
-) -> mlua::Result<Pair<LuaAgentTurn>> {
-    let turn = try_pair!(admit(lua, this, &ctx, message, Default::default(), false));
-    Ok((Some(turn), None))
-}
-
-/// Send an idle-only turn and wait for its exact result.
-/// @param ctx LuaCtx Invocation context.
-/// @param message string User message.
-/// @param opts table? timeout is a nonnegative integer number of seconds; zero is nonblocking. after_turn must match the latest terminal turn.
-/// @return (table?, string|table?) AgentTurn result, or an admission/wait error. A pending timeout returns nil and {kind = "timeout", message, ticket}; the exact ticket remains usable with current valid authority. Timeout does not cancel execution.
-#[lua_fn(name = "prompt")]
-async fn agent_prompt(
-    lua: Lua,
-    this: UserDataRef<LuaAgent>,
-    ctx: UserDataRef<LuaCtx>,
-    message: String,
-    opts: Option<Table>,
-) -> mlua::Result<(Option<Table>, Option<LuaValue>)> {
-    // Malformed options must fail before admission, not strand a queued turn.
-    if let Some(opts) = &opts {
-        opts.get::<Option<u64>>("timeout")?;
-    }
-    let admitted = after_turn(opts.as_ref())?.and_then(|after_turn| {
-        admit(
-            &lua,
-            &this,
-            &ctx,
-            message,
-            TurnAdmissionOptions {
-                idle_only: true,
-                after_turn,
-                ..Default::default()
-            },
-            false,
-        )
-    });
-    let turn = match admitted {
-        Ok(turn) => turn,
-        Err(error) => return Ok((None, Some(LuaValue::String(lua.create_string(error)?)))),
-    };
-    drop(this);
-    let userdata = lua.create_userdata(turn)?;
-    let (result, error) =
-        ticket_wait(lua.clone(), userdata.borrow::<LuaAgentTurn>()?, ctx, opts).await?;
-    if result.is_none()
-        && error
-            .as_deref()
-            .is_none_or(|error| error == TURN_WAIT_TIMEOUT)
-    {
-        let timeout = lua.create_table()?;
-        timeout.set("kind", "timeout")?;
-        timeout.set("message", TURN_WAIT_TIMEOUT)?;
-        timeout.set("ticket", userdata)?;
-        return Ok((None, Some(LuaValue::Table(timeout))));
-    }
-    let error = error
-        .map(|error| lua.create_string(error).map(LuaValue::String))
-        .transpose()?;
-    Ok((result, error))
 }
 
 /// Read the most recently admitted turn, including turns the runtime admitted
@@ -654,7 +578,7 @@ lua_class! {
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
-        agent_transcript, agent_ref, agent_send, agent_submit, agent_enqueue, agent_prompt, agent_set_model,
+        agent_transcript, agent_ref, agent_send, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]

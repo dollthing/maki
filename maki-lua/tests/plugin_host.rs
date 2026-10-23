@@ -6316,7 +6316,6 @@ maki.api.register_tool({
     },
     handler = function(input)
         local calls = {
-            prompt = function() return maki.session.prompt("hi", { session = input.session }) end,
             set_title = function() return maki.session.set_title({ id = input.session, title = "t" }) end,
             new = function() return maki.session.new() end,
             focus = function() return maki.session.focus(input.session) end,
@@ -6331,7 +6330,6 @@ maki.api.register_tool({
 })
 "#;
 
-#[test_case::test_case("prompt", DELEGATED_FOREIGN_SESSION ; "prompt")]
 #[test_case::test_case("set_title", DELEGATED_FOREIGN_SESSION ; "set_title")]
 #[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
 #[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]

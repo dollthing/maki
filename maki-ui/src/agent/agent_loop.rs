@@ -2022,7 +2022,7 @@ mod tests {
                             local child = assert(maki.agent.spawn(ctx, {{
                                 inherit_provider = true, silent = true, mcp = {enabled},
                             }}))
-                            local result = assert(assert(child:send(ctx, "invoke MCP")):wait(ctx))
+                            local result = assert(assert(child:send(ctx, "invoke MCP", {{ when = "idle" }})):wait(ctx))
                             assert(result.text == "{expected}", maki.json.encode(result))
                             assert(child:close(ctx))
                             maki.ui.flash(result.text)

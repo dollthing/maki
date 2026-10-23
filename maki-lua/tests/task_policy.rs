@@ -121,7 +121,8 @@ maki.agent.spawn = function(ctx, opts)
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
   local agent = { opts = opts }
-  function agent:submit(call_ctx, msg, submit_opts)
+  function agent:send(call_ctx, msg, submit_opts)
+    assert(submit_opts.when == "join")
     if opts.name == "unresolved" then
       assert(submit_opts.existing_only == (#recorder.prompts >= @TURN_LIMIT@))
       local turn_id = tostring(#recorder.prompts)
@@ -202,7 +203,7 @@ maki.agent.spawn = function(ctx, opts)
       }
       return latest
     end
-    function agent:submit(call_ctx, msg, submit_opts)
+    function agent:send(call_ctx, msg, submit_opts)
       assert(not submit_opts.existing_only)
       return admit(false)
     end

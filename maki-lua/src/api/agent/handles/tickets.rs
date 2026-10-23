@@ -66,7 +66,7 @@ fn withdraw_delivery(active: Option<&CurrentManagedTurn>, turn_id: TurnId) {
 /// @param opts table? timeout is a nonnegative integer number of seconds. Zero returns nil, nil while pending; positive timeout returns nil and "agent turn wait timed out" without cancelling work.
 /// @return (table?, string?) Per-turn result or error.
 #[lua_fn(name = "wait")]
-pub(super) async fn ticket_wait(
+async fn ticket_wait(
     lua: Lua,
     this: UserDataRef<LuaAgentTurn>,
     ctx: UserDataRef<LuaCtx>,

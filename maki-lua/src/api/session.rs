@@ -246,30 +246,6 @@ async fn new(
     roundtrip(lua, tx, SessionRequest::New { prompt, focus }).await
 }
 
-/// Sends {text} as a regular user prompt to a live session. The text is
-/// never interpreted: slash commands, `exit`, and `!` shell prefixes are
-/// all sent to the model verbatim. If the session is currently streaming,
-/// the prompt is queued and picked up when the agent reaches it.
-///
-/// @param text string The prompt to send. Must not be blank.
-/// @param opts table Required `session` (string) id of a live session.
-/// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
-/// @example
-/// local state, err = maki.session.prompt("run the tests", { session = id })
-#[lua_fn]
-async fn prompt(
-    lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-    text: String,
-    opts: Table,
-) -> LuaResult<Pair<Value>> {
-    let id = try_pair!(required_session(Some(&opts))?);
-    if let Some(denial) = delegated_tool_denial(&lua, id) {
-        return Ok(err_pair(denial));
-    }
-    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
-}
-
 /// Reports {text} to a live session without creating a user turn. The
 /// observation waits for the session's next agent run.
 ///
@@ -365,13 +341,13 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends. A tool handler
     /// cannot create, focus or delete sessions, and the functions that change
-    /// a session (`prompt`, `set_title`) accept
+    /// a session (`set_title`) accept
     /// only the session its own turn belongs to. Every function that reads or
     /// changes one session takes it explicitly; `ctx:session_id()` names the
     /// invocation's session, and `current` names the focused one. Tool
     /// handlers cannot read UI focus, so `current` refuses them.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx), set_default_thinking]
+    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
@@ -489,37 +465,6 @@ mod tests {
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
     }
 
-    #[test]
-    fn prompt_forwards_text_and_session_id() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let expected_id = MakiId::generate();
-        lua.globals()
-            .set("session_id", expected_id.to_string())
-            .unwrap();
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected prompt request");
-            };
-            assert_eq!(id, expected_id);
-            assert_eq!(text, "hi");
-            reply_tx.send(Ok(json!("queued"))).unwrap();
-        });
-        let (val, err): (String, Option<String>) = smol::block_on(
-            lua.load("return session.prompt('hi', { session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val, "queued");
-    }
-
-    #[test_case("return session.prompt('hi', {})" ; "prompt")]
     #[test_case("return session.read({})" ; "read")]
     #[test_case("return session.usage({})" ; "usage")]
     fn session_target_is_required(code: &str) {

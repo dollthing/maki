@@ -3036,12 +3036,6 @@ impl<'t> EventLoop<'t> {
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Prompt { id, text } => {
-                let idx = self
-                    .position(id)
-                    .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"));
-                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
-            }
             SessionRequest::Focus { id } => {
                 let reply = parse_session_id(&id)
                     .and_then(|id| self.focus_session(id))
@@ -3067,6 +3061,7 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    #[cfg(test)]
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
         self.sync_orchestration();
         match self.sessions[idx].submit_text(text)? {
@@ -7747,41 +7742,6 @@ mod tests {
                     .iter()
                     .any(|node| { node.agent_id == child && node.parent_id == Some(root) })
             );
-        });
-    }
-
-    #[test]
-    fn session_operations_do_not_follow_child_focus() {
-        const PROMPT: &str = "session-root prompt";
-        with_event_loop(|event_loop| {
-            let app = &mut event_loop.sessions[0].app;
-            let mut child = crate::chat::Chat::new(
-                "historical child".into(),
-                app.ui_config.clone(),
-                app.lua_event_handle.clone(),
-                Arc::clone(&app.theme_provider),
-            );
-            child.agent_id = Some(AgentId::generate());
-            child.subagent_id = Some("historical-child".into());
-            app.chats.push(child);
-            app.active_chat = 1;
-            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let guard = actor.prepare_idle().unwrap();
-            let (reply, response) = flume::bounded(1);
-            event_loop.handle_session_request(
-                SessionRequest::Prompt {
-                    id: event_loop.sessions[0].id(),
-                    text: PROMPT.into(),
-                },
-                reply,
-            );
-            assert_eq!(response.recv().unwrap().unwrap(), json!("started"));
-            assert_eq!(event_loop.sessions[0].app.active_chat, 1);
-            let pending = actor.pending_submissions();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].text, PROMPT);
-            drop(guard);
         });
     }
 

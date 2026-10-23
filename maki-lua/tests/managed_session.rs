@@ -146,7 +146,7 @@ maki.api.register_tool({
     local result, prompt_err
     maki.async.join(1, {
       function()
-        result, prompt_err = session:prompt(ctx, "reply")
+        result, prompt_err = assert(session:send(ctx, "reply", { when = "idle" })):wait(ctx)
       end,
     })
     assert(session:close(ctx))
@@ -244,7 +244,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local result, err = retained_session:prompt(retained_session_ctx, "wait", { timeout = 1 })
+    local result, err = retained_session:send(retained_session_ctx, "wait", { when = "idle" })
     if result ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected retained authority result: " .. tostring(err), is_error = true }
     end
@@ -264,7 +264,7 @@ maki.api.register_tool({
       auto_deliver = false,
     }))
     retained_session_ctx = ctx
-    local result, err = retained_session:prompt(ctx, "nested initial prompt")
+    local result, err = assert(retained_session:send(ctx, "nested initial prompt", { when = "idle" })):wait(ctx)
     if not result then
       return { llm_output = err, is_error = true }
     end
@@ -278,7 +278,7 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local result, err = retained_session:prompt(retained_session_ctx, "must reject")
+    local result, err = retained_session:send(retained_session_ctx, "must reject", { when = "idle" })
     if result ~= nil or err ~= "$EXPIRED_CONTEXT_ERROR" then
       return { llm_output = "unexpected retained close result: " .. tostring(err), is_error = true }
     end
@@ -300,13 +300,13 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt(ctx, "wait", { timeout = 1 })
-    assert(result == nil and type(prompt_err) == "table")
-    assert(prompt_err.kind == "timeout" and prompt_err.message == "$TIMEOUT_ERROR")
-    assert(prompt_err.ticket:agent_id() == session:id())
-    assert(prompt_err.ticket:result(ctx) == nil)
+    local ticket = assert(session:send(ctx, "wait", { when = "idle" }))
+    local result, prompt_err = ticket:wait(ctx, { timeout = 1 })
+    assert(result == nil and prompt_err == "$TIMEOUT_ERROR")
+    assert(ticket:agent_id() == session:id())
+    assert(ticket:result(ctx) == nil)
     local status = assert(session:status(ctx))
-    assert(status.active_turn == prompt_err.ticket:id())
+    assert(status.active_turn == ticket:id())
     assert(session:close(ctx))
     return "ok"
   end,
@@ -326,7 +326,7 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt(ctx, "reply")
+    local result, prompt_err = assert(session:send(ctx, "reply", { when = "idle" })):wait(ctx)
     assert(session:close(ctx))
     if not result then
       return { llm_output = prompt_err, is_error = true }
@@ -350,7 +350,7 @@ maki.api.register_tool({
     if not session then
       return { llm_output = err, is_error = true }
     end
-    local result, prompt_err = session:prompt(ctx, "reply")
+    local result, prompt_err = assert(session:send(ctx, "reply", { when = "idle" })):wait(ctx)
     assert(session:close(ctx))
     if not result then
       return { llm_output = prompt_err, is_error = true }
@@ -865,7 +865,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     if ctx:workflow() ~= true then error("nested handler saw stale workflow config") end
                     local nested, spawn_err = maki.agent.spawn(ctx, { inherit_provider = true, auto_deliver = false })
                     if not nested then error("nested spawn failed: " .. tostring(spawn_err)) end
-                    local result, prompt_err = nested:prompt(ctx, "nested")
+                    local result, prompt_err = assert(nested:send(ctx, "nested", { when = "idle" })):wait(ctx)
                     if not result then error("nested prompt failed: " .. tostring(prompt_err)) end
                     local closed, close_err = nested:close(ctx)
                     if not closed then error("nested close failed: " .. tostring(close_err)) end
@@ -886,7 +886,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                         audience = "general_sub",
                         tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},
                     }))
-                    local first_result, first_err = child:prompt(ctx, "first")
+                    local first_result, first_err = assert(child:send(ctx, "first", { when = "idle" })):wait(ctx)
                     if not first_result then error("parent prompt failed: " .. tostring(first_err)) end
                     return "ok"
                 end,
