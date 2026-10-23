@@ -775,7 +775,6 @@ mod tests {
                     fast: false,
                     workflow: false,
                     prompt: None,
-                    cancel: None,
                 },
                 event_sender: None,
                 correlation: "prepared-close".into(),

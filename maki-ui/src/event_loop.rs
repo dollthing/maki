@@ -1175,7 +1175,6 @@ impl SessionRuntime {
             fast: config.fast,
             workflow: config.workflow,
             prompt: None,
-            cancel: None,
         };
         if let Err(error) = self.handles.queue.try_push(QueueItem {
             input,
@@ -4816,7 +4815,6 @@ mod tests {
                     fast: false,
                     workflow: false,
                     prompt: None,
-                    cancel: None,
                 },
                 displayed: None,
             });
@@ -5388,7 +5386,6 @@ mod tests {
                     fast: false,
                     workflow: false,
                     prompt: None,
-                    cancel: None,
                 },
                 displayed: None,
             });

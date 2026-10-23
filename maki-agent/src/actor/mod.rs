@@ -686,7 +686,6 @@ fn preparation_input(input: &AgentInput) -> AgentInput {
         fast: input.fast,
         workflow: input.workflow,
         prompt: input.prompt.clone(),
-        cancel: input.cancel.clone(),
     }
 }
 

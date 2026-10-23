@@ -2924,7 +2924,6 @@ impl App {
                         .collect(),
                 })
             }),
-            cancel: None,
         };
         if let Err(error) = self.admit_user_turn(&admission.target, input, None) {
             self.flash(error);

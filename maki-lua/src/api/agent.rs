@@ -482,7 +482,7 @@ impl ActorBackend for LuaActorBackend {
                 &mut input,
                 loaded,
             )
-            .with_user_response_rx(Arc::clone(&state.answer_rx))
+            .with_user_response_rx(Some(Arc::clone(&state.answer_rx)))
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
             .with_local_tool_capture(Arc::clone(&state.commit));
@@ -2620,7 +2620,6 @@ mod tests {
                     fast: state.opts.fast,
                     workflow: false,
                     prompt: None,
-                    cancel: None,
                 },
                 None,
                 String::new(),
@@ -2801,7 +2800,6 @@ mod tests {
                         fast: state.opts.fast,
                         workflow: false,
                         prompt: None,
-                        cancel: None,
                     },
                     None,
                     String::new(),
@@ -2957,7 +2955,6 @@ mod tests {
                             fast: state.opts.fast,
                             workflow: false,
                             prompt: None,
-                            cancel: None,
                         },
                         None,
                         String::new()

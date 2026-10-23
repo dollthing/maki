@@ -532,6 +532,7 @@ pub fn run(
                 project_config,
                 local_tools: Default::default(),
                 state_dir,
+                answers: false,
             },
             headless::default_preparation(),
             session_options,
@@ -1047,6 +1048,7 @@ mod tests {
             project_config: ProjectConfig::for_project(cwd),
             local_tools: Default::default(),
             state_dir,
+            answers: false,
         }
     }
 
@@ -1100,7 +1102,6 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
-            cancel: None,
         }
     }
 

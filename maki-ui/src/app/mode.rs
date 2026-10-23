@@ -216,7 +216,6 @@ impl App {
             fast: config.fast,
             workflow: config.workflow,
             prompt: None,
-            cancel: None,
         }
     }
 

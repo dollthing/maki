@@ -19,7 +19,7 @@ use agent_client_protocol_schema::{
 use flume::{Receiver, Sender};
 use maki_agent::actor::ConfigChange;
 use maki_agent::config_change::ConfigChangeError;
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCancel};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::modes;
@@ -87,7 +87,7 @@ struct PendingOperation {
     kind: OperationKind,
     run_id: Option<u64>,
     cancelling: bool,
-    cancel: Option<maki_agent::cancel::CancelTrigger>,
+    cancel: Option<WorkCancel>,
 }
 
 /// What the client still owes us. Subagents have independent answer channels,
@@ -616,6 +616,7 @@ fn spawn_session_with_history(
         project_config,
         local_tools: Default::default(),
         state_dir: Some(params.storage.path().to_path_buf()),
+        answers: true,
     };
     let (binding, root_target) = maki_lua::orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(
@@ -888,7 +889,6 @@ async fn install_session_with_lock(
         Arc::clone(&pending),
         srv.elicitation,
         handle.answer_tx.clone(),
-        handle.cancel_tx.clone(),
         coordinator.read(),
         maki_storage::paths::home(),
         project_trusted,
@@ -1181,7 +1181,7 @@ async fn send_manual_compaction(
             kind: OperationKind::ManualCompaction,
             run_id: None,
             cancelling: false,
-            cancel: Some(trigger),
+            cancel: Some(WorkCancel::Control(trigger)),
         });
     }
     let sid = SessionId::from(session.handle.session_id.to_string());
@@ -1330,7 +1330,7 @@ async fn send_isolated_turn(
             kind: OperationKind::IsolatedTurn,
             run_id: None,
             cancelling: false,
-            cancel: Some(trigger),
+            cancel: Some(WorkCancel::Control(trigger)),
         });
     }
     let (output, events) = flume::unbounded();
@@ -1453,7 +1453,6 @@ async fn send_command_turn(
                 && option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
         })
     };
-    let (cancel_trigger, cancel) = maki_agent::cancel::CancelToken::new();
     defaults.fast |= enabled(maki_agent::session_options::FAST_OPTION_ID);
     defaults.workflow |= enabled(maki_agent::session_options::WORKFLOW_OPTION_ID);
     let mut input = AgentInput::from_defaults(turn.content.text.to_string(), images, defaults);
@@ -1462,7 +1461,6 @@ async fn send_command_turn(
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
     session.coordinator.as_ref().ok_or_else(no_session)?;
-    input.cancel = Some(cancel);
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut pending = session.pending.lock().unwrap();
@@ -1475,12 +1473,30 @@ async fn send_command_turn(
             kind: OperationKind::PrimaryTurn,
             run_id: None,
             cancelling: false,
-            cancel: Some(cancel_trigger),
+            cancel: None,
         });
     }
-    if session.handle.input_tx.send(input).await.is_err() {
+    let Ok(ticket) = session.handle.input_tx.admit(input).await else {
         release_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
         return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
+    };
+    let cancelled = {
+        let mut pending = session.pending.lock().unwrap();
+        match pending
+            .operation
+            .as_mut()
+            .filter(|operation| operation.id == operation_id)
+        {
+            Some(operation) if !operation.cancelling => {
+                operation.cancel = Some(session.handle.input_tx.turn_cancel(ticket.clone()));
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    };
+    if cancelled {
+        session.handle.input_tx.turn_cancel(ticket).cancel();
     }
     Ok(())
 }
@@ -1730,10 +1746,8 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     (cancellation, permission_answers, elicitation)
                 };
                 answer_cancelled_requests(&session.handle, permission_answers, elicitation);
-                if let Some(trigger) = cancellation {
-                    trigger.cancel();
-                } else {
-                    let _ = session.handle.cancel_tx.try_send(());
+                if let Some(cancellation) = cancellation {
+                    cancellation.cancel();
                 }
             }
         }
@@ -1867,7 +1881,6 @@ fn start_event_pump(
     pending: PendingState,
     elicitation: bool,
     answer_tx: Sender<String>,
-    cancel_tx: Sender<()>,
     session: maki_agent::session_coordinator::SessionReadHandle,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -1976,11 +1989,19 @@ fn start_event_pump(
                 }
                 AgentEvent::AuthRequired => {
                     tool_inputs.clear();
+                    let cancel = pending
+                        .lock()
+                        .unwrap()
+                        .operation
+                        .as_mut()
+                        .and_then(|operation| operation.cancel.take());
                     finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
                         let error = AcpError::auth_required().data(Value::String(AUTH_FAILED_MSG.into()));
                         send(&out_tx, Response::<AgentResponse>::new(request_id, Err(error)));
                     });
-                    let _ = cancel_tx.try_send(());
+                    if let Some(cancel) = cancel {
+                        cancel.cancel();
+                    }
                     continue;
                 }
                 AgentEvent::Question { id, questions } => {
@@ -2474,6 +2495,7 @@ mod tests {
                 project_config: ProjectConfig::for_project(Path::new("/tmp")),
                 local_tools: Default::default(),
                 state_dir: None,
+                answers: true,
             },
             Box::new(move |model, _| Box::pin(async move { Ok((model, initial)) })),
             None,
@@ -2561,7 +2583,6 @@ mod tests {
             Arc::clone(&session.pending),
             false,
             session.handle.answer_tx.clone(),
-            session.handle.cancel_tx.clone(),
             coordinator.read(),
             None,
             PUMP_TRUSTED,
@@ -2850,6 +2871,7 @@ mod tests {
                 project_config: ProjectConfig::for_project(Path::new("/project")),
                 local_tools: Default::default(),
                 state_dir: None,
+                answers: true,
             },
             Box::new(|model, _| {
                 Box::pin(async {
@@ -3007,7 +3029,7 @@ mod tests {
             assert!(!error.is_empty());
             assert!(
                 input_tx
-                    .send(AgentInput::from_defaults(
+                    .admit(AgentInput::from_defaults(
                         String::new(),
                         Vec::new(),
                         SessionDefaults::default(),
@@ -3763,7 +3785,6 @@ mod tests {
                 Arc::clone(&session.pending),
                 false,
                 session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 maki_storage::paths::home(),
                 PUMP_TRUSTED,
@@ -4005,7 +4026,6 @@ mod tests {
                     Arc::clone(&session.pending),
                     false,
                     session.handle.answer_tx.clone(),
-                    session.handle.cancel_tx.clone(),
                     session.coordinator.as_ref().unwrap().read(),
                     maki_storage::paths::home(),
                     PUMP_TRUSTED,
@@ -4139,7 +4159,6 @@ mod tests {
                 Arc::clone(&pending),
                 false,
                 session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -4203,9 +4222,19 @@ mod tests {
             .unwrap();
             let second = input_rx.recv_async().await.unwrap();
             assert_eq!(second.message, "second");
-            assert!(!second.cancel.unwrap().is_cancelled());
+            assert!(operation_state(&pending).is_some_and(|(cancelling, _)| !cancelling));
             take_active_operation(&pending, OperationKind::PrimaryTurn).unwrap();
         });
+    }
+
+    /// Whether the active operation is cancelling and still holds a cancel.
+    fn operation_state(pending: &PendingState) -> Option<(bool, bool)> {
+        pending
+            .lock()
+            .unwrap()
+            .operation
+            .as_ref()
+            .map(|operation| (operation.cancelling, operation.cancel.is_some()))
     }
 
     #[test]
@@ -4225,15 +4254,15 @@ mod tests {
             .unwrap();
             let first = input_rx.recv_async().await.unwrap();
             assert_eq!(first.message, "first");
-            let first_cancel = first.cancel.unwrap();
 
             handle_notification(&srv, "session/cancel", &cancel);
             handle_notification(&srv, "session/cancel", &cancel);
-            assert!(
-                first_cancel.is_cancelled(),
-                "active operation must be cancelled"
-            );
             let pending = &srv.session.as_ref().unwrap().pending;
+            assert_eq!(
+                operation_state(pending),
+                Some((true, false)),
+                "active operation must be cancelled, and its cancel fired once"
+            );
             take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
 
             handle_prompt(
@@ -4246,7 +4275,8 @@ mod tests {
             let second = input_rx.recv_async().await.unwrap();
             assert_eq!(second.message, "second");
             assert!(
-                !second.cancel.unwrap().is_cancelled(),
+                operation_state(&srv.session.as_ref().unwrap().pending)
+                    .is_some_and(|(cancelling, _)| !cancelling),
                 "next prompt must not inherit cancellation"
             );
         });
@@ -4331,7 +4361,6 @@ mod tests {
             pending,
             true,
             answer_tx,
-            flume::bounded(1).0,
             coordinator.read(),
             maki_storage::paths::home(),
             PUMP_TRUSTED,
@@ -4383,7 +4412,6 @@ mod tests {
             Arc::clone(&pending),
             true,
             answer_tx,
-            flume::bounded(1).0,
             coordinator.read(),
             maki_storage::paths::home(),
             PUMP_TRUSTED,
@@ -4455,7 +4483,6 @@ mod tests {
                 Arc::clone(&pending),
                 true,
                 answer_tx,
-                flume::bounded(1).0,
                 coordinator.read(),
                 maki_storage::paths::home(),
                 PUMP_TRUSTED,
@@ -4534,7 +4561,6 @@ mod tests {
             pending,
             true,
             answer_tx,
-            flume::bounded(1).0,
             coordinator.read(),
             maki_storage::paths::home(),
             PUMP_TRUSTED,
@@ -4616,7 +4642,6 @@ mod tests {
             PendingState::default(),
             false,
             answer_tx,
-            flume::bounded(1).0,
             coordinator.read(),
             None,
             PUMP_TRUSTED,
@@ -4760,7 +4785,6 @@ mod tests {
             Arc::clone(&pending),
             true,
             answer_tx,
-            flume::bounded(1).0,
             coordinator.read(),
             maki_storage::paths::home(),
             PUMP_TRUSTED,
@@ -5211,7 +5235,6 @@ mod tests {
                 Arc::clone(&session.pending),
                 false,
                 session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -5687,7 +5710,6 @@ mod tests {
                 Arc::clone(&old.pending),
                 false,
                 old.handle.answer_tx.clone(),
-                old.handle.cancel_tx.clone(),
                 old.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -6562,10 +6584,8 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
-            let (cancel_tx, cancel_rx) = flume::bounded(1);
             let (session_id, pending) = {
                 let session = srv.session.as_mut().unwrap();
-                session.handle.cancel_tx = cancel_tx.clone();
                 session.pending.lock().unwrap().permissions.clear();
                 (
                     session.handle.session_id.clone(),
@@ -6579,7 +6599,6 @@ mod tests {
                 Arc::clone(&pending),
                 false,
                 srv.session.as_ref().unwrap().handle.answer_tx.clone(),
-                cancel_tx,
                 srv.session
                     .as_ref()
                     .unwrap()
@@ -6623,11 +6642,6 @@ mod tests {
                 response["error"]["data"], AUTH_FAILED_MSG,
                 "the client is told why the turn ended: {response}"
             );
-            assert!(
-                cancel_rx.recv_async().await.is_ok(),
-                "the agent parked on re-authentication is released"
-            );
-
             assert!(pending.lock().unwrap().operation.is_none());
         });
     }
@@ -6675,7 +6689,6 @@ mod tests {
                 Arc::clone(&session.pending),
                 false,
                 session.handle.answer_tx.clone(),
-                session.handle.cancel_tx.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,

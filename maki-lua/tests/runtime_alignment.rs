@@ -1139,7 +1139,6 @@ fn ordinary_input(message: &str) -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
-        cancel: None,
     }
 }
 

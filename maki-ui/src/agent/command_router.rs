@@ -221,7 +221,6 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
-            cancel: None,
         }
     }
 

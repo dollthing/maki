@@ -20,7 +20,7 @@ use tracing::warn;
 use crate::actor::{AdmissionPreparation, AgentContextSnapshot, PreparedModel};
 use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::{self, History, ResolvedPromptInputs, TurnPromptInputs};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
@@ -44,6 +44,7 @@ const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 const OPERATION_CANCELLED: &str = "operation cancelled";
 #[cfg(any(test, feature = "test-util"))]
 const SESSION_ENDED: &str = "session ended";
+const ROOT_NOT_READY: &str = "session root is not initialized yet";
 const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
 const COMPACTION_CANCELLED: &str = "compaction cancelled";
 
@@ -65,6 +66,10 @@ impl RootReadiness {
             }
             listener.await;
         }
+    }
+
+    fn current(&self) -> Option<Result<AgentRef, String>> {
+        self.0.result.get().cloned()
     }
 
     fn finish(&self, result: Result<AgentRef, String>) {
@@ -101,6 +106,9 @@ pub struct InteractiveParams {
     pub project_config: ProjectConfig,
     pub local_tools: LocalTools,
     pub state_dir: Option<PathBuf>,
+    /// Whether the frontend answers permission asks over `answer_tx`. Without
+    /// it every ask is denied at once instead of waiting on nobody.
+    pub answers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,46 +313,67 @@ impl InteractiveInputSender {
         self
     }
 
-    pub async fn send(&self, input: AgentInput) -> Result<(), String> {
-        #[cfg(any(test, feature = "test-util"))]
-        if let Some(mirror) = &self.mirror {
-            return mirror
-                .send_async(input)
-                .await
-                .map_err(|_| SESSION_ENDED.to_owned());
-        }
-        self.admit(input).await.map(|_| ())
-    }
-
     pub async fn admit(&self, input: AgentInput) -> Result<TurnTicket, String> {
         let root = self.root.get().await?;
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(mirror) = &self.mirror {
+            mirror
+                .send_async(input)
+                .await
+                .map_err(|_| SESSION_ENDED.to_owned())?;
+            return Ok(TurnTicket::new(TurnId::generate(), Arc::new(())));
+        }
         let actor = root.actor().map_err(|error| error.to_string())?;
         let run = self.next.fetch_add(1, Ordering::Relaxed);
-        let cancel = input.cancel.clone();
-        let ticket = actor
+        actor
             .admit_turn(
                 input,
                 Some(EventSender::new(self.events.clone())),
                 format!("run:{run}"),
             )
-            .map_err(|error| error.to_string())?;
-        if let Some(cancel) = cancel {
-            let ticket = ticket.clone();
-            smol::spawn(async move {
-                future::or(
-                    async {
-                        cancel.cancelled().await;
-                        let _ = actor.cancel_turn(ticket.turn_id());
-                    },
-                    async {
-                        ticket.wait().await;
-                    },
-                )
-                .await;
-            })
-            .detach();
+            .map_err(|error| error.to_string())
+    }
+
+    /// Cancels {ticket}'s turn alone; the rest of the session keeps running.
+    /// Holds no part of the sender, so it never keeps the session alive.
+    pub fn turn_cancel(&self, ticket: TurnTicket) -> WorkCancel {
+        WorkCancel::Turn {
+            ticket,
+            root: self.root.clone(),
         }
-        Ok(ticket)
+    }
+}
+
+/// What a frontend cancels when its user interrupts the work in flight: a
+/// local operation's trigger, or an admitted turn on the actor.
+pub enum WorkCancel {
+    Control(CancelTrigger),
+    Turn {
+        ticket: TurnTicket,
+        root: RootReadiness,
+    },
+}
+
+impl WorkCancel {
+    pub fn cancel(self) {
+        match self {
+            Self::Control(trigger) => trigger.cancel(),
+            Self::Turn { ticket, root } => {
+                let cancelled = root
+                    .current()
+                    .ok_or_else(|| ROOT_NOT_READY.to_owned())
+                    .flatten()
+                    .and_then(|root| root.actor().map_err(|error| error.to_string()))
+                    .and_then(|actor| {
+                        actor
+                            .cancel_turn(ticket.turn_id())
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = cancelled {
+                    warn!(%error, turn_id = %ticket.turn_id(), "turn cancel failed");
+                }
+            }
+        }
     }
 }
 
@@ -355,7 +384,6 @@ pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
     pub input_tx: InteractiveInputSender,
     pub answer_tx: flume::Sender<String>,
-    pub cancel_tx: flume::Sender<()>,
     pub control_tx: InteractiveControlSender,
     pub model: crate::SharedModel,
     pub session_id: SessionRef,
@@ -410,7 +438,7 @@ struct HeadlessBackend {
     append_system: Option<String>,
     local_tools: LocalTools,
     mcp: Option<McpSession>,
-    answer_rx: Arc<Mutex<Receiver<String>>>,
+    answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
     raw_tx: flume::Sender<Envelope>,
     root: RootReadiness,
 }
@@ -479,7 +507,7 @@ impl HeadlessBackend {
             session_id: self.params.session_id.clone(),
             cwd: config.context.cwd().to_path_buf(),
             tool_use_id: None,
-            user_response_rx: Some(Arc::clone(&self.answer_rx)),
+            user_response_rx: self.answer_rx.clone(),
             loaded_instructions: Default::default(),
             cancel: CancelToken::none(),
             mcp: self.mcp.clone(),
@@ -627,7 +655,9 @@ impl ActorBackend for HeadlessBackend {
                 });
             let event_tx = self.event_sender(&context);
             context.output.set_terminal_sender(event_tx.clone());
-            while self.answer_rx.lock().await.try_recv().is_ok() {}
+            if let Some(answer_rx) = &self.answer_rx {
+                while answer_rx.lock().await.try_recv().is_ok() {}
+            }
             let mut agent = Agent::for_actor_turn(
                 self.params.clone(),
                 AgentRunParams {
@@ -640,7 +670,7 @@ impl ActorBackend for HeadlessBackend {
                 &mut input,
                 instructions.loaded,
             )
-            .with_user_response_rx(Arc::clone(&self.answer_rx))
+            .with_user_response_rx(self.answer_rx.clone())
             .with_local_tools(Arc::clone(&self.local_tools))
             .with_mcp(self.mcp.clone());
             let outcome = agent.run(turn_id, input).await;
@@ -915,7 +945,6 @@ pub fn spawn_interactive_with_binding(
         channel: None,
     };
     let (answer_tx, answer_rx) = flume::unbounded();
-    let (cancel_tx, cancel_rx) = flume::bounded(1);
     let mut permission_config = params.permissions_config.clone();
     permission_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
@@ -1004,7 +1033,7 @@ pub fn spawn_interactive_with_binding(
                     append_system: params.append_system_prompt,
                     local_tools: params.local_tools,
                     mcp,
-                    answer_rx: Arc::new(Mutex::new(answer_rx)),
+                    answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
                     raw_tx: raw_tx.clone(),
                     root: root.clone(),
                 };
@@ -1041,19 +1070,8 @@ pub fn spawn_interactive_with_binding(
             }
             .await;
             match initialized {
-                Ok(reference) => {
-                    let cancellation = async {
-                        while cancel_rx.recv_async().await.is_ok() {
-                            let _ = reference.cancel();
-                        }
-                    };
-                    future::or(
-                        async {
-                            let _ = lifetime_rx.recv_async().await;
-                        },
-                        cancellation,
-                    )
-                    .await;
+                Ok(_) => {
+                    let _ = lifetime_rx.recv_async().await;
                 }
                 Err(message) => {
                     root.finish(Err(message.clone()));
@@ -1075,7 +1093,6 @@ pub fn spawn_interactive_with_binding(
         tool_names,
         input_tx,
         answer_tx,
-        cancel_tx,
         control_tx,
         model,
         session_id: session_ref,
@@ -1260,6 +1277,7 @@ pub(crate) mod tests {
             project_config: ProjectConfig::for_project(Path::new(TEST_CWD)),
             local_tools: Arc::default(),
             state_dir: None,
+            answers: true,
         }
     }
 

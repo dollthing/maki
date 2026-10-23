@@ -18,12 +18,14 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
-use maki_agent::cancel::{CancelToken, CancelTrigger};
+use maki_agent::cancel::CancelToken;
 use maki_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
 use maki_agent::config_change::ConfigChangeError;
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{
+    self, InteractiveHandle, InteractiveInputSender, InteractiveParams, WorkCancel,
+};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
@@ -31,8 +33,8 @@ use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::session_defaults;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
-    ToolOutput, TurnOutcome,
+    AgentConfig, AgentEvent, AgentInput, Envelope, ModeId, PermissionsConfig, ToolOutput,
+    TurnOutcome,
 };
 use maki_commands::{CommandContent, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -525,7 +527,7 @@ struct Shared {
     turn_start: Instant,
     pending: HashMap<String, (String, Sender<String>)>,
     turn_active: bool,
-    active_cancel: Option<CancelTrigger>,
+    active_cancel: Option<WorkCancel>,
 }
 
 struct SdkCommands {
@@ -661,6 +663,7 @@ pub fn run(params: SdkParams) -> Result<()> {
             project_config,
             local_tools: Default::default(),
             state_dir: Some(storage.path().to_path_buf()),
+            answers: true,
         },
         headless::default_preparation(),
         Some(initial_history),
@@ -847,18 +850,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                     match sdk_commands.dispatch_input(&prompt, &images) {
                         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                             let input = command_attachments::agent_input(turn, defaults)?;
-                            let input = match prepare_sdk_turn(&shared, input) {
-                                Ok(input) => input,
+                            match admit_sdk_turn(&shared, &handle.input_tx, input) {
+                                Ok(true) => {}
+                                Ok(false) => break,
                                 Err(error) => {
-                                    emit_command_result(&writer, &shared, true, error.into())?;
-                                    continue;
+                                    emit_command_result(&writer, &shared, true, error.into())?
                                 }
-                            };
-                            if smol::block_on(handle.input_tx.send(input)).is_err() {
-                                let mut shared = shared.lock().unwrap();
-                                shared.turn_active = false;
-                                shared.active_cancel.take();
-                                break;
                             }
                         }
                         InputDispatch::Dispatched(CommandOutcome::Completed) => {
@@ -903,18 +900,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 command_attachments::into_images(&content.attachments)?,
                                 defaults,
                             );
-                            let input = match prepare_sdk_turn(&shared, input) {
-                                Ok(input) => input,
+                            match admit_sdk_turn(&shared, &handle.input_tx, input) {
+                                Ok(true) => {}
+                                Ok(false) => break,
                                 Err(error) => {
-                                    emit_command_result(&writer, &shared, true, error.into())?;
-                                    continue;
+                                    emit_command_result(&writer, &shared, true, error.into())?
                                 }
-                            };
-                            if smol::block_on(handle.input_tx.send(input)).is_err() {
-                                let mut shared = shared.lock().unwrap();
-                                shared.turn_active = false;
-                                shared.active_cancel.take();
-                                break;
                             }
                         }
                     }
@@ -1095,10 +1086,11 @@ fn spawn_sdk_operation<F>(
 where
     F: Future<Output = Result<String, String>> + Send + 'static,
 {
-    let cancel = match begin_sdk_work(shared) {
-        Ok(cancel) => cancel,
-        Err(error) => return emit_command_result(writer, shared, true, error.into()),
-    };
+    if let Err(error) = begin_sdk_work(shared) {
+        return emit_command_result(writer, shared, true, error.into());
+    }
+    let (trigger, cancel) = CancelToken::new();
+    shared.lock().unwrap().active_cancel = Some(WorkCancel::Control(trigger));
     let writer = writer.clone();
     let shared = Arc::clone(shared);
     smol::spawn(async move {
@@ -1309,23 +1301,32 @@ struct ControlRequestContext<'a> {
 
 type ModeSetter<'a> = dyn Fn(&str) -> Result<(), ConfigChangeError> + 'a;
 
-fn prepare_sdk_turn(
+/// Admits {input} as the one piece of SDK work in flight; `Ok(false)` means
+/// the session has ended. An interrupt then cancels this turn on the actor.
+fn admit_sdk_turn(
     shared: &Mutex<Shared>,
-    mut input: AgentInput,
-) -> Result<AgentInput, &'static str> {
-    input.cancel = Some(begin_sdk_work(shared)?);
-    Ok(input)
+    input_tx: &InteractiveInputSender,
+    input: AgentInput,
+) -> Result<bool, &'static str> {
+    begin_sdk_work(shared)?;
+    let Ok(ticket) = smol::block_on(input_tx.admit(input)) else {
+        end_sdk_work(shared);
+        return Ok(false);
+    };
+    let mut shared = shared.lock().unwrap();
+    if shared.turn_active {
+        shared.active_cancel = Some(input_tx.turn_cancel(ticket));
+    }
+    Ok(true)
 }
 
-fn begin_sdk_work(shared: &Mutex<Shared>) -> Result<CancelToken, &'static str> {
+fn begin_sdk_work(shared: &Mutex<Shared>) -> Result<(), &'static str> {
     let mut shared = shared.lock().unwrap();
     if shared.turn_active {
         return Err(TURN_ALREADY_ACTIVE);
     }
-    let (trigger, cancel) = CancelToken::new();
     shared.turn_active = true;
-    shared.active_cancel = Some(trigger);
-    Ok(cancel)
+    Ok(())
 }
 
 fn end_sdk_work(shared: &Mutex<Shared>) {
@@ -1918,6 +1919,7 @@ mod tests {
             project_config: ProjectConfig::for_project(&cwd),
             local_tools: Default::default(),
             state_dir: None,
+            answers: true,
         }
     }
 
@@ -1945,10 +1947,18 @@ mod tests {
         }
     }
 
-    /// Like ACP, the end of input cancels the turn still running instead of
-    /// waiting for it, reports it once and lets the session end.
-    #[test]
-    fn input_end_cancels_in_flight_turn_and_exits() {
+    struct PendingSdkSession {
+        handle: InteractiveHandle,
+        coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+        shared: Arc<Mutex<Shared>>,
+        pump: smol::Task<()>,
+        out_rx: Receiver<String>,
+        entering: Receiver<()>,
+    }
+
+    /// An SDK session whose provider parks every request, with one turn
+    /// admitted and already streaming.
+    fn pending_sdk_session() -> PendingSdkSession {
         let (entered, entering) = flume::bounded(1);
         let provider: Arc<dyn Provider> = Arc::new(PendingProvider(entered));
         let handle = headless::spawn_interactive_with_binding(
@@ -1988,39 +1998,106 @@ mod tests {
             ),
         }
         .spawn(handle.event_rx.clone());
-        let input = prepare_sdk_turn(
-            &shared,
-            AgentInput::from_defaults(
+        let session = PendingSdkSession {
+            handle,
+            coordinator,
+            shared,
+            pump,
+            out_rx,
+            entering,
+        };
+        session.admit();
+        session
+    }
+
+    impl PendingSdkSession {
+        fn admit(&self) {
+            let input = AgentInput::from_defaults(
                 SDK_ROOT_PROMPT.into(),
                 Vec::new(),
                 SessionDefaults::default(),
-            ),
-        )
-        .unwrap();
-        smol::block_on(handle.input_tx.send(input)).unwrap();
-        entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+            );
+            assert_eq!(
+                admit_sdk_turn(&self.shared, &self.handle.input_tx, input),
+                Ok(true)
+            );
+            self.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        }
 
-        let InteractiveHandle { input_tx, task, .. } = handle;
-        drop(input_tx);
-        smol::block_on(futures_lite::future::or(
-            async {
-                task.await;
-                pump.await;
-            },
-            async {
-                smol::Timer::after(SDK_GATE_TIMEOUT).await;
-                panic!("{SDK_SETTLEMENT_TIMEOUT}");
-            },
-        ));
-        let results = out_rx
-            .try_iter()
-            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
-            .filter(|message| message["type"] == "result")
-            .collect::<Vec<_>>();
+        fn next_result(&self) -> Value {
+            loop {
+                let line = self.out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+                let message: Value = serde_json::from_str(&line).unwrap();
+                if message["type"] == "result" {
+                    return message;
+                }
+            }
+        }
+
+        /// Ends input the way stdin EOF does and waits for the session to end.
+        fn end_input(self) -> Vec<Value> {
+            let PendingSdkSession {
+                handle,
+                coordinator,
+                shared,
+                pump,
+                out_rx,
+                ..
+            } = self;
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            smol::block_on(futures_lite::future::or(
+                async {
+                    task.await;
+                    pump.await;
+                },
+                async {
+                    smol::Timer::after(SDK_GATE_TIMEOUT).await;
+                    panic!("{SDK_SETTLEMENT_TIMEOUT}");
+                },
+            ));
+            assert!(!shared.lock().unwrap().turn_active);
+            smol::block_on(coordinator.close()).unwrap();
+            out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .filter(|message| message["type"] == "result")
+                .collect()
+        }
+    }
+
+    /// Like ACP, the end of input cancels the turn still running instead of
+    /// waiting for it, reports it once and lets the session end.
+    #[test]
+    fn input_end_cancels_in_flight_turn_and_exits() {
+        let results = pending_sdk_session().end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], true);
-        assert!(!shared.lock().unwrap().turn_active);
-        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn interrupt_cancels_only_the_admitted_turn() {
+        let session = pending_sdk_session();
+        let cancel = session.shared.lock().unwrap().active_cancel.take().unwrap();
+        cancel.cancel();
+        assert_eq!(session.next_result()["is_error"], true);
+        assert!(!session.shared.lock().unwrap().turn_active);
+        session.admit();
+        assert_eq!(session.end_input().len(), 1);
+    }
+
+    #[test]
+    fn sdk_work_runs_one_at_a_time() {
+        let shared = Mutex::new(Shared {
+            turn_start: Instant::now(),
+            pending: HashMap::new(),
+            turn_active: false,
+            active_cancel: None,
+        });
+        assert_eq!(begin_sdk_work(&shared), Ok(()));
+        assert_eq!(begin_sdk_work(&shared), Err(TURN_ALREADY_ACTIVE));
+        end_sdk_work(&shared);
+        assert_eq!(begin_sdk_work(&shared), Ok(()));
     }
 
     fn test_permissions() -> PermissionManager {
@@ -2215,39 +2292,6 @@ mod tests {
         let projection = commands.projection();
         assert_eq!(projection[0]["description"], "/lua description");
         assert_eq!(projection[0]["argumentHint"], "<arg>");
-    }
-
-    #[test]
-    fn sdk_turn_cancellation_is_operation_scoped() {
-        let shared = Mutex::new(Shared {
-            turn_start: Instant::now(),
-            pending: HashMap::new(),
-            turn_active: false,
-            active_cancel: None,
-        });
-        let input = |message: &str| AgentInput {
-            message: message.into(),
-            mode: AgentMode::Build,
-            images: Vec::new(),
-            preamble: Vec::new(),
-            thinking: maki_agent::ThinkingConfig::Off,
-            fast: false,
-            workflow: false,
-            prompt: None,
-            cancel: None,
-        };
-
-        let first = prepare_sdk_turn(&shared, input("first")).unwrap();
-        assert!(prepare_sdk_turn(&shared, input("concurrent")).is_err());
-        let first_cancel = first.cancel.unwrap();
-        let cancel = shared.lock().unwrap().active_cancel.take().unwrap();
-        cancel.cancel();
-        assert!(first_cancel.is_cancelled());
-        assert!(prepare_sdk_turn(&shared, input("during checkpoint")).is_err());
-
-        shared.lock().unwrap().turn_active = false;
-        let second = prepare_sdk_turn(&shared, input("second")).unwrap();
-        assert!(!second.cancel.unwrap().is_cancelled());
     }
 
     struct RecordingSdkProvider {
@@ -2499,6 +2543,7 @@ mod tests {
                 project_config: ProjectConfig::for_project(&cwd),
                 local_tools: Default::default(),
                 state_dir: Some(cwd.clone()),
+                answers: true,
             },
             Box::new(move |model, _| Box::pin(async move { Ok((model, prepared_provider)) })),
             None,
@@ -2728,15 +2773,12 @@ mod tests {
             observer: HeadlessObserver::new(lua_handle, handle.session_id.id()),
         }
         .spawn(handle.event_rx.clone());
-        let input = prepare_sdk_turn(
-            &shared,
-            AgentInput::from_defaults(
-                SDK_ROOT_PROMPT.into(),
-                Vec::new(),
-                SessionDefaults::default(),
-            ),
-        )
-        .unwrap();
+        begin_sdk_work(&shared).unwrap();
+        let input = AgentInput::from_defaults(
+            SDK_ROOT_PROMPT.into(),
+            Vec::new(),
+            SessionDefaults::default(),
+        );
         let ticket = smol::block_on(handle.input_tx.admit(input)).unwrap();
         let permission = loop {
             let line = out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
@@ -3440,19 +3482,9 @@ mod tests {
             turn_active: false,
             active_cancel: None,
         }));
-        let input = AgentInput {
-            message: "parent".into(),
-            mode: AgentMode::Build,
-            images: Vec::new(),
-            preamble: Vec::new(),
-            thinking: maki_agent::ThinkingConfig::Off,
-            fast: false,
-            workflow: false,
-            prompt: None,
-            cancel: None,
-        };
-        let input = prepare_sdk_turn(&shared, input).unwrap();
-        let cancel = input.cancel.unwrap();
+        begin_sdk_work(&shared).unwrap();
+        let (trigger, cancel) = CancelToken::new();
+        shared.lock().unwrap().active_cancel = Some(WorkCancel::Control(trigger));
         let mut pump = EventPump {
             writer: SdkWriter {
                 session_id: SessionRef::generate(),

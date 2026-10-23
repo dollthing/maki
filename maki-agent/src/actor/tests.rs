@@ -421,7 +421,6 @@ pub(super) fn input(message: &str) -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
-        cancel: None,
     }
 }
 

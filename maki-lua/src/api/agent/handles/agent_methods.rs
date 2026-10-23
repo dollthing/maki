@@ -172,7 +172,6 @@ fn admit(
         images: Vec::new(),
         preamble: Vec::new(),
         prompt: None,
-        cancel: None,
     };
     let provenance = if let Ok(trusted) = ctx.trusted(lua) {
         TurnProvenance {

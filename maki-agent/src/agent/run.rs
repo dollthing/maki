@@ -345,9 +345,9 @@ impl<'h> Agent<'h> {
 
     pub fn with_user_response_rx(
         mut self,
-        rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
+        rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     ) -> Self {
-        self.user_response_rx = Some(rx);
+        self.user_response_rx = rx;
         self
     }
 
@@ -444,7 +444,6 @@ impl<'h> Agent<'h> {
             fast,
             workflow,
             prompt: _,
-            cancel: _,
         } = input;
         self.push_input_context(preamble);
         // Observers read this event as "the turn has taken its input", so the
@@ -2231,7 +2230,6 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
-            cancel: None,
         }
     }
 

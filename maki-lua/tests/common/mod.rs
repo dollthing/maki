@@ -369,7 +369,6 @@ pub fn bind_parked_root(
                 fast: ctx.opts.fast,
                 workflow: ctx.workflow,
                 prompt: None,
-                cancel: None,
             },
             None,
             PARKED_ROOT_PROMPT.into(),

@@ -491,7 +491,7 @@ impl TuiActorBackend {
             &mut input,
             self.instructions.loaded.clone(),
         )
-        .with_user_response_rx(Arc::clone(&self.answer_rx))
+        .with_user_response_rx(Some(Arc::clone(&self.answer_rx)))
         .with_mcp(self.mcp.clone());
 
         let outcome = agent.run(turn_id, input).await;
@@ -2985,7 +2985,6 @@ mod tests {
                 qualified_name: "srv.missing".into(),
                 arguments: HashMap::new(),
             })),
-            cancel: None,
         };
         (backend, input, agent_rx)
     }

@@ -138,14 +138,13 @@ pub fn batch_key(input: &AgentInput) -> Option<BatchKey> {
         mode,
         workflow,
         prompt,
-        cancel,
         message: _,
         images: _,
         preamble: _,
         thinking: _,
         fast: _,
     } = input;
-    if prompt.is_some() || cancel.is_some() {
+    if prompt.is_some() {
         return None;
     }
     Some((mode.clone(), *workflow))
@@ -190,7 +189,6 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
-    pub cancel: Option<CancelToken>,
 }
 
 impl AgentInput {
@@ -212,7 +210,6 @@ impl AgentInput {
             fast: defaults.fast,
             workflow: defaults.workflow,
             prompt: None,
-            cancel: None,
         }
     }
 }
