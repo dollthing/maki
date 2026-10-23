@@ -281,10 +281,12 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         if let Some(drop_preparation) = drop_preparation {
             let initial_calls = provider.root_requests.load(Ordering::SeqCst);
             release.send(()).unwrap();
+            // An Idle status shows before a turn's outcome is published, and
+            // approval refuses a subtree with a publication still pending.
             pump_until(event_loop, |event_loop| {
-                child.snapshot().status == ActorStatus::Idle
-                    && provider.root_requests.load(Ordering::SeqCst) == initial_calls + 1
-                    && actor.snapshot().status == ActorStatus::Idle
+                provider.root_requests.load(Ordering::SeqCst) == initial_calls + 1
+                    && manager.prepare_idle_subtree(root).is_ok()
+                    && event_loop.sessions[index].handles.agent_rx.is_empty()
                     && event_loop.sessions[index].app.status == Status::Idle
             });
             approve(event_loop, index, true);
@@ -332,14 +334,9 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
             }
             pump_until(event_loop, |event_loop| {
                 provider.root_requests.load(Ordering::SeqCst) > calls
-                    && actor.snapshot().status == ActorStatus::Idle
+                    && actor.prepare_idle().is_ok()
                     && event_loop.sessions[index].app.status == Status::Idle
             });
-            drop(
-                actor
-                    .prepare_idle()
-                    .expect("aborted approval must release source"),
-            );
             assert_eq!(provider.root_requests.load(Ordering::SeqCst), calls + 1);
             assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
             assert!(requests.is_empty());
