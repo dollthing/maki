@@ -249,7 +249,7 @@ impl PluginHost {
         jit: bool,
         ui: HostUi,
     ) -> Result<Self, PluginError> {
-        Self::with_session_provider_preparer(
+        Self::spawn(
             registry,
             command_registry,
             jit,
@@ -277,7 +277,7 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        Self::with_session_provider_preparer(
+        Self::spawn(
             registry,
             CommandRegistry::new(),
             true,
@@ -288,7 +288,30 @@ impl PluginHost {
         )
     }
 
+    /// A host whose Lua child agents prepare their models through
+    /// {session_provider_preparer} instead of the real providers.
+    #[cfg(feature = "test-support")]
     pub fn with_session_provider_preparer(
+        registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
+        jit: bool,
+        fs: Arc<dyn FsBackend>,
+        state_dir: Option<PathBuf>,
+        session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+        ui: HostUi,
+    ) -> Result<Self, PluginError> {
+        Self::spawn(
+            registry,
+            command_registry,
+            jit,
+            fs,
+            state_dir,
+            session_provider_preparer,
+            ui,
+        )
+    }
+
+    fn spawn(
         registry: Arc<ToolRegistry>,
         command_registry: CommandRegistry,
         jit: bool,
