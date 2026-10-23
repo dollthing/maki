@@ -932,6 +932,12 @@ return end` keeps a listener on roots). `"TurnStart"` adds `turn_id`,
 `context_window` and `num_turns`; `"AgentIdle"` adds `settled`;
 `"ConfigChanged"` adds `generation`, `selection` and `mode`;
 `"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`.
+`"AutoCompacting"` adds `context_size` and `context_window`.
+`"CompactionDone"` adds `status` (`"completed"`, `"failed"` or
+`"cancelled"`), and after a compaction inside a turn also
+`context_size_before`, `context_size_after` and `context_window`; a
+compaction inside a turn that fails ends the turn, so it reports as a
+failed `"TurnEnd"`.
 
 Host events with no agent, where `ctx` is nil: `"SessionReset"`,
 `"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`,

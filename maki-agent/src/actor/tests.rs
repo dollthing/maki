@@ -28,7 +28,7 @@ use super::types::{
 };
 use super::{
     ActorBackend, ActorError, ActorEvent, ActorWork, AgentActorHandle, ChildDelivery,
-    DeliveryStatus,
+    CompactionStatus, DeliveryStatus,
 };
 use crate::tools::DescriptionContext;
 use crate::tools::{
@@ -98,6 +98,7 @@ struct ScriptedState {
     folds: Mutex<Vec<String>>,
     controls: Mutex<Vec<String>>,
     compacts: AtomicU32,
+    compact_fails: std::sync::atomic::AtomicBool,
     compact_policies: Mutex<Vec<(Option<bool>, u64)>>,
     compact_modes: Mutex<Vec<Option<AgentMode>>>,
     entered: AtomicU32,
@@ -309,7 +310,11 @@ impl ActorBackend for ScriptedBackend {
                 .unwrap()
                 .push(context.policy.as_ref().map(|policy| policy.mode.clone()));
             history.push(Message::user("compact".to_owned()));
-            BackendResult::CompactDone
+            if self.state.compact_fails.load(Ordering::SeqCst) {
+                BackendResult::ControlFailed
+            } else {
+                BackendResult::CompactDone
+            }
         })
     }
 }
@@ -2017,6 +2022,28 @@ fn compact_keeps_admitted_policy() {
             state.compact_policies.lock().unwrap().as_slice(),
             &[(Some(false), 0)]
         );
+        handle.shutdown();
+        task.await;
+    });
+}
+
+/// An idle compaction is no turn, so it reports how it ended on its own,
+/// a failure included, for every frontend's plugins to hear.
+#[test_case::test_case(false, CompactionStatus::Completed; "completed")]
+#[test_case::test_case(true, CompactionStatus::Failed; "failed")]
+fn idle_compaction_reports_how_it_ended(fails: bool, expected: CompactionStatus) {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        backend.state.compact_fails.store(fails, Ordering::SeqCst);
+        let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
+        handle.push_compact(1, None).unwrap();
+        let status = loop {
+            if let ActorEvent::CompactionEnd(status) = events.recv_async().await.unwrap() {
+                break status;
+            }
+        };
+        assert_eq!(status, expected);
         handle.shutdown();
         task.await;
     });

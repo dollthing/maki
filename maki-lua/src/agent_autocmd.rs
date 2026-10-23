@@ -4,7 +4,8 @@
 //! for every agent, children included, whichever way maki was started.
 
 use maki_agent::{
-    ActorEvent, AgentEvent, AgentManagerHandle, AgentRef, DoneReason, Envelope, TurnOutcome,
+    ActorEvent, AgentEvent, AgentManagerHandle, AgentRef, CompactionStatus, DoneReason, Envelope,
+    TurnOutcome,
 };
 use serde_json::{Value, json};
 
@@ -19,6 +20,7 @@ pub const TURN_END_EVENT: &str = "TurnEnd";
 pub const AGENT_IDLE_EVENT: &str = "AgentIdle";
 pub const AGENT_CLOSED_EVENT: &str = "AgentClosed";
 pub const CONFIG_CHANGED_EVENT: &str = "ConfigChanged";
+pub const COMPACTION_DONE_EVENT: &str = "CompactionDone";
 
 /// Fires the autocmd for one envelope a frontend read from {root}'s graph.
 pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {
@@ -79,8 +81,9 @@ fn envelope_autocmd(event: &AgentEvent) -> Option<(&'static str, Value)> {
             context_size_after,
             context_window,
         } => Some((
-            "CompactionDone",
+            COMPACTION_DONE_EVENT,
             json!({
+                "status": compaction_status(CompactionStatus::Completed),
                 "context_size_before": context_size_before,
                 "context_size_after": context_size_after,
                 "context_window": context_window,
@@ -130,11 +133,24 @@ fn actor_autocmd(event: ActorEvent) -> Option<(&'static str, Value)> {
                 "mode": commit.config.mode.id().key(),
             }),
         )),
+        ActorEvent::CompactionEnd(status) => Some((
+            COMPACTION_DONE_EVENT,
+            json!({ "status": compaction_status(status) }),
+        )),
         ActorEvent::Close { lifecycle, .. } => Some((
             AGENT_CLOSED_EVENT,
             json!({ "lifecycle": format!("{lifecycle:?}").to_lowercase() }),
         )),
         _ => None,
+    }
+}
+
+/// The status words of `TurnEnd`, so one check reads both events.
+fn compaction_status(status: CompactionStatus) -> &'static str {
+    match status {
+        CompactionStatus::Completed => "completed",
+        CompactionStatus::Failed => "failed",
+        CompactionStatus::Cancelled => "cancelled",
     }
 }
 
@@ -191,6 +207,17 @@ mod tests {
             .as_ref()
             .map(|(event, data)| (*event, data["reason"].as_str().unwrap_or_default()));
         assert_eq!(got, expected.map(|reason| (TURN_END_EVENT, reason)));
+    }
+
+    /// An idle `/compact` is no turn, so it reports through CompactionDone,
+    /// failure included, as compaction inside a turn does on success.
+    #[test_case(CompactionStatus::Completed, "completed" ; "completed")]
+    #[test_case(CompactionStatus::Failed, "failed" ; "failed")]
+    #[test_case(CompactionStatus::Cancelled, "cancelled" ; "cancelled")]
+    fn idle_compaction_fires_compaction_done(status: CompactionStatus, expected: &str) {
+        let (event, data) = actor_autocmd(ActorEvent::CompactionEnd(status)).unwrap();
+        assert_eq!(event, COMPACTION_DONE_EVENT);
+        assert_eq!(data["status"], expected);
     }
 
     /// A budget watchdog reads the whole bill off this one payload, so the keys

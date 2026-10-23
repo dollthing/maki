@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, TurnContext, WorkKind};
 use super::{
-    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
-    settle_and_finalize_turn,
+    ActiveCancel, ActorEvent, ActorInner, ActorWork, CompactionStatus, ProcessingWork,
+    TurnAdmission, cancelled_outcome, settle_and_finalize_turn,
 };
 use crate::types::{ActorWorkIdentity, TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -575,6 +575,7 @@ impl Runner {
             state.active = None;
             return;
         }
+        let cancel = plain.clone();
         let result = self
             .backend
             .run_compact(
@@ -597,13 +598,18 @@ impl Runner {
                 instructions,
             )
             .await;
-        {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.active = None;
-        }
-        if !matches!(result, BackendResult::CompactDone) {
-            warn!(?result, "compact returned unexpected result");
-        }
+        let status = match result {
+            BackendResult::CompactDone => CompactionStatus::Completed,
+            _ if cancel.is_cancelled() => CompactionStatus::Cancelled,
+            BackendResult::ControlFailed => CompactionStatus::Failed,
+            other => {
+                warn!(?other, "compact returned unexpected result");
+                CompactionStatus::Failed
+            }
+        };
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = None;
+        state.emit(ActorEvent::CompactionEnd(status));
     }
 
     /// Clears the active-turn slot together with retaining the turn's outcome,

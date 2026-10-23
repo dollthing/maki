@@ -19,11 +19,12 @@ pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub(crate) mod task_set;
 pub use actor::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
-    AgentActorHandle, AgentContextSnapshot, BackendResult, CompletionPolicy, ConfigChange,
-    ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryBoundary, HistoryChange,
-    InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel, QueueProjection,
-    SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission, TurnAdmissionOptions,
-    TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket, WorkKind,
+    AgentActorHandle, AgentContextSnapshot, BackendResult, CompactionStatus, CompletionPolicy,
+    ConfigChange, ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryBoundary,
+    HistoryChange, InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel,
+    QueueProjection, SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission,
+    TurnAdmissionOptions, TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult,
+    TurnTicket, WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,

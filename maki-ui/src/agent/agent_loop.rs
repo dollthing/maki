@@ -563,7 +563,7 @@ impl ActorBackend for TuiActorBackend {
                     message: "compaction was admitted without an effective agent configuration"
                         .into(),
                 });
-                return BackendResult::CompactDone;
+                return BackendResult::ControlFailed;
             };
             let (base_provider, base_model) = compaction_source(settings);
 

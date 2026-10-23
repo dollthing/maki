@@ -137,10 +137,19 @@ pub enum ActorEvent {
         settled: Option<ActorWorkIdentity>,
     },
     Config(ConfigCommit),
+    /// An idle compaction ended. Compaction inside a turn ends with the turn.
+    CompactionEnd(CompactionStatus),
     Close {
         agent_id: AgentId,
         lifecycle: ActorLifecycle,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 pub(crate) use types::ManagedTurnAdmission;
