@@ -114,6 +114,9 @@ struct Pending {
     elicitation: Option<i64>,
     /// The client closed its input, so no answer to a new ask can arrive.
     input_closed: bool,
+    /// Counts `session/cancel`s, so a prompt dispatching beside a turn, which
+    /// has no operation to mark, sees that it was cancelled meanwhile.
+    cancels: u64,
     settled: Event,
 }
 
@@ -262,6 +265,8 @@ struct PendingDispatch {
     /// The prompt's own operation; `None` while it dispatches beside a
     /// running turn its message may join.
     operation_id: Option<u64>,
+    /// [`Pending::cancels`] when the dispatch started.
+    cancels: u64,
     request_id: RequestId,
     future: CommandFuture<InputDispatch>,
 }
@@ -818,7 +823,12 @@ async fn finish_in_flight(session: &SessionState) {
 /// Stop the old session before the next one starts, so two generations of the
 /// same MCP servers never fight over a port or a lock file.
 async fn close_session(srv: &mut Server) {
-    srv.dispatch = None;
+    // A dispatch with an operation is answered with the operations below.
+    if let Some(dispatch) = srv.dispatch.take()
+        && dispatch.operation_id.is_none()
+    {
+        respond_prompt(&srv.out_tx, dispatch.request_id, StopReason::Cancelled);
+    }
     let Some(mut state) = srv.session.take() else {
         return;
     };
@@ -1253,12 +1263,14 @@ fn start_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Acp
         });
         operation_id
     });
+    let cancels = pending.cancels;
     drop(pending);
     let future = session
         .command_registry
         .dispatch_input(&session.command_target, content);
     srv.dispatch = Some(PendingDispatch {
         operation_id,
+        cancels,
         request_id: id.clone(),
         future,
     });
@@ -1280,6 +1292,7 @@ async fn respond_dispatch(srv: &mut Server, dispatched: InputDispatch) {
 async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<(), AcpError> {
     let Some(PendingDispatch {
         operation_id,
+        cancels,
         request_id,
         ..
     }) = srv.dispatch.take()
@@ -1289,6 +1302,10 @@ async fn finish_prompt(srv: &mut Server, dispatched: InputDispatch) -> Result<()
     let Some(session) = srv.session.as_ref() else {
         return Ok(());
     };
+    if operation_id.is_none() && session.pending.lock().unwrap().cancels != cancels {
+        respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
+        return Ok(());
+    }
     if let Some(operation_id) = operation_id {
         let cancelling = {
             let mut pending = session.pending.lock().unwrap();
@@ -1896,6 +1913,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 let (cancellations, permission_answers, elicitation) = {
                     let mut pending = session.pending.lock().unwrap();
                     let pending = &mut *pending;
+                    pending.cancels += 1;
                     let Some(operation) = pending
                         .operation
                         .as_mut()
@@ -5185,6 +5203,52 @@ mod tests {
             }
             assert!(pending.lock().unwrap().operation.is_none());
             drop(event_tx);
+        });
+    }
+
+    /// A prompt still dispatching beside a running turn has no operation of
+    /// its own, yet a cancel or a closing session answers it cancelled, and
+    /// a cancelled one starts no turn once its dispatch ends.
+    #[test_case(false ; "cancelled")]
+    #[test_case(true ; "session_closed")]
+    fn prompt_dispatching_beside_a_turn_is_answered_cancelled(close: bool) {
+        const FOLLOW_UP: &str = "follow-up";
+        smol::block_on(async {
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turns.next_text().await, "first");
+            let first = turns.latest();
+            start_prompt(
+                &mut srv,
+                &prompt_request(&session_id, FOLLOW_UP, false),
+                &RequestId::Number(42),
+            )
+            .unwrap();
+            if close {
+                close_session(&mut srv).await;
+            } else {
+                handle_notification(
+                    &srv,
+                    "session/cancel",
+                    &serde_json::json!({ "params": { "sessionId": session_id } }),
+                );
+                let dispatched =
+                    (&mut srv.dispatch.as_mut().expect("prompt dispatch").future).await;
+                finish_prompt(&mut srv, dispatched).await.unwrap();
+                assert_eq!(turns.latest().turn_id(), first.turn_id());
+            }
+            let answered = out_rx
+                .try_iter()
+                .find(|message| message["id"] == 42)
+                .expect("the dispatching prompt is answered");
+            assert_eq!(answered["result"]["stopReason"], "cancelled", "{answered}");
         });
     }
 
