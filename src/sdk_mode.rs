@@ -1088,7 +1088,7 @@ impl UserDispatch {
         match admit_sdk_turn(shared, input_tx, input).await {
             Ok(admitted) => Ok(admitted),
             Err(error) => {
-                emit_command_result(writer, shared, true, error.into())?;
+                emit_command_result(writer, shared, true, error)?;
                 Ok(true)
             }
         }
@@ -1410,19 +1410,21 @@ type ModeSetter<'a> = dyn Fn(&str) -> Result<(), ConfigChangeError> + 'a;
 
 /// Submits {input} like the TUI's input does: it joins the turn in flight or
 /// starts one, which an interrupt then cancels. `Ok(false)` means the session
-/// has ended.
+/// has ended; any other refusal, such as a full inbox, is an error.
 async fn admit_sdk_turn(
     shared: &Mutex<Shared>,
     input_tx: &InteractiveInputSender,
     input: AgentInput,
-) -> Result<bool, &'static str> {
+) -> Result<bool, String> {
     let Ok(submission) = input_tx.admitter().ready().await else {
         return Ok(false);
     };
     let mut shared = shared.lock().unwrap();
     check_sdk_work(&shared, |work| work.turn_id().is_none())?;
-    let Ok((ticket, _)) = submission.submit(input) else {
-        return Ok(false);
+    let ticket = match submission.submit(input) {
+        Ok((ticket, _)) => ticket,
+        Err(error) if error.is_closed() => return Ok(false),
+        Err(error) => return Err(error.to_string()),
     };
     if !shared
         .work
@@ -2563,6 +2565,29 @@ mod tests {
         assert_eq!(tracked_turns(&session.shared), running);
         session.release.send(()).unwrap();
         session.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        let results = session.end_input();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["is_error"], false);
+    }
+
+    /// A message the actor refuses for its size is reported as an error; the
+    /// session goes on, so it is not read as the session having ended.
+    #[test]
+    fn refused_message_is_an_error_not_the_end() {
+        let session = pending_sdk_session();
+        let input = AgentInput::new(
+            "a".repeat(maki_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1),
+            Vec::new(),
+        );
+        assert_eq!(
+            smol::block_on(admit_sdk_turn(
+                &session.shared,
+                &session.handle.input_tx,
+                input
+            )),
+            Err(maki_agent::ActorError::InstructionOverflow.to_string())
+        );
+        session.release.send(()).unwrap();
         let results = session.end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], false);

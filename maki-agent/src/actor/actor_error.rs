@@ -43,3 +43,11 @@ pub enum ActorError {
     #[error("no such turn: {0}")]
     UnknownTurn(TurnId),
 }
+
+impl ActorError {
+    /// Whether the actor refused because it closed or is shutting down,
+    /// rather than because of what was asked.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed | Self::Shutdown)
+    }
+}

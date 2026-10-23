@@ -1655,7 +1655,13 @@ async fn send_command_turn(
     // reach the pump.
     let mut pending = session.pending.lock().unwrap();
     pending.admits_prompt()?;
-    let (ticket, run_id) = submission.submit(input).map_err(|_| session_ended())?;
+    let (ticket, run_id) = submission.submit(input).map_err(|error| {
+        if error.is_closed() {
+            session_ended()
+        } else {
+            AcpError::new(-32603, error.to_string())
+        }
+    })?;
     let pending = &mut *pending;
     if let Some(operation) = pending
         .operation
@@ -4370,6 +4376,28 @@ mod tests {
                 .iter()
                 .any(|command| command["name"] == "compact")
         );
+    }
+
+    /// A prompt the actor refuses for its size is an error with the actor's
+    /// reason; the session lives on, so it is not reported as ended.
+    #[test]
+    fn refused_prompt_is_an_error_not_the_end() {
+        smol::block_on(async {
+            let (mut srv, _, _, _) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let text = "a".repeat(maki_agent::actor::MAX_PENDING_INSTRUCTION_BYTES + 1);
+            let error = handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, &text, false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                maki_agent::ActorError::InstructionOverflow.to_string()
+            );
+        });
     }
 
     #[test]
