@@ -310,6 +310,45 @@ impl AgentManagerHandle {
             .collect()
     }
 
+    /// Resolves once no agent in the graph has work running or waiting,
+    /// child results still on their way to a parent included. A pass that
+    /// saw an agent run out of work mid-check is repeated, since that agent
+    /// may have handed work to one already checked.
+    pub async fn wait_settled(&self) {
+        loop {
+            let actors: Vec<_> = self
+                .list()
+                .into_iter()
+                .filter_map(|agent| agent.actor().ok())
+                .collect();
+            let mut drained: Vec<_> = actors
+                .iter()
+                .map(|actor| actor.inner.drained.listen())
+                .collect();
+            if actors.iter().all(AgentActorHandle::is_settled) {
+                let mut changed = false;
+                for listener in &mut drained {
+                    changed |= futures_lite::future::poll_once(listener).await.is_some();
+                }
+                if !changed {
+                    return;
+                }
+                continue;
+            }
+            std::future::poll_fn(|context| {
+                if drained
+                    .iter_mut()
+                    .any(|listener| Pin::new(listener).poll(context).is_ready())
+                {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
     pub fn limits(&self) -> AgentLimits {
         self.0.limits
     }

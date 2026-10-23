@@ -6,8 +6,9 @@
 //! switch between turns through each frontend's own mechanism, a mode set by
 //! a Lua command, and a Lua command whose UI round-trip answers "no UI" at
 //! once. SDK and ACP must also finish a turn whose input ended right after
-//! the prompt, keep reading the answer a Lua command's turn waits on, and a
-//! resumed SDK session comes back in the mode it was saved in.
+//! the prompt, wait for the subagents a command left running and the turns
+//! their results start, keep reading the answer a Lua command's turn waits
+//! on, and a resumed SDK session comes back in the mode it was saved in.
 //!
 //! The TUI cannot join without a pty. Its in-process tests in maki-ui check
 //! the same scenarios at the provider:
@@ -52,6 +53,8 @@ const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
 const ASK_PROMPT: &str = "run the asking tool";
 const CHILD_ASK_COMMAND: &str = "/parity_child_ask";
+const BACKGROUND_COMMAND: &str = "/parity_background";
+const BACKGROUND_PROMPT: &str = "background job";
 /// The toolset the bundled plan mode swaps in.
 const PLAN_TOOLS: [&str; 11] = [
     "edit",
@@ -431,6 +434,47 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     );
 }
 
+/// Input ends right after a command left a subagent working in the
+/// background: the subagent's turn and the root turn its result starts both
+/// run before the process exits.
+#[test_case(Frontend::Sdk ; "sdk_finishes_background_work")]
+#[test_case(Frontend::Acp ; "acp_finishes_background_work")]
+fn closed_input_waits_for_background_subagents(frontend: Frontend) {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut child = spawn_makima(home.path(), &work, frontend_args(frontend));
+    let stderr = drain(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(BACKGROUND_COMMAND));
+            expect(&output, |message| message["type"] == "result");
+        }
+        Frontend::Acp => {
+            let (output, session) = acp_session(&mut child, &mut stdin, &work);
+            send(
+                &mut stdin,
+                json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+                       "params": {"sessionId": session,
+                                  "prompt": [{"type": "text", "text": BACKGROUND_COMMAND}]}}),
+            );
+            expect(&output, |message| message["id"] == PROMPT_ID);
+        }
+        Frontend::Print => unreachable!("print reads its whole input before it starts"),
+    }
+    drop(stdin);
+    let status = wait_exit(child);
+    let log = stderr.join().unwrap();
+    assert!(status.success(), "{log}");
+    let bodies: Vec<_> = bodies.try_iter().collect();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(last_user_text(&bodies[0]), BACKGROUND_PROMPT);
+}
+
 /// Print answers no questions, for children too: a child's permission ask
 /// is refused at once, so the run ends instead of waiting on an answer.
 #[test]
@@ -747,6 +791,13 @@ maki.api.register_command({{
     local _, err = child:prompt(ctx, "{ASK_PROMPT}")
     assert(err == nil, tostring(err))
     child:close(ctx)
+  end,
+}})
+maki.api.register_command({{
+  name = "{BACKGROUND_COMMAND}", tui_only = false,
+  handler = function(_, ctx)
+    local child = assert(maki.agent.spawn(ctx, {{}}))
+    assert(child:submit(ctx, "{BACKGROUND_PROMPT}"))
   end,
 }})
 maki.api.register_command({{

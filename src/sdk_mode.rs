@@ -36,8 +36,8 @@ use maki_agent::session_coordinator::SessionReadHandle;
 use maki_agent::session_defaults;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
-    ToolOutput, TurnOutcome,
+    AgentConfig, AgentEvent, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
+    PermissionsConfig, ToolOutput, TurnOutcome,
 };
 use maki_commands::{
     CommandContent, CommandFuture, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle,
@@ -953,7 +953,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     })();
 
     drop(user_tx);
-    let dispatched = smol::block_on(finish_in_flight(&shared, dispatcher));
+    let dispatched = smol::block_on(finish_in_flight(&shared, &handle.manager, dispatcher));
     drop(sdk_commands);
     drop(model_discovery);
     smol::block_on(projection_watcher.cancel());
@@ -1438,9 +1438,12 @@ fn close_output(shared: &Mutex<Shared>) {
 
 /// Stdin ended but stdout is still read: the user messages already read are
 /// dispatched ({dispatched}), and the work in flight runs to its end and
-/// reports, while permission asks nobody can answer any more are denied.
+/// reports, background subagents in {graph} and the turns their results start
+/// included, while permission asks nobody can answer any more are denied.
+/// Once stdout is gone too, nothing is left to wait for.
 async fn finish_in_flight(
     shared: &Mutex<Shared>,
+    graph: &AgentManagerHandle,
     dispatched: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let unanswered = {
@@ -1452,16 +1455,21 @@ async fn finish_in_flight(
         let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
     }
     let dispatched = dispatched.await;
-    loop {
-        let idle = {
-            let shared = shared.lock().unwrap();
-            if !shared.turn_active {
-                return dispatched;
-            }
-            shared.idle.listen()
-        };
-        idle.await;
-    }
+    let until = |done: fn(&Shared) -> bool| async move {
+        loop {
+            let idle = {
+                let shared = shared.lock().unwrap();
+                if done(&shared) {
+                    return;
+                }
+                shared.idle.listen()
+            };
+            idle.await;
+        }
+    };
+    until(|shared| !shared.turn_active).await;
+    smol::future::or(graph.wait_settled(), until(|shared| shared.output_closed)).await;
+    dispatched
 }
 
 fn handle_control_request(
@@ -2186,7 +2194,11 @@ mod tests {
         /// Ends input the way stdin EOF does: the turn in flight must hold
         /// the session open until the provider is released, then report.
         fn end_input(self) -> Vec<Value> {
-            let mut finishing = Box::pin(finish_in_flight(&self.shared, async { Ok(()) }));
+            let mut finishing = Box::pin(finish_in_flight(
+                &self.shared,
+                &self.handle.manager,
+                async { Ok(()) },
+            ));
             assert!(
                 smol::block_on(futures_lite::future::poll_once(&mut finishing)).is_none(),
                 "input end must wait for the turn in flight"
@@ -2262,11 +2274,18 @@ mod tests {
         } = pending_sdk_session();
         drop(out_rx);
         release.send(()).unwrap();
-        let InteractiveHandle { input_tx, task, .. } = handle;
+        let InteractiveHandle {
+            input_tx,
+            task,
+            manager,
+            ..
+        } = handle;
         smol::block_on(futures_lite::future::or(
             async {
                 pump.await;
-                finish_in_flight(&shared, async { Ok(()) }).await.unwrap();
+                finish_in_flight(&shared, &manager, async { Ok(()) })
+                    .await
+                    .unwrap();
                 drop(input_tx);
                 task.await;
             },

@@ -245,6 +245,8 @@ pub(crate) struct ActorInner {
     runtime_probes: Mutex<Vec<flume::Sender<ActorRuntimeProbe>>>,
     pub(crate) state: Mutex<ActorState>,
     pub(crate) policy_changed: Event,
+    /// Notified each time the runner has run out of work.
+    pub(crate) drained: Event,
     pub(crate) config_waiters: Mutex<VecDeque<Arc<()>>>,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
@@ -342,6 +344,9 @@ pub(crate) struct ActorState {
     close_pending: bool,
     pending_publications: usize,
     idle_pending: bool,
+    /// The runner took work and has not run out yet; set across the whole
+    /// batch, so a child's result is with its parent before this clears.
+    runner_busy: bool,
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) processing: Option<ProcessingWork>,
@@ -947,6 +952,7 @@ impl ActorState {
             close_pending: false,
             pending_publications: 0,
             idle_pending: false,
+            runner_busy: false,
             status: ActorStatus::Idle,
             active: None,
             processing: None,
@@ -1342,6 +1348,7 @@ impl AgentActorHandle {
             runtime_probes: Mutex::new(Vec::new()),
             state: Mutex::new(ActorState::idle(initial_config)),
             policy_changed: Event::new(),
+            drained: Event::new(),
             config_waiters: Mutex::default(),
             queue: Arc::new(ActorQueue::new()),
             outcomes: Mutex::new(HashMap::new()),
@@ -2713,6 +2720,18 @@ impl AgentActorHandle {
             ?reason,
             "correlation cancelled"
         );
+    }
+
+    /// Nothing runs or waits here: no work, no child result on its way in.
+    /// A closed actor is settled.
+    pub(crate) fn is_settled(&self) -> bool {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.lifecycle != ActorLifecycle::Open
+            || !(state.runner_busy
+                || state.preparing.is_some()
+                || state.has_pending_work(&self.inner.queue)
+                || !state.deliveries.is_empty()
+                || !state.delivery_runs.is_empty())
     }
 
     pub fn snapshot(&self) -> ActorSnapshot {

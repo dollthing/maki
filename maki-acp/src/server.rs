@@ -752,7 +752,8 @@ fn refuse_asks(session: &SessionState) {
 }
 
 /// The client closed its input but still reads the output: the work in
-/// flight runs to its end and reports, while the asks it can no longer get
+/// flight runs to its end and reports, background subagents and the turns
+/// their results start included, while the asks it can no longer get
 /// answered are refused.
 async fn finish_in_flight(session: &SessionState) {
     refuse_asks(session);
@@ -760,12 +761,13 @@ async fn finish_in_flight(session: &SessionState) {
         let settled = {
             let pending = session.pending.lock().unwrap();
             if pending.operation.is_none() {
-                return;
+                break;
             }
             pending.settled.listen()
         };
         settled.await;
     }
+    session.handle.manager.wait_settled().await;
 }
 
 /// Stop the old session before the next one starts, so two generations of the
@@ -4574,6 +4576,11 @@ mod tests {
             );
             assert!(session.pending.lock().unwrap().refuses_asks());
             take_active_operation(&session.pending, OperationKind::PrimaryTurn).unwrap();
+            assert!(
+                smol::future::poll_once(&mut finishing).await.is_none(),
+                "input end must wait for the root turn to settle"
+            );
+            turns.release();
             finishing.await;
         });
     }

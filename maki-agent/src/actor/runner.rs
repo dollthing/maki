@@ -129,6 +129,7 @@ impl Runner {
                 }
                 if let Some(work) = &work {
                     state.idle_pending = true;
+                    state.runner_busy = true;
                     state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(|work| {
@@ -215,14 +216,13 @@ impl Runner {
             }
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
-        if self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lifecycle
-            != ActorLifecycle::Open
-        {
+        let lifecycle = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.runner_busy = false;
+            state.lifecycle
+        };
+        self.inner.drained.notify(usize::MAX);
+        if lifecycle != ActorLifecycle::Open {
             return Step::Exit;
         }
 
