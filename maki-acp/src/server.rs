@@ -431,7 +431,6 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
-    close_session(srv).await;
     let cwd = req.cwd.clone();
     let project_config = trusted_project_config(
         &req.cwd,
@@ -440,6 +439,7 @@ async fn new_session(
         &params.trust_policy,
     );
     let permissions = load_permissions(&project_config)?;
+    close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
     let defaults = session_defaults::resolve(
         params.defaults,
@@ -504,7 +504,6 @@ async fn load_session(
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history_from(&params.storage, session_ref.id())?;
-    close_session(srv).await;
     let session_cwd = effective_session_cwd(restored.cwd.as_deref(), &req.cwd);
     let project_config = trusted_project_config(
         &session_cwd,
@@ -513,6 +512,7 @@ async fn load_session(
         &params.trust_policy,
     );
     let permissions = load_permissions(&project_config)?;
+    close_session(srv).await;
     let mcp = start_mcp(
         &session_cwd,
         &req.mcp_servers,
@@ -3878,6 +3878,37 @@ mod tests {
             close_session(&mut srv).await;
             host.wait_for_worker_barrier_for_test();
             assert_eq!(Arc::strong_count(&orchestration), 1);
+        });
+    }
+
+    /// A malformed permissions file fails session/new before the live
+    /// session is closed, so the client keeps the session it had.
+    #[test]
+    fn broken_permissions_keep_the_live_session() {
+        smol::block_on(async {
+            let (mut srv, _, _, turns) = server_awaiting_answer();
+            let live = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let cwd = TempDir::new().unwrap();
+            let project = cwd.path().join(maki_config::PROJECT_DIR);
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("permissions.toml"), "[bash]\ndeyn = [\"x\"]\n").unwrap();
+            let params = test_params(
+                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            let error = new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, (-32603).into(), "{error:?}");
+            assert_eq!(
+                srv.session.as_ref().unwrap().handle.session_id.to_string(),
+                live
+            );
+            turns.assert_untouched();
         });
     }
 
