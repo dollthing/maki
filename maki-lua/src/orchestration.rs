@@ -13,7 +13,10 @@ use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_options::YOLO_OPTION_ID;
-use maki_agent::{AgentRef, ModeRegistry, modes, tools::ToolContext};
+use maki_agent::{
+    AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance, modes,
+    tools::ToolContext,
+};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, ResolutionError, TargetHandle,
@@ -34,8 +37,10 @@ use std::{
 };
 
 mod catalog;
+mod command_host;
 mod targets;
 pub use catalog::{ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog};
+pub use command_host::PinnedCommandHost;
 pub use targets::AgentOrchestration;
 
 const WRONG_TASK: &str = "orchestration context belongs to another task";
@@ -189,23 +194,47 @@ pub fn command_runner(
     })
 }
 
-/// How print, SDK and ACP run a plugin-run command's outcome: model turns are
-/// admitted on the root, compaction is queued on it, and feedback has nowhere
-/// to show. An isolated turn's answer belongs to the prompt that asked for
-/// it, and a plugin-run one has no prompt to answer.
+/// How print, SDK and ACP run a plugin-run command's outcome on the agent it
+/// was pinned to, as the TUI does: model turns are admitted on it and
+/// compaction is queued on it (through the frontend's own paths when that is
+/// the root), and feedback has nowhere to show. An isolated turn's answer
+/// belongs to the prompt that asked for it, and a plugin-run one has no
+/// prompt to answer.
 pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
+    let root = handle.root.clone();
     let admitter = handle.input_tx.admitter();
     let control = handle.control_tx.clone();
-    Arc::new(move |cmdline, outcome, _| {
+    Arc::new(move |cmdline, outcome, admission| {
+        let root = root.clone();
         let admitter = admitter.clone();
         let control = control.clone();
         Box::pin(async move {
-            match outcome {
-                CommandOutcome::FrontendFeedback(_) => Ok(()),
-                CommandOutcome::AgentTurn(turn) => {
+            let root = root.get().await?;
+            let target = admission.target;
+            let child = (target.id() != root.id() || !target.same_manager(&root))
+                .then(|| target.actor().map_err(|error| error.to_string()))
+                .transpose()?;
+            match (outcome, child) {
+                (CommandOutcome::FrontendFeedback(_), _) => Ok(()),
+                (CommandOutcome::AgentTurn(turn), None) => {
                     admitter.admit(command_input(turn)?).await.map(|_| ())
                 }
-                CommandOutcome::ManualCompaction(instructions) => {
+                (CommandOutcome::AgentTurn(turn), Some(actor)) => actor
+                    .admit_turn_with_options(
+                        command_input(turn)?,
+                        None,
+                        String::new(),
+                        TurnAdmissionOptions {
+                            provenance: TurnProvenance {
+                                origin: TurnOrigin::User,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                (CommandOutcome::ManualCompaction(instructions), None) => {
                     let (output, _) = flume::unbounded();
                     control
                         .send(InteractiveControl::ManualCompaction {
@@ -215,7 +244,13 @@ pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
                         })
                         .await
                 }
-                outcome => detached_outcome(&cmdline, InputDispatch::Dispatched(outcome)),
+                (CommandOutcome::ManualCompaction(instructions), Some(actor)) => {
+                    let run_id = actor.reserve_presentation(actor.presentation_id());
+                    actor
+                        .push_compact(run_id, instructions)
+                        .map_err(|error| error.to_string())
+                }
+                (outcome, _) => detached_outcome(&cmdline, InputDispatch::Dispatched(outcome)),
             }
         })
     })

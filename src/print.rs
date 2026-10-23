@@ -365,10 +365,12 @@ fn start_print_session(
     smol::block_on(discovery.wait_active(ACTIVE_DISCOVERY_BOUND));
     let commands = registry.bind_target(
         session_capabilities(),
-        Arc::new(
-            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
-                .with_admission_context(root.clone()),
-        ),
+        Arc::new(orchestration::PinnedCommandHost::new(
+            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
+            root.clone(),
+            &orchestration,
+            headless::default_model_preparer(timeouts),
+        )),
     );
     orchestration.bind_commands(
         &root.target,
@@ -1638,7 +1640,18 @@ mod tests {
                         assert(child:set_option(ctx, "workflow", "disabled"))
                         assert(assert(child:config(ctx)).options.workflow == "disabled")
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
+                        local gate = maki.async.semaphore(1)
+                        local held = gate:acquire()
+                        local pinned, pinned_err
+                        assert(child:on_turn_end(ctx, function(_, child_ctx)
+                            pinned, pinned_err = maki.api.run_command(child_ctx, "/workflow")
+                            held:release()
+                        end))
                         assert(assert(assert(child:send(ctx, "{COMMAND_CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)).text == "{PRINT_RESPONSE}")
+                        gate:acquire():release()
+                        assert(pinned, pinned_err)
+                        assert(assert(child:config(ctx)).options.workflow == "enabled")
+                        assert(assert(root:config(ctx)).options.workflow == "enabled")
                         assert(child:close(ctx))
                         maki.ui.flash("{COMMAND_FINISHED}")
                     end,

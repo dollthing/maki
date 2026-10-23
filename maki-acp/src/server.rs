@@ -23,7 +23,9 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCance
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
-use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
+use maki_agent::session_coordinator::{
+    ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
+};
 use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
@@ -1020,8 +1022,14 @@ async fn install_session_with_lock(
         observer,
     );
     let command_registry = params.command_registry.clone();
-    let command_target =
-        session_command_target(&command_registry, &handle, &coordinator, &trusted_root);
+    let command_target = session_command_target(
+        &command_registry,
+        &handle,
+        &coordinator,
+        &trusted_root,
+        &orchestration,
+        headless::default_model_preparer(params.timeouts),
+    );
     orchestration.bind_commands(
         &trusted_root.target,
         maki_lua::orchestration::command_runner(
@@ -1068,24 +1076,28 @@ async fn install_session_with_lock(
 }
 
 /// The target a session's prompts dispatch on: commands control {handle}'s
-/// session and run on {root}.
+/// session and run on {root}, or on the agent a plugin pinned them to.
 fn session_command_target(
     registry: &CommandRegistry,
     handle: &InteractiveHandle,
     coordinator: &SessionCoordinatorHandle,
     root: &TrustedTarget,
+    orchestration: &Arc<AgentOrchestration>,
+    prepare_model: ModelPreparer,
 ) -> TargetHandle {
     registry.bind_target_with_presentation(
         maki_agent::command::session_capabilities(),
         maki_agent::command::portable_capabilities(),
-        Arc::new(
+        Arc::new(maki_lua::orchestration::PinnedCommandHost::new(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 coordinator.clone(),
             )
-            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
-            .with_admission_context(root.clone()),
-        ),
+            .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
+            root.clone(),
+            orchestration,
+            prepare_model,
+        )),
     )
 }
 
@@ -2817,7 +2829,8 @@ mod tests {
         });
         let observer = HeadlessObserver::new(host.event_handle(), id.id());
         observer.install(root.target.clone());
-        host.event_handle().install_orchestration_services(services);
+        host.event_handle()
+            .install_orchestration_services(services.clone());
         let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
         previous.task.cancel().await;
@@ -2827,6 +2840,8 @@ mod tests {
             &session.handle,
             &coordinator,
             &root,
+            &services,
+            headless::default_model_preparer(Default::default()),
         );
         session.coordinator = Some(coordinator.clone());
         session.option_projection = Some(Arc::new(OptionProjection {

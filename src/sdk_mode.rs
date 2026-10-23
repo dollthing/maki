@@ -41,7 +41,8 @@ use maki_agent::{
     PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
 };
 use maki_commands::{
-    CommandContent, CommandFuture, CommandOutcome, CommandRegistry, InputDispatch, TargetHandle,
+    CommandContent, CommandFuture, CommandHost, CommandOutcome, CommandRegistry, InputDispatch,
+    TargetHandle,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::orchestration::ModelCatalog;
@@ -587,7 +588,7 @@ impl SdkCommands {
     fn new(
         registry: CommandRegistry,
         custom: &[CustomCommand],
-        host: SessionCommandHost,
+        host: impl CommandHost,
     ) -> Result<Self> {
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
@@ -762,20 +763,24 @@ pub fn run(params: SdkParams) -> Result<()> {
         headless::default_model_preparer(timeouts),
     ))
     .map_err(|error| eyre!("bind session actor: {error}"))?;
-    let sdk_commands = Arc::new(SdkCommands::new(
-        command_registry,
-        &commands,
-        SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone())
-            .with_admission_context(trusted_root.clone()),
-    )?);
     let root = trusted_root.target.clone();
     let orchestration = maki_lua::orchestration::durable_frontend(
         "SDK",
         &catalog,
-        trusted_root,
+        trusted_root.clone(),
         coordinator.clone(),
         Arc::clone(&checkpoint),
     );
+    let sdk_commands = Arc::new(SdkCommands::new(
+        command_registry,
+        &commands,
+        maki_lua::orchestration::PinnedCommandHost::new(
+            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
+            trusted_root,
+            &orchestration,
+            headless::default_model_preparer(timeouts),
+        ),
+    )?);
     orchestration.bind_commands(
         &root,
         maki_lua::orchestration::command_runner(
