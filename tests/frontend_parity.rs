@@ -743,7 +743,7 @@ maki.api.register_command({{
 maki.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local child = assert(maki.agent.spawn(ctx, {{}}))
+    local child = assert(maki.agent.spawn(ctx, {{ auto_deliver = false }}))
     local _, err = child:prompt(ctx, "{ASK_PROMPT}")
     assert(err == nil, tostring(err))
     child:close(ctx)
