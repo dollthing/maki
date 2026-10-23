@@ -198,7 +198,7 @@ pub mod test_support {
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
-                if let Request::FireAutocmd { event, data } = req {
+                if let Request::FireAutocmd { event, data, .. } = req {
                     return Some((event, data));
                 }
             }

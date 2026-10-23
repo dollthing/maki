@@ -37,8 +37,8 @@ pub use mailbox::{MailboxError, PreparedSessionMailbox, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use manager::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
-    CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, ManagerError, PromptWaitError,
-    ShutdownReport, TurnPermitLease,
+    CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
+    PromptWaitError, ShutdownReport, TurnPermitLease,
 };
 pub mod command;
 pub mod config_change;

@@ -112,7 +112,7 @@ maki.api.mode.reset("plan")  -- drop a plugin override, restore the built-in
 maki.api.mode.reset()        -- restore every built-in
 ```
 
-Switching modes fires the autocmd `ModeChanged` with data `{ mode = "<id>" }`. Setting the mode you are already in does not fire it.
+Every committed config change of an agent fires the autocmd `ConfigChanged`, with the agent's mode in `ev.data.mode`. Compare it with the last value you saw to react to mode switches.
 
 ## Example: a plan-review workflow
 

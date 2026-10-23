@@ -9,7 +9,7 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 
 use crate::agent_errors::TRUSTED_TIMER_REQUIRED;
 use crate::api::util::pair::{Pair, try_pair};
-use crate::runtime::{ASYNC_RUN_DEFAULT_DEADLINE, MAX_LUA_SECONDS, PendingAsyncTask};
+use crate::runtime::{ASYNC_RUN_DEFAULT_DEADLINE, MAX_LUA_SECONDS, PendingAsyncTask, TaskCall};
 
 const ERR_SECONDS_RANGE: &str = "seconds must be a finite number > 0 and < 1e9";
 
@@ -191,7 +191,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     command_depth: 0,
                     command_invocation: None,
                     pinned_target: None,
-                    timer_id: Some(timer_id),
+                    call: TaskCall::Timer(timer_id),
                 }),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to pin timer callback");

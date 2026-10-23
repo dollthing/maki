@@ -62,7 +62,6 @@ pub struct ActorRuntimeProbe {
     pub queued: usize,
     pub deliveries: usize,
     pub pending_publications: usize,
-    pub pending_callbacks: usize,
     pub retained_results: usize,
     pub processing: bool,
 }
@@ -74,7 +73,6 @@ impl ActorRuntimeProbe {
             && self.queued == 0
             && self.deliveries == 0
             && self.pending_publications == 0
-            && self.pending_callbacks == 0
             && !self.processing
     }
 }
@@ -115,32 +113,6 @@ pub struct TurnAdmissionOptions {
     /// When set, admission uses it verbatim instead of allocating one, because
     /// the app has already drawn (or will draw) the bubble under that id.
     pub displayed_presentation: Option<u64>,
-}
-
-#[derive(Default)]
-struct CallbackDrain {
-    pending: Mutex<usize>,
-    changed: Event,
-}
-
-pub struct ActorEventLease(Arc<CallbackDrain>);
-
-impl Drop for ActorEventLease {
-    fn drop(&mut self) {
-        *self.0.pending.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        self.0.changed.notify(usize::MAX);
-    }
-}
-
-pub struct LeasedActorEvent {
-    event: ActorEvent,
-    _lease: ActorEventLease,
-}
-
-impl LeasedActorEvent {
-    pub fn into_parts(self) -> (ActorEvent, ActorEventLease) {
-        (self.event, self._lease)
-    }
 }
 
 #[derive(Clone)]
@@ -240,7 +212,6 @@ impl ActorWork {
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
     pub(crate) identity: Arc<()>,
-    callback_drain: Arc<CallbackDrain>,
     #[cfg(any(test, feature = "test-util"))]
     runtime_probes: Mutex<Vec<flume::Sender<ActorRuntimeProbe>>>,
     pub(crate) state: Mutex<ActorState>,
@@ -365,7 +336,7 @@ pub(crate) struct ActorState {
     prepared_publication: Option<prepared::PreparedPublicationState>,
     config_observers: Vec<flume::Sender<ConfigCommit>>,
     event_observers: Vec<flume::Sender<ActorEvent>>,
-    leased_event_observers: Vec<(flume::Sender<LeasedActorEvent>, Arc<CallbackDrain>)>,
+    graph_observers: Vec<(AgentId, flume::Sender<(AgentId, ActorEvent)>)>,
     next_operation_id: u64,
     next_submission_id: u64,
     /// Identity of the work that settled most recently, published with the
@@ -841,15 +812,8 @@ impl ActorState {
         }
         self.event_observers
             .retain(|sender| sender.send(event.clone()).is_ok());
-        self.leased_event_observers.retain(|(sender, drain)| {
-            *drain.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-            sender
-                .send(LeasedActorEvent {
-                    event: event.clone(),
-                    _lease: ActorEventLease(Arc::clone(drain)),
-                })
-                .is_ok()
-        });
+        self.graph_observers
+            .retain(|(agent_id, sender)| sender.send((*agent_id, event.clone())).is_ok());
     }
     pub(super) fn finish_close(&mut self, inner: &ActorInner) {
         if self.close_pending
@@ -866,12 +830,9 @@ impl ActorState {
                 agent_id: inner.agent_id,
                 lifecycle: self.lifecycle,
             });
-            // Close is terminal: dropping the senders frees leases stranded in
-            // channels whose receivers stopped before draining.
             self.event_observers.clear();
-            self.leased_event_observers.clear();
+            self.graph_observers.clear();
             self.config_observers.clear();
-            inner.callback_drain.changed.notify(usize::MAX);
         }
     }
 
@@ -971,7 +932,7 @@ impl ActorState {
             prepared_publication: None,
             config_observers: Vec::new(),
             event_observers: Vec::new(),
-            leased_event_observers: Vec::new(),
+            graph_observers: Vec::new(),
             next_operation_id: 0,
             next_submission_id: 0,
             settled: None,
@@ -1343,7 +1304,6 @@ impl AgentActorHandle {
         let inner = Arc::new(ActorInner {
             agent_id,
             identity: Arc::new(()),
-            callback_drain: Arc::default(),
             #[cfg(any(test, feature = "test-util"))]
             runtime_probes: Mutex::new(Vec::new()),
             state: Mutex::new(ActorState::idle(initial_config)),
@@ -1791,39 +1751,12 @@ impl AgentActorHandle {
         Arc::clone(&self.inner.identity)
     }
 
-    pub fn subscribe_leased_events(&self) -> flume::Receiver<LeasedActorEvent> {
-        let (sender, receiver) = flume::unbounded();
+    /// Tags every later event with this actor's id for a whole-graph
+    /// subscriber.
+    pub(crate) fn attach_graph_observer(&self, sender: flume::Sender<(AgentId, ActorEvent)>) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.close_emitted() {
-            state
-                .leased_event_observers
-                .push((sender, Arc::clone(&self.inner.callback_drain)));
-        }
-        receiver
-    }
-
-    /// Close has been emitted and every leased event handed out, Close
-    /// included, has been released. Until Close is emitted a closing actor
-    /// can still lease events, so an empty count alone is not enough.
-    pub(crate) fn callbacks_drained(&self) -> bool {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.close_emitted()
-            && *self
-                .inner
-                .callback_drain
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                == 0
-    }
-
-    pub(crate) async fn wait_callback_drain(&self) {
-        loop {
-            let listener = self.inner.callback_drain.changed.listen();
-            if self.callbacks_drained() {
-                return;
-            }
-            listener.await;
+            state.graph_observers.push((self.inner.agent_id, sender));
         }
     }
 

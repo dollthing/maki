@@ -1576,13 +1576,10 @@ mod tests {
             &format!(
                 r#"
                 maki.api.create_autocmd("{MODE_AUTOCMD}", {{
-                    callback = function(ev)
-                        maki.async.run(function()
-                            local opts = {{ session = ev.data.session_id }}
-                            local plan, plan_err = maki.session.set_mode("plan", opts)
-                            local build, build_err = maki.session.set_mode("build", opts)
-                            maki.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
-                        end)
+                    callback = function(ev, ctx)
+                        local plan, plan_err = ev.agent:set_mode(ctx, "plan")
+                        local build, build_err = ev.agent:set_mode(ctx, "build")
+                        maki.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
                     end,
                 }})
             "#
@@ -1667,9 +1664,10 @@ mod tests {
                 ));
                 assert_eq!(handle.permissions.is_yolo(), yolo);
             }
-            host.event_handle().fire_autocmd(
+            host.event_handle().fire_agent_autocmd(
                 MODE_AUTOCMD,
-                serde_json::json!({ "session_id": session_id.to_string() }),
+                root.clone(),
+                serde_json::json!({}),
             );
             assert_eq!(notices.recv_timeout(GATE_TIMEOUT).unwrap(), MODES_SET);
             host.event_handle()

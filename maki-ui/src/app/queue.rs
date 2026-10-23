@@ -408,6 +408,5 @@ impl App {
         // point lands on the next turn.
         self.run_model = Some(self.state.session.model.clone());
         self.run_context_window = Some(self.root_config().model.context_window);
-        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
     }
 }

@@ -12,7 +12,7 @@ use structured_output::StructuredOutput;
 
 pub(crate) use handles::{
     AGENT_DOCS, LuaAgent, LuaAgentRef, REF_DOCS, SUBSCRIPTION_DOCS, TURN_DOCS, agent_defer_close,
-    current, focused_agent_ref,
+    current, focused_agent_ref, lookup_agent, origin_json, result_json, selection_json,
 };
 use handles::{
     current__doc, current__register, get__doc, get__register, list__doc, list__register, root__doc,

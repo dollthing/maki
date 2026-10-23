@@ -9,6 +9,7 @@ use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::session_coordinator::SessionOptionCatalog;
 use maki_agent::tools::{ToolRegistry, ToolSource};
+use maki_agent::{AgentManagerHandle, AgentRef};
 use maki_commands::{CommandBehavior, CommandRegistry};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
@@ -616,6 +617,18 @@ impl PluginHost {
                 plugin: "<test-gc>".to_owned(),
                 source,
             })
+    }
+
+    /// Waits until every queued and running Lua task, event callbacks
+    /// included, has finished.
+    #[cfg(feature = "test-support")]
+    pub fn drain_tasks_for_test(&self) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestDrainTasks { reply: reply_tx })
+            .expect("Lua worker is alive");
+        reply_rx.recv().expect("Lua worker drained its tasks");
     }
 
     #[cfg(feature = "test-support")]
@@ -1254,7 +1267,22 @@ impl EventHandle {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
             data,
+            agent: None,
         });
+    }
+
+    /// Fires {event} as {agent}'s, so callbacks get its handle and a ctx.
+    pub fn fire_agent_autocmd(&self, event: &str, agent: AgentRef, data: serde_json::Value) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.to_owned(),
+            data,
+            agent: Some(agent),
+        });
+    }
+
+    /// Fires the lifecycle autocmds of every agent in {manager}'s graph.
+    pub fn observe_agents(&self, manager: &AgentManagerHandle) {
+        let _ = self.tx.try_send(Request::ObserveAgents(manager.clone()));
     }
 
     /// Queues one `splash.render` frame without waiting for the Lua host.

@@ -22,7 +22,7 @@ use maki_providers::Message;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use maki_storage::sessions::{HistorySnapshot, SessionMeta, StoredSubagent};
-use mlua::{Function, Lua, RegistryKey};
+use mlua::Lua;
 use std::{
     collections::HashMap,
     future::Future,
@@ -40,7 +40,6 @@ pub use targets::AgentOrchestration;
 
 const WRONG_TASK: &str = "orchestration context belongs to another task";
 pub const DURABLE_CONFIG_UNAVAILABLE: &str = "durable configuration adapter is unavailable";
-static NEXT_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PLUGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PluginAuthority {
@@ -111,89 +110,6 @@ impl PluginAuthority {
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
-}
-
-pub struct AgentEventRequest {
-    pub callback_id: u64,
-    pub payload: serde_json::Value,
-    pub target: TrustedTarget,
-    pub lease: maki_agent::actor::ActorEventLease,
-}
-
-struct EventCallback {
-    function: RegistryKey,
-    plugin: Arc<str>,
-    owner: Arc<PluginAuthority>,
-    services: Option<Arc<dyn OrchestrationServices>>,
-    cancel: CancelToken,
-    _trigger: CancelTrigger,
-}
-
-#[derive(Default)]
-struct EventCallbacks(HashMap<u64, EventCallback>);
-
-pub(crate) fn register_event_callback(
-    lua: &Lua,
-    plugin: Arc<str>,
-    function: Function,
-) -> mlua::Result<u64> {
-    crate::runtime::validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
-    let plugin = crate::runtime::current_plugin(lua).map_or(plugin, |(plugin, _)| plugin);
-    let owner = lua
-        .app_data_ref::<TaskHandle>()
-        .and_then(|task| lock_cell(&task).plugin_owner.clone())
-        .unwrap_or_else(|| plugin_authority(lua, plugin.clone()));
-    let services = services(lua);
-    if lua.app_data_ref::<EventCallbacks>().is_none() {
-        lua.set_app_data(EventCallbacks::default());
-    }
-    let id = NEXT_CALLBACK_ID.fetch_add(1, Ordering::Relaxed);
-    let function = lua.create_registry_value(function)?;
-    let (trigger, cancel) = CancelToken::new();
-    lua.app_data_mut::<EventCallbacks>()
-        .expect("callbacks installed")
-        .0
-        .insert(
-            id,
-            EventCallback {
-                function,
-                plugin,
-                owner,
-                services,
-                cancel,
-                _trigger: trigger,
-            },
-        );
-    Ok(id)
-}
-
-pub(crate) fn close_event_callback(lua: &Lua, id: u64) {
-    let callback = lua
-        .app_data_mut::<EventCallbacks>()
-        .and_then(|mut callbacks| callbacks.0.remove(&id));
-    if let Some(callback) = callback {
-        lua.remove_registry_value(callback.function).ok();
-    }
-}
-
-pub(crate) fn event_callback(lua: &Lua, id: u64) -> Option<(Function, Arc<str>, CancelToken)> {
-    let callbacks = lua.app_data_ref::<EventCallbacks>()?;
-    let callback = callbacks.0.get(&id)?;
-    let current = services(lua);
-    let same_host = match (&callback.services, &current) {
-        (Some(captured), Some(current)) => Arc::ptr_eq(captured, current),
-        (None, None) => true,
-        _ => false,
-    };
-    if !same_host || callback.cancel.is_cancelled() || !callback.owner.alive.load(Ordering::Acquire)
-    {
-        return None;
-    }
-    Some((
-        lua.registry_value(&callback.function).ok()?,
-        callback.plugin.clone(),
-        callback.cancel.clone(),
-    ))
 }
 
 #[derive(Clone)]
@@ -664,21 +580,8 @@ pub(crate) fn revoke_plugin(lua: &Lua, plugin: &str) {
         alive.revoke();
     }
     crate::api::agent::close_plugin_agents(lua, plugin);
-    let removed = if let Some(mut callbacks) = lua.app_data_mut::<EventCallbacks>() {
-        let ids: Vec<_> = callbacks
-            .0
-            .iter()
-            .filter(|(_, callback)| callback.plugin.as_ref() == plugin)
-            .map(|(id, _)| *id)
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| callbacks.0.remove(&id))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    for callback in removed {
-        lua.remove_registry_value(callback.function).ok();
+    if let Some(mut store) = lua.app_data_mut::<crate::api::autocmd::AutocmdStore>() {
+        store.revoke_plugin(plugin);
     }
 }
 
@@ -828,8 +731,8 @@ pub(crate) fn validate_pinned_target(
 mod tests {
     use super::{
         CommandContent, CommandError, CommandOutcome, InputDispatch, NEEDS_FRONTEND,
-        ScopeAuthority, WRONG_TASK, close_event_callback, detached_outcome, event_callback,
-        install_plugin_authority, plugin_authority, register_event_callback, revoke_plugin,
+        ScopeAuthority, WRONG_TASK, detached_outcome, install_plugin_authority, plugin_authority,
+        revoke_plugin,
     };
     use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
@@ -868,29 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_cannot_cross_services_installation() {
-        struct Services;
-        impl super::OrchestrationServices for Services {
-            fn resolve_target(
-                &self,
-                _: Option<&maki_commands::CommandInvocation>,
-            ) -> Result<Option<super::TrustedTarget>, String> {
-                Ok(None)
-            }
-        }
-        let lua = Lua::new();
-        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
-        lua.set_app_data(super::OrchestrationServicesSlot(Some(Arc::new(Services))));
-        install_plugin_authority(&lua, Arc::from("owner"));
-        let id = register_event_callback(&lua, Arc::from("owner"), callback).unwrap();
-        assert!(event_callback(&lua, id).is_some());
-        lua.set_app_data(super::OrchestrationServicesSlot(Some(Arc::new(Services))));
-        assert!(event_callback(&lua, id).is_none());
-        close_event_callback(&lua, id);
-    }
-
-    #[test]
-    fn cancellation_expires_scope_and_subscription_close_cancels_all_calls() {
+    fn cancellation_expires_scope() {
         let lua = Lua::new();
         let (trigger, cancel) = CancelToken::new();
         let scope = TaskScope::new(&lua, TaskCell::new(cancel, None, None));
@@ -903,14 +784,6 @@ mod tests {
             authority.validate(&lua).unwrap_err(),
             ORCHESTRATION_CONTEXT_EXPIRED
         );
-        drop(scope);
-        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
-        let id = register_event_callback(&lua, Arc::from("owner"), callback).unwrap();
-        let (_, _, first) = event_callback(&lua, id).unwrap();
-        let (_, _, second) = event_callback(&lua, id).unwrap();
-        close_event_callback(&lua, id);
-        assert!(first.is_cancelled() && second.is_cancelled());
-        assert!(event_callback(&lua, id).is_none());
     }
 
     #[test_case::test_case(

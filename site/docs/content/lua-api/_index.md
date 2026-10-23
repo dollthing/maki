@@ -93,7 +93,7 @@ The rules:
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning agent handle. |
 | [`maki.agent.AgentRef`](#maki-agent-AgentRef) | Visibility-only identity. |
-| [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | A revocable subscription. |
+| [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | An autocmd filtered to one agent. |
 | [`maki.agent.AgentTurn`](#maki-agent-AgentTurn) | An exact-turn ticket with repeatable retained result reads. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
@@ -934,32 +934,38 @@ maki.api.create_autocmd({event}, {opts})
 Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
-Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"ProviderChanged"`, `"ModeChanged"`, `"SessionPickerRequested"`,
-`"SplashShown"`, `"SplashHidden"`, and `"StoreChanged"`. Plugins can
-also fire their own events with `exec_autocmds`.
+Every callback runs as its own task, called as `callback(ev, ctx)`: it
+can await, and it never blocks the event that fired it. `ev` is
+`{ id, event, match, data, agent }`.
 
-`"SessionPickerRequested"` opens the `/sessions` picker, but only
-asynchronously: the callback defers through `maki.async.run`, so the
-picker is not open when the event returns.
+Agent events fire for every agent, children included: `"TurnStart"`,
+`"TurnEnd"`, `"AgentIdle"`, `"ConfigChanged"`, `"AgentClosed"`,
+`"ToolStart"`, `"ToolDone"`, `"AutoCompacting"` and `"CompactionDone"`.
+Their `ev.agent` is the agent's handle (nil once it has left the graph),
+`ctx` is a trusted context pinned to it, and `ev.data` carries `agent_id`,
+`session_id` and `parent_id` (nil for a root, so `if ev.data.parent_id then
+return end` keeps a listener on roots). `"TurnStart"` adds `turn_id`,
+`origin` and `selection`; `"TurnEnd"` carries the same fields as
+`AgentTurn:result` plus `reason`, `cost`, `list_cost`, `context_size`,
+`context_window` and `num_turns`; `"AgentIdle"` adds `settled`;
+`"ConfigChanged"` adds `generation`, `selection` and `mode`;
+`"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`.
 
-Except `"SessionPickerRequested"`, `"ModeChanged"` and `"StoreChanged"`, each host event
-carries `data.session_id`. For `"SessionReset"` that
-is the session being left behind; the other events name the session now
-running or focused. A callback has no ctx; it reaches that session through
-the session-addressed calls, such as `maki.session.set_option` and
-`maki.session.set_mode`. Tool events also carry `data.tool_id` and `data.tool`.
-`"SessionFocusChanged"` also carries `data.previous_session_id` except on
-initial startup. `"ModeChanged"` carries `data.mode`, and fires only when
-the mode actually changes. `"StoreChanged"` carries `data.registry` and, for
-registrations, `data.key`.
+Host events with no agent, where `ctx` is nil: `"SessionReset"`,
+`"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`,
+`"SplashShown"`, `"SplashHidden"` and `"StoreChanged"`. `"SessionReset"`
+and `"SessionFocusChanged"` carry `data.session_id`: the session left
+behind, and the one now focused, which also has `data.previous_session_id`
+except on initial startup. `"StoreChanged"` carries `data.registry` and,
+for registrations, `data.key`. Plugins can fire their own events with
+`exec_autocmds`.
 
 **Parameters:**
 
 - `{event}` (`string|string[]`) Event name or list of names.
 - `{opts}` (`table`) Options:
-  - `callback` (`function`) called with an ev table `{ id, event, match, data }`.
+  - `callback` (`function`) called as `callback(ev, ctx)`.
+  - `agent` (`Agent`) only fire for this agent's events.
   - `once` (`boolean`) remove the handler after it fires once (default false).
   - `pattern` (`string|string[]`) only fire when the pattern matches. `"*"` matches everything. Omit to match all.
 
@@ -968,9 +974,12 @@ registrations, `data.key`.
 **Example:**
 
 ```lua
-local id = maki.api.create_autocmd("TurnEnd", {
-  callback = function(ev)
-    print("turn ended: " .. ev.event)
+maki.api.create_autocmd("TurnEnd", {
+  callback = function(ev, ctx)
+    if ev.data.parent_id then
+      return
+    end
+    maki.log.info("root turn ended: " .. ev.data.status)
   end,
 })
 ```
@@ -983,8 +992,8 @@ local id = maki.api.create_autocmd("TurnEnd", {
 maki.api.del_autocmd({id})
 ```
 
-Remove a previously registered autocmd. Does nothing if the {id}
-does not exist.
+Remove a previously registered autocmd and cancel its running callbacks.
+Does nothing if the {id} does not exist.
 
 **Parameters:**
 
@@ -1004,8 +1013,8 @@ maki.api.del_autocmd(id)
 maki.api.exec_autocmds({event}, {opts?})
 ```
 
-Fire one or more events manually. Every matching autocmd callback
-runs synchronously before this function returns.
+Fire one or more events manually. Each matching callback starts as its
+own task; none has run yet when this function returns.
 
 **Parameters:**
 
@@ -1943,12 +1952,12 @@ Close this agent at the end of the current host task, even on cancellation.
 Agent:on_turn_start({ctx}, {handler})
 ```
 
-Subscribe to future turn admissions. Handlers may overlap.
+Alias for `create_autocmd("TurnStart", { agent = self, callback = handler })`.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
-- `{handler}` (`function`) Called as handler(payload, ctx) with a fresh trusted scoped context. Payload fields: agent_id, turn_id, origin, selection (normalized {spec, thinking, fast}, when available). origin contains kind ("user", "plugin", or "internal"), plugin?, plugin_generation?, source_agent?, source_turn?. Provenance does not grant authority.
+- `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -1960,12 +1969,12 @@ Subscribe to future turn admissions. Handlers may overlap.
 Agent:on_turn_end({ctx}, {handler})
 ```
 
-Subscribe to exact settled turn results. Handlers may overlap.
+Alias for `create_autocmd("TurnEnd", { agent = self, callback = handler })`.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
-- `{handler}` (`function`) Called as handler(result, ctx). result has the same fields as AgentTurn:result and AgentTurn:wait. Each invocation has a fresh trusted scoped context.
+- `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -1977,12 +1986,13 @@ Subscribe to exact settled turn results. Handlers may overlap.
 Agent:on_idle({ctx}, {handler})
 ```
 
-Subscribe to transitions to no pending turn work.
+Alias for `create_autocmd("AgentIdle", { agent = self, callback = handler })`.
+Idle is an observation, not a reservation against new work.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
-- `{handler}` (`function`) Called as handler({agent_id}, ctx) with a fresh trusted scoped context. Idle is an observation, not a reservation against new work.
+- `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -1994,12 +2004,12 @@ Subscribe to transitions to no pending turn work.
 Agent:on_config_change({ctx}, {handler})
 ```
 
-Subscribe to committed model or mode changes.
+Alias for `create_autocmd("ConfigChanged", { agent = self, callback = handler })`.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
-- `{handler}` (`function`) Called as handler(payload, ctx). Payload fields: agent_id, generation (committed integer), selection (normalized {spec, thinking, fast}), mode (registered name). The context is fresh and trusted.
+- `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2011,12 +2021,12 @@ Subscribe to committed model or mode changes.
 Agent:on_close({ctx}, {handler})
 ```
 
-Subscribe to permanent lifecycle closure.
+Alias for `create_autocmd("AgentClosed", { agent = self, callback = handler })`.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation context.
-- `{handler}` (`function`) Called as handler({agent_id, lifecycle}, ctx). lifecycle is "closed" or "shutdown". The context is fresh and trusted.
+- `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
 
@@ -2040,8 +2050,8 @@ Read a reference's stable identity.
 
 ## maki.agent.AgentSubscription {#maki-agent-AgentSubscription}
 
-A revocable subscription. Garbage collection does not unsubscribe.
-Close explicitly to cancel callbacks; plugin unload also revokes registration.
+An autocmd filtered to one agent. Garbage collection does not
+unsubscribe; close it, or unload the plugin.
 
 ---
 
@@ -2051,7 +2061,8 @@ Close explicitly to cancel callbacks; plugin unload also revokes registration.
 AgentSubscription:close()
 ```
 
-Revoke future deliveries and cancel active handlers.
+Same as `maki.api.del_autocmd` with this subscription's id: stops future
+deliveries and cancels running callbacks.
 
 **Returns:** (`boolean?`, `string?`) Success.
 
@@ -4074,7 +4085,7 @@ attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
 a session (`prompt`, `set_option`, `set_title`) accept
-only the session its own turn belongs to; `set_mode` refuses them. Every function that reads or
+only the session its own turn belongs to. Every function that reads or
 changes one session takes it explicitly; `ctx:session_id()` names the
 invocation's session, and `current` names the focused one. Tool
 handlers cannot read UI focus, so `current` refuses them.
@@ -4407,32 +4418,6 @@ See [Configuration changes](/docs/modes/#configuration-changes).
 
 ```lua
 local ok, err = maki.session.set_option("fast", "enabled", { session = id })
-```
-
----
-
-### `maki.session.set_mode()` {#maki-session-set_mode}
-
-```lua
-maki.session.set_mode({name}, {opts})
-```
-
-Switches a live session's root agent to mode {name}, through the same
-config queue as `Agent:set_mode`. Autocmd and timer callbacks have no ctx,
-so they set a mode this way, naming the session their event carries.
-Tool handlers use `Agent:set_mode` on their own agent instead.
-
-**Parameters:**
-
-- `{name}` (`string`) Registered mode name.
-- `{opts}` (`table`) Required `session` (string) id of a live session.
-
-**Returns:** (`string|nil`, `string|nil`) The committed mode name, or nil and an error.
-
-**Example:**
-
-```lua
-local mode, err = maki.session.set_mode("plan", { session = ev.data.session_id })
 ```
 
 ---

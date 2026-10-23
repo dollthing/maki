@@ -17,11 +17,13 @@ use crate::api::agent::{LuaActorState, LuaSession};
 use crate::api::util::pair::Pair;
 
 pub(crate) use agent_methods::{AGENT_DOCS, agent_defer_close};
+pub(crate) use authority::lookup as lookup_agent;
 pub(crate) use module_fns::{current, focused_agent_ref};
 pub(super) use module_fns::{
     current__doc, current__register, get__doc, get__register, list__doc, list__register, root__doc,
     root__register, spawn__doc, spawn__register,
 };
+pub(crate) use projection::{origin_json, result_json, selection_json};
 pub(crate) use subscriptions::SUBSCRIPTION_DOCS;
 pub(crate) use tickets::TURN_DOCS;
 
@@ -36,6 +38,13 @@ pub(crate) struct LuaAgent {
 }
 
 impl LuaAgent {
+    /// The autocmd filter for this agent's events, making sure its graph
+    /// feeds this host.
+    pub(crate) fn listen(&self, lua: &Lua) -> crate::api::autocmd::AgentFilter {
+        crate::agent_autocmd::observe(lua, &self.manager);
+        crate::api::autocmd::AgentFilter::new(&self.manager, self.id)
+    }
+
     /// The id the UI keys this agent's transcript by.
     pub(crate) fn transcript_id(&self) -> Option<&str> {
         self.state.as_ref().map(|state| state.ui_id.as_str())

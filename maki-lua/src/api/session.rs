@@ -15,7 +15,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::{
     DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION,
-    DELEGATED_SESSION_LIFECYCLE, NO_FOCUSED_AGENT, NO_ORCHESTRATION_SERVICES, SESSION_REQUIRED_ERR,
+    DELEGATED_SESSION_LIFECYCLE, NO_FOCUSED_AGENT, SESSION_REQUIRED_ERR,
 };
 use crate::api::env::host_state_dir;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
@@ -407,34 +407,6 @@ async fn set_option(lua: Lua, id: String, value: String, opts: Table) -> LuaResu
     }
 }
 
-/// Switches a live session's root agent to mode {name}, through the same
-/// config queue as `Agent:set_mode`. Autocmd and timer callbacks have no ctx,
-/// so they set a mode this way, naming the session their event carries.
-/// Tool handlers use `Agent:set_mode` on their own agent instead.
-///
-/// @param name string Registered mode name.
-/// @param opts table Required `session` (string) id of a live session.
-/// @return (string|nil, string|nil) The committed mode name, or nil and an error.
-/// @example
-/// local mode, err = maki.session.set_mode("plan", { session = ev.data.session_id })
-#[lua_fn]
-async fn set_mode(lua: Lua, name: String, opts: Table) -> LuaResult<Pair<String>> {
-    if crate::runtime::in_delegated_tool(&lua) {
-        return Ok(err_pair(DELEGATED_HOST_MUTATION));
-    }
-    try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    let session = try_pair!(required_session(Some(&opts))?);
-    let target = try_pair!(try_pair!(SessionCoordinatorHandle::resolve(session)).agent());
-    let services = try_pair!(crate::orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
-    let template = try_pair!(services.template(&target));
-    let state_dir = try_pair!(host_state_dir(&lua));
-    let commit = try_pair!(
-        crate::orchestration::set_mode(&*services, &target, &template.modes, &name, &state_dir)
-            .await
-    );
-    Ok((Some(commit.config.mode.id().key().to_string()), None))
-}
-
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -502,12 +474,12 @@ lua_table! {
     /// directly, so it also works under ACP and SDK frontends. A tool handler
     /// cannot create, focus or delete sessions, and the functions that change
     /// a session (`prompt`, `set_option`, `set_title`) accept
-    /// only the session its own turn belongs to; `set_mode` refuses them. Every function that reads or
+    /// only the session its own turn belongs to. Every function that reads or
     /// changes one session takes it explicitly; `ctx:session_id()` names the
     /// invocation's session, and `current` names the focused one. Tool
     /// handlers cannot read UI focus, so `current` refuses them.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options, set_option, set_mode, set_title(tx), set_default_thinking]
+    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options, set_option, set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
@@ -660,7 +632,6 @@ mod tests {
     #[test_case("return session.usage({})" ; "usage")]
     #[test_case("return session.options({})" ; "options")]
     #[test_case("return session.set_option('yolo', 'enabled', {})" ; "set_option")]
-    #[test_case("return session.set_mode('plan', {})" ; "set_mode")]
     fn session_target_is_required(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));

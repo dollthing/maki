@@ -29,7 +29,7 @@ pub(in crate::api::agent) fn result_table(lua: &Lua, result: &TurnResult) -> mlu
     )
 }
 
-pub(super) fn selection_json(config: &EffectiveAgentConfig) -> JsonValue {
+pub(crate) fn selection_json(config: &EffectiveAgentConfig) -> JsonValue {
     let options = RequestOptions {
         thinking: config.thinking,
         fast: config.fast,
@@ -37,7 +37,7 @@ pub(super) fn selection_json(config: &EffectiveAgentConfig) -> JsonValue {
     json!(CompleteModelSelection::from_model(&config.model, options))
 }
 
-pub(super) fn origin_json(origin: &TurnProvenance) -> JsonValue {
+pub(crate) fn origin_json(origin: &TurnProvenance) -> JsonValue {
     let kind = match origin.origin {
         TurnOrigin::Internal => "internal",
         TurnOrigin::User => "user",
@@ -52,7 +52,7 @@ pub(super) fn origin_json(origin: &TurnProvenance) -> JsonValue {
     })
 }
 
-pub(super) fn result_json(result: &TurnResult) -> JsonValue {
+pub(crate) fn result_json(result: &TurnResult) -> JsonValue {
     let outcome = &result.outcome;
     let usage = outcome.usage();
     let mut value = json!({

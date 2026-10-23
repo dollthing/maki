@@ -1146,7 +1146,6 @@ mod tests {
             }
             actor.close();
             runner.await;
-            assert!(actor.callbacks_drained());
         });
     }
 

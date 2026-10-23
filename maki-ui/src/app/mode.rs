@@ -184,14 +184,6 @@ impl App {
             None => {}
         }
         self.file_completion.close();
-        if previous.id() != mode.id() {
-            self.emit_mode_changed(mode.id().key());
-        }
-    }
-
-    fn emit_mode_changed(&self, id: &str) {
-        let data = serde_json::json!({ "mode": id });
-        self.lua_event_handle.fire_autocmd("ModeChanged", data);
     }
 
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {

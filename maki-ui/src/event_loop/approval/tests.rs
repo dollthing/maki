@@ -101,8 +101,12 @@ fn observer() -> String {
         starts = starts + 1
         maki.api.register_command({{ name = "{START_COMMAND_PREFIX}" .. tostring(starts), description = "observed", tui_only = false, handler = function() end }})
     end }})
-    local modes = 0
-    maki.api.create_autocmd("ModeChanged", {{ callback = function()
+    local modes, mode = 0, "plan"
+    maki.api.create_autocmd("ConfigChanged", {{ callback = function(ev)
+        if ev.data.parent_id or ev.data.mode == mode then
+            return
+        end
+        mode = ev.data.mode
         modes = modes + 1
         maki.api.register_command({{ name = "{MODE_COMMAND_PREFIX}" .. tostring(modes), description = "observed", tui_only = false, handler = function() end }})
     end }})
@@ -1023,6 +1027,7 @@ fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
 
 fn assert_preserved(
     event_loop: &EventLoop<'_>,
+    host: &PluginHost,
     index: usize,
     path: &Path,
     run_id: u64,
@@ -1044,14 +1049,19 @@ fn assert_preserved(
     );
     assert!(!app.plan_approval_pending);
     assert_eq!(app.state.session.messages().len(), 1);
-    assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
+    assert!(observed(event_loop, host, index, START_COMMAND_PREFIX).is_empty());
 }
 
 /// Names and descriptions of the commands the observer plugin registered
 /// under `prefix`.
-fn observed(event_loop: &EventLoop<'_>, index: usize, prefix: &str) -> Vec<(String, String)> {
+fn observed(
+    event_loop: &EventLoop<'_>,
+    host: &PluginHost,
+    index: usize,
+    prefix: &str,
+) -> Vec<(String, String)> {
     let app = &event_loop.sessions[index].app;
-    app.lua_event_handle.collect_prompt_slots();
+    host.drain_tasks_for_test();
     event_loop
         .ctx
         .command_runtime
@@ -1071,7 +1081,7 @@ fn observed(event_loop: &EventLoop<'_>, index: usize, prefix: &str) -> Vec<(Stri
 #[test_case(false, true; "after_config_only_commit")]
 fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_config: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         if prior_config {
             let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
             let operation = manager
@@ -1102,7 +1112,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
             event_loop.sessions[index].app.root_config().model.spec(),
             SOURCE_MODEL
         );
-        assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
+        assert!(observed(event_loop, &host, index, START_COMMAND_PREFIX).is_empty());
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
             let runtime = &event_loop.sessions[index];
@@ -1120,7 +1130,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
                 })
                 && !requests.is_empty()
         });
-        let starts: Vec<_> = observed(event_loop, index, START_COMMAND_PREFIX)
+        let starts: Vec<_> = observed(event_loop, &host, index, START_COMMAND_PREFIX)
             .into_iter()
             .map(|(name, _)| name)
             .collect();
@@ -1233,8 +1243,8 @@ fn final_ready(
 #[test]
 fn mode_transition_emits_once_and_config_only_emits_none() {
     with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
-        let before = observed(event_loop, index, MODE_COMMAND_PREFIX).len();
+        let (index, _, requests, host) = setup(event_loop);
+        let before = observed(event_loop, &host, index, MODE_COMMAND_PREFIX).len();
         approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.root_mode() == Mode::Build
@@ -1244,7 +1254,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
         requests.recv_timeout(WAIT).unwrap();
         let _ = event_loop.tick();
         assert_eq!(
-            observed(event_loop, index, MODE_COMMAND_PREFIX).len(),
+            observed(event_loop, &host, index, MODE_COMMAND_PREFIX).len(),
             before + 1
         );
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -1253,7 +1263,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
         event_loop.sessions[index].project_config(&commit);
         let _ = event_loop.tick();
         assert_eq!(
-            observed(event_loop, index, MODE_COMMAND_PREFIX).len(),
+            observed(event_loop, &host, index, MODE_COMMAND_PREFIX).len(),
             before + 1
         );
     });
@@ -1262,7 +1272,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
 #[test]
 fn clear_context_preserves_runtime_and_session_state() {
     with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
+        let (index, _, requests, host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         let command_target = event_loop.sessions[index].app.command_target.id();
@@ -1321,7 +1331,7 @@ fn clear_context_preserves_runtime_and_session_state() {
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
-        assert!(observed(event_loop, index, RESET_COMMAND).is_empty());
+        assert!(observed(event_loop, &host, index, RESET_COMMAND).is_empty());
         assert!(
             event_loop
                 .ctx
@@ -1595,7 +1605,7 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
 #[test]
 fn stale_plan_path_rejects_approval() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let cwd = coordinator.read().cwd().unwrap().join(MOVED_CWD);
@@ -1626,7 +1636,14 @@ fn stale_plan_path_rejects_approval() {
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        assert_preserved(event_loop, index, &relative, run, Some(APPROVAL_CHANGED));
+        assert_preserved(
+            event_loop,
+            &host,
+            index,
+            &relative,
+            run,
+            Some(APPROVAL_CHANGED),
+        );
         assert_eq!(
             manager
                 .actor(root)
@@ -1643,14 +1660,14 @@ fn stale_plan_path_rejects_approval() {
 #[test]
 fn permission_change_before_publication_preserves_source() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         approve(event_loop, index, true);
         let ready = final_ready(event_loop, &requests);
         event_loop.sessions[index].app.permissions.toggle_yolo();
         event_loop.handle_internal(ready);
-        assert_preserved(event_loop, index, &path, run, Some(APPROVAL_CHANGED));
+        assert_preserved(event_loop, &host, index, &path, run, Some(APPROVAL_CHANGED));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -1660,7 +1677,7 @@ fn permission_change_before_publication_preserves_source() {
 #[test_case(true; "fresh_context")]
 fn provider_preparation_failure_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         event_loop.ctx.prepare_provider = Arc::new(|_, _| Err(PROVIDER_FAILURE.into()));
@@ -1669,7 +1686,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
             !event_loop.sessions[index].app.plan_approval_pending
         });
         let failure = ConfigChangeError::ModelPreparation(PROVIDER_FAILURE.into()).to_string();
-        assert_preserved(event_loop, index, &path, run, Some(&failure));
+        assert_preserved(event_loop, &host, index, &path, run, Some(&failure));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -1678,7 +1695,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
 #[test]
 fn cancel_during_provider_preparation_ignores_late_result() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
@@ -1701,7 +1718,7 @@ fn cancel_during_provider_preparation_ignores_late_result() {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
-        assert_preserved(event_loop, index, &path, run, None);
+        assert_preserved(event_loop, &host, index, &path, run, None);
         release.send(()).unwrap();
         completion.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -1726,14 +1743,14 @@ fn cancel_during_provider_preparation_ignores_late_result() {
 #[test_case(true; "fresh_context")]
 fn cancel_before_ready_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         let _ = event_loop.tick();
-        assert_preserved(event_loop, index, &path, run, None);
+        assert_preserved(event_loop, &host, index, &path, run, None);
         assert!(requests.is_empty());
     });
 }

@@ -14,8 +14,10 @@ Maki has two ways for Lua to react to what the agent does.
 | Know that something happened | [Autocmds](/docs/lua-api/#maki-api-create_autocmd) |
 | Change what happens, or stop it | Slots |
 
-Autocmds are notifications. Many plugins can listen to one event, they run in no
-particular order, and what they return is ignored. Slots are a chain: each layer
+Autocmds are notifications. Many plugins can listen to one event, each callback
+runs as its own task in no particular order, and what it returns is ignored. An
+agent event reaches its callback with the agent's handle and a ctx, so the
+callback can act on that agent. Slots are a chain: each layer
 gets the value, decides, and passes it down by calling `prev`. The last layer
 registered runs first.
 

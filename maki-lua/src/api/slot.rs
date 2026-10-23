@@ -10,7 +10,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::agent_errors::DELEGATED_REGISTRATION;
-use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
+use crate::api::util::dispatch::{DepthGuard, call_swallowing};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
@@ -285,7 +285,7 @@ async fn run_chain(
     layers: Arc<[SlotLayer]>,
     args: MultiValue,
 ) -> LuaResult<MultiValue> {
-    let _guard = DepthGuard::enter(lua, SEAM, &name, Reentry::Task).map_err(|_| {
+    let _guard = DepthGuard::enter(lua, SEAM, &name).map_err(|_| {
         mlua::Error::runtime(format!(
             "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
         ))

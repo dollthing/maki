@@ -1170,8 +1170,8 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                     for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(selection[key] == roundtrip[key]) end
                     assert(root:mode(ctx) == "build")
                     local subscription = assert(root:on_config_change(ctx, function(event, callback_ctx)
-                        assert(event.agent_id == root:id() and event.mode == "plan" and event.generation > 0)
-                        for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(event.selection[key] == selection[key]) end
+                        assert(event.data.agent_id == root:id() and event.data.mode == "plan" and event.data.generation > 0)
+                        for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(event.data.selection[key] == selection[key]) end
                         assert(root:mode(callback_ctx) == "plan")
                         local child = assert(maki.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                         assert(callback_ctx:defer_close(child))
@@ -3014,18 +3014,18 @@ fn trusted_turn_callbacks_overlap_and_revocation_cancels_deferred_children() {
                     observed = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     close_probe = assert(maki.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
                     start_subscription = assert(observed:on_turn_start(ctx, guard("start", function(event, callback_ctx)
-                        assert(event.agent_id == observed:id())
-                        assert(event.origin.kind == "plugin" and event.origin.plugin == "pr5_event_callbacks")
-                        assert(event.origin.plugin_generation ~= nil)
+                        assert(event.data.agent_id == observed:id())
+                        assert(event.data.origin.kind == "plugin" and event.data.origin.plugin == "pr5_event_callbacks")
+                        assert(event.data.origin.plugin_generation ~= nil)
                         hold(callback_ctx, "start callback blocked")
                     end)))
                     end_subscription = assert(observed:on_turn_end(ctx, guard("end", function(event, callback_ctx)
-                        assert(event.status == "completed" and event.text == "observed reply")
-                        assert(event.origin.kind == "plugin" and event.origin.plugin == "pr5_event_callbacks")
+                        assert(event.data.status == "completed" and event.data.text == "observed reply")
+                        assert(event.data.origin.kind == "plugin" and event.data.origin.plugin == "pr5_event_callbacks")
                         hold(callback_ctx, "end callback blocked")
                     end)))
                     close_subscription = assert(observed:on_close(ctx, guard("close", function(event, callback_ctx)
-                        assert(event.lifecycle == "closed")
+                        assert(event.data.lifecycle == "closed")
                         assert(callback_ctx:defer_close(close_probe))
                         assert(assert(close_probe:send(callback_ctx, "close callback delivered")):wait(callback_ctx))
                     end)))
@@ -3150,6 +3150,8 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
                     maki.api.register_command({ name = "/pr5_timer_check", tui_only = false,
                         handler = function()
                             assert(effects == 0, "scheduled callback or command escaped")
+                            assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == pr5_command_error,
+                                tostring(pr5_autocmd_escape.err))
                             local id, err = maki.timer.set(3600, function() end)
                             assert(id == 0 and err == nil, "denied timer mutated the store")
                             maki.timer.del(id)
@@ -3201,8 +3203,8 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             end
             local assigned, assignment_err = pcall(function() maki.notify = pr5_timer_escape end)
             assert(not assigned and tostring(assignment_err):find(registration_error, 1, true), tostring(assignment_err))
+            pr5_command_error = command_error
             maki.api.exec_autocmds("User", { pattern = "pr5_escape" })
-            assert(pr5_autocmd_escape.ran == nil and pr5_autocmd_escape.err == command_error, tostring(pr5_autocmd_escape.err))
             for name, mutate in pairs({
                 mode_reset = function() return maki.api.mode.reset() end,
                 session_set_default_thinking = function() return maki.session.set_default_thinking("max") end,
@@ -3226,7 +3228,7 @@ fn delegated_tools_cannot_reach_trusted_entry_points() {
             Ok(())
         );
         bounded(fixture.root_ticket.wait(), "delegated turn settlement").await;
-        fixture._host.wait_for_worker_barrier_for_test();
+        fixture._host.drain_tasks_for_test();
         let check = run_command(
             &fixture._host.command_registry(),
             "/pr5_timer_check",

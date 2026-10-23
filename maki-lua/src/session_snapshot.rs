@@ -2,7 +2,7 @@
 //! drivers all serialize this struct, so a plugin sees the same keys wherever
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use maki_agent::{AgentEvent, AgentRef, Envelope};
 use maki_providers::{TokenUsage, add_cost};
@@ -88,6 +88,7 @@ pub struct HeadlessObserver {
     handle: EventHandle,
     session_id: MakiId,
     totals: Arc<Mutex<Totals>>,
+    root: Arc<OnceLock<AgentRef>>,
 }
 
 impl HeadlessObserver {
@@ -96,20 +97,16 @@ impl HeadlessObserver {
             handle,
             session_id,
             totals: Arc::default(),
+            root: Arc::default(),
         }
     }
 
-    /// Folds one envelope into the totals, then fires its autocmd. Folded
-    /// first, so a plugin handling `TurnEnd` finds the finished totals when
-    /// it calls `maki.session.read()`.
+    /// Folds one envelope into the totals, then fires its autocmd.
     pub fn observe(&self, envelope: &Envelope) {
         self.fold(envelope);
-        agent_autocmd::dispatch(
-            &self.handle,
-            &self.session_id,
-            envelope,
-            envelope.subagent.is_some(),
-        );
+        if let Some(root) = self.root.get() {
+            agent_autocmd::dispatch(&self.handle, root, envelope);
+        }
     }
 
     fn fold(&self, envelope: &Envelope) {
@@ -146,6 +143,8 @@ impl HeadlessObserver {
     /// There is no rename path under the headless drivers, so `title` stays
     /// nil rather than echoing the id back as a fake one.
     pub fn install(&self, root: AgentRef) {
+        self.handle.observe_agents(&root.manager());
+        let _ = self.root.set(root.clone());
         let totals = Arc::clone(&self.totals);
         let id = self.session_id;
         self.handle.install_session_snapshot(Box::new(move |want| {

@@ -194,12 +194,6 @@ impl Runner {
                 queued: self.queue.len(),
                 deliveries: state.deliveries.len(),
                 pending_publications: state.pending_publications,
-                pending_callbacks: *self
-                    .inner
-                    .callback_drain
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()),
                 retained_results: state.retained_order.len(),
                 processing: state.processing.is_some()
                     || state.active.is_some()

@@ -6101,39 +6101,13 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
     });
 }
 
-/// The picker must open through the `/sessions` command, which the host runs
-/// as a deadline-free coroutine. A silent no-op autocmd would never reach the
-/// frontend's runner, and a direct `open()` call would never route through it.
+/// The autocmd callback is its own deadline-free task, so it opens the
+/// picker itself; a silent no-op autocmd would never open a window.
 #[test]
-fn session_picker_requested_routes_through_sessions_command() {
+fn session_picker_requested_opens_the_picker() {
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    let registry = guard.host().command_registry();
-    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
-    let (runs_tx, runs) = flume::unbounded();
-    let _root = common::install_command_root(
-        guard.host(),
-        Arc::new(move |cmdline, depth, _| {
-            let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
-            let dispatch = registry.dispatch_command_with_depth(
-                &target,
-                resolved.command,
-                resolved.arguments,
-                cmdline.as_str().into(),
-                usize::from(depth),
-            );
-            runs_tx.send(cmdline).unwrap();
-            Box::pin(async move {
-                assert!(matches!(dispatch.await, CommandOutcome::Completed));
-                Ok(())
-            })
-        }),
-    );
     let actions = guard.host().ui_action_rx();
     handle.fire_autocmd("SessionPickerRequested", json!({}));
-    assert_eq!(
-        runs.recv_timeout(HOST_REPLY_TIMEOUT).unwrap(),
-        PICKER_COMMAND
-    );
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close("esc");

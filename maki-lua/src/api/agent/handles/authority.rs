@@ -145,7 +145,7 @@ pub(super) fn destination_template(lua: &Lua, agent: &LuaAgent) -> Result<AgentC
     Ok(AgentContext::from(&service.template(&target)?))
 }
 
-pub(super) fn lookup(
+pub(crate) fn lookup(
     manager: AgentManagerHandle,
     id: AgentId,
     lua: &Lua,

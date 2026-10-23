@@ -408,6 +408,7 @@ pub struct App {
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
+    pub(crate) root_agent: Option<maki_agent::AgentRef>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
@@ -609,6 +610,7 @@ impl App {
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
             answer_tx: None,
+            root_agent: None,
             cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
@@ -2257,12 +2259,9 @@ impl App {
             return vec![];
         }
 
-        maki_lua::agent_autocmd::dispatch(
-            &self.lua_event_handle,
-            &self.state.session.id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        if let Some(root) = &self.root_agent {
+            maki_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+        }
 
         let subagent_id = envelope
             .subagent

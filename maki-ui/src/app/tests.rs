@@ -1938,17 +1938,17 @@ fn load_session_clears_plan() {
 }
 
 #[test]
-fn tool_lifecycle_events_name_the_session_and_tool() {
+fn tool_lifecycle_events_name_the_tool() {
     let mut app = streaming_app();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let session_id = app.state.session.id.to_string();
+    let manager = AgentManagerHandle::new(maki_agent::AgentLimits::default()).unwrap();
+    app.root_agent = Some(manager.reference(AgentId::generate()));
 
     app.update(agent_msg(tool_start("tool-1", "bash")));
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolStart fired");
     assert_eq!(event, "ToolStart");
-    assert_eq!(data["session_id"], serde_json::json!(session_id));
     assert_eq!(data["tool_id"], "tool-1");
     assert_eq!(data["tool"], "bash");
 
@@ -1963,7 +1963,6 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
 
     let (event, data) = probe.try_recv_autocmd().expect("ToolDone fired");
     assert_eq!(event, "ToolDone");
-    assert_eq!(data["session_id"], serde_json::json!(session_id));
     assert_eq!(data["tool_id"], "tool-1");
     assert_eq!(data["tool"], "bash");
 

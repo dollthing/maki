@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use crate::actor::{ActorCloseCut, ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
-    ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
+    ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
     SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
 
@@ -44,6 +44,20 @@ static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RunnerTask = smol::Task<()>;
+
+pub struct GraphEvents {
+    manager: Weak<ManagerInner>,
+    events: flume::Receiver<(AgentId, ActorEvent)>,
+}
+
+impl GraphEvents {
+    /// The next event and its agent, whether or not that agent is still live.
+    pub async fn recv(&self) -> Option<(AgentRef, ActorEvent)> {
+        let (agent_id, event) = self.events.recv_async().await.ok()?;
+        let manager = AgentManagerHandle(self.manager.upgrade()?);
+        Some((manager.reference(agent_id), event))
+    }
+}
 
 impl AgentManagerHandle {
     pub fn prepare_idle_subtree(&self, agent_id: AgentId) -> Result<ActorIdleGuard, ManagerError> {
@@ -145,6 +159,7 @@ struct GraphState {
     revision: u64,
     next_reservation: u64,
     shutting_down: bool,
+    observers: Vec<(u64, flume::Sender<(AgentId, ActorEvent)>)>,
 }
 
 #[cfg(test)]
@@ -200,6 +215,7 @@ impl AgentManagerHandle {
                 revision: 0,
                 next_reservation: 1,
                 shutting_down: false,
+                observers: Vec::new(),
             }),
             shutdown: AtomicBool::new(false),
             reaped: Event::new(),
@@ -282,6 +298,22 @@ impl AgentManagerHandle {
             })
     }
 
+    /// A reference to {agent_id} that grants nothing until validated, for
+    /// naming an agent that may already have left the graph.
+    pub fn reference(&self, agent_id: AgentId) -> AgentRef {
+        let terminal = self
+            .lock_graph()
+            .nodes
+            .get(&agent_id)
+            .map(|node| node.terminal.clone())
+            .unwrap_or_default();
+        AgentRef {
+            manager: self.clone(),
+            agent_id,
+            terminal,
+        }
+    }
+
     pub fn lookup(&self, agent_id: AgentId) -> Result<AgentRef, ManagerError> {
         let terminal = self
             .lock_graph()
@@ -301,6 +333,29 @@ impl AgentManagerHandle {
 
     pub fn root(&self) -> Result<AgentRef, ManagerError> {
         self.lookup(self.root_id()?)
+    }
+
+    /// Every event of every actor in this graph, actors committed later
+    /// included, tagged with the agent that emitted it, or `None` when
+    /// {subscriber} already listens. Holds the manager weakly, so it ends
+    /// once the graph is dropped.
+    pub fn subscribe_events(&self, subscriber: u64) -> Option<GraphEvents> {
+        let mut graph = self.lock_graph();
+        graph
+            .observers
+            .retain(|(_, sender)| !sender.is_disconnected());
+        if graph.observers.iter().any(|(key, _)| *key == subscriber) {
+            return None;
+        }
+        let (sender, events) = flume::unbounded();
+        for actor in graph.nodes.values().filter_map(|node| node.actor.as_ref()) {
+            actor.attach_graph_observer(sender.clone());
+        }
+        graph.observers.push((subscriber, sender));
+        Some(GraphEvents {
+            manager: Arc::downgrade(&self.0),
+            events,
+        })
     }
 
     pub fn list(&self) -> Vec<AgentRef> {
@@ -931,23 +986,8 @@ impl AgentManagerHandle {
         }
         let (actor, task) = spawn(admission);
         let manager = Arc::downgrade(&self.0);
-        let callback_actor = actor.clone();
         let task = smol::spawn(async move {
             task.await;
-            if let Some(manager) = manager.upgrade() {
-                let mut graph = manager
-                    .graph
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if let Some(node) = graph.nodes.get_mut(&agent_id)
-                    && node.reservation == reservation
-                {
-                    node.lifecycle = GraphLifecycle::Closed;
-                    graph.revision += 1;
-                }
-                manager.reaped.notify(usize::MAX);
-            }
-            callback_actor.wait_callback_drain().await;
             let Some(manager) = manager.upgrade() else {
                 return;
             };
@@ -955,10 +995,8 @@ impl AgentManagerHandle {
                 .graph
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let Some(node) = graph.nodes.get_mut(&agent_id) else {
-                return;
-            };
-            if node.reservation == reservation
+            if let Some(node) = graph.nodes.get_mut(&agent_id)
+                && node.reservation == reservation
                 && !matches!(
                     node.lifecycle,
                     GraphLifecycle::Closed | GraphLifecycle::Removed
@@ -992,6 +1030,13 @@ impl AgentManagerHandle {
         let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
         node.actor = Some(actor.clone());
         node.task = Some(task);
+        graph
+            .observers
+            .retain(|(_, sender)| !sender.is_disconnected());
+        for (_, observer) in &graph.observers {
+            actor.attach_graph_observer(observer.clone());
+        }
+        let node = graph.nodes.get_mut(&agent_id).unwrap();
         if !closing && !cancel_on_commit {
             node.reservation_pending = false;
             node.lifecycle = GraphLifecycle::Live;
@@ -1509,10 +1554,6 @@ impl AgentManagerHandle {
                 .filter_map(|(&id, node)| {
                     (!node.reservation_pending
                         && node.children.is_empty()
-                        && node
-                            .actor
-                            .as_ref()
-                            .is_none_or(AgentActorHandle::callbacks_drained)
                         && (node.lifecycle == GraphLifecycle::Closed
                             || (node.lifecycle == GraphLifecycle::Closing
                                 && node.task.as_ref().is_some_and(smol::Task::is_finished))))

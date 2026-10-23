@@ -411,7 +411,9 @@ impl AgentHandles {
     }
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
-        app.chats[0].agent_id = Some(self.manager_and_root().1);
+        app.chats[0].agent_id = Some(self.root_id);
+        app.root_agent = Some(self.manager.reference(self.root_id));
+        app.lua_event_handle.observe_agents(&self.manager);
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));

@@ -1767,6 +1767,7 @@ mod tests {
                 .unwrap();
             let actor = root.actor().unwrap();
             let lifecycle = actor.subscribe_events();
+            let manager = root.manager();
             let mut app = crate::app::tests::actor_presentation_app(root, 0);
             let host = maki_lua::PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
             host.load_source(
@@ -1779,6 +1780,8 @@ mod tests {
             )
             .unwrap();
             app.lua_event_handle = host.event_handle();
+            app.lua_event_handle.observe_agents(&manager);
+            host.wait_for_worker_barrier_for_test();
             app.update(crate::app::Msg::Paste(PROMPT.into()));
             let actions = app.update(crate::app::Msg::Key(crate::components::key(
                 crossterm::event::KeyCode::Enter,
@@ -1823,7 +1826,7 @@ mod tests {
                 app.update(crate::app::Msg::Agent(Box::new(envelope)));
             }
             assert_eq!(app.run_id, submitted_run);
-            host.wait_for_worker_barrier_for_test();
+            host.drain_tasks_for_test();
             assert_eq!(
                 run_command(&host.command_registry(), "/assert_single_start", 0, None)
                     .recv_timeout(TEST_TIMEOUT)

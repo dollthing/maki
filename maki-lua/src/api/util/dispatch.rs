@@ -11,33 +11,15 @@ pub const MAX_HOOK_DEPTH: u8 = 8;
 /// load and the other startup paths live there, one at a time.
 const NO_TASK: u64 = 0;
 
-/// What a depth count is scoped to. A seam either keeps its callbacks in the
-/// caller's task or hands each one a fresh task, and only the seam knows
-/// which.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Reentry {
-    /// One count for the whole VM, for seams that detach every callback
-    /// (autocmds). A refire shares no task with the fire it came from, so
-    /// nothing narrower could see it.
-    Vm,
-    /// One count per Lua task, for seams whose chain runs inside the caller's
-    /// task (slots). Re-entering stays in one task while two chains at once
-    /// are two tasks, and counting those together would read a wide `batch` as
-    /// recursion and drop layers it should have run. So this bounds re-entry
-    /// within one chain, never a cycle across calls: a chain fired again by a
-    /// fresh tool call is a fresh task, bounded by that call's window instead.
-    Task,
-}
-
-impl Reentry {
-    fn task(self, lua: &Lua) -> u64 {
-        match self {
-            Self::Vm => NO_TASK,
-            Self::Task => lua
-                .app_data_ref::<TaskHandle>()
-                .map_or(NO_TASK, |handle| lock_cell(&handle).id),
-        }
-    }
+/// One count per Lua task: a slot chain runs inside the caller's task, so
+/// re-entering stays in one task while two chains at once are two tasks, and
+/// counting those together would read a wide `batch` as recursion and drop
+/// layers it should have run. So this bounds re-entry within one chain, never
+/// a cycle across calls: a chain fired again by a fresh tool call is a fresh
+/// task, bounded by that call's window instead.
+fn current_task(lua: &Lua) -> u64 {
+    lua.app_data_ref::<TaskHandle>()
+        .map_or(NO_TASK, |handle| lock_cell(&handle).id)
 }
 
 #[derive(Default)]
@@ -56,16 +38,11 @@ pub(crate) struct DepthGuard {
 }
 
 impl DepthGuard {
-    pub(crate) fn enter(
-        lua: &Lua,
-        kind: &'static str,
-        name: &str,
-        scope: Reentry,
-    ) -> Result<Self, DepthExceeded> {
+    pub(crate) fn enter(lua: &Lua, kind: &'static str, name: &str) -> Result<Self, DepthExceeded> {
         if lua.app_data_ref::<DepthStore>().is_none() {
             lua.set_app_data(DepthStore::default());
         }
-        let key = (kind, name.to_owned(), scope.task(lua));
+        let key = (kind, name.to_owned(), current_task(lua));
         let mut store = lua
             .app_data_mut::<DepthStore>()
             .expect("DepthStore just ensured");
@@ -99,7 +76,7 @@ impl Drop for DepthGuard {
 ///
 /// Runs in the caller's task, not a detached one. Every seam using this waits
 /// for the answer, so the caller's cancellation and deadline belong on the
-/// callback producing it, and [`Reentry::Task`] only tells nesting from
+/// callback producing it, and the per-task depth only tells nesting from
 /// concurrency while nesting stays inside one task.
 pub(crate) async fn call_swallowing<R: FromLuaMulti>(
     func: &Function,
@@ -157,17 +134,16 @@ mod tests {
 
     const SEAM: &str = "seam";
 
-    #[test_case::test_case(Reentry::Vm ; "vm")]
-    #[test_case::test_case(Reentry::Task ; "task")]
-    fn depth_guard_enforces_max_and_unwinds(scope: Reentry) {
+    #[test]
+    fn depth_guard_enforces_max_and_unwinds() {
         let lua = Lua::new();
         let guards: Vec<_> = (0..MAX_HOOK_DEPTH)
-            .map(|_| DepthGuard::enter(&lua, "test", SEAM, scope).expect("within bound"))
+            .map(|_| DepthGuard::enter(&lua, "test", SEAM).expect("within bound"))
             .collect();
-        assert!(DepthGuard::enter(&lua, "test", SEAM, scope).is_err());
-        assert!(DepthGuard::enter(&lua, "test", "other", scope).is_ok());
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_err());
+        assert!(DepthGuard::enter(&lua, "test", "other").is_ok());
         drop(guards);
-        assert!(DepthGuard::enter(&lua, "test", SEAM, scope).is_ok());
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_ok());
         let store = lua.app_data_ref::<DepthStore>().unwrap();
         assert!(store.depths.is_empty(), "zero entries removed");
     }
@@ -180,17 +156,15 @@ mod tests {
         let concurrent: Vec<_> = (0..=MAX_HOOK_DEPTH)
             .map(|_| {
                 let scope = TaskScope::detached(&lua);
-                let guard = DepthGuard::enter(&lua, "test", SEAM, Reentry::Task)
-                    .expect("a fresh task starts at zero");
+                let guard =
+                    DepthGuard::enter(&lua, "test", SEAM).expect("a fresh task starts at zero");
                 (scope, guard)
             })
             .collect();
         let nested: Vec<_> = (1..MAX_HOOK_DEPTH)
-            .map(|_| {
-                DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).expect("within the bound")
-            })
+            .map(|_| DepthGuard::enter(&lua, "test", SEAM).expect("within the bound"))
             .collect();
-        assert!(DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).is_err());
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_err());
         drop((concurrent, nested));
     }
 
