@@ -4594,6 +4594,10 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .clone();
+            // The pump treats a closed stream as session end and settles
+            // whatever operation is active, so the sender stays alive for
+            // the whole test like the session stream does in production.
+            let checkpoint_events = event_tx.clone();
             let checkpoint_task = smol::spawn(async move {
                 coordinator
                     .persist_history(maki_agent::agent::HistorySnapshot::new(vec![
@@ -4601,7 +4605,7 @@ mod tests {
                     ]))
                     .await
                     .unwrap();
-                event_tx
+                checkpoint_events
                     .send_async(Envelope {
                         event: AgentEvent::ControlComplete {
                             usage: TokenUsage::default(),
@@ -4636,6 +4640,8 @@ mod tests {
             assert_eq!(turns.next_text().await, "second");
             assert!(operation_state(&pending).is_some_and(|(cancelling, _)| !cancelling));
             take_active_operation(&pending, OperationKind::PrimaryTurn).unwrap();
+            assert!(out_rx.is_empty());
+            drop(event_tx);
         });
     }
 
