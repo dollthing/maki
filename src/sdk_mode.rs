@@ -1888,9 +1888,9 @@ mod tests {
     use maki_agent::actor::{ConfigChange, ConfigPatch};
     use maki_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
     use maki_agent::tools::ToolRegistry;
-    use maki_agent::{AgentError, AgentRef, ModelSource, PreparedModel};
+    use maki_agent::{AgentError, AgentId, AgentRef, ModelSource, PreparedModel};
     use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
-    use maki_lua::orchestration::OrchestrationServices;
+    use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
@@ -2279,6 +2279,53 @@ mod tests {
         smol::block_on(coordinator.close()).unwrap();
     }
 
+    /// A plugin's run_command reaches the agent it pinned, at its hop depth,
+    /// as in the TUI, rather than the root at depth zero.
+    #[test]
+    fn detached_command_runner_runs_on_the_pinned_agent_at_its_depth() {
+        struct Pinned(Sender<(Option<AgentId>, usize)>);
+        impl maki_commands::CommandBehavior for Pinned {
+            fn execute(
+                &self,
+                invocation: maki_commands::CommandInvocation,
+            ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+                let pinned = invocation
+                    .admission_context::<TrustedTarget>()
+                    .map(|pinned| pinned.target.id());
+                self.0.send((pinned, invocation.depth)).unwrap();
+                Box::pin(async { Ok(CommandOutcome::Completed) })
+            }
+        }
+        let session = pending_sdk_session();
+        let root = smol::block_on(session.handle.initialized_root()).unwrap();
+        let registry = CommandRegistry::new();
+        let (seen_tx, seen) = flume::unbounded();
+        let mut pinned = registration(PINNED_COMMAND, CommandOutcome::Completed);
+        pinned.behavior = Arc::new(Pinned(seen_tx));
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        plugin.replace(vec![pinned]).unwrap();
+        let commands = sdk_commands(registry.clone());
+        let runner = maki_lua::orchestration::detached_command_runner(
+            registry,
+            commands.target.clone(),
+            session.handle.control_tx.clone(),
+        );
+        smol::block_on(runner(
+            PINNED_COMMAND.into(),
+            PINNED_DEPTH,
+            TrustedTarget {
+                target: root.clone(),
+                template: maki_agent::tools::cli_tool_ctx(std::env::temp_dir()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            seen.try_recv().unwrap(),
+            (Some(root.id()), usize::from(PINNED_DEPTH))
+        );
+        session.end_input();
+    }
+
     #[test]
     fn interrupt_cancels_only_the_admitted_turn() {
         let session = pending_sdk_session();
@@ -2352,6 +2399,8 @@ mod tests {
         }
     }
 
+    const PINNED_COMMAND: &str = "/pinned";
+    const PINNED_DEPTH: u8 = 3;
     const OTHER_CWD: &str = "/elsewhere";
     const THIS_CWD: &str = "/here";
     /// A pid no live process on this machine has.

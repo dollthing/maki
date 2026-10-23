@@ -18,7 +18,7 @@ use maki_agent::session_options::YOLO_OPTION_ID;
 use maki_agent::{AgentMode, AgentRef, ModeId, ModeRegistry, tools::ToolContext};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
-    InputDispatch, TargetHandle,
+    InputDispatch, ResolutionError, TargetHandle,
 };
 use maki_providers::Message;
 use maki_storage::StateDir;
@@ -223,7 +223,8 @@ pub type CommandRunner =
 pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
 
 /// A runner for a frontend that hands no outcome back to a frontend loop:
-/// commands run on {target}, compaction is queued on the root through
+/// commands run through {target} on the agent the caller pinned, at its hop
+/// depth, like the TUI's; compaction is queued on the root through
 /// {control}, feedback has nowhere to show, and the outcomes that still need
 /// a frontend loop are errors.
 pub fn detached_command_runner(
@@ -231,11 +232,26 @@ pub fn detached_command_runner(
     target: TargetHandle,
     control: InteractiveControlSender,
 ) -> CommandRunner {
-    Arc::new(move |cmdline, _, _| {
-        let dispatch = registry.dispatch_input(&target, CommandContent::from(cmdline.as_str()));
+    Arc::new(move |cmdline, depth, admission| {
+        let dispatch = registry
+            .resolve_input_for(&target, &cmdline)
+            .map(|resolved| {
+                registry.dispatch_command_with_admission(
+                    &target,
+                    resolved.command,
+                    resolved.arguments,
+                    CommandContent::default(),
+                    depth.into(),
+                    Arc::new(admission),
+                )
+            });
         let control = control.clone();
         Box::pin(async move {
-            match dispatch.await {
+            let dispatch = dispatch.map_err(|error| match error {
+                ResolutionError::UnknownCommand(name) => format!("unknown command '{name}'"),
+                ResolutionError::StaleTarget => error.to_string(),
+            })?;
+            match InputDispatch::Dispatched(dispatch.await) {
                 InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(_)) => Ok(()),
                 InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
                     let (output, _) = flume::unbounded();
