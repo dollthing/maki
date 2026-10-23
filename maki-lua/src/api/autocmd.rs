@@ -366,7 +366,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// return end` keeps a listener on roots). `"TurnStart"` adds `turn_id`,
 /// `origin` and `selection`; `"TurnEnd"` carries the same fields as
 /// `AgentTurn:result` plus `reason`, `cost`, `list_cost`, `context_size`,
-/// `context_window` and `num_turns`; `"AgentIdle"` adds `settled`;
+/// `context_window` and `num_turns`; `"AgentIdle"` fires once work (a turn,
+/// a compaction) settled, not after a config change alone, and adds `settled`;
 /// `"ConfigChanged"` adds `generation`, `selection` and `mode`;
 /// `"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`.
 /// `"AutoCompacting"` adds `context_size` and `context_window`.

@@ -73,7 +73,8 @@ fn on_turn_end(
 }
 
 /// Alias for `create_autocmd("AgentIdle", { agent = self, callback = handler })`.
-/// Idle is an observation, not a reservation against new work.
+/// Idle is an observation, not a reservation against new work. It fires once
+/// work settled, so a handler that changes config does not wake itself.
 /// @param ctx LuaCtx Trusted invocation context.
 /// @param handler function Called as handler(ev, ctx), like any autocmd callback.
 /// @return (AgentSubscription?, string?) Revocable subscription.

@@ -3,9 +3,11 @@
 //! envelopes a frontend reads ([`dispatch`]), so a plugin sees the same events
 //! for every agent, children included, whichever way maki was started.
 
+use std::collections::HashMap;
+
 use maki_agent::{
-    ActorEvent, AgentEvent, AgentManagerHandle, AgentRef, CompactionStatus, DoneReason, Envelope,
-    TurnOutcome,
+    ActorEvent, ActorWorkIdentity, AgentEvent, AgentId, AgentManagerHandle, AgentRef,
+    CompactionStatus, DoneReason, Envelope, TurnOutcome,
 };
 use serde_json::{Value, json};
 
@@ -48,7 +50,11 @@ pub(crate) fn observe(lua: &Lua, manager: &AgentManagerHandle) {
     };
     let tx = tx.0.clone();
     smol::spawn(async move {
+        let mut idle = IdleFilter::default();
         while let Some((agent, event)) = events.recv().await {
+            if !idle.passes(&event) {
+                continue;
+            }
             let Some((name, data)) = actor_autocmd(event) else {
                 continue;
             };
@@ -63,6 +69,27 @@ pub(crate) fn observe(lua: &Lua, manager: &AgentManagerHandle) {
         }
     })
     .detach();
+}
+
+/// Lets an actor's idle through only when work settled since the last one.
+/// A config-only commit passes through idle too, and an AgentIdle callback
+/// that changes config would otherwise wake itself forever.
+#[derive(Default)]
+struct IdleFilter(HashMap<AgentId, ActorWorkIdentity>);
+
+impl IdleFilter {
+    fn passes(&mut self, event: &ActorEvent) -> bool {
+        match event {
+            ActorEvent::Idle { agent_id, settled } => {
+                settled.is_some_and(|settled| self.0.insert(*agent_id, settled) != Some(settled))
+            }
+            ActorEvent::Close { agent_id, .. } => {
+                self.0.remove(agent_id);
+                true
+            }
+            _ => true,
+        }
+    }
 }
 
 fn envelope_autocmd(event: &AgentEvent) -> Option<(&'static str, Value)> {
@@ -218,6 +245,27 @@ mod tests {
         let (event, data) = actor_autocmd(ActorEvent::CompactionEnd(status)).unwrap();
         assert_eq!(event, COMPACTION_DONE_EVENT);
         assert_eq!(data["status"], expected);
+    }
+
+    /// Idle after a config-only commit settles no new work, so only the idle
+    /// that follows new work fires AgentIdle.
+    #[test]
+    fn agent_idle_fires_once_per_settled_work() {
+        let agent_id = AgentId::generate();
+        let work = |presentation| {
+            Some(ActorWorkIdentity::new(
+                agent_id,
+                maki_agent::ActorWorkKind::Control { operation_id: 0 },
+                presentation,
+            ))
+        };
+        let idle = |settled| ActorEvent::Idle { agent_id, settled };
+        let mut filter = IdleFilter::default();
+        let fired: Vec<_> = [idle(None), idle(work(1)), idle(work(1)), idle(work(2))]
+            .iter()
+            .map(|event| filter.passes(event))
+            .collect();
+        assert_eq!(fired, [false, true, false, true]);
     }
 
     /// A budget watchdog reads the whole bill off this one payload, so the keys
