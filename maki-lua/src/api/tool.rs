@@ -1034,6 +1034,8 @@ fn allow_is_delegated(
 ///                          pinned agent; later focus changes do not retarget it.
 ///                          Retaining ctx does not extend its authority beyond
 ///                          the handler. Existing one-argument handlers still work.
+///                          The command finishes when the handler returns, and
+///                          fails with the handler's error if it raises.
 ///                          `opts.args` is
 ///                          the outer-trimmed original argument remainder. It
 ///                          keeps inner whitespace and source quotes. For typed

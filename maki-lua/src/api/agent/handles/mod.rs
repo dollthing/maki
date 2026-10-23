@@ -570,14 +570,17 @@ mod tests {
                     "#,
                 )
                 .unwrap();
-            if registry_dispatch {
+            let dispatch = if registry_dispatch {
                 let commands = host.host().command_registry();
                 let target =
                     commands.bind_target(TargetCapabilities::ALL, Arc::new(EditorCommandHost));
-                commands.dispatch_input(&target, "/edit".into()).await;
+                Some(smol::spawn(async move {
+                    commands.dispatch_input(&target, "/edit".into()).await
+                }))
             } else {
                 handle.run_command(Arc::from(PLUGIN), Arc::from("/editor"), String::new(), 0);
-            }
+                None
+            };
             let actions = host.host().ui_action_rx();
             let UiAction::OpenEditor {
                 target,
@@ -606,6 +609,9 @@ mod tests {
                 panic!("expected editor result");
             };
             assert_eq!(message, format!("{}|{code}", original.id()));
+            if let Some(dispatch) = dispatch {
+                dispatch.await;
+            }
             manager.shutdown(RETIRE_TIMEOUT).await;
             replacement_manager.shutdown(RETIRE_TIMEOUT).await;
             drop(fixtures);

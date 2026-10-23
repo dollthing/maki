@@ -6162,12 +6162,17 @@ fn session_picker_requested_routes_through_sessions_command() {
     picker.close("esc");
 }
 
-fn dispatch_sessions_command(host: &PluginHost, input: &str) {
+/// Starts {input}; the command completes once its picker closes.
+fn dispatch_sessions_command(host: &PluginHost, input: &str) -> smol::Task<InputDispatch> {
     let registry = host.command_registry();
     let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
-    let outcome = smol::block_on(registry.dispatch_input(&target, input.into()));
+    let dispatch = registry.dispatch_input(&target, input.into());
+    smol::spawn(dispatch)
+}
+
+fn assert_completed(dispatch: smol::Task<InputDispatch>) {
     assert!(matches!(
-        outcome,
+        smol::block_on(dispatch),
         InputDispatch::Dispatched(CommandOutcome::Completed)
     ));
 }
@@ -6293,22 +6298,25 @@ impl SessionsPicker {
 fn sessions_command_initializes_closes_and_reopens(input: &str, close_key: &str) {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
     let actions = guard.host().ui_action_rx();
-    dispatch_sessions_command(guard.host(), input);
+    let dispatch = dispatch_sessions_command(guard.host(), input);
     let first = SessionsPicker::load(&actions);
     first.wait_for_unfiltered_rows();
     first.close(close_key);
-    dispatch_sessions_command(guard.host(), input);
+    assert_completed(dispatch);
+    let dispatch = dispatch_sessions_command(guard.host(), input);
     let second = SessionsPicker::load(&actions);
     assert!(!Arc::ptr_eq(&first.buf, &second.buf));
     second.wait_for_unfiltered_rows();
     second.close(close_key);
+    assert_completed(dispatch);
 }
 
 #[test_case::test_case(PICKER_QUERY)]
 fn sessions_command_query_filters_and_escape_clears(query: &str) {
     let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
     let actions = guard.host().ui_action_rx();
-    dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
+    let dispatch =
+        dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
     let picker = SessionsPicker::load(&actions);
     let filter = format!("{PICKER_FILTER_PREFIX} {query}");
     picker.wait_for_render(|text| {
@@ -6322,6 +6330,7 @@ fn sessions_command_query_filters_and_escape_clears(query: &str) {
     picker.key("esc");
     picker.wait_for_unfiltered_rows();
     picker.close("esc");
+    assert_completed(dispatch);
 }
 
 #[test_case::test_case("esc")]

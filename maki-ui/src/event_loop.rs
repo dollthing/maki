@@ -8466,7 +8466,7 @@ mod tests {
             assert_ne!(thinking(root_id), pinned_thinking);
             assert_ne!(child_thinking, pinned_thinking);
 
-            smol::block_on(registry.dispatch_input(&command_target, "/pin-outer".into()));
+            let outer = smol::spawn(registry.dispatch_input(&command_target, "/pin-outer".into()));
             let UiAction::WinSaveView { reply_tx } = actions.recv_timeout(ACTION_TIMEOUT).unwrap()
             else {
                 panic!("outer command did not reach its gate");
@@ -8495,6 +8495,7 @@ mod tests {
                 actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
                 UiAction::Flash(text) if text == INNER_DONE
             ));
+            smol::block_on(outer);
             assert_eq!(thinking(root_id), pinned_thinking);
             assert_eq!(thinking(child_id), child_thinking);
         });

@@ -84,6 +84,8 @@ use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
+const LUA_HOST_STOPPED: &str = "Lua host stopped";
+pub const COMMAND_HANDLER_UNAVAILABLE: &str = "command handler is unavailable";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
 static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -278,6 +280,7 @@ pub enum Request {
         command: Arc<str>,
         generation: u64,
         invocation: CommandInvocation,
+        completion: flume::Sender<Result<(), String>>,
     },
     #[cfg(feature = "test-support")]
     TestPause {
@@ -2208,14 +2211,22 @@ impl CommandBehavior for LuaCommandBehavior {
                 Err(CommandError::Producer(Arc::from(LUA_COMMAND_ATTACHMENTS)))
             });
         }
-        let result = self.tx.send(Request::ExecuteCommand {
+        let (completion, finished) = flume::bounded(1);
+        let sent = self.tx.send(Request::ExecuteCommand {
             plugin: Arc::clone(&self.plugin),
             command: Arc::clone(&self.command),
             generation: self.generation,
             invocation,
+            completion,
         });
         Box::pin(async move {
-            result.map_err(|_| CommandError::Producer(Arc::from("Lua host stopped")))?;
+            let stopped = || CommandError::Producer(Arc::from(LUA_HOST_STOPPED));
+            sent.map_err(|_| stopped())?;
+            finished
+                .recv_async()
+                .await
+                .map_err(|_| stopped())?
+                .map_err(|error| CommandError::Producer(Arc::from(error)))?;
             Ok(CommandOutcome::Completed)
         })
     }
@@ -5190,7 +5201,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 })
                                 .detach();
                             } else if let Some(completion) = completion {
-                                let _ = completion.send(Err("command handler is unavailable".to_owned()));
+                                let _ = completion.send(Err(COMMAND_HANDLER_UNAVAILABLE.to_owned()));
                             }
                         }
                         #[cfg(feature = "test-support")]
@@ -5244,6 +5255,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             command,
                             generation,
                             invocation,
+                            completion,
                         } => {
                             let handler_fn = resolve_command_handler(
                                 &rt.lua,
@@ -5268,13 +5280,18 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>((opts, ctx))?.await
                                     };
-                                    if let Err(e) = run_command_scoped(&lua, invocation, pinned, run).await {
-                                        tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
+                                    let result = run_command_scoped(&lua, invocation, pinned, run)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    if let Err(error) = &result {
+                                        tracing::warn!(plugin = %plugin, command = %command, error, "command handler failed");
                                     }
+                                    let _ = completion.send(result);
                                 })
                                 .detach();
                             } else {
-                                tracing::warn!(plugin = %plugin, command = %command, "command handler is unavailable");
+                                tracing::warn!(plugin = %plugin, command = %command, "{COMMAND_HANDLER_UNAVAILABLE}");
+                                let _ = completion.send(Err(COMMAND_HANDLER_UNAVAILABLE.to_owned()));
                             }
                         }
                         Request::ComputeHeader {

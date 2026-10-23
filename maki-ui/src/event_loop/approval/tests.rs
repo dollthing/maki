@@ -263,7 +263,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         event_loop.sync_orchestration();
         let registry = event_loop.ctx.command_runtime.registry.clone();
         let target = event_loop.sessions[index].app.command_target.clone();
-        smol::block_on(registry.dispatch_input(&target, CHILD_COMMAND.into()));
+        smol::spawn(registry.dispatch_input(&target, CHILD_COMMAND.into())).detach();
         entry.recv_timeout(WAIT).unwrap();
         pump_until(event_loop, |_| actor.snapshot().status == ActorStatus::Idle);
         assert_eq!(event_loop.sessions[index].app.status, Status::Idle);

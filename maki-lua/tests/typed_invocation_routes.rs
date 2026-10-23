@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_commands::{CommandHost, CommandOutcome, CommandRegistry, HostResponse, InputDispatch};
+use maki_commands::{
+    CommandError, CommandHost, CommandOutcome, CommandRegistry, HostResponse, InputDispatch,
+};
 use maki_lua::{EventHandle, PluginHost, UiAction};
 
 const COMMAND_PLUGIN: &str = r#"
@@ -193,12 +195,7 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
     let actions = host.ui_action_rx();
     let release = host.pause_worker_for_test();
 
-    let old_outcome =
-        smol::block_on(registry.dispatch_input(&target, "/typed generation-a".into()));
-    assert!(matches!(
-        old_outcome,
-        InputDispatch::Dispatched(CommandOutcome::Completed)
-    ));
+    let old_outcome = smol::spawn(registry.dispatch_input(&target, "/typed generation-a".into()));
 
     let replacement = host
         .queue_load_source_for_test("generation", GENERATION_B_PLUGIN)
@@ -209,6 +206,11 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
         .expect("replacement load reply")
         .expect("replacement load failed");
     host.wait_for_worker_barrier_for_test();
+    assert!(matches!(
+        smol::block_on(old_outcome),
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(error)))
+            if error.as_ref() == maki_lua::COMMAND_HANDLER_UNAVAILABLE
+    ));
 
     assert!(matches!(
         actions.try_recv(),
