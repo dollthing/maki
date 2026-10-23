@@ -21,7 +21,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::agent::PromptSlotSource;
-use maki_agent::cancel::CancelToken;
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
@@ -536,6 +536,9 @@ struct Shared {
     /// The SDK work in flight: one local operation, or the turns carrying
     /// user messages. A message sent while a turn runs joins it.
     work: Vec<WorkCancel>,
+    /// Counts the local operations begun, so one that ends after an
+    /// interrupt dropped it leaves the work begun since alone.
+    operation: u64,
     /// Stdin ended, so no answer to a new permission ask can arrive.
     input_closed: bool,
     /// The event pump stopped, so nothing reports or ends SDK work any more.
@@ -563,6 +566,7 @@ impl Shared {
             turn_start: Instant::now(),
             pending: HashMap::new(),
             work: Vec::new(),
+            operation: 0,
             input_closed: false,
             output_closed: false,
             idle: Event::new(),
@@ -1190,14 +1194,15 @@ where
     F: Future<Output = Result<String, String>> + Send + 'static,
 {
     let (trigger, cancel) = CancelToken::new();
-    if let Err(error) = begin_sdk_work(shared, WorkCancel::Control(trigger)) {
-        return emit_command_result(writer, shared, true, error.into());
-    }
+    let begun = match begin_sdk_operation(shared, trigger) {
+        Ok(begun) => begun,
+        Err(error) => return emit_command_result(writer, shared, true, error.into()),
+    };
     let writer = writer.clone();
     let shared = Arc::clone(shared);
     smol::spawn(async move {
         let result = operation(cancel).await;
-        end_sdk_work(&shared);
+        end_sdk_operation(&shared, begun);
         let (is_error, text) = match result {
             Ok(text) => (false, text),
             Err(error) => (true, error),
@@ -1429,12 +1434,26 @@ async fn admit_sdk_turn(
     Ok(true)
 }
 
-/// Starts a local operation as the SDK's only work in flight.
-fn begin_sdk_work(shared: &Mutex<Shared>, cancel: WorkCancel) -> Result<(), &'static str> {
+/// Starts a local operation as the SDK's only work in flight and returns
+/// its number.
+fn begin_sdk_operation(shared: &Mutex<Shared>, cancel: CancelTrigger) -> Result<u64, &'static str> {
     let mut shared = shared.lock().unwrap();
     check_sdk_work(&shared, |_| true)?;
-    shared.work.push(cancel);
-    Ok(())
+    shared.work.push(WorkCancel::Control(cancel));
+    shared.operation += 1;
+    Ok(shared.operation)
+}
+
+/// Ends local operation {operation}, unless an interrupt already dropped it
+/// and other work began since.
+fn end_sdk_operation(shared: &Mutex<Shared>, operation: u64) {
+    let mut shared = shared.lock().unwrap();
+    if shared.operation == operation {
+        shared.work.retain(|work| work.turn_id().is_some());
+    }
+    if shared.work.is_empty() {
+        shared.idle.notify(usize::MAX);
+    }
 }
 
 fn check_sdk_work(shared: &Shared, conflicts: fn(&WorkCancel) -> bool) -> Result<(), &'static str> {
@@ -2413,7 +2432,10 @@ mod tests {
                 panic!("{SDK_SETTLEMENT_TIMEOUT}");
             },
         ));
-        assert_eq!(begin_sdk_work(&shared, local_work()), Err(OUTPUT_CLOSED));
+        assert_eq!(
+            begin_sdk_operation(&shared, local_work()),
+            Err(OUTPUT_CLOSED)
+        );
         smol::block_on(coordinator.close()).unwrap();
     }
 
@@ -2549,14 +2571,31 @@ mod tests {
     #[test]
     fn local_operations_run_one_at_a_time() {
         let shared = Mutex::new(Shared::new());
-        assert_eq!(begin_sdk_work(&shared, local_work()), Ok(()));
-        assert_eq!(begin_sdk_work(&shared, local_work()), Err(WORK_ACTIVE));
-        end_sdk_work(&shared);
-        assert_eq!(begin_sdk_work(&shared, local_work()), Ok(()));
+        let first = begin_sdk_operation(&shared, local_work()).unwrap();
+        assert_eq!(begin_sdk_operation(&shared, local_work()), Err(WORK_ACTIVE));
+        end_sdk_operation(&shared, first);
+        assert!(begin_sdk_operation(&shared, local_work()).is_ok());
     }
 
-    fn local_work() -> WorkCancel {
-        WorkCancel::Control(CancelToken::new().0)
+    /// An operation an interrupt dropped that ends late leaves the work
+    /// begun since in place, so the next interrupt still cancels it.
+    #[test]
+    fn late_operation_end_keeps_later_work() {
+        let shared = Mutex::new(Shared::new());
+        let interrupted = begin_sdk_operation(&shared, local_work()).unwrap();
+        cancel_sdk_work(&shared);
+        let (trigger, later) = CancelToken::new();
+        let current = begin_sdk_operation(&shared, trigger).unwrap();
+        end_sdk_operation(&shared, interrupted);
+        assert_eq!(shared.lock().unwrap().work.len(), 1);
+        cancel_sdk_work(&shared);
+        assert!(later.is_cancelled());
+        end_sdk_operation(&shared, current);
+        assert!(shared.lock().unwrap().work.is_empty());
+    }
+
+    fn local_work() -> CancelTrigger {
+        CancelToken::new().0
     }
 
     fn tracked_turns(shared: &Mutex<Shared>) -> Vec<TurnId> {
@@ -3948,7 +3987,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let shared = Arc::new(Mutex::new(Shared::new()));
         let (trigger, cancel) = CancelToken::new();
-        begin_sdk_work(&shared, WorkCancel::Control(trigger)).unwrap();
+        begin_sdk_operation(&shared, trigger).unwrap();
         let mut pump = EventPump {
             writer: SdkWriter {
                 session_id: SessionRef::generate(),
