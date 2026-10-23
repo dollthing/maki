@@ -2613,7 +2613,7 @@ mod tests {
                 handler = function(_, ctx)
                     local root = assert(maki.agent.current(ctx))
                     assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
-                    assert(assert(root:model(ctx)).fast)
+                    assert(assert(root:config(ctx)).model.fast)
                     local session = assert(maki.session.read({{ session = ctx:session_id() }}))
                     assert(session.fast and session.model == "{FAST_SPEC}", maki.json.encode(session))
                     local view, view_err = maki.fn.winsaveview()

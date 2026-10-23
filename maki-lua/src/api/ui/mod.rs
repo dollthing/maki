@@ -717,7 +717,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
 /// local focused, err = maki.ui.focused_agent()
 /// if focused then
 ///   local agent = assert(maki.agent.get(ctx, focused))
-///   local selection = assert(agent:model(ctx))
+///   local model = assert(agent:config(ctx)).model
 /// end
 #[lua_fn]
 fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {

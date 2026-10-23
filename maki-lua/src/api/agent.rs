@@ -1019,20 +1019,6 @@ async fn permission_prompt(
     }
 }
 
-/// Whether this session is in YOLO mode, where permission prompts are skipped
-/// and the bash automode classifier's deny or failure is final (no escalation).
-///
-/// YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
-/// than caching it.
-///
-/// @param ctx LuaCtx Agent context.
-/// @return (boolean) `true` when YOLO mode is active.
-#[lua_fn]
-async fn is_yolo(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<bool>> {
-    let agent = try_pair!(dispatch_ctx(&lua, &ctx, "is_yolo"));
-    Ok((Some(agent.permissions.is_yolo()), None))
-}
-
 fn request_tools_json(lua: &Lua, value: &LuaValue) -> LuaResult<JsonValue> {
     if let LuaValue::Table(table) = value
         && table.is_empty()
@@ -1880,7 +1866,7 @@ lua_table! {
     /// agent:close(ctx)
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt, is_yolo,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt,
         current, root, list, get, spawn,
     ]
 }

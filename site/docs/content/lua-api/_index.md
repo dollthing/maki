@@ -155,7 +155,7 @@ Resolve the pinned invocation subject, not current UI focus. Equivalent to maki.
 LuaCtx:model()
 ```
 
-Read the executing turn's admitted selection. This can differ from Agent:model(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
+Read the executing turn's admitted selection. This can differ from Agent:config(ctx).model, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
 
 **Returns:** (`table?`, `string?`) Complete normalized selection {spec, thinking, fast}; thinking is a setting string or budget integer. Disabled values are off and false.
 
@@ -167,7 +167,7 @@ Read the executing turn's admitted selection. This can differ from Agent:model(c
 LuaCtx:mode()
 ```
 
-Read the executing turn's admitted mode. This can differ from Agent:mode(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
+Read the executing turn's admitted mode. This can differ from Agent:config(ctx).mode, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.
 
 **Returns:** (`string?`, `string?`) Registered mode name.
 
@@ -445,7 +445,7 @@ string or a table with richer output fields.
   - `start` (`function`) Optional. Called when the tool call starts, before the handler runs.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
-  - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available.
+  - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available, and `ctx.options` maps its session option ids to their values.
   - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
@@ -1152,16 +1152,35 @@ the candidate. It returns `false, message` or raises an error to reject it.
 Rejection leaves every session and the active plugin generation unchanged.
 Validation cannot yield or mutate session options.
 
-Compatible plugin replacement retains current session values. The returned
-handle becomes stale after replacement or unload. Runtime failures from
-`get(opts)` and `set(value, opts)` use the normal `(value, err)` convention.
-Both methods take a required `{ session = id }` target.
+Compatible plugin replacement retains current session values. Read a
+value through `Agent:config(ctx).options[id]` and change it with
+`Agent:set_option(ctx, id, value)`.
 
 **Parameters:**
 
 - `{spec}` (`table`) Session option definition and optional validation callback.
 
-**Returns:** userdata Generation-bound handle with `get(opts)` and `set(value, opts)`.
+---
+
+### `maki.api.get_session_options()` {#maki-api-get_session_options}
+
+```lua
+maki.api.get_session_options()
+```
+
+Lists the definitions of every option `Agent:set_option` accepts: the
+built-in `workflow` and `yolo` toggles and every plugin's options. A
+session's current values are in `Agent:config(ctx).options`.
+
+**Returns:** table Array of `{id, name, description, category, values, owner, persistent}`, where `values` is an array of `{value, name}` and `owner` is "builtin" or the plugin name.
+
+**Example:**
+
+```lua
+for _, option in ipairs(maki.api.get_session_options()) do
+  print(option.id, option.name)
+end
+```
 
 
 ## maki.perf {#maki-perf}
@@ -1509,26 +1528,6 @@ if not ok then return { llm_output = err, is_error = true } end
 
 ---
 
-### `maki.agent.is_yolo()` {#maki-agent-is_yolo}
-
-```lua
-maki.agent.is_yolo({ctx})
-```
-
-Whether this session is in YOLO mode, where permission prompts are skipped
-and the bash automode classifier's deny or failure is final (no escalation).
-
-YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
-than caching it.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Agent context.
-
-**Returns:** (`boolean`) `true` when YOLO mode is active.
-
----
-
 ### `maki.agent.current()` {#maki-agent-current}
 
 ```lua
@@ -1693,35 +1692,19 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 ---
 
-### `Agent:mode()` {#Agent-mode}
+### `Agent:config()` {#Agent-config}
 
 ```lua
-Agent:mode({ctx})
+Agent:config({ctx})
 ```
 
-Read the currently committed mode.
+Read the committed configuration.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`string?`, `string?`) Registered mode name.
-
----
-
-### `Agent:model()` {#Agent-model}
-
-```lua
-Agent:model({ctx})
-```
-
-Read the actor's committed model configuration.
-
-**Parameters:**
-
-- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-
-**Returns:** (`table?`, `string?`) Complete normalized selection {spec, thinking, fast}. thinking is a setting string or budget integer; disabled options are "off" and false. Descriptive model metadata is not included.
+**Returns:** (`table?`, `string?`) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. Options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
 
 ---
 
@@ -1879,6 +1862,27 @@ Switch mode through the actor configuration FIFO.
 - `{name}` (`string`) Registered mode name.
 
 **Returns:** (`string?`, `string?`) Committed mode name or error.
+
+---
+
+### `Agent:set_option()` {#Agent-set_option}
+
+```lua
+Agent:set_option({ctx}, {id}, {value})
+```
+
+Set one session option: workflow, yolo or a plugin option. Model,
+thinking, fast and mode have typed setters (`set_model`, `set_mode`) and
+are refused here. Plugin options run their owner's validator first.
+See [Configuration changes](/docs/modes/#configuration-changes).
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{id}` (`string`) Option id.
+- `{value}` (`string`) Selectable value id.
+
+**Returns:** (`boolean?`, `string?`) Success.
 
 ---
 
@@ -4084,7 +4088,7 @@ delete them. Session management returns `nil, "no interactive UI
 attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
-a session (`prompt`, `set_option`, `set_title`) accept
+a session (`prompt`, `set_title`) accept
 only the session its own turn belongs to. Every function that reads or
 changes one session takes it explicitly; `ctx:session_id()` names the
 invocation's session, and `current` names the focused one. Tool
@@ -4369,55 +4373,6 @@ observation waits for the session's next agent run.
 
 ```lua
 maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
-```
-
----
-
-### `maki.session.options()` {#maki-session-options}
-
-```lua
-maki.session.options({opts})
-```
-
-Returns the complete ordered option snapshot for a live session.
-
-**Parameters:**
-
-- `{opts}` (`table`) Required `session` (string) id.
-
-**Returns:** (`table|nil`, `string|nil`) `{version, options}`, or nil and an error.
-
-**Example:**
-
-```lua
-local snapshot, err = maki.session.options({ session = id })
-```
-
----
-
-### `maki.session.set_option()` {#maki-session-set_option}
-
-```lua
-maki.session.set_option({id}, {value}, {opts})
-```
-
-Sets one option explicitly for a live session. Model, thinking, fast, and
-workflow changes follow the agent configuration rules. Other options keep
-their owner's persistence behavior.
-See [Configuration changes](/docs/modes/#configuration-changes).
-
-**Parameters:**
-
-- `{id}` (`string`) Stable option id.
-- `{value}` (`string`) Selectable value id.
-- `{opts}` (`table`) Required `session` (string) id.
-
-**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
-
-**Example:**
-
-```lua
-local ok, err = maki.session.set_option("fast", "enabled", { session = id })
 ```
 
 ---
@@ -6222,7 +6177,7 @@ UI focus.
 local focused, err = maki.ui.focused_agent()
 if focused then
   local agent = assert(maki.agent.get(ctx, focused))
-  local selection = assert(agent:model(ctx))
+  local model = assert(agent:config(ctx)).model
 end
 ```
 

@@ -365,6 +365,16 @@ fn actor_options(
 }
 
 impl SessionOptionCatalog {
+    /// Every plugin's definitions, in plugin order.
+    pub fn definitions(&self) -> Vec<SessionOptionDefinition> {
+        lock(&self.state)
+            .definitions
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     pub fn plugin_definitions(&self, plugin: &str) -> Vec<SessionOptionDefinition> {
         lock(&self.state)
             .definitions
@@ -1670,21 +1680,35 @@ pub fn builtin_option_definitions(
             initial_value: current_model,
             persistent: true,
         },
-        toggle_definition(YOLO_OPTION_ID, "YOLO", "Skip permission prompts", yolo),
+        yolo_definition(yolo),
         toggle_definition(
             FAST_OPTION_ID,
             "Fast",
             "Use the model's fast service tier",
             fast,
         ),
-        toggle_definition(
-            WORKFLOW_OPTION_ID,
-            "Workflow",
-            "Enable workflow tools for future turns",
-            workflow,
-        ),
+        workflow_definition(workflow),
         thinking_definition(thinking),
     ]
+}
+
+/// The built-in options a plain set accepts; model, thinking and fast have
+/// typed setters instead.
+pub fn settable_builtin_definitions() -> [SessionOptionDefinition; 2] {
+    [yolo_definition(false), workflow_definition(false)]
+}
+
+fn yolo_definition(yolo: bool) -> SessionOptionDefinition {
+    toggle_definition(YOLO_OPTION_ID, "YOLO", "Skip permission prompts", yolo)
+}
+
+fn workflow_definition(workflow: bool) -> SessionOptionDefinition {
+    toggle_definition(
+        WORKFLOW_OPTION_ID,
+        "Workflow",
+        "Enable workflow tools for future turns",
+        workflow,
+    )
 }
 
 fn thinking_definition(thinking: ThinkingConfig) -> SessionOptionDefinition {

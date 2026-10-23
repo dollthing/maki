@@ -2784,7 +2784,7 @@ mod tests {
                         local child = assert(maki.agent.current(ctx))
                         local selected = assert(child:set_model(ctx, {{ spec = "{STARTUP_MODEL}", thinking = "off", fast = false }}))
                         assert(selected.spec == "{STARTUP_MODEL}")
-                        assert(assert(child:model(ctx)).spec == "{STARTUP_MODEL}")
+                        assert(assert(child:config(ctx)).model.spec == "{STARTUP_MODEL}")
                         local captured = assert(ctx:model())
                         assert(captured.spec == inherited.spec)
                         assert(maki.json.encode(captured.thinking) == maki.json.encode(inherited.thinking))

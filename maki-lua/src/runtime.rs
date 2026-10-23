@@ -1642,6 +1642,25 @@ pub(crate) fn event_depth(lua: &Lua) -> u8 {
         .map_or(0, |handle| lock_cell(&handle).event_depth)
 }
 
+/// Names the session and its option values in a permission_scopes context;
+/// the callback runs before the tool has a ctx to read them from.
+fn permission_scopes_session(
+    lua: &Lua,
+    context: &mlua::Table,
+    session: &SessionRef,
+) -> mlua::Result<()> {
+    context.set("session_id", session.to_string())?;
+    let options = lua.create_table()?;
+    if let Ok(coordinator) =
+        maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session.id())
+    {
+        for state in coordinator.read().options().options.iter() {
+            options.set(state.definition.id.as_ref(), state.current_value.as_ref())?;
+        }
+    }
+    context.set("options", options)
+}
+
 /// Queues an event callback {work} as its own task, owned by {plugin} and
 /// cancelled with {cancel}, with a trusted ctx for {target} when there is one.
 pub(crate) fn enqueue_callback(
@@ -3970,7 +3989,7 @@ impl LuaRuntime {
             }
         };
         if let Some(session_id) = session_id
-            && let Err(error) = context.set("session_id", session_id.to_string())
+            && let Err(error) = permission_scopes_session(&self.lua, &context, &session_id)
         {
             tracing::warn!(plugin, tool, %error, "failed to build permission_scopes context");
             return Some(PermissionScopes::force_prompt(input.to_string()));

@@ -2,18 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::session_coordinator::{SessionCoordinatorError, SessionOptionCatalog};
+use maki_agent::session_coordinator::{
+    SessionCoordinatorError, SessionOptionCatalog, settable_builtin_definitions,
+};
 use maki_agent::session_options::{
     SessionOptionCategory, SessionOptionDefinition, SessionOptionError, SessionOptionOwner,
     SessionOptionState, SessionOptionValue,
 };
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{
-    Function, Lua, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods, Value,
-};
-
-use crate::api::session::resolve_coordinator;
-use crate::api::util::pair::err_pair;
+use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 const SPEC_KEYS: &[&str] = &[
     "id",
@@ -59,13 +56,6 @@ impl Drop for ValidationGuard {
     }
 }
 
-#[derive(Clone)]
-struct SessionOptionHandle {
-    plugin: Arc<str>,
-    generation: u64,
-    id: Arc<str>,
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -106,10 +96,6 @@ impl SessionOptionStore {
         if let Some(generation) = self.generations.get_mut(plugin) {
             *generation += 1;
         }
-    }
-
-    fn is_current(&self, plugin: &str, generation: u64) -> bool {
-        self.generations.get(plugin).copied() == Some(generation)
     }
 }
 
@@ -190,20 +176,6 @@ fn parse_definition(
         .validate()
         .map_err(|error| spec_error(&id, error.to_string()))?;
     Ok((definition, spec.get("validate")?))
-}
-
-fn ensure_current(lua: &Lua, handle: &SessionOptionHandle) -> Result<(), String> {
-    if lua
-        .app_data_ref::<SessionOptionStore>()
-        .is_some_and(|store| store.is_current(&handle.plugin, handle.generation))
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "session option was replaced by a newer plugin generation: {}",
-            handle.id
-        ))
-    }
 }
 
 fn validation_guard(lua: &Lua) -> Result<ValidationGuard, SessionOptionError> {
@@ -305,59 +277,6 @@ fn validate_value(
     validate_function(lua, function, value)
 }
 
-impl UserData for SessionOptionHandle {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_method("get", |lua, this, opts: Option<Table>| async move {
-            if let Err(error) = ensure_current(&lua, &this) {
-                return Ok(err_pair(error));
-            }
-            let coordinator = match resolve_coordinator(opts.as_ref()) {
-                Ok(coordinator) => coordinator,
-                Err(error) => return Ok(err_pair(error)),
-            };
-            let value = coordinator
-                .read()
-                .options()
-                .options
-                .iter()
-                .find(|option| option.definition.id == this.id)
-                .map(|option| option.current_value.to_string());
-            Ok(match value {
-                Some(value) => (Some(value), None),
-                None => err_pair(format!("unknown session option: {}", this.id)),
-            })
-        });
-        methods.add_async_method(
-            "set",
-            |lua, this, (value, opts): (String, Option<Table>)| async move {
-                if let Err(error) = ensure_current(&lua, &this) {
-                    return Ok(err_pair(error));
-                }
-                if let Err(error) = ensure_validation_not_in_progress(&lua) {
-                    return Ok(err_pair(error));
-                }
-                let coordinator = match resolve_coordinator(opts.as_ref()) {
-                    Ok(coordinator) => coordinator,
-                    Err(error) => return Ok(err_pair(error)),
-                };
-                let snapshot = coordinator.read().options();
-                if let Err(error) =
-                    validate_value(&lua, &this.plugin, this.generation, &this.id, &value)
-                {
-                    return Ok(err_pair(error));
-                }
-                match coordinator
-                    .set_option_if_version(Arc::clone(&this.id), value, Some(snapshot.version))
-                    .await
-                {
-                    Ok(_) => Ok((Some(true), None)),
-                    Err(error) => Ok(err_pair(error)),
-                }
-            },
-        );
-    }
-}
-
 /// Registers one selectable session option owned by the loading plugin.
 ///
 /// The `id` must use the plugin namespace, such as `bash.auto_mode`. Global
@@ -372,19 +291,18 @@ impl UserData for SessionOptionHandle {
 /// Rejection leaves every session and the active plugin generation unchanged.
 /// Validation cannot yield or mutate session options.
 ///
-/// Compatible plugin replacement retains current session values. The returned
-/// handle becomes stale after replacement or unload. Runtime failures from
-/// `get(opts)` and `set(value, opts)` use the normal `(value, err)` convention.
-/// Both methods take a required `{ session = id }` target.
+/// Compatible plugin replacement retains current session values. Read a
+/// value through `Agent:config(ctx).options[id]` and change it with
+/// `Agent:set_option(ctx, id, value)`.
 ///
 /// @param spec table Session option definition and optional validation callback.
-/// @return userdata Generation-bound handle with `get(opts)` and `set(value, opts)`.
+/// @return
 #[lua_fn]
 fn register_session_option(
     lua: &Lua,
     #[ctx] pending: PendingSessionOptions,
     spec: Table,
-) -> LuaResult<mlua::AnyUserData> {
+) -> LuaResult<()> {
     crate::runtime::require_plugin_load(lua, &pending.plugin, "register_session_option")?;
     let (definition, validator) = parse_definition(&pending, &spec)?;
     let mut definitions = lock(&pending.definitions);
@@ -397,23 +315,73 @@ fn register_session_option(
             "option id registered more than once",
         ));
     }
-    let handle = SessionOptionHandle {
-        plugin: Arc::clone(&pending.plugin),
-        generation: pending.generation,
-        id: Arc::clone(&definition.id),
-    };
+    let id = Arc::clone(&definition.id);
     definitions.push(definition);
     drop(definitions);
     if let Some(validator) = validator {
-        pending.insert_validator(Arc::clone(&handle.id), validator);
+        pending.insert_validator(id, validator);
     }
-    lua.create_userdata(handle)
+    Ok(())
+}
+
+/// Lists the definitions of every option `Agent:set_option` accepts: the
+/// built-in `workflow` and `yolo` toggles and every plugin's options. A
+/// session's current values are in `Agent:config(ctx).options`.
+///
+/// @return table Array of `{id, name, description, category, values, owner, persistent}`, where `values` is an array of `{value, name}` and `owner` is "builtin" or the plugin name.
+/// @example
+/// for _, option in ipairs(maki.api.get_session_options()) do
+///   print(option.id, option.name)
+/// end
+#[lua_fn]
+fn get_session_options(lua: &Lua) -> LuaResult<Table> {
+    let plugins = lua
+        .app_data_ref::<SessionOptionCatalog>()
+        .map(|catalog| catalog.definitions())
+        .unwrap_or_default();
+    let definitions = settable_builtin_definitions().into_iter().chain(plugins);
+    let list = lua.create_table()?;
+    for definition in definitions {
+        list.push(definition_table(lua, &definition)?)?;
+    }
+    Ok(list)
+}
+
+fn definition_table(lua: &Lua, definition: &SessionOptionDefinition) -> LuaResult<Table> {
+    let option = lua.create_table()?;
+    option.set("id", definition.id.as_ref())?;
+    option.set("name", definition.name.as_ref())?;
+    option.set("description", definition.description.as_ref())?;
+    option.set(
+        "category",
+        match definition.category {
+            SessionOptionCategory::Model => "model",
+            SessionOptionCategory::Mode => "mode",
+        },
+    )?;
+    option.set("persistent", definition.persistent)?;
+    option.set(
+        "owner",
+        match &definition.owner {
+            SessionOptionOwner::Builtin => "builtin",
+            SessionOptionOwner::Plugin { plugin, .. } => plugin.as_ref(),
+        },
+    )?;
+    let values = lua.create_table()?;
+    for value in definition.values.iter() {
+        let item = lua.create_table()?;
+        item.set("value", value.value.as_ref())?;
+        item.set("name", value.name.as_ref())?;
+        values.push(item)?;
+    }
+    option.set("values", values)?;
+    Ok(option)
 }
 
 lua_table! {
     extend "maki.api" => pub(crate) fn add_session_option_fn(
         pending: PendingSessionOptions
-    ), DOCS [register_session_option(pending)]
+    ), DOCS [register_session_option(pending), get_session_options]
 }
 
 pub(crate) async fn commit_catalog(
@@ -571,72 +539,61 @@ mod tests {
         store.commit(plugin, reloaded);
 
         assert!(reloaded > first);
-        assert!(!store.is_current("test", first));
     }
 
     #[test]
-    fn generation_bound_handle_targets_explicit_sessions_and_becomes_stale() {
+    fn listing_has_the_settable_builtins_then_plugin_options() {
         smol::block_on(async {
-            let first_id = MakiId::generate();
-            let second_id = MakiId::generate();
             let catalog = SessionOptionCatalog::default();
-            let first = coordinator(first_id, &catalog);
-            let second = coordinator(second_id, &catalog);
             let lua = Lua::new();
             lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
-            lua.set_app_data(SessionOptionStore::default());
             lua.set_app_data(SessionOptionValidators::default());
-            lua.set_app_data(SessionOptionValidation::default());
+            lua.set_app_data(catalog.clone());
             let pending = PendingSessionOptions::new(Arc::from("test"), 1);
             let api = lua.create_table().unwrap();
             add_session_option_fn(&api, &lua, pending.clone()).unwrap();
             lua.globals().set("api", api).unwrap();
-            lua.globals().set("first", first_id.to_string()).unwrap();
-            lua.globals().set("second", second_id.to_string()).unwrap();
             lua.globals().set("spec", option_spec(&lua)).unwrap();
-            lua.load("handle = api.register_session_option(spec)")
+            lua.load("api.register_session_option(spec)")
                 .exec()
                 .unwrap();
             commit_pending(&lua, &catalog, &pending).await.unwrap();
-            lua.app_data_mut::<SessionOptionStore>()
-                .unwrap()
-                .commit(Arc::from("test"), 1);
 
-            let (ok, error): (bool, Option<String>) = lua
-                .load("return handle:set('b', { session = first })")
-                .eval_async()
-                .await
+            let ids: Vec<String> = lua
+                .load(
+                    "local ids = {} for _, o in ipairs(api.get_session_options()) do ids[#ids + 1] = o.id .. '@' .. o.owner end return ids",
+                )
+                .eval::<Vec<String>>()
                 .unwrap();
-            assert!(ok);
-            assert_eq!(error, None);
-            let (first_value, error): (String, Option<String>) = lua
-                .load("return handle:get({ session = first })")
-                .eval_async()
-                .await
-                .unwrap();
-            assert_eq!(first_value, "b");
-            assert_eq!(error, None);
-            let (second_value, error): (String, Option<String>) = lua
-                .load("return handle:get({ session = second })")
-                .eval_async()
-                .await
-                .unwrap();
-            assert_eq!(second_value, "a");
-            assert_eq!(error, None);
-
-            lua.app_data_mut::<SessionOptionStore>()
-                .unwrap()
-                .commit(Arc::from("test"), 2);
-            let (value, error): (Value, Option<String>) = lua
-                .load("return handle:get({ session = first })")
-                .eval_async()
-                .await
-                .unwrap();
-            assert!(value.is_nil());
-            assert!(error.is_some_and(|error| error.contains("newer plugin generation")));
-            first.close().await.unwrap();
-            second.close().await.unwrap();
+            assert_eq!(
+                ids,
+                ["yolo@builtin", "workflow@builtin", "test.choice@test"]
+            );
         });
+    }
+
+    /// The validated set `Agent:set_option` runs once it has the session.
+    async fn set_choice(
+        lua: &Lua,
+        session: &SessionCoordinatorHandle,
+        value: &str,
+    ) -> Result<(), String> {
+        let snapshot = session.read().options();
+        let option = snapshot
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == "test.choice")
+            .unwrap();
+        validate_option_value(lua, option, value).map_err(|error| error.to_string())?;
+        session
+            .set_option_if_version(
+                Arc::from("test.choice"),
+                Arc::from(value),
+                Some(snapshot.version),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     #[test]
@@ -674,7 +631,7 @@ mod tests {
             )
             .unwrap();
             lua.globals().set("spec", spec).unwrap();
-            lua.load("handle = api.register_session_option(spec)")
+            lua.load("api.register_session_option(spec)")
                 .exec()
                 .unwrap();
             commit_pending(&lua, &catalog, &pending).await.unwrap();
@@ -683,17 +640,10 @@ mod tests {
                 .commit(Arc::from("test"), 1);
 
             lua.globals().set("reject", true).unwrap();
-            let (value, error): (Value, Option<String>) = lua
-                .load("return handle:set('b', { session = first })")
-                .eval_async()
-                .await
-                .unwrap();
-            assert!(value.is_nil());
+            let error = set_choice(&lua, &first, "b").await.unwrap_err();
             assert!(
-                error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("value rejected")),
-                "unexpected validator error: {error:?}"
+                error.contains("value rejected"),
+                "unexpected validator error: {error}"
             );
             for session in [&first, &second] {
                 assert_eq!(
@@ -733,30 +683,14 @@ mod tests {
                 )
                 .unwrap();
             lua.globals().set("next_spec", next_spec).unwrap();
-            lua.load("next_handle = next_api.register_session_option(next_spec)")
+            lua.load("next_api.register_session_option(next_spec)")
                 .exec()
                 .unwrap();
 
             let error = commit_pending(&lua, &catalog, &next).await.unwrap_err();
             assert!(error.contains("replacement rejected"));
-            assert!(
-                lua.app_data_ref::<SessionOptionStore>()
-                    .unwrap()
-                    .is_current("test", 1)
-            );
-            assert!(
-                !lua.app_data_ref::<SessionOptionStore>()
-                    .unwrap()
-                    .is_current("test", 2)
-            );
             lua.globals().set("reject", false).unwrap();
-            let (ok, error): (bool, Option<String>) = lua
-                .load("return handle:set('b', { session = first })")
-                .eval_async()
-                .await
-                .unwrap();
-            assert!(ok);
-            assert_eq!(error, None);
+            set_choice(&lua, &first, "b").await.unwrap();
             assert_eq!(
                 first
                     .read()

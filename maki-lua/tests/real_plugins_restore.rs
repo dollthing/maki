@@ -15,6 +15,7 @@ use maki_agent::session_coordinator::{
     SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions,
 };
+use maki_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, YOLO_OPTION_ID};
 use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
 use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{
@@ -41,6 +42,7 @@ const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
 const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
+const AUTO_MODE_DENIED: &str = "command denied by auto-mode: ";
 
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
@@ -734,10 +736,11 @@ fn prompt_permissions() -> Arc<PermissionManager> {
     ))
 }
 
-/// YOLO `PermissionManager`: prompts are skipped, so a classifier deny must
-/// reject outright via `maki.agent.is_yolo` in the plugin (never reaching
-/// `enforce` at all).
-fn yolo_permissions() -> Arc<PermissionManager> {
+/// YOLO on {session} and its `PermissionManager`, as the frontends keep them:
+/// prompts are skipped, so a classifier deny must reject outright through the
+/// session's `yolo` option in the plugin (never reaching `enforce` at all).
+fn yolo_permissions(session: &SessionCoordinatorHandle) -> Arc<PermissionManager> {
+    smol::block_on(session.set_option(YOLO_OPTION_ID, ENABLED_VALUE)).unwrap();
     Arc::new(PermissionManager::new(
         PermissionsConfig {
             default: DefaultEffect::Prompt,
@@ -815,23 +818,18 @@ const CLASSIFY_ERROR_STUB: &str =
 #[test]
 fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
     let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
-    let result = exec_verdict_prompt(
+    let err = exec_bash_real(
         &host,
         &reg,
         &session,
+        Arc::new(common::CannedProvider::new(vec![])),
+        yolo_permissions(&session),
         json!({ "command": "echo denied-side-effect" }),
-        yolo_permissions(),
-        None,
-    );
-    assert!(result.is_error, "a yolo deny must fail the tool");
+    )
+    .expect_err("a yolo deny must fail the tool");
     assert!(
-        result.output.contains("stub deny reason"),
-        "deny carries the classifier reason: {}",
-        result.output
-    );
-    assert!(
-        permission_requests(&result.events).is_empty(),
-        "a yolo deny must not prompt"
+        err.starts_with(AUTO_MODE_DENIED) && err.contains("stub deny reason"),
+        "a yolo deny is final and carries the classifier reason: {err}"
     );
 }
 
@@ -1072,7 +1070,7 @@ fn automode_deny_blocks_and_approve_runs() {
         &reg,
         &session,
         Arc::clone(&deny),
-        yolo_permissions(),
+        yolo_permissions(&session),
         json!({ "command": "echo denied-side-effect" }),
     )
     .expect_err("under yolo a deny must fail the tool");
@@ -1086,6 +1084,7 @@ fn automode_deny_blocks_and_approve_runs() {
         "the deny verdict must come from the real classifier"
     );
 
+    smol::block_on(session.set_option(YOLO_OPTION_ID, DISABLED_VALUE)).unwrap();
     let approve = Arc::new(common::CannedProvider::new(vec![
         verdict_tool_use(true, "ok"),
         common::canned_reply("done"),
@@ -1157,7 +1156,7 @@ fn automode_toggle_flows_through_ui() {
         &reg_on,
         &session_on,
         Arc::clone(&deny),
-        yolo_permissions(),
+        yolo_permissions(&session_on),
         json!({ "command": "echo should-be-denied" }),
     )
     .expect_err("with auto mode on under yolo the classifier gates the command");

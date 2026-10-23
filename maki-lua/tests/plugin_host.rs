@@ -6305,105 +6305,6 @@ fn sessions_keybind_initializes_and_closes(close_key: &str) {
     picker.close(close_key);
 }
 
-const SESSION_OPTION_PLUGIN_ID: &str = "session_option_e2e.choice";
-const SESSION_OPTION_VALIDATOR_REJECTION: &str = "c is not allowed";
-const SESSION_OPTION_PLUGIN: &str = r#"
-maki.api.register_session_option({
-    id = "session_option_e2e.choice",
-    name = "Choice",
-    description = "e2e choice",
-    category = "mode",
-    values = {
-        { value = "a", name = "A" },
-        { value = "b", name = "B" },
-        { value = "c", name = "C" },
-    },
-    initial_value = "a",
-    validate = function(value)
-        if value == "c" then return false, "c is not allowed" end
-        return true
-    end,
-})
-
-maki.api.register_tool({
-    name = "set_choice",
-    description = "sets the plugin-owned session option",
-    schema = {
-        type = "object",
-        properties = {
-            session = { type = "string" },
-            value = { type = "string" },
-        },
-        required = { "session", "value" },
-    },
-    handler = function(input, ctx)
-        local ok, err = maki.session.set_option(
-            "session_option_e2e.choice",
-            input.value,
-            { session = input.session })
-        if not ok then
-            return "error: " .. tostring(err)
-        end
-        return "ok"
-    end,
-})
-"#;
-
-const SESSION_OPTION_SET_OK: &str = "ok";
-
-fn plugin_option_state(
-    session: &maki_agent::session_coordinator::SessionCoordinatorHandle,
-) -> (String, u64) {
-    let snapshot = session.read().options();
-    let state = snapshot
-        .options
-        .iter()
-        .find(|option| option.definition.id.as_ref() == SESSION_OPTION_PLUGIN_ID)
-        .expect("plugin-owned option missing from session snapshot");
-    (state.current_value.to_string(), snapshot.version)
-}
-
-/// Covers the Lua-facing set path end to end: a plugin loaded through the
-/// real host registers a plugin-owned option (including its validator), and a
-/// tool handler mutates a live session through `maki.session.set_option`.
-#[test]
-fn session_set_option_applies_plugin_owned_option_on_live_session() {
-    let (reg, host) = builtins_host();
-    let session = test_session(&host);
-    host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
-        .unwrap();
-    let session_id = session.read().session_id().to_string();
-    let (value, _) = plugin_option_state(&session);
-    assert_eq!(value, "a");
-
-    let own_session = session.read().session_id();
-    let out = exec_tool_in_session(
-        &reg,
-        "set_choice",
-        json!({ "session": session_id, "value": "b" }),
-        own_session,
-    );
-    assert_eq!(out, SESSION_OPTION_SET_OK);
-    let (value, version) = plugin_option_state(&session);
-    assert_eq!(value, "b");
-    let set_version = version;
-
-    let out = exec_tool_in_session(
-        &reg,
-        "set_choice",
-        json!({ "session": session_id, "value": "c" }),
-        own_session,
-    );
-    assert!(
-        out.contains(SESSION_OPTION_VALIDATOR_REJECTION),
-        "expected validator rejection, got: {out}"
-    );
-    let (value, version) = plugin_option_state(&session);
-    assert_eq!(value, "b");
-    assert_eq!(version, set_version);
-    smol::block_on(session.close()).unwrap();
-}
-
 const SESSION_MUTATION_PLUGIN: &str = r#"
 maki.api.register_tool({
     name = "mutate_session",
@@ -6416,9 +6317,6 @@ maki.api.register_tool({
     handler = function(input)
         local calls = {
             prompt = function() return maki.session.prompt("hi", { session = input.session }) end,
-            set_option = function()
-                return maki.session.set_option("fast", "enabled", { session = input.session })
-            end,
             set_title = function() return maki.session.set_title({ id = input.session, title = "t" }) end,
             new = function() return maki.session.new() end,
             focus = function() return maki.session.focus(input.session) end,
@@ -6426,7 +6324,6 @@ maki.api.register_tool({
             current = function() return maki.session.current() end,
             usage = function() return maki.session.usage({}) end,
             read = function() return maki.session.read({}) end,
-            options = function() return maki.session.options({}) end,
         }
         local _, err = calls[input.call]()
         return tostring(err)
@@ -6435,7 +6332,6 @@ maki.api.register_tool({
 "#;
 
 #[test_case::test_case("prompt", DELEGATED_FOREIGN_SESSION ; "prompt")]
-#[test_case::test_case("set_option", DELEGATED_FOREIGN_SESSION ; "set_option")]
 #[test_case::test_case("set_title", DELEGATED_FOREIGN_SESSION ; "set_title")]
 #[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
 #[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
@@ -6443,7 +6339,6 @@ maki.api.register_tool({
 #[test_case::test_case("current", DELEGATED_FOCUS ; "current")]
 #[test_case::test_case("usage", SESSION_REQUIRED_ERR ; "usage")]
 #[test_case::test_case("read", SESSION_REQUIRED_ERR ; "read")]
-#[test_case::test_case("options", SESSION_REQUIRED_ERR ; "options")]
 fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
     let (reg, host) = builtins_host();
     host.load_source("session_mutation", SESSION_MUTATION_PLUGIN)

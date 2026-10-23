@@ -44,11 +44,11 @@ local function target(ctx)
   if not agent then
     return nil, nil, err
   end
-  local selection, model_err = agent:model(ctx)
-  if not selection then
-    return nil, nil, model_err
+  local config, config_err = agent:config(ctx)
+  if not config then
+    return nil, nil, config_err
   end
-  return agent, selection
+  return agent, config.model
 end
 
 local function set_thinking(ctx, agent, mode)

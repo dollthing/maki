@@ -3,6 +3,8 @@ use std::sync::Arc;
 use maki_agent::actor::{
     ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch, PreparedModel,
 };
+use maki_agent::session_coordinator::SessionCoordinatorHandle;
+use maki_agent::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, THINKING_OPTION_ID};
 use maki_agent::{
     AgentInput, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId, TurnOrigin,
     TurnProvenance,
@@ -21,18 +23,25 @@ use super::tickets::ticket_wait;
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
-    RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT,
+    RESTRICTED_MODE_CHANGE, STALE_TURN, TURN_WAIT_TIMEOUT, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
     LuaTaskOwner, SessionProviderPreparer, build_session_provider, validate_required_output_mode,
 };
 use crate::api::env::host_state_dir;
+use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
 use crate::orchestration::{self, plugin_authority};
-use crate::runtime::{current_managed_turn, current_plugin, register_defer_close};
+use crate::runtime::{
+    current_managed_turn, current_plugin, register_defer_close, validate_plugin_effect,
+};
+
+const MODE_KEY: &str = "mode";
+const NO_SESSION_OPTIONS: &str = "agent belongs to no session with options";
+const TYPED_OPTIONS: [&str; 3] = [MODEL_OPTION_ID, THINKING_OPTION_ID, FAST_OPTION_ID];
 
 /// Read the stable agent ID.
 /// @return (string?, string?) Agent ID.
@@ -73,15 +82,78 @@ fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
     Ok((Some(table), None))
 }
 
-/// Read the actor's committed model configuration.
+/// The coordinator of the session {agent} works in; a child shares its
+/// root's.
+fn session_coordinator(lua: &Lua, agent: &LuaAgent) -> Result<SessionCoordinatorHandle, String> {
+    let template = destination_template(lua, agent)?;
+    let session = template.session_id.as_ref().ok_or(NO_SESSION_OPTIONS)?;
+    SessionCoordinatorHandle::resolve(session.id()).map_err(|error| error.to_string())
+}
+
+/// Read the committed configuration.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Complete normalized selection {spec, thinking, fast}. thinking is a setting string or budget integer; disabled options are "off" and false. Descriptive model metadata is not included.
-#[lua_fn(name = "model")]
-fn agent_model(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
+/// @return (table?, string?) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. Options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
+#[lua_fn(name = "config")]
+fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(authorize(lua, &ctx, this));
     let actor = try_pair!(this.manager.actor(this.id));
-    let config = try_pair!(actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE));
-    Ok((Some(selection_table(lua, &config)?), None))
+    let commit = try_pair!(actor.config_snapshot().ok_or(AGENT_CONFIG_UNAVAILABLE));
+    let options = lua.create_table()?;
+    if let Ok(coordinator) = session_coordinator(lua, this) {
+        for state in coordinator.read().options().options.iter() {
+            let id = state.definition.id.as_ref();
+            if !TYPED_OPTIONS.contains(&id) {
+                options.set(id, state.current_value.as_ref())?;
+            }
+        }
+    }
+    let config = lua.create_table()?;
+    config.set("version", commit.generation)?;
+    config.set("model", selection_table(lua, &commit.config)?)?;
+    config.set("mode", commit.config.mode.id().key())?;
+    config.set("options", options)?;
+    Ok((Some(config), None))
+}
+
+/// Set one session option: workflow, yolo or a plugin option. Model,
+/// thinking, fast and mode have typed setters (`set_model`, `set_mode`) and
+/// are refused here. Plugin options run their owner's validator first.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
+/// @param ctx LuaCtx Invocation context.
+/// @param id string Option id.
+/// @param value string Selectable value id.
+/// @return (boolean?, string?) Success.
+#[lua_fn(name = "set_option")]
+async fn agent_set_option(
+    lua: Lua,
+    this: UserDataRef<LuaAgent>,
+    ctx: UserDataRef<LuaCtx>,
+    id: String,
+    value: String,
+) -> mlua::Result<Pair<bool>> {
+    if TYPED_OPTIONS.contains(&id.as_str()) || id == MODE_KEY {
+        return Ok(err_pair(TYPED_OPTION_SETTER));
+    }
+    try_pair!(authorize(&lua, &ctx, &this));
+    try_pair!(validate_plugin_effect(&lua));
+    try_pair!(ensure_validation_not_in_progress(&lua));
+    let coordinator = try_pair!(session_coordinator(&lua, &this));
+    drop(this);
+    drop(ctx);
+    let snapshot = coordinator.read().options();
+    if let Some(option) = snapshot
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == id)
+    {
+        try_pair!(validate_option_value(&lua, option, &value));
+    }
+    try_pair!(
+        coordinator
+            .set_option_if_version(id, value, Some(snapshot.version))
+            .await
+    );
+    Ok((Some(true), None))
 }
 
 /// List authenticated, policy-filtered model spec strings without changing focus.
@@ -437,17 +509,6 @@ fn mode_is_restricted(context: &AgentContext) -> bool {
             .is_some_and(|mode| mode.tools.is_some())
 }
 
-/// Read the currently committed mode.
-/// @param ctx LuaCtx Invocation context.
-/// @return (string?, string?) Registered mode name.
-#[lua_fn(name = "mode")]
-fn agent_mode(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<String>> {
-    try_pair!(authorize(lua, &ctx, this));
-    let actor = try_pair!(this.manager.actor(this.id));
-    let config = try_pair!(actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE));
-    Ok((Some(config.mode.id().key().to_string()), None))
-}
-
 /// Switch mode through the actor configuration FIFO.
 /// @param ctx LuaCtx Invocation context.
 /// @param name string Registered mode name.
@@ -592,9 +653,9 @@ lua_class! {
     /// Reads and effects require current invocation authority; identity is context-free.
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "maki.agent.Agent" => LuaAgent, AGENT_DOCS [
-        agent_id, agent_latest_turn, agent_status, agent_mode, agent_model, agent_available_models,
+        agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
         agent_transcript, agent_ref, agent_send, agent_submit, agent_enqueue, agent_prompt, agent_set_model,
-        agent_set_mode, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
+        agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]
     extra agent_internal_methods

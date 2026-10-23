@@ -1086,10 +1086,10 @@ fn trusted_model_catalog_filters_destination_policy_and_preserves_error_pair() {
                 name = "/pr7_catalog_filtered", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(maki.agent.current(ctx))
-                    local before = assert(root:model(ctx))
+                    local before = assert(root:config(ctx)).model
                     local models, err = root:available_models(ctx)
                     assert(err == nil and #models == 1 and models[1] == "{FAST_MODEL}")
-                    local after = assert(root:model(ctx))
+                    local after = assert(root:config(ctx)).model
                     assert(before.spec == after.spec and before.thinking == after.thinking and before.fast == after.fast)
                     assert(assert(maki.agent.current(ctx)):id() == root:id())
                 end,
@@ -1166,13 +1166,13 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                     local root = assert(maki.agent.current(ctx))
                     local selection = assert(root:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(selection.spec == "{FAST_MODEL}" and selection.thinking == "low" and selection.fast == true)
-                    local roundtrip = assert(root:model(ctx))
+                    local roundtrip = assert(root:config(ctx)).model
                     for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(selection[key] == roundtrip[key]) end
-                    assert(root:mode(ctx) == "build")
+                    assert(assert(root:config(ctx)).mode == "build")
                     local subscription = assert(root:on_config_change(ctx, function(event, callback_ctx)
                         assert(event.data.agent_id == root:id() and event.data.mode == "plan" and event.data.generation > 0)
                         for _, key in ipairs({{ "spec", "thinking", "fast" }}) do assert(event.data.selection[key] == selection[key]) end
-                        assert(root:mode(callback_ctx) == "plan")
+                        assert(assert(root:config(callback_ctx)).mode == "plan")
                         local child = assert(maki.agent.spawn(callback_ctx, {{ inherit_provider = true, silent = true, tools = {{}} }}))
                         assert(callback_ctx:defer_close(child))
                         assert(child:prompt(callback_ctx, "callback delivered after GC"))
@@ -1184,21 +1184,21 @@ fn trusted_config_callback_survives_subscription_gc_and_revocation(shutdown: boo
                 name = "/pr7_gc_deliver", tui_only = false,
                 handler = function(_, ctx)
                     local root = assert(maki.agent.current(ctx))
-                    local selection = assert(root:model(ctx))
+                    local selection = assert(root:config(ctx)).model
                     local listed_root
                     for _, reference in ipairs(assert(maki.agent.list(ctx))) do
                         if reference:id() == root:id() then listed_root = assert(maki.agent.get(ctx, reference)) end
                     end
                     assert(listed_root:set_mode(ctx, "plan") == "plan")
-                    assert(root:mode(ctx) == "plan")
+                    assert(assert(root:config(ctx)).mode == "plan")
                     local visible = assert(maki.agent.list(ctx))
                     local found = false
                     for _, reference in ipairs(visible) do
                         local agent = assert(maki.agent.get(ctx, reference))
                         if agent:id() == root:id() then
                             found = true
-                            assert(agent:mode(ctx) == "plan")
-                            assert(assert(agent:model(ctx)).spec == selection.spec)
+                            assert(assert(agent:config(ctx)).mode == "plan")
+                            assert(assert(agent:config(ctx)).model.spec == selection.spec)
                         end
                     end
                     assert(found)
@@ -1502,11 +1502,11 @@ fn required_output_schema_rejects_excluded_mode_without_allocating_and_preserves
                     local child = assert(maki.agent.spawn(ctx, opts))
                     local mode, err = child:set_mode(ctx, "{DENIED_MODE}")
                     assert(mode == nil and err == {POLICY_ERROR:?}, err)
-                    assert(child:mode(ctx) == "{ALLOWED_MODE}")
+                    assert(assert(child:config(ctx)).mode == "{ALLOWED_MODE}")
                     local controlled = assert(maki.agent.get(ctx, assert(child:ref())))
                     local changed, change_err = controlled:set_mode(ctx, "{DENIED_MODE}")
                     assert(changed == nil and change_err == {POLICY_ERROR:?}, change_err)
-                    assert(controlled:mode(ctx) == "{ALLOWED_MODE}")
+                    assert(assert(controlled:config(ctx)).mode == "{ALLOWED_MODE}")
                     local turn = assert(child:send(ctx, "required schema under allowed mode"))
                     local result = assert(turn:wait(ctx))
                     assert(result.status == "completed" and result.captured.answer == 42)
@@ -1595,7 +1595,7 @@ fn executing_child_tool_cannot_control_ancestor_or_sibling(
                         return (({not_descendant:?}):gsub({child_placeholder:?}, target:id()):gsub({parent_placeholder:?}, current:id()))
                     end
                     if {mode_locked} then
-                        assert(assert(current:mode(child_ctx)) == {mode_key:?})
+                        assert(assert(current:config(child_ctx)).mode == {mode_key:?})
                         local changed, mode_err = current:set_mode(child_ctx, "build")
                         assert(changed == nil and mode_err == {RESTRICTED_MODE_CHANGE:?}, mode_err)
                     end
@@ -1952,7 +1952,7 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
                     assert(parent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "low", fast = true }}))
                     assert(parent:set_mode(ctx, "plan") == "plan")
                     local child = assert(maki.agent.spawn(ctx, {{ silent = true, tools = {{}} }}))
-                    local selection = assert(child:model(ctx))
+                    local selection = assert(child:config(ctx)).model
                     assert(selection.spec == "{FAST_MODEL}")
                     assert(selection.thinking == "low" and selection.fast == true)
                     assert(assert(assert(child:send(ctx, "inherited configuration")):wait(ctx)).text == "{FIRST_REPLY}")
@@ -2321,7 +2321,7 @@ fn trusted_mode_changes_preserve_registered_target_model_policy() {
                     local changed, model_err = target:set_model(ctx, {UPDATED_MODEL:?})
                     assert(changed == nil and model_err == {not_allowed:?}, model_err)
                     assert(target:set_model(ctx, {{ thinking = "low" }}))
-                    assert(assert(target:model(ctx)).thinking == "low")
+                    assert(assert(target:config(ctx)).model.thinking == "low")
                 end,
             }})
         "#
@@ -2499,7 +2499,7 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
             local changed, err = agent:set_model(ctx, {{ spec = "{FAST_MODEL}", thinking = "high", fast = true }})
             assert(changed, err)
             if {keep_authority} then
-                assert(assert(agent:model(ctx)).thinking == "high")
+                assert(assert(agent:config(ctx)).model.thinking == "high")
                 assert(assert(ctx:model()).thinking == "off")
                 assert(sentinel:close(ctx))
             end
@@ -4470,7 +4470,7 @@ fn bundled_task_gates_new_work_on_admitted_mode_across_configuration_changes() {
             local task = maki.json.decode(text)
             local parent = assert(maki.agent.current(ctx))
             assert(parent:set_mode(ctx, "plan") == "plan")
-            assert(ctx:mode() == "build" and parent:mode(ctx) == "plan")
+            assert(ctx:mode() == "build" and assert(parent:config(ctx)).mode == "plan")
             local sent, err = maki.agent.call_tool(ctx, "task_send", {
                 task_id = task.task_id, message = "keep editing",
             })
@@ -4496,11 +4496,11 @@ fn spawn_takes_the_shared_selection_and_rejects_other_options() {
             &format!(
                 r#"
             local parent = assert(maki.agent.current(ctx))
-            local selection = assert(parent:model(ctx))
+            local selection = assert(parent:config(ctx)).model
             local child = assert(maki.agent.spawn(ctx, {{
                 inherit_provider = true, silent = true, tools = {{}}, model = selection,
             }}))
-            local copied = assert(child:model(ctx))
+            local copied = assert(child:config(ctx)).model
             assert(copied.spec == selection.spec and copied.thinking == selection.thinking and copied.fast == selection.fast)
             assert(child:close(ctx))
             for key, opts in pairs({{

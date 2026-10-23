@@ -3,10 +3,6 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use maki_agent::SessionMailbox;
-use maki_agent::session_coordinator::SessionCoordinatorHandle;
-use maki_agent::session_options::{
-    SessionOptionCategory, SessionOptionOwner, SessionOptionsSnapshot,
-};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::parse_thinking;
 use maki_storage::id::MakiId;
@@ -18,7 +14,6 @@ use crate::agent_errors::{
     DELEGATED_SESSION_LIFECYCLE, NO_FOCUSED_AGENT, SESSION_REQUIRED_ERR,
 };
 use crate::api::env::host_state_dir;
-use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -48,14 +43,6 @@ async fn roundtrip(
     .await
 }
 
-/// The coordinator of the session {opts} names in `session`.
-pub(crate) fn resolve_coordinator(
-    opts: Option<&Table>,
-) -> Result<SessionCoordinatorHandle, String> {
-    let id = required_session(opts).map_err(|error| error.to_string())??;
-    SessionCoordinatorHandle::resolve(id).map_err(|e| e.to_string())
-}
-
 /// The `session` id {opts} must name; the inner error is a missing or
 /// malformed id.
 fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
@@ -67,46 +54,6 @@ fn required_session(opts: Option<&Table>) -> LuaResult<Result<MakiId, String>> {
         return Ok(Err(SESSION_REQUIRED_ERR.to_owned()));
     };
     Ok(raw.parse::<MakiId>().map_err(|error| error.to_string()))
-}
-
-fn snapshot_table(lua: &Lua, snapshot: &SessionOptionsSnapshot) -> LuaResult<Table> {
-    let result = lua.create_table()?;
-    result.set("version", snapshot.version)?;
-    let options = lua.create_table_with_capacity(snapshot.options.len(), 0)?;
-    for (index, state) in snapshot.options.iter().enumerate() {
-        let option = lua.create_table()?;
-        let definition = &state.definition;
-        option.set("id", definition.id.as_ref())?;
-        option.set("name", definition.name.as_ref())?;
-        option.set("description", definition.description.as_ref())?;
-        option.set(
-            "category",
-            match definition.category {
-                SessionOptionCategory::Model => "model",
-                SessionOptionCategory::Mode => "mode",
-            },
-        )?;
-        option.set("current_value", state.current_value.as_ref())?;
-        option.set("persistent", definition.persistent)?;
-        option.set(
-            "owner",
-            match &definition.owner {
-                SessionOptionOwner::Builtin => "builtin",
-                SessionOptionOwner::Plugin { plugin, .. } => plugin.as_ref(),
-            },
-        )?;
-        let values = lua.create_table_with_capacity(definition.values.len(), 0)?;
-        for (value_index, value) in definition.values.iter().enumerate() {
-            let item = lua.create_table()?;
-            item.set("value", value.value.as_ref())?;
-            item.set("name", value.name.as_ref())?;
-            values.set(value_index + 1, item)?;
-        }
-        option.set("values", values)?;
-        options.set(index + 1, option)?;
-    }
-    result.set("options", options)?;
-    Ok(result)
 }
 
 /// Lists sessions stored for the current project. Answered from a
@@ -352,61 +299,6 @@ fn notify(_lua: &Lua, text: String, opts: Table) -> LuaResult<Pair<bool>> {
     Ok((Some(true), None))
 }
 
-/// Returns the complete ordered option snapshot for a live session.
-///
-/// @param opts table Required `session` (string) id.
-/// @return (table|nil, string|nil) `{version, options}`, or nil and an error.
-/// @example
-/// local snapshot, err = maki.session.options({ session = id })
-#[lua_fn]
-fn options(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
-    try_pair!(crate::runtime::validate_plugin_effect(lua));
-    let coordinator = try_pair!(resolve_coordinator(Some(&opts)));
-    let snapshot = snapshot_table(lua, &coordinator.read().options())?;
-    Ok((Some(snapshot), None))
-}
-
-/// Sets one option explicitly for a live session. Model, thinking, fast, and
-/// workflow changes follow the agent configuration rules. Other options keep
-/// their owner's persistence behavior.
-/// See [Configuration changes](/docs/modes/#configuration-changes).
-///
-/// @param id string Stable option id.
-/// @param value string Selectable value id.
-/// @param opts table Required `session` (string) id.
-/// @return (boolean|nil, string|nil) true, or nil and an error.
-/// @example
-/// local ok, err = maki.session.set_option("fast", "enabled", { session = id })
-#[lua_fn]
-async fn set_option(lua: Lua, id: String, value: String, opts: Table) -> LuaResult<Pair<bool>> {
-    try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    let session = try_pair!(required_session(Some(&opts))?);
-    if let Some(denial) = delegated_tool_denial(&lua, session) {
-        return Ok(err_pair(denial));
-    }
-    if let Err(error) = ensure_validation_not_in_progress(&lua) {
-        return Ok(err_pair(error));
-    }
-    let coordinator = try_pair!(SessionCoordinatorHandle::resolve(session));
-    let snapshot = coordinator.read().options();
-    if let Some(option) = snapshot
-        .options
-        .iter()
-        .find(|option| option.definition.id.as_ref() == id)
-        && let Err(error) = validate_option_value(&lua, option, &value)
-    {
-        return Ok(err_pair(error));
-    }
-    try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    match coordinator
-        .set_option_if_version(id, value, Some(snapshot.version))
-        .await
-    {
-        Ok(_) => Ok((Some(true), None)),
-        Err(error) => Ok(err_pair(error)),
-    }
-}
-
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -473,13 +365,13 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends. A tool handler
     /// cannot create, focus or delete sessions, and the functions that change
-    /// a session (`prompt`, `set_option`, `set_title`) accept
+    /// a session (`prompt`, `set_title`) accept
     /// only the session its own turn belongs to. Every function that reads or
     /// changes one session takes it explicitly; `ctx:session_id()` names the
     /// invocation's session, and `current` names the focused one. Tool
     /// handlers cannot read UI focus, so `current` refuses them.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options, set_option, set_title(tx), set_default_thinking]
+    DOCS [list(tx), list_all(tx), live(tx), current, usage(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
@@ -630,8 +522,6 @@ mod tests {
     #[test_case("return session.prompt('hi', {})" ; "prompt")]
     #[test_case("return session.read({})" ; "read")]
     #[test_case("return session.usage({})" ; "usage")]
-    #[test_case("return session.options({})" ; "options")]
-    #[test_case("return session.set_option('yolo', 'enabled', {})" ; "set_option")]
     fn session_target_is_required(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
@@ -640,80 +530,6 @@ mod tests {
         assert!(value.is_nil());
         assert_eq!(error.as_deref(), Some(SESSION_REQUIRED_ERR));
         assert!(rx.is_empty());
-    }
-
-    #[test]
-    fn options_explicit_session_returns_complete_ordered_snapshot() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        let lua = lua_with_session(None);
-        lua.globals().set("session_id", id.to_string()).unwrap();
-
-        let (snapshot, error): (Table, Option<String>) = smol::block_on(
-            lua.load("return session.options({ session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-
-        assert_eq!(error, None);
-        assert_eq!(snapshot.get::<u64>("version").unwrap(), 1);
-        let options = snapshot.get::<Table>("options").unwrap();
-        let ids = options
-            .sequence_values::<Table>()
-            .map(|option| option.unwrap().get::<String>("id").unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["model", "yolo", "fast", "workflow", "thinking"]);
-        let model = options.get::<Table>(1).unwrap();
-        assert_eq!(model.get::<String>("category").unwrap(), "model");
-        assert_eq!(model.get::<String>("current_value").unwrap(), "test/model");
-        assert_eq!(model.get::<Table>("values").unwrap().raw_len(), 1);
-        smol::block_on(coordinator.close()).unwrap();
-    }
-
-    #[test]
-    fn set_option_commits_through_the_named_coordinator() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        lua.globals().set("session_id", id.to_string()).unwrap();
-
-        let (ok, error): (bool, Option<String>) = smol::block_on(
-            lua.load("return session.set_option('yolo', 'enabled', { session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-        assert!(ok);
-        assert_eq!(error, None);
-        assert!(rx.is_empty());
-        assert!(
-            coordinator
-                .read()
-                .options()
-                .options
-                .iter()
-                .any(|option| option.definition.id.as_ref() == "yolo"
-                    && option.current_value.as_ref() == "enabled")
-        );
-        smol::block_on(coordinator.close()).unwrap();
-    }
-
-    #[test]
-    fn options_rejects_closed_explicit_session() {
-        let id = MakiId::generate();
-        let (_, coordinator) = live_mailbox(id);
-        smol::block_on(coordinator.close()).unwrap();
-        let lua = lua_with_session(None);
-        lua.globals().set("session_id", id.to_string()).unwrap();
-
-        let (value, error): (Value, Option<String>) = smol::block_on(
-            lua.load("return session.options({ session = session_id })")
-                .eval_async(),
-        )
-        .unwrap();
-
-        assert!(value.is_nil());
-        assert_eq!(error, Some(format!("session not live: {id}")));
     }
 
     #[test]

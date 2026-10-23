@@ -63,7 +63,7 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
         FnDoc {
             name: "model",
             args: "",
-            desc: "Read the executing turn's admitted selection. This can differ from Agent:model(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            desc: "Read the executing turn's admitted selection. This can differ from Agent:config(ctx).model, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
             params: &[],
             returns: "(table?, string?) Complete normalized selection {spec, thinking, fast}; thinking is a setting string or budget integer. Disabled values are off and false.",
             example: "",
@@ -72,7 +72,7 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
         FnDoc {
             name: "mode",
             args: "",
-            desc: "Read the executing turn's admitted mode. This can differ from Agent:mode(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            desc: "Read the executing turn's admitted mode. This can differ from Agent:config(ctx).mode, which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
             params: &[],
             returns: "(string?, string?) Registered mode name.",
             example: "",

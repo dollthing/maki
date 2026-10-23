@@ -30,7 +30,7 @@ mod tests {
     #[test_case("maki.api.run_command()", "maki.api.run_command({cmdline})"; "run_command")]
     #[test_case("maki.agent.spawn()", "maki.agent.spawn({ctx}, {opts})"; "agent_spawn")]
     #[test_case("Agent:status()", "Agent:status({ctx})"; "agent_status")]
-    #[test_case("Agent:model()", "Agent:model({ctx})"; "agent_model")]
+    #[test_case("Agent:config()", "Agent:config({ctx})"; "agent_config")]
     #[test_case("Agent:available_models()", "Agent:available_models({ctx})"; "agent_available_models")]
     #[test_case("Agent:transcript()", "Agent:transcript({ctx}, {opts})"; "agent_transcript")]
     #[test_case("Agent:prompt()", "Agent:prompt({ctx}, {message}, {opts?})"; "agent_prompt")]

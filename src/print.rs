@@ -1526,7 +1526,7 @@ mod tests {
                     audiences = {{ "main", "general_sub" }},
                     handler = function(input, ctx)
                         local agent = assert(maki.agent.current(ctx))
-                        local selection = assert(agent:model(ctx))
+                        local selection = assert(agent:config(ctx)).model
                         local root_ref = assert(maki.agent.root(ctx))
                         if input.child then
                             assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
@@ -1594,18 +1594,20 @@ mod tests {
                     handler = function(_, ctx)
                         local root = assert(maki.agent.current(ctx))
                         assert(root:id() == assert(maki.agent.root(ctx)):id())
-                        local selection = assert(root:model(ctx))
+                        local selection = assert(root:config(ctx)).model
                         assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         local slow = assert(root:set_model(ctx, {{ fast = false }}))
-                        assert(not slow.fast and not assert(root:model(ctx)).fast)
+                        assert(not slow.fast and not assert(root:config(ctx)).model.fast)
                         assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
                         local view, view_err = maki.fn.winsaveview()
                         assert(view == nil and view_err == "{no_ui}", view_err)
                         assert(root:set_mode(ctx, "plan"))
-                        assert(root:mode(ctx) == "plan", root:mode(ctx))
+                        assert(assert(root:config(ctx)).mode == "plan", assert(root:config(ctx)).mode)
                         assert(root:set_mode(ctx, "build"))
-                        local set, set_err = maki.session.set_option("model", "{PRINT_MODEL}", {{}})
-                        assert(set == nil and set_err == "{session_required}", set_err)
+                        local set, set_err = root:set_option(ctx, "model", "{PRINT_MODEL}")
+                        assert(set == nil and set_err == "{typed_setter}", set_err)
+                        assert(root:set_option(ctx, "workflow", "enabled"))
+                        assert(assert(root:config(ctx)).options.workflow == "enabled")
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
@@ -1615,7 +1617,7 @@ mod tests {
                     end,
                 }})
             "#,
-                session_required = maki_lua::agent_errors::SESSION_REQUIRED_ERR,
+                typed_setter = maki_lua::agent_errors::TYPED_OPTION_SETTER,
                 no_ui = maki_lua::ui_sink::NO_UI_ERR,
             ),
         ).unwrap();

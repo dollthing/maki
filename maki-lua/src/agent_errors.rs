@@ -24,6 +24,8 @@ pub const SELF_TURN_WAIT: &str = "cannot wait for a turn on the calling agent";
 pub const NO_FOCUSED_AGENT: &str = "no agent has UI focus";
 pub const TURN_WAIT_TIMEOUT: &str = "agent turn wait timed out";
 pub const UNKNOWN_SPAWN_OPTION: &str = "unknown spawn option";
+pub const TYPED_OPTION_SETTER: &str =
+    "model, thinking, fast and mode have typed setters: use Agent:set_model or Agent:set_mode";
 pub const AGENT_BUSY: &str = "agent has pending work";
 pub const STALE_TURN: &str = "after_turn is not the agent's latest settled turn";
 pub const RESTRICTED_MODE_CHANGE: &str = "restricted agents cannot change mode";
