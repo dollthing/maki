@@ -81,6 +81,15 @@ pub enum SessionError {
     LogDiverged { reason: &'static str },
     #[error("session is open in another terminal; close it there first")]
     OpenElsewhere,
+    #[error(
+        "session log {path} line {line} holds a record this makima cannot read ({reason}); \
+         the session is not loaded so that saving it cannot drop that record"
+    )]
+    UnreadableRecord {
+        path: String,
+        line: usize,
+        reason: String,
+    },
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
@@ -913,14 +922,25 @@ where
         if line.is_empty() {
             continue;
         }
+        // A crash can tear an append, so a line that is not JSON at all is
+        // skipped, and so is a bad header, which leaves the log headerless.
+        // Whole JSON after the header that does not decode came from another
+        // version; skipping it would let the next save drop it from disk.
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
+            Err(e) if e.is_data() && id.is_some() => {
+                return Err(SessionError::UnreadableRecord {
+                    path: display_path.to_owned(),
+                    line: line_count,
+                    reason: e.to_string(),
+                });
+            }
             Err(e) => {
                 warn!(
                     path = display_path,
                     error = %e,
                     line = line_count,
-                    "skipping unrecognized JSONL record",
+                    "skipping torn JSONL record",
                 );
                 continue;
             }
@@ -3472,8 +3492,9 @@ mod tests {
         assert_eq!(loaded.messages().len(), 2);
     }
 
-    #[test]
-    fn unknown_record_type_is_skipped() {
+    #[test_case(b"{\"t\":\"future_type\",\"d\":{}}\n" ; "unknown_record_type")]
+    #[test_case(b"{\"t\":\"meta\",\"title\":7}\n" ; "record_with_a_field_of_the_wrong_shape")]
+    fn record_another_version_wrote_refuses_the_load_and_stays_on_disk(record: &[u8]) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
@@ -3482,13 +3503,17 @@ mod tests {
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"{\"t\":\"future_type\",\"d\":{}}\n")
-            .unwrap();
+        file.write_all(record).unwrap();
         drop(file);
         append_raw_msg(&path, user_message("second"));
+        let before = fs::read(&path).unwrap();
 
-        let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.messages().len(), 2);
+        let error = TestSession::load_from(session.id, dir).unwrap_err();
+        assert!(
+            matches!(error, SessionError::UnreadableRecord { line: 4, .. }),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
