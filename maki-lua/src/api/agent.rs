@@ -144,7 +144,9 @@ struct LuaActorState {
     mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
-    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
+    /// `None` when the parent has no answer channel either (print), so the
+    /// child's asks are refused at once like its parent's.
+    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
     answer_tx: Option<flume::Sender<String>>,
     ui_id: String,
     parent_event_tx: EventSender,
@@ -482,7 +484,7 @@ impl ActorBackend for LuaActorBackend {
                 &context,
                 loaded,
             )
-            .with_user_response_rx(Some(Arc::clone(&state.answer_rx)))
+            .with_user_response_rx(state.answer_rx.clone())
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
             .with_local_tool_capture(Arc::clone(&state.commit));
@@ -1757,7 +1759,13 @@ async fn build_session(
     ));
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (answer_tx, answer_rx) = match parent.context.user_response_rx {
+        Some(_) => {
+            let (answer_tx, answer_rx) = flume::unbounded::<String>();
+            (Some(answer_tx), Some(Arc::new(AsyncMutex::new(answer_rx))))
+        }
+        None => (None, None),
+    };
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let ui_id = parent
         .context
@@ -1791,8 +1799,8 @@ async fn build_session(
             .filter(|_| options.mcp)
             .map(McpSession::fresh),
         chip_event_tx: EventSender::with_identity(sub_tx, parent.context.event_tx.identity()),
-        answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
-        answer_tx: Some(answer_tx),
+        answer_rx,
+        answer_tx,
         ui_id,
         parent_event_tx: parent.context.event_tx.clone(),
         cancel,
@@ -2541,7 +2549,7 @@ mod tests {
             mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx),
-            answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
+            answer_rx: Some(Arc::new(AsyncMutex::new(answer_rx))),
             answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
             parent_event_tx: EventSender::with_identity(

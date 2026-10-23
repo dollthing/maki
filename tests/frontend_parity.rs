@@ -51,6 +51,7 @@ const UI_COMMAND: &str = "/parity_ui";
 const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
 const ASK_PROMPT: &str = "run the asking tool";
+const CHILD_ASK_COMMAND: &str = "/parity_child_ask";
 /// The toolset the bundled plan mode swaps in.
 const PLAN_TOOLS: [&str; 11] = [
     "edit",
@@ -379,11 +380,7 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     write_config(home.path(), &base_url, BLANK);
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let args = frontend_args(frontend)
-        .into_iter()
-        .filter(|arg| !matches!(arg.as_str(), "--yolo" | "--max-turns" | "1"))
-        .collect();
-    let mut child = spawn_makima(home.path(), &work, args);
+    let mut child = spawn_makima(home.path(), &work, asking_args(frontend, PROMPT));
     let stderr = drain(child.stderr.take().unwrap());
     let mut stdin = child.stdin.take().unwrap();
     match frontend {
@@ -423,6 +420,33 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
         Frontend::Print => unreachable!("print answers no questions"),
     }
     drop(stdin);
+    let status = wait_exit(child);
+    let log = stderr.join().unwrap();
+    assert!(status.success(), "{log}");
+    let bodies: Vec<_> = bodies.try_iter().collect();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(
+        bodies[1]["messages"].as_array().unwrap().last().unwrap()["role"],
+        "tool"
+    );
+}
+
+/// Print answers no questions, for children too: a child's permission ask
+/// is refused at once, so the run ends instead of waiting on an answer.
+#[test]
+fn print_refuses_a_child_ask_at_once() {
+    let (base_url, bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut child = spawn_makima(
+        home.path(),
+        &work,
+        asking_args(Frontend::Print, CHILD_ASK_COMMAND),
+    );
+    let stderr = drain(child.stderr.take().unwrap());
+    drop(child.stdin.take());
     let status = wait_exit(child);
     let log = stderr.join().unwrap();
     assert!(status.success(), "{log}");
@@ -559,6 +583,18 @@ fn print_args(prompt: &str) -> Vec<String> {
     .collect()
 }
 
+/// {frontend}'s arguments without YOLO or a turn limit, so a tool asks
+/// permission and the turn goes on after the answer. Print runs {prompt}.
+fn asking_args(frontend: Frontend, prompt: &str) -> Vec<String> {
+    let args = match frontend {
+        Frontend::Print => print_args(prompt),
+        _ => frontend_args(frontend),
+    };
+    args.into_iter()
+        .filter(|arg| !matches!(arg.as_str(), "--yolo" | "--max-turns" | "1"))
+        .collect()
+}
+
 fn frontend_args(frontend: Frontend) -> Vec<String> {
     let spec = format!("{PROVIDER}/{MODEL}");
     let args: &[&str] = match frontend {
@@ -676,7 +712,8 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
 
 /// The Lua commands the scenarios run: switch the model between two turns,
 /// set plan mode (then prompt with any argument), prompt for a tool that
-/// asks permission, and prompt with what a UI round-trip answered.
+/// asks permission (on the root, or on a child), and prompt with what a UI
+/// round-trip answered.
 fn parity_commands() -> String {
     format!(
         r#"
@@ -702,6 +739,15 @@ maki.api.register_command({{
 maki.api.register_command({{
   name = "{ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
+}})
+maki.api.register_command({{
+  name = "{CHILD_ASK_COMMAND}", tui_only = false,
+  handler = function(_, ctx)
+    local child = assert(maki.agent.spawn(ctx, {{}}))
+    local _, err = child:prompt(ctx, "{ASK_PROMPT}")
+    assert(err == nil, tostring(err))
+    child:close(ctx)
+  end,
 }})
 maki.api.register_command({{
   name = "{UI_COMMAND}", tui_only = false,

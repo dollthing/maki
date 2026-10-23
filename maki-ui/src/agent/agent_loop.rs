@@ -161,6 +161,7 @@ impl TuiActorBackend {
                 tools,
             },
         )
+        .with_user_response_rx(Some(Arc::clone(&self.answer_rx)))
         .with_mcp(self.mcp.clone());
         agent.tool_context_at((**self.cwd.load()).clone())
     }

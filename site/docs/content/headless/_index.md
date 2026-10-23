@@ -21,6 +21,8 @@ echo "list all TODO comments" | makima --print
 
 With both `-p` and piped stdin, the prompt is the `-p` text, a blank line, then everything read from stdin. Makima reads stdin until it closes, so a run whose stdin stays open waits for it. Inside a `while read` loop, Makima would also read the rest of the loop's input. Give such runs `</dev/null` (see the [migration example](#examples)).
 
+Nobody can answer a question in `--print`, so every permission ask is refused at once, for subagents too. Pass `--yolo` or allow rules in `permissions.toml` for the tools a run needs.
+
 ## Output Formats
 
 | Format | Description |
