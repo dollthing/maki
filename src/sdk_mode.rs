@@ -1526,7 +1526,8 @@ fn close_output(shared: &Mutex<Shared>) {
 /// dispatched ({dispatched}), and the work in flight runs to its end and
 /// reports, background subagents in {graph} and the turns their results start
 /// included, while permission asks nobody can answer any more are denied.
-/// Once stdout is gone too, nothing is left to wait for.
+/// Once stdout is gone too, nothing is left to wait for, a dispatch still
+/// waiting on a command's handler included: it is dropped.
 async fn finish_in_flight(
     shared: &Mutex<Shared>,
     graph: &AgentManagerHandle,
@@ -1540,7 +1541,6 @@ async fn finish_in_flight(
     for (ask_id, answer_tx) in unanswered.into_values() {
         let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
     }
-    let dispatched = dispatched.await;
     let until = |done: fn(&Shared) -> bool| async move {
         loop {
             let idle = {
@@ -1553,6 +1553,11 @@ async fn finish_in_flight(
             idle.await;
         }
     };
+    let dispatched = smol::future::or(dispatched, async {
+        until(|shared| shared.output_closed).await;
+        Ok(())
+    })
+    .await;
     until(|shared| shared.work.is_empty()).await;
     smol::future::or(graph.wait_settled(), until(|shared| shared.output_closed)).await;
     dispatched
@@ -2400,9 +2405,11 @@ mod tests {
     }
 
     /// The parent died mid-turn: stdout broke and the pump stopped before the
-    /// turn's outcome, yet input end must not wait on work nobody reports.
-    #[test]
-    fn input_end_exits_once_the_output_is_gone() {
+    /// turn's outcome, yet input end must not wait on work nobody reports,
+    /// nor on a dispatch stuck behind a command's handler.
+    #[test_case(false ; "with_dispatch_done")]
+    #[test_case(true ; "with_dispatch_stuck_on_a_handler")]
+    fn input_end_exits_once_the_output_is_gone(stuck: bool) {
         let PendingSdkSession {
             handle,
             coordinator,
@@ -2423,9 +2430,14 @@ mod tests {
         smol::block_on(futures_lite::future::or(
             async {
                 pump.await;
-                finish_in_flight(&shared, &manager, async { Ok(()) })
-                    .await
-                    .unwrap();
+                finish_in_flight(&shared, &manager, async {
+                    if stuck {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
                 drop(input_tx);
                 task.await;
             },
