@@ -5428,7 +5428,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::FireAutocmd { event, data, agent } => {
                             let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
                             crate::api::autocmd::dispatch(&rt.lua, &event, None, data, agent.as_ref());
-                            if event == crate::agent_autocmd::TURN_END_EVENT {
+                            let root = agent.as_ref().is_none_or(|agent| {
+                                agent.snapshot().is_ok_and(|node| node.parent_id.is_none())
+                            });
+                            if root && event == crate::agent_autocmd::TURN_END_EVENT {
                                 rt.lua.gc_collect().ok();
                             }
                         }
