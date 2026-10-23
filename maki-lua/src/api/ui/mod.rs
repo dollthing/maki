@@ -1139,8 +1139,8 @@ mod tests {
             }
         }
         use maki_agent::{
-            ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, AgentRef,
-            BackendResult, ControlWork, CurrentManagedTurn, History, TurnContext, WorkKind,
+            ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
+            ControlWork, CurrentManagedTurn, History, TurnContext, WorkKind,
         };
         use std::{future::Future, pin::Pin};
 
@@ -1189,12 +1189,8 @@ mod tests {
                 .admit_turn(
                     AgentInput {
                         message: "editor".into(),
-                        mode: AgentMode::Build,
                         images: Vec::new(),
                         preamble: Vec::new(),
-                        thinking: Default::default(),
-                        fast: false,
-                        workflow: false,
                         prompt: None,
                     },
                     None,

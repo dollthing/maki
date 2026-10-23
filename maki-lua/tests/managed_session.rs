@@ -1038,12 +1038,8 @@ impl Provider for PendingProvider {
 fn input() -> AgentInput {
     AgentInput {
         message: "create child".into(),
-        mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
         prompt: None,
     }
 }

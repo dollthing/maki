@@ -712,15 +712,11 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
         let candidate = Arc::clone(&config);
         let result = cancel
             .race(async move {
-                let snapshot = if let (Some(mut input), Some(prepare)) = (input, prepare) {
-                    input.mode = candidate.mode.clone();
-                    input.thinking = candidate.thinking;
-                    input.fast = candidate.fast;
-                    input.workflow = candidate.workflow;
+                let snapshot = if let (Some(input), Some(prepare)) = (input, prepare) {
                     Some(
                         smol::unblock(move || {
                             catch_unwind(AssertUnwindSafe(|| {
-                                let mut snapshot = prepare(&input, &input.mode, Some(&candidate));
+                                let mut snapshot = prepare(&input, Some(&candidate));
                                 if let Some(mode_def) = &candidate.mode_def {
                                     snapshot.mode_def = Some(Arc::new(mode_def.clone()));
                                 }

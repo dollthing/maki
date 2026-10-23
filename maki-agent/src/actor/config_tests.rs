@@ -27,7 +27,7 @@ fn admitted_prompt_dependencies_remain_pinned() {
         let mut backend = ScriptedBackend::gated(Arc::clone(&gate));
         backend.preparation = Some(Arc::new({
             let source = Arc::clone(&source);
-            move |_, _, _| {
+            move |_, _| {
                 let value = source.lock().unwrap().clone();
                 let mut snapshot = empty_snapshot();
                 snapshot.prompt_inputs = Some(Arc::new(crate::agent::TurnPromptInputs {
@@ -315,7 +315,7 @@ fn cancel_during_preparation_terminalizes_once() {
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             empty_snapshot()
@@ -640,7 +640,7 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(|_, _, _| empty_snapshot()));
+        backend.preparation = Some(Arc::new(|_, _| empty_snapshot()));
         backend.readiness = Some(Arc::new(move |_| {
             let entered = entered_tx.clone();
             let release = release_rx.clone();
@@ -966,7 +966,7 @@ fn prepared_callback_panic_settles_and_releases_successor(readiness: bool) {
     const PANIC: &str = "test preparation panic";
     smol::block_on(async {
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             assert!(readiness, "{PANIC}");
             empty_snapshot()
         }));
@@ -1010,7 +1010,7 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
         let (disposed_tx, disposed_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(|_, _, _| empty_snapshot()));
+        backend.preparation = Some(Arc::new(|_, _| empty_snapshot()));
         backend.readiness = Some(Arc::new(move |snapshot| {
             let entered = entered_tx.clone();
             let release = release_rx.clone();
@@ -1113,7 +1113,7 @@ fn control_waits_for_earlier_preparation(root: bool) {
         let backend_gate = super::Gate::new();
         let mut backend = ScriptedBackend::gated(Arc::clone(&backend_gate));
         let observed = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             empty_snapshot()
@@ -1172,7 +1172,7 @@ fn deferred_control_queue_operations(action: &str) {
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             empty_snapshot()
@@ -1233,8 +1233,7 @@ fn acceptance_does_not_run_blocking_preparation_inline(root: bool) {
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(move |input, _, config| {
-            assert!(!input.workflow);
+        backend.preparation = Some(Arc::new(move |_, config| {
             assert!(!config.unwrap().workflow);
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -1288,7 +1287,7 @@ fn submitted_preparation_failure_is_visible_once_and_successors_progress() {
         const FAILED: &str = "panic";
         const NEXT: &str = "next";
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(|input, _, _| {
+        backend.preparation = Some(Arc::new(|input, _| {
             assert_ne!(input.message, FAILED);
             empty_snapshot()
         }));
@@ -1328,7 +1327,7 @@ fn final_submitted_preparation_panic_publishes_end_before_idle_once() {
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             panic!("preparation panic");
@@ -1377,7 +1376,7 @@ fn final_submitted_preparation_panic_publishes_end_before_idle_once() {
 fn preparation_panic_releases_successors() {
     smol::block_on(async {
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(|input, _, _| {
+        backend.preparation = Some(Arc::new(|input, _| {
             assert_ne!(input.message, "panic");
             empty_snapshot()
         }));
@@ -1504,7 +1503,7 @@ fn cancelled_preparation_does_not_block_successors() {
         let (successor_tx, successor_rx) = flume::bounded(1);
         let (release_successor_tx, release_successor_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(move |input, _, _| {
+        backend.preparation = Some(Arc::new(move |input, _| {
             if input.message == "blocked" {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();

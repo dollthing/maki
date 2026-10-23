@@ -274,13 +274,7 @@ impl App {
         else {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
-        let mut input = self.build_agent_input(&msg);
-        if let Ok(Some(config)) = target.effective_config() {
-            input.mode = config.mode.clone();
-            input.thinking = config.settings.thinking;
-            input.fast = config.settings.fast;
-            input.workflow = config.settings.workflow;
-        }
+        let input = self.build_agent_input(&msg);
         match self.admit_user_turn(&target, input, Some(msg.text)) {
             Ok(true) => SubmitOutcome::Started(Vec::new()),
             Ok(false) => SubmitOutcome::Queued,

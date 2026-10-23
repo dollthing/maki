@@ -123,54 +123,10 @@ pub trait InterruptSource: Send + Sync {
     }
 }
 
-/// What a message must agree on with its neighbours to share their turn.
-pub type BatchKey = (AgentMode, bool);
-
-/// The set of messages this one may share a turn with, or `None` when it
-/// has to run alone: the agent resolves one MCP prompt per run. `mode` is
-/// a permission boundary and `workflow` picks the tool catalog, so a
-/// message queued under either may not execute under another one.
-///
-/// Destructured on purpose: a new `AgentInput` field then has to be
-/// classified here instead of silently merging across.
-pub fn batch_key(input: &AgentInput) -> Option<BatchKey> {
-    let AgentInput {
-        mode,
-        workflow,
-        prompt,
-        message: _,
-        images: _,
-        preamble: _,
-        thinking: _,
-        fast: _,
-    } = input;
-    if prompt.is_some() {
-        return None;
-    }
-    Some((mode.clone(), *workflow))
-}
-
-/// Folds a run of queued messages into one agent input. The last message
-/// drives the run and the earlier ones ride in front of it as their own user
-/// messages, so each keeps its images and the model answers the burst in one
-/// request. The run shares one mode and one workflow by construction, so only
-/// the preferences (thinking, fast) come from the last message, the user's
-/// most recent intent.
-pub fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
-    let mut last = inputs.pop()?;
-    let mut preamble = Vec::new();
-    for earlier in inputs {
-        preamble.extend(earlier.preamble);
-        let message = maki_providers::Message::user_with_images(earlier.message, earlier.images);
-        // An input with neither text nor images would become a user message
-        // with no content at all, which providers reject.
-        if !message.content.is_empty() {
-            preamble.push(message);
-        }
-    }
-    preamble.append(&mut last.preamble);
-    last.preamble = preamble;
-    Some(last)
+/// Whether this message may share a turn with its neighbours: the agent
+/// resolves one MCP prompt per run, so a message carrying one runs alone.
+pub fn batchable(input: &AgentInput) -> bool {
+    input.prompt.is_none()
 }
 
 #[derive(Clone)]
@@ -179,36 +135,20 @@ pub struct McpPromptRef {
     pub arguments: HashMap<String, String>,
 }
 
+/// No `Default` on this struct so adding a field forces every call site to update.
 pub struct AgentInput {
     pub message: String,
-    pub mode: AgentMode,
     pub images: Vec<ImageSource>,
     pub preamble: Vec<Message>,
-    pub thinking: ThinkingConfig,
-    pub fast: bool,
-    /// No `Default` on this struct so adding a field forces every call site to update.
-    pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
 }
 
 impl AgentInput {
-    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
-    /// about the toggles beyond what config says, so they all build their input
-    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
-    /// The mode is the actor's committed one, stamped at admission.
-    pub fn from_defaults(
-        message: String,
-        images: Vec<ImageSource>,
-        defaults: SessionDefaults,
-    ) -> Self {
+    pub fn new(message: String, images: Vec<ImageSource>) -> Self {
         Self {
             message,
-            mode: AgentMode::Build,
             images,
             preamble: Vec::new(),
-            thinking: defaults.thinking.into(),
-            fast: defaults.fast,
-            workflow: defaults.workflow,
             prompt: None,
         }
     }

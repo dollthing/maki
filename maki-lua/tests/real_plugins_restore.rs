@@ -1007,7 +1007,7 @@ fn exec_bash_real(
         .actor()
         .unwrap()
         .admit_turn(
-            AgentInput::from_defaults("run bash".into(), Vec::new(), Default::default()),
+            AgentInput::new("run bash".into(), Vec::new()),
             None,
             "bash".into(),
         )

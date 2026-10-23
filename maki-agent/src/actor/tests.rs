@@ -414,12 +414,8 @@ impl ActorBackend for CancellableBackend {
 pub(super) fn input(message: &str) -> AgentInput {
     AgentInput {
         message: message.to_owned(),
-        mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: maki_providers::ThinkingConfig::Off,
-        fast: false,
-        workflow: false,
         prompt: None,
     }
 }
@@ -1003,7 +999,7 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
         });
         let mut backend = ScriptedBackend::new();
         if preparation_panic {
-            backend.preparation = Some(Arc::new(|_, _, _| panic!("{PANIC_DIAGNOSTIC}")));
+            backend.preparation = Some(Arc::new(|_, _| panic!("{PANIC_DIAGNOSTIC}")));
         }
         let state = Arc::clone(&backend.state);
         let (_start, rx) = flume::bounded(1);
@@ -1426,7 +1422,7 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
     let (entered_tx, entered_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let mut backend = ScriptedBackend::new();
-    backend.preparation = Some(Arc::new(move |_, _, _| {
+    backend.preparation = Some(Arc::new(move |_, _| {
         entered_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         crate::agent::TurnAdmissionSnapshot {
@@ -1467,7 +1463,7 @@ fn pending_cancellation_publishes_end_before_single_idle(
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
         let observations = Arc::clone(&backend.state);
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             crate::agent::TurnAdmissionSnapshot {
@@ -1665,8 +1661,8 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
         backend.preparation = Some(Arc::new({
             let modes = Arc::clone(&modes);
             let registry = Arc::clone(&registry);
-            move |_, mode, _| crate::agent::TurnAdmissionSnapshot {
-                mode_def: Some(Arc::new(modes.current(mode))),
+            move |_, _| crate::agent::TurnAdmissionSnapshot {
+                mode_def: Some(Arc::new(modes.current(&AgentMode::Build))),
                 prompt_inputs: None,
                 bindings: Arc::new(crate::tools::TurnToolBindings::capture(
                     &registry,
@@ -4571,7 +4567,7 @@ fn prepared_initial_submission_cannot_be_removed_and_constrained_join_uses_reser
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         let mut backend = ScriptedBackend::new();
-        backend.preparation = Some(Arc::new(move |_, _, _| {
+        backend.preparation = Some(Arc::new(move |_, _| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             crate::agent::TurnAdmissionSnapshot {

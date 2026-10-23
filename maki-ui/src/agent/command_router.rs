@@ -47,9 +47,9 @@ mod tests {
 
     use maki_agent::{
         ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentMetadata,
-        AgentMode, BackendResult, ControlWork, CurrentManagedTurn, DoneReason,
-        EffectiveAgentConfig, EventSender, History, RunSettings, TurnCancellationReason,
-        TurnContext, TurnOutcome, WorkKind,
+        BackendResult, ControlWork, CurrentManagedTurn, DoneReason, EffectiveAgentConfig,
+        EventSender, History, RunSettings, TurnCancellationReason, TurnContext, TurnOutcome,
+        WorkKind,
     };
     use maki_providers::{
         AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -214,12 +214,8 @@ mod tests {
     fn input() -> AgentInput {
         AgentInput {
             message: "test".into(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: None,
         }
     }

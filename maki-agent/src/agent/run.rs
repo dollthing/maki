@@ -255,7 +255,6 @@ impl<'h> Agent<'h> {
         mut params: AgentParams,
         mut run: AgentRunParams<'h>,
         context: &TurnContext,
-        input: &mut AgentInput,
         loaded: LoadedInstructions,
     ) -> Self {
         params.agent_id = context.agent_id;
@@ -263,13 +262,18 @@ impl<'h> Agent<'h> {
         if let Some(policy) = &context.policy {
             params.provider = Arc::clone(&policy.provider);
             params.model = policy.model.clone();
-            input.mode = policy.mode.clone();
-            input.thinking = policy.thinking;
-            input.fast = policy.fast;
-            input.workflow = policy.workflow;
         }
         run.event_tx = run.event_tx.with_output(context.output.clone());
-        let mut agent = Self::new(params, run)
+        let mut agent = Self::new(params, run);
+        if let Some(policy) = &context.policy {
+            agent.mode = policy.mode.clone();
+            agent.workflow = policy.workflow;
+            agent.opts = RequestOptions {
+                thinking: policy.thinking,
+                fast: policy.fast,
+            };
+        }
+        agent = agent
             .with_loaded_instructions(loaded)
             .with_turn_inbox(context.inbox.clone())
             .with_cancel(context.cancel.clone())
@@ -437,12 +441,8 @@ impl<'h> Agent<'h> {
 
         let AgentInput {
             message,
-            mode,
             images,
             preamble,
-            thinking,
-            fast,
-            workflow,
             prompt: _,
         } = input;
         self.push_input_context(preamble);
@@ -481,7 +481,6 @@ impl<'h> Agent<'h> {
             }
             self.history.push(user_message);
         }
-        self.mode = mode;
         self.mode_def = self
             .admission
             .as_ref()
@@ -490,7 +489,6 @@ impl<'h> Agent<'h> {
                 AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
                 _ => Some(Arc::new(self.modes.current(&self.mode))),
             });
-        self.workflow = workflow;
         self.turn_bindings = self
             .admission
             .as_ref()
@@ -502,7 +500,6 @@ impl<'h> Agent<'h> {
                     self.mcp.as_ref(),
                 ))
             });
-        self.opts = RequestOptions { thinking, fast };
         info!(
             agent_id = %self.agent_id,
             %turn_id,
@@ -1180,12 +1177,14 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::Envelope;
-    use crate::actor::{PendingSubmission, SubmissionId};
+    use crate::actor::{EffectiveAgentConfig, PendingSubmission, SubmissionId};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
 
     const TEST_CWD: &str = "/tmp";
+    const TEST_PLAN_PATH: &str = "/tmp/plan.md";
+    const TEST_THINKING_BUDGET: u32 = 8192;
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1401,10 +1400,10 @@ mod tests {
 
     /// What the actor admits for the next turn in `mode`: its mode, its tool
     /// bindings and the working directory tools run in.
-    fn admit(agent: &mut Agent<'_>, mode: &AgentMode) {
-        let mode_def = match mode {
+    fn admit(agent: &mut Agent<'_>) {
+        let mode_def = match &agent.mode {
             AgentMode::Custom(id) => agent.modes.get(id),
-            _ => Some(agent.modes.current(mode)),
+            mode => Some(agent.modes.current(mode)),
         };
         let prompt_inputs = TurnPromptInputs {
             cwd: TEST_CWD.into(),
@@ -1430,7 +1429,7 @@ mod tests {
         turn_id: TurnId,
         input: AgentInput,
     ) -> TurnOutcome {
-        admit(agent, &input.mode);
+        admit(agent);
         agent.run(turn_id, input).await
     }
 
@@ -2157,19 +2156,99 @@ mod tests {
     }
 
     #[test]
-    fn run_uses_input_options_without_settings_snapshot() {
+    fn actor_turn_runs_under_committed_policy() {
         let mut history = History::new(Vec::new());
-        let (mut agent, _rx) = make_agent(
-            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-            &mut history,
+        let params = test_params(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+        let plan = AgentMode::Plan(PathBuf::from(TEST_PLAN_PATH));
+        let policy = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: params.model.clone(),
+                fast: true,
+                workflow: true,
+                thinking: ThinkingConfig::Budget(TEST_THINKING_BUDGET),
+            },
+            plan.clone(),
         );
-        let mut input = default_input();
-        input.workflow = true;
-        input.fast = true;
-        input.thinking = ThinkingConfig::Budget(8192);
-        smol::block_on(run_admitted(&mut agent, TurnId::generate(), input));
+        let context = TurnContext {
+            agent_id: params.agent_id,
+            turn_id: None,
+            work: ActorWorkIdentity::new(
+                params.agent_id,
+                ActorWorkKind::Turn {
+                    operation_id: 0,
+                    turn_id: TurnId::generate(),
+                },
+                0,
+            ),
+            output: Default::default(),
+            provenance: Default::default(),
+            cancel: CancelToken::none(),
+            cancel_reason: ReasonedCancelToken::none(),
+            generation: 0,
+            policy: Some(Arc::new(policy)),
+            interrupt: None,
+            inbox: None,
+            managed_turn: None,
+            admission: None,
+        };
+        let (raw_tx, _rx) = flume::unbounded();
+        let mut agent = Agent::for_actor_turn(
+            params,
+            AgentRunParams {
+                history: &mut history,
+                system: String::new(),
+                event_tx: EventSender::new(raw_tx),
+                tools: RequestTools::default(),
+            },
+            &context,
+            LoadedInstructions::new(),
+        );
+        smol::block_on(run_admitted(
+            &mut agent,
+            TurnId::generate(),
+            default_input(),
+        ));
+        assert_eq!(agent.mode, plan);
         assert!(agent.workflow && agent.opts.fast);
-        assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
+        assert_eq!(
+            agent.opts.thinking,
+            ThinkingConfig::Budget(TEST_THINKING_BUDGET)
+        );
+    }
+
+    fn test_params(provider: impl Provider + 'static) -> AgentParams {
+        AgentParams {
+            agent_id: AgentId::generate(),
+            provider: Arc::new(provider),
+            model: default_model(),
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig {
+                    default: maki_config::DefaultEffect::Allow,
+                    rules: vec![],
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_CWD),
+                maki_config::ProjectConfig::for_project(std::path::Path::new(TEST_CWD)),
+                Arc::default(),
+            )),
+            session_id: None,
+            mailbox: None,
+            timeouts: maki_providers::Timeouts::default(),
+            file_tracker: FileReadTracker::fresh(),
+            prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+            modes: crate::ModeRegistry::builtin().into(),
+            subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+            registry: Arc::new(crate::tools::ToolRegistry::new()),
+            audience: ToolAudience::MAIN,
+            question_mode: crate::tools::QuestionMode::Tui,
+            model_policy: Arc::new(ModelPolicy::default()),
+            file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+            offload: None,
+            managed_turn: None,
+        }
     }
 
     fn make_agent_with_sender(
@@ -2179,37 +2258,7 @@ mod tests {
         event_rx: flume::Receiver<Envelope>,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
-            AgentParams {
-                agent_id: AgentId::generate(),
-                provider: Arc::new(provider),
-                model: default_model(),
-                config: AgentConfig::default(),
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    maki_config::PermissionsConfig {
-                        default: maki_config::DefaultEffect::Allow,
-                        rules: vec![],
-                        ..Default::default()
-                    },
-                    PathBuf::from(TEST_CWD),
-                    maki_config::ProjectConfig::for_project(std::path::Path::new(TEST_CWD)),
-                    Arc::default(),
-                )),
-                session_id: None,
-                mailbox: None,
-                timeouts: maki_providers::Timeouts::default(),
-                file_tracker: FileReadTracker::fresh(),
-                prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-                modes: crate::ModeRegistry::builtin().into(),
-                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                registry: Arc::new(crate::tools::ToolRegistry::new()),
-                audience: ToolAudience::MAIN,
-                question_mode: crate::tools::QuestionMode::Tui,
-                model_policy: Arc::new(ModelPolicy::default()),
-                file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
-                offload: None,
-                managed_turn: None,
-            },
+            test_params(provider),
             AgentRunParams {
                 history,
                 system: "system".into(),
@@ -2223,12 +2272,8 @@ mod tests {
     fn default_input() -> AgentInput {
         AgentInput {
             message: "hello".into(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: None,
         }
     }
@@ -2241,7 +2286,7 @@ mod tests {
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
                 &mut history,
             );
-            admit(&mut agent, &AgentMode::Build);
+            admit(&mut agent);
             agent.admission.as_mut().unwrap().mcp_startup_notice = Some(2);
 
             agent.run(TurnId::generate(), default_input()).await;
@@ -2325,7 +2370,6 @@ mod tests {
             let mailbox = SessionMailbox::new(id);
             mailbox.push("mailbox".into(), false);
             let mut input = default_input();
-            input.mode = AgentMode::Plan(PathBuf::from("/tmp/queued-plan"));
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
             let mut history = History::new(Vec::new());
@@ -2333,9 +2377,7 @@ mod tests {
             agent.mailbox = Some(mailbox);
             let mut agent = agent.with_interrupt_source(source);
 
-            agent.mode = AgentMode::Build;
             assert!(agent.handle_queued_command().await.unwrap());
-            assert!(matches!(agent.mode, AgentMode::Build));
             drop(agent);
 
             let text = history
@@ -3049,7 +3091,7 @@ mod tests {
             serde_json::json!([{ "name": "read", "description": "pinned description" }]);
         agent.tools =
             crate::tools::RequestTools::assembled(definitions.clone(), &agent.config, &agent.model);
-        admit(&mut agent, &AgentMode::Build);
+        admit(&mut agent);
         let context = agent.tool_context().unwrap();
         assert_eq!(context.execution_agent_id, Some(agent.agent_id));
         let snapshot = context.request_tools.unwrap();
@@ -3065,7 +3107,7 @@ mod tests {
         let error = agent.tool_context().err().expect("no admission, no cwd");
         assert_eq!(error.to_string(), NO_ADMITTED_CWD_ERR);
 
-        admit(&mut agent, &AgentMode::Build);
+        admit(&mut agent);
         let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
         agent.session_id = Some(session.clone());
         let context = agent.tool_context().unwrap();
@@ -3139,10 +3181,7 @@ mod tests {
         let outcome = smol::block_on(run_admitted(
             &mut agent,
             TurnId::generate(),
-            AgentInput {
-                mode: AgentMode::Custom(crate::ModeId::Custom("removed".into())),
-                ..default_input()
-            },
+            default_input(),
         ));
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
         assert!(agent.mode_def.is_none());
@@ -3182,13 +3221,11 @@ mod tests {
             &AgentConfig::default(),
             &default_model(),
         );
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("audit".into()));
         let outcome = smol::block_on(run_admitted(
             &mut agent,
             TurnId::generate(),
-            AgentInput {
-                mode: AgentMode::Custom(crate::ModeId::Custom("audit".into())),
-                ..default_input()
-            },
+            default_input(),
         ));
         assert!(matches!(
             outcome,
@@ -3235,8 +3272,7 @@ mod tests {
             &agent.local_tools,
             agent.mcp.as_ref(),
         ));
-        let mode = agent.mode.clone();
-        admit(&mut agent, &mode);
+        admit(&mut agent);
         assert!(tool_dispatch::authorize_advertised(
             &agent.tool_context().unwrap(),
             "srv__probe"
@@ -3268,8 +3304,7 @@ mod tests {
             "srv.probe",
             "probe",
         )]));
-        let mode = agent.mode.clone();
-        admit(&mut agent, &mode);
+        admit(&mut agent);
         let names: Vec<String> = agent
             .request_tools()
             .unwrap()

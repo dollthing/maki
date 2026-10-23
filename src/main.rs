@@ -45,14 +45,10 @@ mod command_attachments {
             .collect()
     }
 
-    pub(crate) fn agent_input(
-        turn: AgentTurn,
-        defaults: maki_config::SessionDefaults,
-    ) -> Result<AgentInput> {
-        let mut input = AgentInput::from_defaults(
+    pub(crate) fn agent_input(turn: AgentTurn) -> Result<AgentInput> {
+        let mut input = AgentInput::new(
             turn.content.text.to_string(),
             into_images(&turn.content.attachments)?,
-            defaults,
         );
         input.prompt = turn.prompt.map(|prompt| {
             Box::new(McpPromptRef {

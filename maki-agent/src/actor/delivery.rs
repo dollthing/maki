@@ -9,7 +9,7 @@ use super::{
 };
 use crate::tools::offload::OffloadStore;
 use crate::types::{ActorWorkIdentity, ActorWorkKind};
-use crate::{AgentInput, AgentMode, TurnCancellationReason, TurnId, TurnOutcome};
+use crate::{AgentInput, TurnCancellationReason, TurnId, TurnOutcome};
 
 pub const MAX_PENDING_DELIVERIES: usize = 64;
 pub const MAX_DELIVERY_PREVIEW_BYTES: usize = 16 * 1024;
@@ -131,7 +131,6 @@ impl ChildDelivery {
         let envelope = self.to_json();
         AgentInput {
             message: String::new(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: vec![Message {
                 observation_source: Some(ObservationSource::ChildResult {
@@ -140,9 +139,6 @@ impl ChildDelivery {
                 }),
                 ..Message::observation(format!("{DELIVERY_HEADER}\n{}", without_nulls(envelope)))
             }],
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: None,
         }
     }
@@ -486,11 +482,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     );
     state.operations.push_back(ActorOperation::Turn {
         id,
-        input: Box::new(AgentInput::from_defaults(
-            String::new(),
-            Vec::new(),
-            Default::default(),
-        )),
+        input: Box::new(AgentInput::new(String::new(), Vec::new())),
         event_sender: None,
         correlation: "child-results".into(),
         ticket,
@@ -639,7 +631,7 @@ mod tests {
             );
             let user = actor
                 .admit_turn(
-                    AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
+                    AgentInput::new(String::new(), Vec::new()),
                     None,
                     CORRELATION.into(),
                 )
@@ -669,7 +661,7 @@ mod tests {
             assert!(actor.latest_ticket().is_none());
             let user = actor
                 .admit_turn(
-                    AgentInput::from_defaults(String::new(), Vec::new(), Default::default()),
+                    AgentInput::new(String::new(), Vec::new()),
                     None,
                     CORRELATION.into(),
                 )
@@ -1087,7 +1079,7 @@ mod tests {
             );
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
+                    AgentInput::new(INSTRUCTION.into(), Vec::new()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1157,7 +1149,7 @@ mod tests {
             );
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
+                    AgentInput::new(INSTRUCTION.into(), Vec::new()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1233,7 +1225,7 @@ mod tests {
             };
             let ticket = actor
                 .submit(
-                    AgentInput::from_defaults(INSTRUCTION.into(), Vec::new(), Default::default()),
+                    AgentInput::new(INSTRUCTION.into(), Vec::new()),
                     None,
                     INSTRUCTION.into(),
                     Default::default(),
@@ -1243,11 +1235,7 @@ mod tests {
             assert_eq!(
                 actor
                     .submit(
-                        AgentInput::from_defaults(
-                            INSTRUCTION.into(),
-                            Vec::new(),
-                            Default::default()
-                        ),
+                        AgentInput::new(INSTRUCTION.into(), Vec::new()),
                         None,
                         INSTRUCTION.into(),
                         Default::default()

@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use maki_agent::AgentMode;
 use maki_agent::actor::{
     ActorEvent, ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch,
     PreparedModel,
@@ -14,6 +13,7 @@ use maki_agent::actor::{
 use maki_agent::config_change::ConfigChangeError;
 use maki_agent::manager::ManagerError;
 use maki_agent::tools::ToolRegistry;
+use maki_agent::{AgentInput, AgentMode};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -296,7 +296,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
             let calls = provider.root_requests.load(Ordering::SeqCst);
             let ticket = child
                 .admit_turn(
-                    super::build_input(CHILD_PROMPT.into()),
+                    AgentInput::new(CHILD_PROMPT.into(), Vec::new()),
                     None,
                     CHILD_PROMPT.into(),
                 )

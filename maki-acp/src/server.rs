@@ -208,7 +208,6 @@ struct Server {
     elicitation: bool,
     supports_boolean: bool,
     lua_event_handle: maki_lua::EventHandle,
-    defaults: SessionDefaults,
 }
 
 impl Server {
@@ -238,7 +237,6 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         elicitation: false,
         supports_boolean: false,
         lua_event_handle: params.lua_event_handle.clone(),
-        defaults: params.defaults,
     };
 
     let _discovery = server.catalog.discover(
@@ -1144,7 +1142,6 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
                     content,
                     prompt: None,
                 },
-                srv.defaults,
             )
             .await
         }
@@ -1156,7 +1153,7 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
             Ok(())
         }
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            send_command_turn(session, id, turn, srv.defaults).await
+            send_command_turn(session, id, turn).await
         }
         InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
             send_isolated_turn(session, &srv.out_tx, id, turn).await
@@ -1443,7 +1440,6 @@ async fn send_command_turn(
     session: &SessionState,
     id: &RequestId,
     turn: AgentTurn,
-    mut defaults: SessionDefaults,
 ) -> Result<(), AcpError> {
     let prompt = turn.prompt.map(|prompt| maki_agent::McpPromptRef {
         qualified_name: prompt.qualified_name.to_string(),
@@ -1464,21 +1460,7 @@ async fn send_command_turn(
             )
         })
         .collect();
-    let options = session
-        .coordinator
-        .as_ref()
-        .ok_or_else(no_session)?
-        .read()
-        .options();
-    let enabled = |id: &str| {
-        options.options.iter().any(|option| {
-            option.definition.id.as_ref() == id
-                && option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
-        })
-    };
-    defaults.fast |= enabled(maki_agent::session_options::FAST_OPTION_ID);
-    defaults.workflow |= enabled(maki_agent::session_options::WORKFLOW_OPTION_ID);
-    let mut input = AgentInput::from_defaults(turn.content.text.to_string(), images, defaults);
+    let mut input = AgentInput::new(turn.content.text.to_string(), images);
     input.prompt = prompt.map(Box::new);
     if session.pending.lock().unwrap().operation.is_some() {
         return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
@@ -3110,7 +3092,6 @@ mod tests {
             elicitation: false,
             supports_boolean: false,
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
-            defaults: SessionDefaults::default(),
         };
         (server, answer_rx, out_rx, turns)
     }
@@ -3141,7 +3122,6 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
-                defaults: SessionDefaults::default(),
             };
             let (handle, root_target) = spawn_session(
                 &params,
@@ -3181,11 +3161,7 @@ mod tests {
             assert!(!error.is_empty());
             assert!(
                 input_tx
-                    .admit(AgentInput::from_defaults(
-                        String::new(),
-                        Vec::new(),
-                        SessionDefaults::default(),
-                    ))
+                    .admit(AgentInput::new(String::new(), Vec::new()))
                     .await
                     .is_err(),
                 "session task was not cancelled"
@@ -3210,7 +3186,6 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
-                defaults: SessionDefaults::default(),
             };
             let session_id = SessionRef::from(MakiId::generate());
             let persisted_options = BTreeMap::new();
@@ -3756,7 +3731,6 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
-                defaults: SessionDefaults::default(),
             };
             new_session(
                 &mut srv,
@@ -6525,7 +6499,6 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
-                defaults: params.defaults,
             };
             let raw = serde_json::json!({
                 "params": {
@@ -6567,7 +6540,6 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
-                defaults: SessionDefaults::default(),
             };
             let raw = serde_json::json!({
                 "params": {

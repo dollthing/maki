@@ -196,11 +196,6 @@ fn dispatch_print(
     target: &TargetHandle,
     literal: AgentInput,
 ) -> Result<Option<PrintWork>> {
-    let defaults = SessionDefaults {
-        fast: literal.fast,
-        workflow: literal.workflow,
-        thinking: Some(literal.thinking.into()),
-    };
     let content = CommandContent {
         text: Arc::from(literal.message.as_str()),
         attachments: command_attachments::from_images(&literal.images),
@@ -208,7 +203,7 @@ fn dispatch_print(
     Ok(Some(
         match smol::block_on(registry.dispatch_input(target, content)) {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-                PrintWork::Turn(command_attachments::agent_input(turn, defaults)?)
+                PrintWork::Turn(command_attachments::agent_input(turn)?)
             }
             InputDispatch::Dispatched(
                 CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
@@ -220,10 +215,9 @@ fn dispatch_print(
                 PrintWork::Compaction(instructions)
             }
             InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
-            InputDispatch::LiteralInput(content) => PrintWork::Turn(AgentInput::from_defaults(
+            InputDispatch::LiteralInput(content) => PrintWork::Turn(AgentInput::new(
                 content.text.to_string(),
                 command_attachments::into_images(&content.attachments)?,
-                defaults,
             )),
         },
     ))
@@ -485,7 +479,7 @@ pub fn run(
         .unwrap_or_default();
     let defaults =
         session_defaults::resolve(defaults, &prefs, &SessionMeta::default(), true, model);
-    let literal = AgentInput::from_defaults(prompt, images, defaults);
+    let literal = AgentInput::new(prompt, images);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
     let prompt_slots = lua_handle.collect_prompt_slots();
@@ -776,8 +770,7 @@ mod tests {
     use super::*;
     use flume::{Receiver, Sender};
     use maki_agent::{
-        AgentError, AgentId, AgentMode, SubagentInfo, ToolOutput, TurnCancellationReason,
-        TurnFailure, TurnId,
+        AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
@@ -1095,12 +1088,8 @@ mod tests {
     fn input(message: &str) -> AgentInput {
         AgentInput {
             message: message.into(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: None,
         }
     }
@@ -1610,12 +1599,11 @@ mod tests {
             ),
         ).unwrap();
         let moved_to = std::fs::canonicalize(state_dir.path()).unwrap();
-        let mut literal = input(&match outcome {
+        let literal = input(&match outcome {
             "unknown" => "/print_unknown".to_owned(),
             "completed" => format!("/cd {}", moved_to.display()),
             _ => "/project:print_prompt".to_owned(),
         });
-        literal.fast = true;
         let cwd = std::env::temp_dir();
         let lua_handle = host.event_handle();
         let mut params = print_params(&cwd, Some(state_dir.path().to_path_buf()));
@@ -1623,7 +1611,7 @@ mod tests {
         params.permissions_config.yolo = true;
         params.prompt_slots = Arc::new(lua_handle.collect_prompt_slots());
         params.system_prompt_override = Some(SYSTEM.into());
-        params.defaults.fast = literal.fast;
+        params.defaults.fast = true;
         let session = start_print_session(
             params,
             provided(provider),

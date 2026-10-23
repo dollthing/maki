@@ -549,7 +549,8 @@ impl ActorBackend for HeadlessBackend {
         let params = self.params.clone();
         let local_tools = Arc::clone(&self.local_tools);
         let mcp = self.mcp.clone();
-        Some(Arc::new(move |_, mode, config| {
+        Some(Arc::new(move |_, config| {
+            let mode = config.map_or(&AgentMode::Build, |config| &config.mode);
             agent::TurnAdmissionSnapshot {
                 mode_def: config
                     .and_then(|config| config.mode_def.clone())
@@ -589,7 +590,7 @@ impl ActorBackend for HeadlessBackend {
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        mut input: AgentInput,
+        input: AgentInput,
         _work: WorkKind,
     ) -> BoxFuture<'a, BackendResult> {
         Box::pin(async move {
@@ -628,7 +629,6 @@ impl ActorBackend for HeadlessBackend {
                     tools: self.tools(&config),
                 },
                 &context,
-                &mut input,
                 instructions.loaded,
             )
             .with_user_response_rx(self.answer_rx.clone())
@@ -1191,7 +1191,7 @@ pub(crate) mod tests {
     }
 
     fn first_input() -> AgentInput {
-        AgentInput::from_defaults("hello".into(), Vec::new(), SessionDefaults::default())
+        AgentInput::new("hello".into(), Vec::new())
     }
 
     /// Spawns a headless session on {provider} and admits its first turn.
@@ -1767,11 +1767,7 @@ pub(crate) mod tests {
                 ..
             } = handle;
             let ticket = input_tx
-                .admit(AgentInput::from_defaults(
-                    DISPATCHED_INPUT.into(),
-                    Vec::new(),
-                    SessionDefaults::default(),
-                ))
+                .admit(AgentInput::new(DISPATCHED_INPUT.into(), Vec::new()))
                 .await
                 .unwrap();
             assert!(matches!(

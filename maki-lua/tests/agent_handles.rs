@@ -845,12 +845,8 @@ impl Fixture {
             .admit_turn(
                 AgentInput {
                     message: "exercise handles".into(),
-                    mode,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 None,
@@ -2262,12 +2258,8 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
             .admit_turn(
                 AgentInput {
                     message: "check foreign scope".into(),
-                    mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 None,
@@ -3845,12 +3837,8 @@ fn retained_tool_context_cannot_authorize_another_invocation() {
             .admit_turn(
                 AgentInput {
                     message: PROMPT.into(),
-                    mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 None,

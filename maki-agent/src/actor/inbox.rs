@@ -8,7 +8,7 @@ use maki_providers::{ImageSource, Message};
 use super::{
     ActorInner, ActorLifecycle, AgentActorHandle, EffectiveAgentConfig, TurnProvenance, TurnTicket,
 };
-use crate::{AgentId, AgentInput, BatchKey, CurrentManagedTurn, TurnId};
+use crate::{AgentId, AgentInput, CurrentManagedTurn, TurnId};
 
 pub const MAX_PENDING_INSTRUCTIONS: usize = 64;
 pub const MAX_PENDING_INSTRUCTION_BYTES: usize = 256 * 1024;
@@ -89,7 +89,7 @@ pub(super) struct InstructionInbox {
     pub policy: Option<Arc<EffectiveAgentConfig>>,
     pub initial: Option<PendingSubmission>,
     pub operation: u64,
-    pub batch_key: Option<BatchKey>,
+    pub batchable: bool,
     pub correlations: Vec<String>,
 }
 
@@ -105,7 +105,7 @@ impl InstructionInbox {
             policy: None,
             initial: None,
             operation: 0,
-            batch_key: None,
+            batchable: false,
             correlations: Vec::new(),
         }
     }

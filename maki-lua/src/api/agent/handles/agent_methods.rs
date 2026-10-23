@@ -162,13 +162,9 @@ fn admit(
         .manager
         .actor(agent.id)
         .map_err(|error| error.to_string())?;
-    let config = actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE)?;
+    actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE)?;
     let input = AgentInput {
         message,
-        mode: config.mode.clone(),
-        thinking: config.thinking,
-        fast: config.fast,
-        workflow: config.workflow,
         images: Vec::new(),
         preamble: Vec::new(),
         prompt: None,

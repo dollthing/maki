@@ -205,11 +205,7 @@ pub struct ActorSnapshot {
 /// implementations must use its resolved mode definition when present. Cancellation
 /// can retire the admission before this callback returns.
 pub type AdmissionPreparation = Arc<
-    dyn Fn(
-            &crate::AgentInput,
-            &AgentMode,
-            Option<&EffectiveAgentConfig>,
-        ) -> crate::agent::TurnAdmissionSnapshot
+    dyn Fn(&crate::AgentInput, Option<&EffectiveAgentConfig>) -> crate::agent::TurnAdmissionSnapshot
         + Send
         + Sync,
 >;

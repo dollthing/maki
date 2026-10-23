@@ -297,12 +297,8 @@ mod tests {
                 .admit_turn(
                     AgentInput {
                         message: REPLY.into(),
-                        mode: AgentMode::Build,
                         images: Vec::new(),
                         preamble: Vec::new(),
-                        thinking: Default::default(),
-                        fast: false,
-                        workflow: false,
                         prompt: None,
                     },
                     None,

@@ -296,20 +296,18 @@ impl ActorBackend for LuaActorBackend {
 
     fn admission_preparation(&self) -> Option<AdmissionPreparation> {
         let state = Arc::clone(&self.state);
-        Some(Arc::new(move |_input, mode, config| {
+        Some(Arc::new(move |_input, config| {
             let params = state
                 .params
                 .get()
                 .expect("session parameters initialized before admission");
-            let mode_def = if let Some(config) = config {
-                config.mode_def.clone().map(Arc::new)
-            } else if *mode == state.mode {
-                state.mode_def.clone().or_else(|| match mode {
-                    AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
-                    _ => Some(Arc::new(params.modes.current(mode))),
-                })
-            } else {
-                None
+            let mode_def = match config {
+                Some(config) => config.mode_def.clone().map(Arc::new),
+                None if state.mode == AgentMode::Build => state
+                    .mode_def
+                    .clone()
+                    .or_else(|| Some(Arc::new(params.modes.current(&AgentMode::Build)))),
+                None => None,
             };
             let cwd = config
                 .map(|config| config.context.cwd().to_path_buf())
@@ -366,7 +364,7 @@ impl ActorBackend for LuaActorBackend {
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        mut input: AgentInput,
+        input: AgentInput,
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
@@ -457,7 +455,10 @@ impl ActorBackend for LuaActorBackend {
                     Some(build_mode_system_prompt(
                         &env_vars_for(&inputs.cwd),
                         &definition,
-                        &input.mode,
+                        context
+                            .policy
+                            .as_ref()
+                            .map_or(&AgentMode::Build, |policy| &policy.mode),
                     ))
                 })
                 .unwrap_or_default();
@@ -479,7 +480,6 @@ impl ActorBackend for LuaActorBackend {
                     tools: state.tools.clone(),
                 },
                 &context,
-                &mut input,
                 loaded,
             )
             .with_user_response_rx(Some(Arc::clone(&state.answer_rx)))
@@ -2608,17 +2608,13 @@ mod tests {
         (actor, state, sess, parent_rx)
     }
 
-    fn admit(state: &LuaActorState, actor: &AgentActorHandle, message: &str) -> TurnTicket {
+    fn admit(actor: &AgentActorHandle, message: &str) -> TurnTicket {
         actor
             .admit_turn(
                 AgentInput {
                     message: message.to_owned(),
-                    mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: state.opts.thinking,
-                    fast: state.opts.fast,
-                    workflow: false,
                     prompt: None,
                 },
                 None,
@@ -2688,7 +2684,7 @@ mod tests {
                     ))) as Box<dyn ActorBackend>)
                 })
                 .unwrap();
-            let ticket = admit(&state, &root.actor().unwrap(), "missing policy");
+            let ticket = admit(&root.actor().unwrap(), "missing policy");
             let outcome = ticket.wait().await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             let result = ticket.peek_result().unwrap();
@@ -2723,9 +2719,9 @@ mod tests {
             const REPLY: &str = "accepted";
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
-            let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
+            let (actor, _, _fixture, _rx) = session_with_provider(provider, None);
             let reservation = actor.reserve_prepared_operation(None).unwrap();
-            let ticket = admit(&state, &actor, MESSAGE);
+            let ticket = admit(&actor, MESSAGE);
             assert!(ticket.peek().is_none());
             drop(reservation);
             while actor.snapshot().latest.is_none() {
@@ -2747,13 +2743,11 @@ mod tests {
                 canned_reply_with_usage(FIRST_REPLY, FIRST_USAGE),
                 canned_reply_with_usage(SECOND_REPLY, SECOND_USAGE),
             ]));
-            let (actor, state, _fixture, _events) = session_with_provider(provider, None);
-            let first = admit(&state, &actor, "first request").wait_result().await;
+            let (actor, _, _fixture, _events) = session_with_provider(provider, None);
+            let first = admit(&actor, "first request").wait_result().await;
             assert_eq!(first.text, FIRST_REPLY);
             assert_eq!(first.outcome.usage(), FIRST_USAGE);
-            let second = admit(&state, &actor, "follow-up request")
-                .wait_result()
-                .await;
+            let second = admit(&actor, "follow-up request").wait_result().await;
             assert_eq!(second.text, SECOND_REPLY);
             assert_eq!(second.outcome.usage(), SECOND_USAGE);
             assert_eq!(actor.snapshot().cumulative_usage, CUMULATIVE_USAGE);
@@ -2767,9 +2761,9 @@ mod tests {
             const REPLY: &str = "accepted";
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
-            let (actor, state, _fixture, _rx) = session_with_provider(provider, None);
+            let (actor, _, _fixture, _rx) = session_with_provider(provider, None);
             let reservation = actor.reserve_prepared_operation(None).unwrap();
-            let ticket = admit(&state, &actor, MESSAGE);
+            let ticket = admit(&actor, MESSAGE);
             let mut pending = Box::pin(ticket.wait_result());
             assert!(
                 futures_lite::future::poll_once(&mut pending)
@@ -2785,7 +2779,7 @@ mod tests {
 
     #[test]
     fn close_rejects_new_admission_and_closes_actor() {
-        let (actor, state, _sess, _rx) = canned_state();
+        let (actor, _, _sess, _rx) = canned_state();
         actor.close();
         assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Closed));
         assert!(
@@ -2793,12 +2787,8 @@ mod tests {
                 .admit_turn(
                     AgentInput {
                         message: "rejected".into(),
-                        mode: AgentMode::Build,
                         images: Vec::new(),
                         preamble: Vec::new(),
-                        thinking: state.opts.thinking,
-                        fast: state.opts.fast,
-                        workflow: false,
                         prompt: None,
                     },
                     None,
@@ -2810,8 +2800,8 @@ mod tests {
 
     #[test]
     fn queued_only_close_does_not_relay_history() {
-        let (actor, state, sess, parent_rx) = canned_state();
-        let _ticket = admit(&state, &actor, "queued");
+        let (actor, _, sess, parent_rx) = canned_state();
+        let _ticket = admit(&actor, "queued");
         sess.close_controlled();
         assert!(
             parent_rx
@@ -2822,8 +2812,8 @@ mod tests {
 
     #[test]
     fn admitted_and_closed_turn_resolves_as_cancelled() {
-        let (actor, state, _sess, _rx) = canned_state();
-        let ticket = admit(&state, &actor, "waiting");
+        let (actor, _, _sess, _rx) = canned_state();
+        let ticket = admit(&actor, "waiting");
         let turn_id = ticket.turn_id();
         actor.close();
         let outcome = smol::block_on(ticket.wait());
@@ -2861,7 +2851,7 @@ mod tests {
         let (started_tx, started_rx) = flume::bounded(1);
         let (actor, state, sess, parent_rx) =
             session_with_provider(Arc::new(StartedProvider(started_tx)), None);
-        let ticket = admit(&state, &actor, "cancel me");
+        let ticket = admit(&actor, "cancel me");
         smol::block_on(started_rx.recv_async()).unwrap();
         sess.close_controlled();
         assert!(matches!(
@@ -2898,8 +2888,8 @@ mod tests {
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
             canned_reply_with_usage("done", FIRST_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
-        let ticket = admit(&state, &actor, "run me");
+        let (actor, _, sess, parent_rx) = session_with_provider(provider, None);
+        let ticket = admit(&actor, "run me");
         assert!(matches!(
             smol::block_on(ticket.wait()),
             TurnOutcome::Completed { .. }
@@ -2929,8 +2919,8 @@ mod tests {
             let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
                 canned_reply_with_usage(REPLY, FIRST_USAGE),
             ]));
-            let (actor, state, sess, parent_rx) = session_with_provider(provider, Some(release_rx));
-            let ticket = admit(&state, &actor, "run me");
+            let (actor, _, sess, parent_rx) = session_with_provider(provider, Some(release_rx));
+            let ticket = admit(&actor, "run me");
 
             assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
             let before_close = parent_rx.drain().collect::<Vec<_>>();
@@ -2948,12 +2938,8 @@ mod tests {
                     .admit_turn(
                         AgentInput {
                             message: "rejected".into(),
-                            mode: AgentMode::Build,
                             images: Vec::new(),
                             preamble: Vec::new(),
-                            thinking: state.opts.thinking,
-                            fast: state.opts.fast,
-                            workflow: false,
                             prompt: None,
                         },
                         None,
@@ -3043,9 +3029,9 @@ mod tests {
                 "child done",
             )]));
         let (turn_tx, turn_rx) = flume::unbounded();
-        let (actor, state, session, _relayed) =
+        let (actor, _, session, _relayed) =
             session_with_provider_and_parent(provider, None, Some(turn_tx.clone()));
-        let ticket = admit(&state, &actor, "run me");
+        let ticket = admit(&actor, "run me");
         let outcome = smol::block_on(ticket.wait());
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
         assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Open));
@@ -3113,8 +3099,8 @@ mod tests {
             canned_reply_with_usage("the answer", FIRST_USAGE),
             canned_reply_with_usage("the follow-up", SECOND_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
-        let first = admit(&state, &actor, "run me");
+        let (actor, _, sess, parent_rx) = session_with_provider(provider, None);
+        let first = admit(&actor, "run me");
         let first_id = first.turn_id();
         let first_outcome = smol::block_on(first.wait());
         assert!(matches!(
@@ -3128,7 +3114,7 @@ mod tests {
             TurnOutcome::Completed { .. }
         ));
 
-        let second = admit(&state, &actor, "follow up");
+        let second = admit(&actor, "follow up");
         let second_id = second.turn_id();
         let second_outcome = smol::block_on(second.wait());
         assert!(matches!(
@@ -3147,11 +3133,11 @@ mod tests {
 
     #[test]
     fn status_stays_running_while_turn_is_active_or_queued() {
-        let (actor, state, sess, _rx) = canned_state();
+        let (actor, _, sess, _rx) = canned_state();
         assert!(actor.snapshot().active_turn.is_none());
         assert_eq!(actor.snapshot().queued, 0);
 
-        let _active = admit(&state, &actor, "active");
+        let _active = admit(&actor, "active");
         smol::block_on(async {
             while actor.snapshot().active_turn.is_none() {
                 smol::future::yield_now().await;
@@ -3159,7 +3145,7 @@ mod tests {
         });
         assert_eq!(actor.snapshot().queued, 0);
 
-        let _queued = admit(&state, &actor, "queued");
+        let _queued = admit(&actor, "queued");
         assert!(actor.snapshot().active_turn.is_some());
         assert_eq!(
             actor.snapshot().queued,
@@ -3183,8 +3169,8 @@ mod tests {
             .unwrap();
         let backend = LuaActorBackend::new(Arc::clone(&state));
         let prepare = backend.admission_preparation().unwrap();
-        let input = AgentInput::from_defaults("queued".into(), Vec::new(), Default::default());
-        let admitted = prepare(&input, &input.mode, None);
+        let input = AgentInput::new("queued".into(), Vec::new());
+        let admitted = prepare(&input, None);
         let params = state.params.get().unwrap();
         let config = EffectiveAgentConfig::new(
             RunSettings {
@@ -3205,9 +3191,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            prepare(&input, &input.mode, Some(&config))
-                .mode_def
-                .as_deref(),
+            prepare(&input, Some(&config)).mode_def.as_deref(),
             admitted.mode_def.as_deref(),
         );
         assert_eq!(
@@ -3215,7 +3199,7 @@ mod tests {
             Some("before")
         );
         assert_eq!(
-            prepare(&input, &input.mode, None)
+            prepare(&input, None)
                 .mode_def
                 .as_ref()
                 .unwrap()
@@ -3244,11 +3228,11 @@ mod tests {
             AgentMode::Build,
         )
         .with_context(AgentContextSnapshot::new(directory.path().into()));
-        let input = AgentInput::from_defaults("queued".into(), Vec::new(), Default::default());
+        let input = AgentInput::new("queued".into(), Vec::new());
         let prepare = LuaActorBackend::new(Arc::clone(&state))
             .admission_preparation()
             .unwrap();
-        let admitted = prepare(&input, &input.mode, Some(&config));
+        let admitted = prepare(&input, Some(&config));
         let inputs = admitted.prompt_inputs.as_ref().unwrap();
         assert_eq!(inputs.cwd, directory.path());
         let mut history = History::new(Vec::new());
@@ -3276,9 +3260,9 @@ mod tests {
     fn failed_turn_keeps_session_open_for_later_turn() {
         let fail = Arc::new(FailOnceProvider::default());
         let provider: Arc<dyn Provider> = fail.clone();
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let (actor, _, sess, parent_rx) = session_with_provider(provider, None);
 
-        let ticket = admit(&state, &actor, "fail this turn");
+        let ticket = admit(&actor, "fail this turn");
         let turn_id = ticket.turn_id();
         let failed = smol::block_on(ticket.wait());
         assert!(matches!(
@@ -3293,7 +3277,7 @@ mod tests {
             "failed turn must present an error"
         );
 
-        let recovered = admit(&state, &actor, "reuse the same session");
+        let recovered = admit(&actor, "reuse the same session");
         let recovered_id = recovered.turn_id();
         let outcome = smol::block_on(recovered.wait());
         assert!(matches!(

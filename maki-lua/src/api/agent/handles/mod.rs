@@ -411,12 +411,8 @@ mod tests {
     fn turn_input() -> maki_agent::AgentInput {
         maki_agent::AgentInput {
             message: "turn".into(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: None,
         }
     }

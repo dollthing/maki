@@ -8,7 +8,6 @@ use maki_agent::actor::{
 use maki_agent::config_change::prepare_patch;
 use maki_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
-    SessionDefaults,
 };
 use maki_providers::Message;
 use maki_storage::checkpoint::CheckpointPublication;
@@ -185,14 +184,10 @@ impl SessionRuntime {
 
 fn implementation_turn(message: String, sender: Option<EventSender>) -> PreparedTurn {
     PreparedTurn {
-        input: build_input(message),
+        input: AgentInput::new(message, Vec::new()),
         event_sender: sender,
         correlation: IMPLEMENTATION_CORRELATION.into(),
     }
-}
-
-fn build_input(message: String) -> AgentInput {
-    AgentInput::from_defaults(message, Vec::new(), SessionDefaults::default())
 }
 
 impl EventLoop<'_> {
@@ -501,7 +496,7 @@ impl EventLoop<'_> {
             let parallel = request.parallel;
             let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;
             operation
-                .replace_turn_input(build_input(plan.message.clone()))
+                .replace_turn_input(AgentInput::new(plan.message.clone(), Vec::new()))
                 .map_err(|error| error.to_string())?;
             let spec = request.model.as_deref();
             let patch = prepare_patch(

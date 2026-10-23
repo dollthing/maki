@@ -1132,12 +1132,8 @@ impl ActorBackend for ManagedDriver {
 fn ordinary_input(message: &str) -> AgentInput {
     AgentInput {
         message: message.into(),
-        mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
         prompt: None,
     }
 }

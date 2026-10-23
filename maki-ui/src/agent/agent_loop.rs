@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
+use maki_agent::actor::{
+    ActorBackend, BackendResult, ControlWork, EffectiveAgentConfig, TurnContext, WorkKind,
+};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
@@ -240,7 +242,7 @@ impl TuiActorBackend {
     async fn prepare_run(
         &mut self,
         input: &mut AgentInput,
-        model: &Model,
+        policy: &EffectiveAgentConfig,
         admission: Option<&maki_agent::agent::TurnAdmissionSnapshot>,
     ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
         if let Some(prompt) = admission.and_then(|snapshot| snapshot.prompt_inputs.as_ref()) {
@@ -256,7 +258,7 @@ impl TuiActorBackend {
             }
             self.vars = vars;
         }
-        self.tools = self.build_tools(model, input.workflow);
+        self.tools = self.build_tools(&policy.model, policy.workflow);
         let ready = admission
             .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
             .and_then(|prompt| prompt.ready.clone());
@@ -337,9 +339,9 @@ impl TuiActorBackend {
         } else {
             Arc::new(self.lua_handle.collect_prompt_slots_async().await)
         };
-        let system = self.build_system_with(&input.mode, &prompt_slots, admission);
+        let system = self.build_system_with(&policy.mode, &prompt_slots, admission);
         self.publish_btw_system(&prompt_slots);
-        self.tools = self.build_tools(model, input.workflow);
+        self.tools = self.build_tools(&policy.model, policy.workflow);
         let tools = self.tools.clone();
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
@@ -437,12 +439,8 @@ impl TuiActorBackend {
                 };
                 let provider = Arc::clone(&policy.settings.provider);
                 let model = policy.settings.model.clone();
-                input.fast = policy.settings.fast;
-                input.workflow = policy.settings.workflow;
-                input.thinking = policy.settings.thinking;
-                input.mode = policy.mode.clone();
                 let prepared = match self
-                    .prepare_run(&mut input, &model, context.admission.as_ref())
+                    .prepare_run(&mut input, policy, context.admission.as_ref())
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -488,7 +486,6 @@ impl TuiActorBackend {
                 tools,
             },
             context,
-            &mut input,
             self.instructions.loaded.clone(),
         )
         .with_user_response_rx(Some(Arc::clone(&self.answer_rx)))
@@ -604,7 +601,7 @@ impl ActorBackend for TuiActorBackend {
         let cwd = Arc::clone(&self.cwd);
         let lua_handle = self.lua_handle.clone();
         let mcp_reader = mcp.as_ref().map(|mcp| mcp.reader());
-        Some(Arc::new(move |input, _mode, config| {
+        Some(Arc::new(move |input, config| {
             let mcp_startup_notice = mcp_reader.as_ref().and_then(|reader| {
                 let count = reader
                     .load()
@@ -987,8 +984,7 @@ mod tests {
             // turn after it is the one that allocates its own presentation.
             actor.observe_presentation(RUN_ID - 1);
             let mut app = crate::app::tests::actor_presentation_app(root.clone(), RUN_ID - 1);
-            let make_input =
-                |text: &str| AgentInput::from_defaults(text.into(), Vec::new(), Default::default());
+            let make_input = |text: &str| AgentInput::new(text.into(), Vec::new());
             if deferred {
                 actor.observe_presentation(RUN_ID - 2);
                 // The UI already drew this deferred submission, so admission
@@ -1034,10 +1030,7 @@ mod tests {
                     actor.config_snapshot().unwrap().generation,
                     active_policy_generation
                 );
-                assert_eq!(
-                    maki_agent::batch_key(&make_input("successor")),
-                    Some((AgentMode::Build, false))
-                );
+                assert!(maki_agent::batchable(&make_input("successor")));
                 assert_eq!(
                     actor
                         .pending_submissions()
@@ -1294,13 +1287,7 @@ mod tests {
         smol::block_on(futures_lite::future::or(
             async {
                 let (mut backend, _, events) = failing_backend();
-                let make_input = || {
-                    AgentInput::from_defaults(
-                        "explicit root".into(),
-                        Vec::new(),
-                        Default::default(),
-                    )
-                };
+                let make_input = || AgentInput::new("explicit root".into(), Vec::new());
                 let (release, released) = flume::bounded(1);
                 let provider = Arc::new(ExplicitProvider {
                     release: released.clone(),
@@ -1553,11 +1540,7 @@ mod tests {
                 let settlements = actor.subscribe_events();
                 let mut app = crate::app::tests::actor_presentation_app(target.clone(), 0);
                 let submission = |text: &str| {
-                    let mut input = AgentInput::from_defaults(
-                        text.into(),
-                        vec![image.clone()],
-                        Default::default(),
-                    );
+                    let mut input = AgentInput::new(text.into(), vec![image.clone()]);
                     input.preamble = vec![Message::observation(format!("{SHELL_CONTEXT}: {text}"))];
                     QueueItem {
                         input,
@@ -1752,7 +1735,7 @@ mod tests {
                 assert!(serde_json::to_string(&request).unwrap().contains(INITIAL));
                 let joined = actor
                     .submit(
-                        AgentInput::from_defaults(STEERING.into(), Vec::new(), Default::default()),
+                        AgentInput::new(STEERING.into(), Vec::new()),
                         None,
                         String::new(),
                         Default::default(),
@@ -2530,9 +2513,7 @@ mod tests {
                 let parent = actor.submit(input, None, String::new(), Default::default()).unwrap();
                 request_rx.recv_async().await.unwrap();
                 const STEERING: &str = "steering during tool batch";
-                let steering = actor.submit(AgentInput::from_defaults(
-                    STEERING.into(), Vec::new(), Default::default(),
-                ), None, String::new(), Default::default()).unwrap();
+                let steering = actor.submit(AgentInput::new(STEERING.into(), Vec::new()), None, String::new(), Default::default()).unwrap();
                 assert_eq!(steering.turn_id(), parent.turn_id());
 
                 let (mut child_backend, mut child_input, _child_events) = failing_backend();
@@ -2817,12 +2798,8 @@ mod tests {
             None,
             init_cancel,
         );
-        let mut input = AgentInput::from_defaults(
-            "hello".into(),
-            Vec::new(),
-            maki_config::SessionDefaults::default(),
-        );
-        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+        let mut input = AgentInput::new("hello".into(), Vec::new());
+        let mut snapshot = backend.admission_preparation().unwrap()(&input, None);
         let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
         prompt.instructions.text = "admitted instructions".into();
         let (tx, rx) = flume::bounded(1);
@@ -2859,9 +2836,9 @@ mod tests {
                 .slots,
         ));
         cwd.store(Arc::new(PathBuf::from("/tmp/changed")));
-        let model = crate::components::test_model();
         let (system, _, used_slots) =
-            smol::block_on(backend.prepare_run(&mut input, &model, Some(&snapshot))).unwrap();
+            smol::block_on(backend.prepare_run(&mut input, &stub_policy(), Some(&snapshot)))
+                .unwrap();
         assert!(Arc::ptr_eq(&pinned_slots, &used_slots));
         assert!(system.contains("admitted instructions"));
         assert!(system.contains("admitted identity"));
@@ -2874,7 +2851,7 @@ mod tests {
     fn prepared_prompt_input_errors_fail(mcp_error: bool) {
         const MCP_ERROR: &str = "MCP prompt expansion failed";
         let (backend, input, _) = failing_backend();
-        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+        let mut snapshot = backend.admission_preparation().unwrap()(&input, None);
         let (tx, rx) = flume::bounded(1);
         Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap()).resolved = Some(rx);
         if mcp_error {
@@ -2898,7 +2875,7 @@ mod tests {
         smol::block_on(async {
             let (mut backend, mut input, _) = failing_backend();
             input.prompt = None;
-            let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+            let mut snapshot = backend.admission_preparation().unwrap()(&input, None);
             let (slot_tx, slot_rx) = flume::bounded(1);
             drop(slot_tx);
             let (slots, slots_error) = resolve_prompt_slots(slot_rx).await;
@@ -2925,14 +2902,23 @@ mod tests {
             }))
             .unwrap();
             backend
-                .prepare_run(
-                    &mut input,
-                    &crate::components::test_model(),
-                    Some(&ordinary),
-                )
+                .prepare_run(&mut input, &stub_policy(), Some(&ordinary))
                 .await
                 .unwrap();
         });
+    }
+
+    fn stub_policy() -> EffectiveAgentConfig {
+        EffectiveAgentConfig::new(
+            maki_agent::RunSettings {
+                provider: Arc::new(StubProvider),
+                model: crate::components::test_model(),
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            AgentMode::Build,
+        )
     }
 
     fn failing_backend() -> (TuiActorBackend, AgentInput, flume::Receiver<Envelope>) {
@@ -2975,12 +2961,8 @@ mod tests {
 
         let input = AgentInput {
             message: "hello".into(),
-            mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: false,
-            workflow: false,
             prompt: Some(Box::new(McpPromptRef {
                 qualified_name: "srv.missing".into(),
                 arguments: HashMap::new(),
@@ -3063,7 +3045,7 @@ mod tests {
     fn cancelled_prompt_setup_releases_backend(reason: TurnCancellationReason) {
         smol::block_on(async {
             let (mut backend, input, events) = failing_backend();
-            let mut admission = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+            let mut admission = backend.admission_preparation().unwrap()(&input, None);
             let (pending_prompt, receiver) = flume::bounded(1);
             Arc::make_mut(admission.prompt_inputs.as_mut().unwrap()).resolved = Some(receiver);
             let policy = Arc::new(maki_agent::actor::EffectiveAgentConfig::new(
@@ -3094,8 +3076,7 @@ mod tests {
                 inbox: None,
                 managed_turn: None,
             };
-            let mut successor_input =
-                AgentInput::from_defaults(input.message.clone(), Vec::new(), Default::default());
+            let mut successor_input = AgentInput::new(input.message.clone(), Vec::new());
             successor_input.prompt = input.prompt.clone();
             let mut history = History::new(Vec::new());
             let outcome = {

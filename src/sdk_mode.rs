@@ -881,7 +881,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.lock().unwrap().turn_start = Instant::now();
                     match sdk_commands.dispatch_input(&prompt, &images) {
                         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-                            let input = command_attachments::agent_input(turn, defaults)?;
+                            let input = command_attachments::agent_input(turn)?;
                             match admit_sdk_turn(&shared, &handle.input_tx, input) {
                                 Ok(true) => {}
                                 Ok(false) => break,
@@ -927,10 +927,9 @@ pub fn run(params: SdkParams) -> Result<()> {
                             emit_command_result(&writer, &shared, true, error.to_string())?
                         }
                         InputDispatch::LiteralInput(content) => {
-                            let input = AgentInput::from_defaults(
+                            let input = AgentInput::new(
                                 content.text.to_string(),
                                 command_attachments::into_images(&content.attachments)?,
-                                defaults,
                             );
                             match admit_sdk_turn(&shared, &handle.input_tx, input) {
                                 Ok(true) => {}
@@ -2089,11 +2088,7 @@ mod tests {
 
     impl PendingSdkSession {
         fn admit(&self) {
-            let input = AgentInput::from_defaults(
-                SDK_ROOT_PROMPT.into(),
-                Vec::new(),
-                SessionDefaults::default(),
-            );
+            let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
             assert_eq!(
                 admit_sdk_turn(&self.shared, &self.handle.input_tx, input),
                 Ok(true)
@@ -2866,11 +2861,7 @@ mod tests {
         }
         .spawn(handle.event_rx.clone());
         begin_sdk_work(&shared).unwrap();
-        let input = AgentInput::from_defaults(
-            SDK_ROOT_PROMPT.into(),
-            Vec::new(),
-            SessionDefaults::default(),
-        );
+        let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
         let ticket = smol::block_on(handle.input_tx.admit(input)).unwrap();
         let permission = loop {
             let line = out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
@@ -3217,7 +3208,7 @@ mod tests {
         else {
             panic!("attachment-aware command did not return an agent turn");
         };
-        let input = command_attachments::agent_input(turn, SessionDefaults::default()).unwrap();
+        let input = command_attachments::agent_input(turn).unwrap();
         assert_eq!(input.message, "inspected");
         assert_eq!(input.images.len(), 1);
         assert_eq!(

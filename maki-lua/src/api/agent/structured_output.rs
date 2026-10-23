@@ -210,7 +210,7 @@ mod tests {
             AgentActorHandle::spawn(AgentId::generate(), Vec::new(), None, Box::new(Backend));
         let ticket = actor
             .admit_turn(
-                AgentInput::from_defaults("report".into(), Vec::new(), Default::default()),
+                AgentInput::new("report".into(), Vec::new()),
                 None,
                 "report".into(),
             )

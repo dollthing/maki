@@ -362,12 +362,8 @@ pub fn bind_parked_root(
         .admit_turn(
             AgentInput {
                 message: PARKED_ROOT_PROMPT.into(),
-                mode: ctx.mode.clone(),
                 images: Vec::new(),
                 preamble: Vec::new(),
-                thinking: ctx.opts.thinking,
-                fast: ctx.opts.fast,
-                workflow: ctx.workflow,
                 prompt: None,
             },
             None,

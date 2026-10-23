@@ -561,20 +561,14 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
         };
         if let (Some(input), Some(prepare)) = (input, &inner.admission_preparation) {
             let policy = state.policy.clone();
-            let mut input = preparation_input(input);
-            if let Some(config) = &policy {
-                input.mode = config.mode.clone();
-                input.thinking = config.thinking;
-                input.fast = config.fast;
-                input.workflow = config.workflow;
-            }
+            let input = preparation_input(input);
             let prepare = Arc::clone(prepare);
             let inner = Arc::clone(inner);
             state.preparing = Some(id);
             smol::spawn(async move {
                 let snapshot = smol::unblock(move || {
                     catch_unwind(AssertUnwindSafe(|| {
-                        let mut snapshot = prepare(&input, &input.mode, policy.as_deref());
+                        let mut snapshot = prepare(&input, policy.as_deref());
                         if let Some(config) = policy
                             && let Some(mode_def) = &config.mode_def
                         {
@@ -675,12 +669,8 @@ fn submission_bytes(input: &AgentInput) -> Result<usize, ActorError> {
 fn preparation_input(input: &AgentInput) -> AgentInput {
     AgentInput {
         message: input.message.clone(),
-        mode: input.mode.clone(),
         images: input.images.clone(),
         preamble: input.preamble.clone(),
-        thinking: input.thinking,
-        fast: input.fast,
-        workflow: input.workflow,
         prompt: input.prompt.clone(),
     }
 }
@@ -693,19 +683,13 @@ fn materialize(
 ) {
     match work {
         ActorOperation::Turn {
-            mut input,
+            input,
             event_sender,
             correlation,
             ticket,
             identity,
             ..
         } => {
-            if let Some(config) = &state.policy {
-                input.mode = config.mode.clone();
-                input.thinking = config.thinking;
-                input.fast = config.fast;
-                input.workflow = config.workflow;
-            }
             if !state.delivery_runs.contains_key(&ticket.turn_id()) {
                 state
                     .instructions
@@ -1990,7 +1974,7 @@ impl AgentActorHandle {
         options: TurnAdmissionOptions,
     ) -> Result<(TurnTicket, u64), ActorError> {
         let bytes = submission_bytes(&input)?;
-        let batch_key = crate::batch_key(&input);
+        let batchable = crate::batchable(&input);
         if bytes > MAX_PENDING_INSTRUCTION_BYTES {
             return Err(ActorError::InstructionOverflow);
         }
@@ -2012,9 +1996,8 @@ impl AgentActorHandle {
                 .filter(|id| {
                     state.instructions.get(id).is_some_and(|inbox| {
                         inbox.open
-                            && batch_key
-                                .as_ref()
-                                .is_some_and(|key| inbox.batch_key.as_ref() == Some(key))
+                            && batchable
+                            && inbox.batchable
                             && match (&inbox.policy, &state.policy) {
                                 (Some(active), Some(current)) => Arc::ptr_eq(active, current),
                                 (None, None) => true,
@@ -2030,9 +2013,8 @@ impl AgentActorHandle {
                 .or_else(|| {
                     state.instructions.iter().find_map(|(id, inbox)| {
                         (inbox.open
-                            && batch_key
-                                .as_ref()
-                                .is_some_and(|key| inbox.batch_key.as_ref() == Some(key))
+                            && batchable
+                            && inbox.batchable
                             && inbox.submit_operation == Some(state.next_operation_id))
                         .then_some(*id)
                     })
@@ -2064,9 +2046,8 @@ impl AgentActorHandle {
                         || state.lifecycle != ActorLifecycle::Open
                         || state.instructions.get(&target).is_none_or(|inbox| {
                             !inbox.open
-                                || batch_key
-                                    .as_ref()
-                                    .is_none_or(|key| inbox.batch_key.as_ref() != Some(key))
+                                || !batchable
+                                || !inbox.batchable
                                 || (inbox.submit_operation != Some(operation_boundary)
                                     && (state
                                         .operations
@@ -2170,7 +2151,7 @@ impl AgentActorHandle {
             inbox.drained.push((ticket.provenance().clone(), bytes));
             inbox.submit_operation = Some(id);
             inbox.operation = id;
-            inbox.batch_key = batch_key.clone();
+            inbox.batchable = batchable;
             inbox.initial = Some(state.pending_submission(
                 turn_id,
                 &input,

@@ -2033,12 +2033,8 @@ fn config(model: &str, fast: bool) -> crate::actor::EffectiveAgentConfig {
 fn input() -> AgentInput {
     AgentInput {
         message: "test".into(),
-        mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
         prompt: None,
     }
 }
@@ -2303,19 +2299,16 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (tx, rx) = flume::bounded(1);
         let gate = Gate::new();
+        let plan_mode = AgentMode::Plan("plan.md".into());
+        let mut root_config = config("anthropic/claude-sonnet-4-20250514", false);
+        root_config.mode = plan_mode.clone();
         let root = manager
-            .create_root_with_config(
-                Some(config("anthropic/claude-sonnet-4-20250514", false)),
-                Vec::new(),
-                None,
-                |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
-            )
+            .create_root_with_config(Some(root_config), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
+            })
             .unwrap();
         let actor = root.actor().unwrap();
-        let plan_mode = AgentMode::Plan("plan.md".into());
-        let mut plan_input = input();
-        plan_input.mode = plan_mode.clone();
-        actor.admit_turn(plan_input, None, "root".into()).unwrap();
+        actor.admit_turn(input(), None, "root".into()).unwrap();
         let current = rx.recv_async().await.unwrap();
         let child = current
             .spawn_child(
@@ -2326,16 +2319,10 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
             )
             .unwrap();
         let child_actor = child.actor().unwrap();
-        let mut plan_input = input();
-        plan_input.mode = plan_mode;
+        assert_eq!(child_actor.effective_config().unwrap().mode, plan_mode);
         assert!(
             child_actor
-                .admit_turn(plan_input, None, "plan-child".into())
-                .is_ok()
-        );
-        assert!(
-            child_actor
-                .admit_turn(input(), None, "build-child".into())
+                .admit_turn(input(), None, "plan-child".into())
                 .is_ok()
         );
         gate.release(1);
@@ -2349,20 +2336,19 @@ fn custom_parent_mode_is_admitted_by_managed_child() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (tx, rx) = flume::bounded(1);
         let gate = Gate::new();
+        let custom_mode = AgentMode::Custom(crate::ModeId::parse("review"));
+        let mut root_config = config("anthropic/claude-sonnet-4-20250514", false).with_mode_def(
+            Some(crate::ModeDef::default_for(crate::ModeId::parse("review"))),
+        );
+        root_config.mode = custom_mode.clone();
         let root = manager
-            .create_root_with_config(
-                Some(config("anthropic/claude-sonnet-4-20250514", false)),
-                Vec::new(),
-                None,
-                |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
-            )
+            .create_root_with_config(Some(root_config), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
+            })
             .unwrap();
         let actor = root.actor().unwrap();
-        let custom_mode = AgentMode::Custom(crate::ModeId::parse("review"));
-        let mut parent_input = input();
-        parent_input.mode = custom_mode.clone();
         actor
-            .admit_turn(parent_input, None, "root-custom".into())
+            .admit_turn(input(), None, "root-custom".into())
             .unwrap();
         let current = rx.recv_async().await.unwrap();
         let child = current
@@ -2374,16 +2360,10 @@ fn custom_parent_mode_is_admitted_by_managed_child() {
             )
             .unwrap();
         let child_actor = child.actor().unwrap();
-        let mut child_input = input();
-        child_input.mode = custom_mode;
+        assert_eq!(child_actor.effective_config().unwrap().mode, custom_mode);
         assert!(
             child_actor
-                .admit_turn(child_input, None, "custom-child".into())
-                .is_ok()
-        );
-        assert!(
-            child_actor
-                .admit_turn(input(), None, "build-child".into())
+                .admit_turn(input(), None, "custom-child".into())
                 .is_ok()
         );
         gate.release(1);

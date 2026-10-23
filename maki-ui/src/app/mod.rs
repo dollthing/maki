@@ -2909,10 +2909,6 @@ impl App {
         let input = AgentInput {
             message: turn.content.text.to_string(),
             images,
-            mode: admission.template.mode.clone(),
-            thinking: admission.template.opts.thinking,
-            fast: admission.template.opts.fast,
-            workflow: admission.template.workflow,
             preamble: Vec::new(),
             prompt: turn.prompt.map(|prompt| {
                 Box::new(McpPromptRef {

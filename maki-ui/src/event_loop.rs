@@ -1159,7 +1159,7 @@ impl SessionRuntime {
             return Err(EMPTY_PROMPT_ERR.to_owned());
         }
         let text = self.app.lua_event_handle.expand_references(&text)?;
-        let config = self.config().ok_or(NOT_LIVE_ERR)?;
+        self.config().ok_or(NOT_LIVE_ERR)?;
         let (manager, root) = self.handles.manager_and_root();
         let actor = manager.actor(root).map_err(|error| error.to_string())?;
         let snapshot = actor.snapshot();
@@ -1168,12 +1168,8 @@ impl SessionRuntime {
         preamble.extend_from_slice(self.app.shell.results_for(None));
         let input = maki_agent::AgentInput {
             message: text,
-            mode: config.mode.clone(),
             images: Vec::new(),
             preamble,
-            thinking: config.thinking,
-            fast: config.fast,
-            workflow: config.workflow,
             prompt: None,
         };
         if let Err(error) = self.handles.queue.try_push(QueueItem {
@@ -4808,12 +4804,8 @@ mod tests {
             runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "after barrier".into(),
-                    mode: Default::default(),
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 displayed: None,
@@ -5379,12 +5371,8 @@ mod tests {
             runtime.handles.queue.push(QueueItem {
                 input: maki_agent::AgentInput {
                     message: "queued root".into(),
-                    mode: Default::default(),
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 displayed: None,

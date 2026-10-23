@@ -337,7 +337,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures_lite::future;
-    use maki_providers::{ContentBlock, Message, Role, ThinkingConfig, TokenUsage};
+    use maki_providers::{ContentBlock, Message, Role, TokenUsage};
     use maki_storage::checkpoint::CheckpointPublication;
     use maki_storage::sessions::HistorySnapshot;
     use test_case::test_case;
@@ -768,12 +768,8 @@ mod tests {
             let turn = (close || shutdown).then(|| PreparedTurn {
                 input: AgentInput {
                     message: String::new(),
-                    mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: ThinkingConfig::Off,
-                    fast: false,
-                    workflow: false,
                     prompt: None,
                 },
                 event_sender: None,
