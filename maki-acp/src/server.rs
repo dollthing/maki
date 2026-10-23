@@ -1281,12 +1281,7 @@ async fn run_dispatch(
             send_manual_compaction(session, &srv.out_tx, id, instructions).await
         }
         InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
-            let text = match feedback {
-                maki_commands::FrontendFeedback::WorkingDirectory(path) => {
-                    format!("Working directory: {}", path.display())
-                }
-                maki_commands::FrontendFeedback::Text(text) => text.to_string(),
-            };
+            let text = feedback.to_string();
             let sid = SessionId::from(session.handle.session_id.to_string());
             session_update(&srv.out_tx, &sid, translate::text_delta(&text));
             respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);

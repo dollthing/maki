@@ -1027,13 +1027,7 @@ impl UserDispatch {
                 return Ok(true);
             }
             InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
-                let result = match feedback {
-                    maki_commands::FrontendFeedback::WorkingDirectory(path) => {
-                        format!("Working directory: {}", path.display())
-                    }
-                    maki_commands::FrontendFeedback::Text(text) => text.to_string(),
-                };
-                emit_command_result(writer, shared, false, result)?;
+                emit_command_result(writer, shared, false, feedback.to_string())?;
                 return Ok(true);
             }
             InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {

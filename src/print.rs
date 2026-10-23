@@ -187,6 +187,8 @@ enum VerboseOutput {
 /// What a print run's input asks for once its command, if any, has run.
 enum PrintWork {
     Turn(AgentInput),
+    /// A command that finished at dispatch, with the text it reported.
+    Reply(String),
     IsolatedTurn(IsolatedTurn),
     Compaction(Option<String>),
 }
@@ -195,19 +197,20 @@ fn dispatch_print(
     registry: &CommandRegistry,
     target: &TargetHandle,
     literal: AgentInput,
-) -> Result<Option<PrintWork>> {
+) -> Result<PrintWork> {
     let content = CommandContent {
         text: Arc::from(literal.message.as_str()),
         attachments: command_attachments::from_images(&literal.images),
     };
-    Ok(Some(
+    Ok(
         match smol::block_on(registry.dispatch_input(target, content)) {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                 PrintWork::Turn(command_attachments::agent_input(turn)?)
             }
-            InputDispatch::Dispatched(
-                CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
-            ) => return Ok(None),
+            InputDispatch::Dispatched(CommandOutcome::Completed) => PrintWork::Reply(String::new()),
+            InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
+                PrintWork::Reply(feedback.to_string())
+            }
             InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
                 PrintWork::IsolatedTurn(turn)
             }
@@ -220,7 +223,7 @@ fn dispatch_print(
                 command_attachments::into_images(&content.attachments)?,
             )),
         },
-    ))
+    )
 }
 
 impl VerboseOutput {
@@ -539,9 +542,7 @@ pub fn run(
             let handle = &session.handle;
             let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
             observer.install(session.root.target.clone());
-            let Some(work) = dispatch_print(&command_registry, &session.commands, literal)? else {
-                return Ok(());
-            };
+            let work = dispatch_print(&command_registry, &session.commands, literal)?;
             let session_id = &handle.session_id;
             let start = Instant::now();
             let (mut result, verbose_out) = match work {
@@ -710,6 +711,7 @@ pub fn run(
                     ));
                     (operation_result(answer, session_id), None)
                 }
+                PrintWork::Reply(text) => (operation_result(Ok(text), session_id), None),
                 PrintWork::Compaction(instructions) => {
                     let compacted = smol::block_on(
                         handle.control_tx.compact(instructions, CancelToken::none()),
@@ -777,7 +779,9 @@ mod tests {
             offload::{OffloadBackend, OffloadError, OffloadStore},
         },
     };
-    use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
+    use maki_commands::{
+        CommandError, CommandFuture, FrontendFeedback, TargetCapabilities, TargetCapability,
+    };
     use maki_providers::{
         ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage, model_registry,
@@ -1603,7 +1607,7 @@ mod tests {
                         assert(root:set_mode(ctx, "plan"))
                         assert(root:mode(ctx) == "plan", root:mode(ctx))
                         assert(root:set_mode(ctx, "build"))
-                        local set, set_err = maki.session.set_option("model", "{PRINT_MODEL}")
+                        local set, set_err = maki.session.set_option("model", "{PRINT_MODEL}", {{}})
                         assert(set == nil and set_err == "{session_required}", set_err)
                         local child = assert(maki.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
@@ -1693,13 +1697,18 @@ mod tests {
                     "initialized command did not finish"
                 );
             }
-            let Some(work) = dispatch_print(&registry, target, literal)? else {
+            let work = dispatch_print(&registry, target, literal)?;
+            if let PrintWork::Reply(reply) = &work {
                 assert_eq!(
                     root.effective_config().unwrap().unwrap().context.cwd(),
                     moved_to
                 );
+                assert_eq!(
+                    *reply,
+                    FrontendFeedback::WorkingDirectory(moved_to.clone()).to_string()
+                );
                 return Ok(());
-            };
+            }
             {
                 {
                     let PrintWork::Turn(input) = work else {
@@ -1798,7 +1807,7 @@ mod tests {
     }
 
     /// Dispatches {literal} on an idle print session's command target.
-    fn dispatch_idle(registry: &CommandRegistry, literal: AgentInput) -> Result<Option<PrintWork>> {
+    fn dispatch_idle(registry: &CommandRegistry, literal: AgentInput) -> Result<PrintWork> {
         let session = start_print_session(
             print_params(&std::env::temp_dir(), None),
             provided(Arc::new(RecordingPrintProvider {
@@ -1877,7 +1886,7 @@ mod tests {
             maki_agent::ImageMediaType::Png,
             Arc::from("AAAA"),
         ));
-        let Some(PrintWork::Turn(received)) = dispatch_idle(&registry, literal).unwrap() else {
+        let PrintWork::Turn(received) = dispatch_idle(&registry, literal).unwrap() else {
             panic!("attachment-aware command did not return a turn");
         };
         assert_eq!(received.message, "inspected");
@@ -1899,7 +1908,7 @@ mod tests {
             maki_agent::ImageMediaType::Png,
             Arc::from("AAAA"),
         ));
-        let Some(PrintWork::IsolatedTurn(turn)) = dispatch_idle(&registry, literal).unwrap() else {
+        let PrintWork::IsolatedTurn(turn) = dispatch_idle(&registry, literal).unwrap() else {
             panic!("quick question did not return an isolated turn");
         };
         assert_eq!(turn.content.text.as_ref(), "explain this");
@@ -1937,7 +1946,10 @@ mod tests {
                 argument_completions: Vec::new(),
             }])
             .unwrap();
-        assert!(dispatch_idle(&registry, input("/done")).unwrap().is_none());
+        assert!(matches!(
+            dispatch_idle(&registry, input("/done")).unwrap(),
+            PrintWork::Reply(reply) if reply.is_empty()
+        ));
     }
 
     #[test]
@@ -1963,7 +1975,7 @@ mod tests {
             maki_agent::ImageMediaType::Webp,
             Arc::from("AAAA"),
         ));
-        let Some(PrintWork::Turn(received)) = dispatch_idle(&registry, literal).unwrap() else {
+        let PrintWork::Turn(received) = dispatch_idle(&registry, literal).unwrap() else {
             panic!("escaped input did not become a turn");
         };
         assert_eq!(received.message, expected);

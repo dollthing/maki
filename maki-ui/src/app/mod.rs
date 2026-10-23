@@ -2880,12 +2880,7 @@ impl App {
     }
 
     pub(crate) fn present_frontend_feedback(&mut self, feedback: maki_commands::FrontendFeedback) {
-        match feedback {
-            maki_commands::FrontendFeedback::WorkingDirectory(path) => {
-                self.flash(format!("Working directory: {}", path.display()));
-            }
-            maki_commands::FrontendFeedback::Text(text) => self.flash(text.to_string()),
-        }
+        self.flash(feedback.to_string());
     }
 
     pub(crate) fn submit_command_turn(

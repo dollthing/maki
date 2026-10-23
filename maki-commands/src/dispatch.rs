@@ -364,6 +364,17 @@ pub enum FrontendFeedback {
     Text(Arc<str>),
 }
 
+impl fmt::Display for FrontendFeedback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkingDirectory(path) => {
+                write!(formatter, "Working directory: {}", path.display())
+            }
+            Self::Text(text) => formatter.write_str(text),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
     Completed,
