@@ -197,8 +197,6 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the makima repo holds the plugins that ship with makima, compiled into the
   binary, so a file dropped there does nothing until makima is rebuilt. That
   holds even when the project you have open is a makima checkout.
-- Both global config dirs can exist, and `~/.makima/` wins, so look before you
-  write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with the normal write and edit tools.
 - You cannot run slash commands or restart makima, so ask the user to run

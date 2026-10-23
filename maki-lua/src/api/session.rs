@@ -181,9 +181,9 @@ fn current(lua: &Lua) -> LuaResult<Pair<String>> {
 async fn usage(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Option<Table>,
+    opts: Table,
 ) -> LuaResult<Pair<Value>> {
-    let id = try_pair!(required_session(opts.as_ref())?);
+    let id = try_pair!(required_session(Some(&opts))?);
     roundtrip(lua, tx, SessionRequest::Usage { id }).await
 }
 
@@ -260,9 +260,9 @@ async fn delete(
 async fn read(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
-    opts: Option<Table>,
+    opts: Table,
 ) -> LuaResult<Pair<Value>> {
-    let id = try_pair!(required_session(opts.as_ref())?);
+    let id = try_pair!(required_session(Some(&opts))?);
     if let Some(slot) = lua.app_data_ref::<SessionSnapshotSlot>() {
         return match (slot.0)(id) {
             Ok(value) => Ok((Some(json_to_lua(&lua, &value)?), None)),
@@ -314,9 +314,9 @@ async fn prompt(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     text: String,
-    opts: Option<Table>,
+    opts: Table,
 ) -> LuaResult<Pair<Value>> {
-    let id = try_pair!(required_session(opts.as_ref())?);
+    let id = try_pair!(required_session(Some(&opts))?);
     if let Some(denial) = delegated_tool_denial(&lua, id) {
         return Ok(err_pair(denial));
     }
@@ -334,13 +334,10 @@ async fn prompt(
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn]
-fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+fn notify(_lua: &Lua, text: String, opts: Table) -> LuaResult<Pair<bool>> {
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
-    let Some(opts) = opts else {
-        return Ok(err_pair(SESSION_REQUIRED_ERR));
-    };
     let Some(raw_id) = opts.get::<Option<String>>("session")? else {
         return Ok(err_pair(SESSION_REQUIRED_ERR));
     };
@@ -362,9 +359,9 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
 /// @example
 /// local snapshot, err = maki.session.options({ session = id })
 #[lua_fn]
-fn options(lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+fn options(lua: &Lua, opts: Table) -> LuaResult<Pair<Table>> {
     try_pair!(crate::runtime::validate_plugin_effect(lua));
-    let coordinator = try_pair!(resolve_coordinator(opts.as_ref()));
+    let coordinator = try_pair!(resolve_coordinator(Some(&opts)));
     let snapshot = snapshot_table(lua, &coordinator.read().options())?;
     Ok((Some(snapshot), None))
 }
@@ -381,14 +378,9 @@ fn options(lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<Table>> {
 /// @example
 /// local ok, err = maki.session.set_option("fast", "enabled", { session = id })
 #[lua_fn]
-async fn set_option(
-    lua: Lua,
-    id: String,
-    value: String,
-    opts: Option<Table>,
-) -> LuaResult<Pair<bool>> {
+async fn set_option(lua: Lua, id: String, value: String, opts: Table) -> LuaResult<Pair<bool>> {
     try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    let session = try_pair!(required_session(opts.as_ref())?);
+    let session = try_pair!(required_session(Some(&opts))?);
     if let Some(denial) = delegated_tool_denial(&lua, session) {
         return Ok(err_pair(denial));
     }
@@ -426,12 +418,12 @@ async fn set_option(
 /// @example
 /// local mode, err = maki.session.set_mode("plan", { session = ev.data.session_id })
 #[lua_fn]
-async fn set_mode(lua: Lua, name: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
+async fn set_mode(lua: Lua, name: String, opts: Table) -> LuaResult<Pair<String>> {
     if crate::runtime::in_delegated_tool(&lua) {
         return Ok(err_pair(DELEGATED_HOST_MUTATION));
     }
     try_pair!(crate::runtime::validate_plugin_effect(&lua));
-    let session = try_pair!(required_session(opts.as_ref())?);
+    let session = try_pair!(required_session(Some(&opts))?);
     let target = try_pair!(try_pair!(SessionCoordinatorHandle::resolve(session)).agent());
     let services = try_pair!(crate::orchestration::services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
     let template = try_pair!(services.template(&target));
@@ -663,11 +655,12 @@ mod tests {
         assert_eq!(val, "queued");
     }
 
-    #[test_case("return session.prompt('hi')" ; "prompt")]
-    #[test_case("return session.read()" ; "read")]
-    #[test_case("return session.usage()" ; "usage")]
-    #[test_case("return session.options()" ; "options")]
-    #[test_case("return session.set_option('yolo', 'enabled')" ; "set_option")]
+    #[test_case("return session.prompt('hi', {})" ; "prompt")]
+    #[test_case("return session.read({})" ; "read")]
+    #[test_case("return session.usage({})" ; "usage")]
+    #[test_case("return session.options({})" ; "options")]
+    #[test_case("return session.set_option('yolo', 'enabled', {})" ; "set_option")]
+    #[test_case("return session.set_mode('plan', {})" ; "set_mode")]
     fn session_target_is_required(code: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
@@ -796,8 +789,10 @@ mod tests {
     #[test]
     fn notify_rejects_missing_and_non_live_sessions() {
         let lua = lua_with_session(None);
-        let (_, missing): (Value, Option<String>) =
-            lua.load("return session.notify('built')").eval().unwrap();
+        let (_, missing): (Value, Option<String>) = lua
+            .load("return session.notify('built', {})")
+            .eval()
+            .unwrap();
         assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
 
         let id = MakiId::generate();

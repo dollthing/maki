@@ -4167,7 +4167,7 @@ local id = maki.session.current()
 ### `maki.session.usage()` {#maki-session-usage}
 
 ```lua
-maki.session.usage({opts?})
+maki.session.usage({opts})
 ```
 
 Returns a session's token usage without making a network request.
@@ -4177,7 +4177,7 @@ descending, then model spec ascending.
 
 **Parameters:**
 
-- `{opts?}` (`table`) Required `session` (string) id.
+- `{opts}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) `{total={input, output, cache_creation,
   cache_read, cost}, models}`, where each model has `{model, input, output,
@@ -4194,7 +4194,7 @@ local usage, err = maki.session.usage({ session = ctx:session_id() })
 ### `maki.session.read()` {#maki-session-read}
 
 ```lua
-maki.session.read({opts?})
+maki.session.read({opts})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
@@ -4223,7 +4223,7 @@ lives on the `TurnEnd` autocmd instead.
 
 **Parameters:**
 
-- `{opts?}` (`table`) Required `session` (string) id.
+- `{opts}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
@@ -4312,7 +4312,7 @@ local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
 ### `maki.session.prompt()` {#maki-session-prompt}
 
 ```lua
-maki.session.prompt({text}, {opts?})
+maki.session.prompt({text}, {opts})
 ```
 
 Sends {text} as a regular user prompt to a live session. The text is
@@ -4323,7 +4323,7 @@ the prompt is queued and picked up when the agent reaches it.
 **Parameters:**
 
 - `{text}` (`string`) The prompt to send. Must not be blank.
-- `{opts?}` (`table`) Required `session` (string) id of a live session.
+- `{opts}` (`table`) Required `session` (string) id of a live session.
 
 **Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
 
@@ -4338,7 +4338,7 @@ local state, err = maki.session.prompt("run the tests", { session = id })
 ### `maki.session.notify()` {#maki-session-notify}
 
 ```lua
-maki.session.notify({text}, {opts?})
+maki.session.notify({text}, {opts})
 ```
 
 Reports {text} to a live session without creating a user turn. The
@@ -4347,7 +4347,7 @@ observation waits for the session's next agent run.
 **Parameters:**
 
 - `{text}` (`string`) What to report. Must not be blank.
-- `{opts?}` (`table`) Options:
+- `{opts}` (`table`) Options:
   - `session` (`string`) id of a live session.
   - `wake` (`boolean`) start a TUI turn when it next becomes idle (default false).
 
@@ -4364,14 +4364,14 @@ maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 ### `maki.session.options()` {#maki-session-options}
 
 ```lua
-maki.session.options({opts?})
+maki.session.options({opts})
 ```
 
 Returns the complete ordered option snapshot for a live session.
 
 **Parameters:**
 
-- `{opts?}` (`table`) Required `session` (string) id.
+- `{opts}` (`table`) Required `session` (string) id.
 
 **Returns:** (`table|nil`, `string|nil`) `{version, options}`, or nil and an error.
 
@@ -4386,7 +4386,7 @@ local snapshot, err = maki.session.options({ session = id })
 ### `maki.session.set_option()` {#maki-session-set_option}
 
 ```lua
-maki.session.set_option({id}, {value}, {opts?})
+maki.session.set_option({id}, {value}, {opts})
 ```
 
 Sets one option explicitly for a live session. Model, thinking, fast, and
@@ -4398,7 +4398,7 @@ See [Configuration changes](/docs/modes/#configuration-changes).
 
 - `{id}` (`string`) Stable option id.
 - `{value}` (`string`) Selectable value id.
-- `{opts?}` (`table`) Required `session` (string) id.
+- `{opts}` (`table`) Required `session` (string) id.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 
@@ -4413,7 +4413,7 @@ local ok, err = maki.session.set_option("fast", "enabled", { session = id })
 ### `maki.session.set_mode()` {#maki-session-set_mode}
 
 ```lua
-maki.session.set_mode({name}, {opts?})
+maki.session.set_mode({name}, {opts})
 ```
 
 Switches a live session's root agent to mode {name}, through the same
@@ -4424,7 +4424,7 @@ Tool handlers use `Agent:set_mode` on their own agent instead.
 **Parameters:**
 
 - `{name}` (`string`) Registered mode name.
-- `{opts?}` (`table`) Required `session` (string) id of a live session.
+- `{opts}` (`table`) Required `session` (string) id of a live session.
 
 **Returns:** (`string|nil`, `string|nil`) The committed mode name, or nil and an error.
 

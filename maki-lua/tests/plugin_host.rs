@@ -6473,9 +6473,9 @@ maki.api.register_tool({
             focus = function() return maki.session.focus(input.session) end,
             delete = function() return maki.session.delete(input.session) end,
             current = function() return maki.session.current() end,
-            usage = function() return maki.session.usage() end,
-            read = function() return maki.session.read() end,
-            options = function() return maki.session.options() end,
+            usage = function() return maki.session.usage({}) end,
+            read = function() return maki.session.read({}) end,
+            options = function() return maki.session.options({}) end,
         }
         local _, err = calls[input.call]()
         return tostring(err)
