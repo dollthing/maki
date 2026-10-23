@@ -697,6 +697,7 @@ impl App {
             PathBuf::from(&session.cwd),
             &lua_event_handle.mode_registry(),
             &storage,
+            maki_config::SessionDefaults::default(),
         );
         Self::prepare(
             config,

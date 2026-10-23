@@ -19,7 +19,7 @@ use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, StoredThinking};
+use maki_storage::sessions::SESSIONS_DIR;
 use maki_ui::{AppSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -426,18 +426,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
-    let default_thinking: Option<StoredThinking> = maki_storage::sessions::read_prefs(&storage)
-        .default_thinking
-        .or(stack.config.session_defaults.thinking);
-
     loop {
-        for session in &mut tabs {
-            if session.messages().is_empty() {
-                let mut defaults = stack.config.session_defaults;
-                defaults.thinking = default_thinking;
-                defaults.seed(&mut session.meta);
-            }
-        }
         let focused_tab = &tabs[focused];
         let model = restored_session_model(
             &stack.model,
@@ -475,6 +464,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                session_defaults: stack.config.session_defaults,
                 system_prompt_override: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
                 project_config: trust.project_config.clone(),

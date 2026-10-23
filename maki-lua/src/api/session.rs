@@ -441,8 +441,9 @@ async fn set_title(
 }
 
 /// Persists the default thinking setting for new sessions without changing
-/// any live session. `mode` is a thinking setting as `Agent:set_model` accepts
-/// it; the empty toggle that `set_thinking` allows is rejected here.
+/// any live session. Every frontend starts a blank session on it, ahead of
+/// `always_thinking`. `mode` is a thinking setting as `Agent:set_model`
+/// accepts it.
 ///
 /// @param mode string The thinking setting.
 /// @return (table|nil, string|nil) `{mode}` with the normalized setting, or nil and an error.

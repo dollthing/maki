@@ -65,7 +65,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `always_automode` | bool | `false` | Start every session with bash auto mode (classify every bash command) |
 | `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task tools callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget). A default saved with `/thinking` wins over it |
 
 ### `ui`
 

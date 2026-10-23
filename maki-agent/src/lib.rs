@@ -47,6 +47,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod session_checkpoint;
 pub mod session_coordinator;
+pub mod session_defaults;
 pub mod session_options;
 pub mod template;
 pub mod tools;

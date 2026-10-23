@@ -26,6 +26,7 @@ use maki_agent::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
 };
+use maki_agent::session_defaults;
 use maki_agent::tools::offload::OffloadCleanup;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
@@ -43,8 +44,10 @@ use maki_lua::orchestration::{
 use maki_lua::session_snapshot::HeadlessObserver;
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::StateDir;
 use maki_storage::checkpoint::ClaimingWriter;
 use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::{SessionMeta, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -474,6 +477,11 @@ pub fn run(
     };
 
     let images = load_images(&image_paths)?;
+    let prefs = StateDir::resolve()
+        .map(|state| read_prefs(&state))
+        .unwrap_or_default();
+    let defaults =
+        session_defaults::resolve(defaults, &prefs, &SessionMeta::default(), true, model);
     let literal = AgentInput::from_defaults(prompt, images, defaults);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;

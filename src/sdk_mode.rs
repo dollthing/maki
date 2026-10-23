@@ -28,6 +28,7 @@ use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session_coordinator::SessionReadHandle;
+use maki_agent::session_defaults;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, ModeId, PermissionsConfig,
@@ -42,7 +43,7 @@ use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta};
+use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -577,7 +578,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
-        mut defaults,
+        defaults,
         model_policy,
         plugin_rules,
         project_config,
@@ -602,13 +603,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
-    let model = resolve_startup_settings(
-        model,
-        &restored,
-        explicit_model,
-        &model_policy,
-        &mut defaults,
-    );
+    let model = startup_model(model, &restored, explicit_model, &model_policy);
     let permission_mode = restored_permission_mode(
         restored_state,
         restored.meta.yolo,
@@ -616,19 +611,13 @@ pub fn run(params: SdkParams) -> Result<()> {
         explicit_permission_mode,
     );
     let yolo = permission_mode == PermissionMode::BypassPermissions;
-    let fast = if restored_state {
-        restored.meta.fast && model.supports_fast()
-    } else {
-        defaults.fast && model.supports_fast()
-    };
-    let workflow = if restored_state {
-        restored.meta.workflow
-    } else {
-        defaults.workflow
-    };
-    defaults.fast = fast;
-    defaults.workflow = workflow;
-    let thinking = defaults.thinking.into();
+    let defaults = session_defaults::resolve(
+        defaults,
+        &read_prefs(&storage),
+        &restored.meta,
+        restored.history.messages.is_empty(),
+        &model,
+    );
     let persisted_options = restored.meta.session_options;
     let session_id = restored.id;
     let initial_history = restored.history;
@@ -681,9 +670,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         startup_model.spec(),
         catalog.snapshot(),
         yolo,
-        fast,
-        workflow,
-        thinking,
+        defaults.fast,
+        defaults.workflow,
+        defaults.thinking.into(),
     );
     let locked_id = handle.session_id.id();
     let sessions_dir = storage
@@ -1159,33 +1148,21 @@ struct ResolvedSession {
     meta: SessionMeta,
 }
 
-fn resolve_startup_settings(
+fn startup_model(
     startup: Model,
     restored: &ResolvedSession,
     explicit_model: bool,
     model_policy: &ModelPolicy,
-    defaults: &mut SessionDefaults,
 ) -> Model {
-    let model = if explicit_model {
-        startup
-    } else {
-        restored
-            .model
-            .as_deref()
-            .and_then(|spec| Model::from_spec(spec).ok())
-            .filter(|candidate| model_policy.allows(&candidate.spec()))
-            .unwrap_or(startup)
-    };
-    if restored.model.is_some() {
-        let thinking = restored
-            .meta
-            .thinking
-            .map(maki_agent::ThinkingConfig::from)
-            .filter(|_| model.supports_thinking())
-            .unwrap_or_default();
-        defaults.thinking = Some(thinking.into());
+    if explicit_model {
+        return startup;
     }
-    model
+    restored
+        .model
+        .as_deref()
+        .and_then(|spec| Model::from_spec(spec).ok())
+        .filter(|candidate| model_policy.allows(&candidate.spec()))
+        .unwrap_or(startup)
 }
 
 fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedSession> {
@@ -1783,6 +1760,7 @@ mod tests {
         ContentBlock, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
     };
     use maki_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
+    use maki_storage::sessions::Prefs;
     use std::path::PathBuf;
     use std::time::Duration;
     use test_case::test_case;
@@ -1810,48 +1788,20 @@ mod tests {
     #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
     #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_persisted_model")]
     fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
-        let startup = Model::from_spec(STARTUP_MODEL).unwrap();
         let restored = ResolvedSession {
             id: None,
             history: Default::default(),
             model: Some(RESTORED_MODEL.into()),
-            meta: SessionMeta {
-                thinking: Some(maki_providers::ThinkingConfig::Off.into()),
-                ..Default::default()
-            },
+            meta: SessionMeta::default(),
         };
-        let mut defaults = SessionDefaults {
-            thinking: Some(
-                maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High).into(),
-            ),
-            ..Default::default()
-        };
-        let fresh_defaults = defaults;
-        let resolved = resolve_startup_settings(
-            startup.clone(),
+        let resolved = startup_model(
+            Model::from_spec(STARTUP_MODEL).unwrap(),
             &restored,
             explicit_model,
             &ModelPolicy::default(),
-            &mut defaults,
         );
 
         assert_eq!(resolved.spec(), expected);
-        assert_eq!(
-            defaults.thinking,
-            Some(maki_providers::ThinkingConfig::Off.into())
-        );
-        let mut defaults = fresh_defaults;
-        resolve_startup_settings(
-            startup,
-            &ResolvedSession {
-                model: None,
-                ..restored
-            },
-            explicit_model,
-            &ModelPolicy::default(),
-            &mut defaults,
-        );
-        assert_eq!(defaults, fresh_defaults);
     }
 
     struct OutcomeBehavior(CommandOutcome);
@@ -2502,28 +2452,24 @@ mod tests {
         "#)).unwrap();
         let lua_handle = host.event_handle();
         let prepared_provider = Arc::clone(&provider);
-        let mut defaults = SessionDefaults {
-            fast: true,
-            thinking: Some(
-                maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High).into(),
-            ),
-            ..Default::default()
-        };
         let thinking = maki_providers::ThinkingConfig::Off;
-        let model = resolve_startup_settings(
-            Model::from_spec(STARTUP_MODEL).unwrap(),
-            &ResolvedSession {
-                id: None,
-                history: Default::default(),
-                model: Some(STARTUP_MODEL.into()),
-                meta: SessionMeta {
-                    thinking: Some(thinking.into()),
-                    ..Default::default()
-                },
+        let model = Model::from_spec(STARTUP_MODEL).unwrap();
+        let defaults = session_defaults::resolve(
+            SessionDefaults {
+                fast: true,
+                thinking: Some(
+                    maki_providers::ThinkingConfig::Effort(maki_providers::Effort::High).into(),
+                ),
+                ..Default::default()
+            },
+            &Prefs::default(),
+            &SessionMeta {
+                fast: true,
+                thinking: Some(thinking.into()),
+                ..Default::default()
             },
             false,
-            &ModelPolicy::default(),
-            &mut defaults,
+            &model,
         );
         let (binding, root_target) = maki_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(

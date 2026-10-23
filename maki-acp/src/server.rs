@@ -23,6 +23,7 @@ use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::session_coordinator::SessionCoordinatorError;
+use maki_agent::session_defaults;
 use maki_agent::session_options::SessionOptionError;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
@@ -42,7 +43,7 @@ use maki_providers::{Message, TokenUsage, add_cost, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, StoredTokenUsage};
+use maki_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -171,9 +172,7 @@ struct InstallSession<'a> {
     current_model: String,
     initial_cost: Option<f64>,
     cwd: PathBuf,
-    fast: bool,
-    workflow: bool,
-    thinking: maki_agent::ThinkingConfig,
+    defaults: SessionDefaults,
     persisted_options: &'a BTreeMap<String, String>,
 }
 
@@ -373,6 +372,13 @@ async fn new_session(
     );
     let permissions = load_permissions(&project_config)?;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
+    let defaults = session_defaults::resolve(
+        params.defaults,
+        &read_prefs(&params.storage),
+        &SessionMeta::default(),
+        true,
+        &params.model,
+    );
     let (handle, root_target) = spawn_session(
         params,
         SpawnSession {
@@ -383,7 +389,7 @@ async fn new_session(
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
             yolo: params.yolo,
-            defaults: params.defaults,
+            defaults,
             project_config,
             permissions,
         },
@@ -401,9 +407,7 @@ async fn new_session(
             current_model: spec,
             initial_cost: None,
             cwd,
-            fast: false,
-            workflow: false,
-            thinking: maki_agent::ThinkingConfig::Off,
+            defaults,
             persisted_options: &persisted_options,
         },
     )
@@ -454,15 +458,14 @@ async fn load_session(
         _ => params.model.clone(),
     };
     let spec = recorded_model.spec();
-    let fast = restored.meta.fast && recorded_model.supports_fast();
     let yolo = restored.meta.yolo.unwrap_or(params.yolo);
-    let workflow = restored.meta.workflow;
-    let thinking = restored
-        .meta
-        .thinking
-        .map(maki_agent::ThinkingConfig::from)
-        .filter(|_| recorded_model.supports_thinking())
-        .unwrap_or_default();
+    let defaults = session_defaults::resolve(
+        params.defaults,
+        &read_prefs(&params.storage),
+        &restored.meta,
+        restored.history.messages.is_empty(),
+        &recorded_model,
+    );
     let replay_history = Arc::clone(&restored.history.messages);
     let history_snapshot = restored.history;
     let (handle, root_target) = spawn_session_with_history(
@@ -475,12 +478,7 @@ async fn load_session(
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
             yolo,
-            defaults: {
-                let mut d = params.defaults;
-                d.workflow |= workflow;
-                d.fast |= fast;
-                d
-            },
+            defaults,
             project_config,
             permissions,
         },
@@ -490,7 +488,7 @@ async fn load_session(
         &restored.usage,
         &mut restored.by_model,
         &recorded_model,
-        fast,
+        defaults.fast,
     );
     let snapshot = install_session(
         srv,
@@ -502,9 +500,7 @@ async fn load_session(
             root_target,
             initial_cost: restored_cost,
             cwd: session_cwd.clone(),
-            fast,
-            workflow,
-            thinking,
+            defaults,
             persisted_options: &restored.meta.session_options,
         },
     )
@@ -758,18 +754,16 @@ async fn install_session_with_lock(
         current_model,
         initial_cost,
         cwd,
-        fast,
-        workflow,
-        thinking,
+        defaults,
         persisted_options,
     } = session;
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
         Arc::from(current_model.as_str()),
         srv.catalog.snapshot(),
         handle.permissions.is_yolo(),
-        fast,
-        workflow,
-        thinking,
+        defaults.fast,
+        defaults.workflow,
+        defaults.thinking.into(),
     );
     let lock = match lock_session(handle.session_id.id()) {
         Ok(lock) => lock,
@@ -2953,9 +2947,7 @@ mod tests {
                     current_model: OFFLINE_SPEC.to_owned(),
                     initial_cost: None,
                     cwd: cwd.path().to_path_buf(),
-                    fast: false,
-                    workflow: false,
-                    thinking: maki_agent::ThinkingConfig::Off,
+                    defaults: SessionDefaults::default(),
                     persisted_options: &persisted_options,
                 },
             )
@@ -3024,9 +3016,7 @@ mod tests {
                     current_model: OFFLINE_SPEC.to_owned(),
                     initial_cost: None,
                     cwd: cwd.path().to_path_buf(),
-                    fast: false,
-                    workflow: false,
-                    thinking: maki_agent::ThinkingConfig::Off,
+                    defaults: SessionDefaults::default(),
                     persisted_options: &persisted_options,
                 },
                 |_| Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),

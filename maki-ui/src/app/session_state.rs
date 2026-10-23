@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
-use maki_agent::{AgentMode, ModeRegistry, RunSettings};
+use maki_agent::session_defaults;
+use maki_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::{Provider, adjust_model};
-use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
+use maki_providers::{Model, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
 
@@ -135,9 +136,9 @@ impl SessionState {
         }
     }
 
-    /// The configuration the agent is seeded with, read from the session being
-    /// resumed. The app shows it until the agent answers, then the agent's
-    /// committed config.
+    /// The configuration the agent is seeded with: the session being resumed,
+    /// or {defaults} for a blank one. The app shows it until the agent
+    /// answers, then the agent's committed config.
     pub fn starting_config(
         &self,
         provider: Arc<dyn Provider>,
@@ -145,16 +146,23 @@ impl SessionState {
         cwd: PathBuf,
         registry: &ModeRegistry,
         storage: &StateDir,
+        defaults: SessionDefaults,
     ) -> EffectiveAgentConfig {
         let mode = self.agent_mode();
-        let meta = &self.session.meta;
+        let settings = session_defaults::resolve(
+            defaults,
+            &read_prefs(storage),
+            &self.session.meta,
+            self.session.messages().is_empty(),
+            model,
+        );
         EffectiveAgentConfig::new(
             RunSettings {
                 provider,
                 model: model.clone(),
-                thinking: resolve_thinking(&self.session, model, storage),
-                fast: meta.fast && model.supports_fast(),
-                workflow: meta.workflow,
+                thinking: settings.thinking.into(),
+                fast: settings.fast,
+                workflow: settings.workflow,
             },
             mode.clone(),
         )
@@ -234,20 +242,6 @@ fn stored_mode(mode: &Option<StoredMode>) -> Mode {
     }
 }
 
-/// The thinking a session starts on: its own saved value, else the global
-/// default, and off outright when the model cannot think. The coordinator owns
-/// thinking once a session is registered, so this is read both to seed the
-/// option and to seed the state the option is mirrored into.
-pub fn resolve_thinking(session: &AppSession, model: &Model, storage: &StateDir) -> ThinkingConfig {
-    session
-        .meta
-        .thinking
-        .or_else(|| read_prefs(storage).default_thinking)
-        .map(Into::into)
-        .filter(|_| model.supports_thinking())
-        .unwrap_or_default()
-}
-
 impl From<Mode> for StoredMode {
     fn from(mode: Mode) -> Self {
         match mode {
@@ -320,8 +314,7 @@ mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
     use maki_providers::model::FastSupport;
-    use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
-    use maki_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
+    use maki_providers::{FastPricing, ModelPricing};
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -424,6 +417,7 @@ mod tests {
             tmp.path().to_path_buf(),
             &ModeRegistry::builtin(),
             &storage,
+            SessionDefaults::default(),
         );
         assert_eq!(seeded.fast, fast_rates);
     }
@@ -535,84 +529,11 @@ mod tests {
     fn from_session_applies_provider_adjust_model() {
         // SAFETY: this test runs single-threaded; no other thread reads the env.
         unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
-        session.meta.thinking = Some(StoredThinking::Adaptive);
         let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
         assert!(
             model.supports_thinking(),
             "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
-        );
-        assert_eq!(
-            resolve_thinking(&session, &model, &storage),
-            ThinkingConfig::Adaptive,
-            "resumed thinking config should be preserved when the model supports it",
-        );
-    }
-
-    fn with_prefs(prefs: &Prefs) -> (tempfile::TempDir, StateDir) {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        write_prefs(&storage, prefs).unwrap();
-        (tmp, storage)
-    }
-
-    fn prefs_high() -> Prefs {
-        Prefs {
-            default_thinking: Some(StoredThinking::Effort {
-                level: Effort::High,
-            }),
-        }
-    }
-
-    #[test]
-    fn new_session_uses_pref_thinking_default() {
-        let (_tmp, storage) = with_prefs(&prefs_high());
-        let mut session = AppSession::new("test-model", "/tmp");
-        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
-        assert_eq!(
-            resolve_thinking(&session, &model, &storage),
-            ThinkingConfig::Effort(Effort::High)
-        );
-    }
-
-    #[test]
-    fn explicit_session_thinking_beats_pref() {
-        let (_tmp, storage) = with_prefs(&prefs_high());
-        let mut session = AppSession::new("test-model", "/tmp");
-        session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
-        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
-        assert_eq!(
-            resolve_thinking(&session, &model, &storage),
-            ThinkingConfig::Budget(4096)
-        );
-    }
-
-    #[test]
-    fn pref_thinking_ignored_when_model_unsupported() {
-        let (_tmp, storage) = with_prefs(&prefs_high());
-        let model = Model {
-            thinking_override: Some(ThinkingSupport::No),
-            ..test_model()
-        };
-        let mut session = AppSession::new("test-model", "/tmp");
-        let model = resumed_model(&mut session, &model, &ModelPolicy::default());
-        assert_eq!(
-            resolve_thinking(&session, &model, &storage),
-            ThinkingConfig::Off
-        );
-    }
-
-    #[test]
-    fn new_session_without_pref_stays_off() {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new("test-model", "/tmp");
-        let model = resumed_model(&mut session, &test_model(), &ModelPolicy::default());
-        assert_eq!(
-            resolve_thinking(&session, &model, &storage),
-            ThinkingConfig::Off
         );
     }
 }

@@ -47,8 +47,7 @@ use maki_agent::{
 };
 use maki_commands::{BuiltinOperation, CommandError, HostResponse};
 use maki_config::project::TrustQuestion;
-use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
-use maki_domain::ThinkingConfig as DomainThinkingConfig;
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults, UiConfig};
 use maki_lua::orchestration::{
     AgentOrchestration, ConfigMutationReserver, DURABLE_CONFIG_UNAVAILABLE, Discovery,
     ModelCatalog, OrchestrationServices, TrustedTarget,
@@ -169,6 +168,7 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub session_defaults: SessionDefaults,
     pub project_config: ProjectConfig,
     pub trust_question: Option<TrustQuestion>,
     pub startup_notice: Option<String>,
@@ -1241,6 +1241,7 @@ struct SpawnCtx {
     catalog: ModelCatalog,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
+    session_defaults: SessionDefaults,
     system_prompt: SystemPromptOverride,
     command_runtime: Arc<CommandRuntime>,
     trust_question: Option<TrustQuestion>,
@@ -1259,7 +1260,7 @@ fn prepare_coordinator(
     available_models: Vec<Arc<str>>,
     handles: &PreparedAgentHandles,
     permissions: &Arc<PermissionManager>,
-    thinking: DomainThinkingConfig,
+    config: &maki_agent::EffectiveAgentConfig,
 ) -> Result<PreparedSessionCoordinator> {
     let mailbox = handles
         .mailbox()
@@ -1269,9 +1270,9 @@ fn prepare_coordinator(
         Arc::from(model_spec.as_str()),
         available_models,
         permissions.is_yolo(),
-        session.meta.fast,
-        session.meta.workflow,
-        thinking,
+        config.fast,
+        config.workflow,
+        config.thinking,
     );
     PreparedSessionCoordinator::new(SessionCoordinatorParams {
         session_id: session.id,
@@ -1425,8 +1426,10 @@ impl SpawnCtx {
                 cwd.clone(),
                 &self.lua_event_handle.mode_registry(),
                 &self.storage,
+                self.session_defaults,
             )
         });
+        let coordinator_config = config.clone();
         let mut app = App::prepare(
             config.clone(),
             session.clone(),
@@ -1472,7 +1475,7 @@ impl SpawnCtx {
             self.catalog.snapshot(),
             &handles,
             &permissions,
-            crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
+            &coordinator_config,
         )?;
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
@@ -1718,6 +1721,7 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            session_defaults,
             project_config,
             trust_question,
             startup_notice,
@@ -1802,6 +1806,7 @@ impl<'t> EventLoop<'t> {
             catalog,
             storage_writer,
             model_policy,
+            session_defaults,
             system_prompt: SystemPromptOverride {
                 override_text: system_prompt_override,
                 append_text: append_system_prompt,
@@ -4733,6 +4738,7 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_domain::ThinkingConfig as DomainThinkingConfig;
     use maki_storage::checkpoint::ClaimingWriter;
 
     /// Projects every pending config commit the way the event loop's tick does,
@@ -5952,6 +5958,7 @@ mod tests {
                 catalog,
                 storage_writer,
                 model_policy: Arc::new(ModelPolicy::default()),
+                session_defaults: SessionDefaults::default(),
                 system_prompt: SystemPromptOverride::default(),
                 command_runtime,
                 trust_question: None,
