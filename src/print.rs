@@ -318,6 +318,7 @@ fn start_print_session(
     session_options: SessionOptionCatalog,
     lua_handle: &EventHandle,
     registry: &CommandRegistry,
+    discover: impl FnOnce(&ModelCatalog, String) -> Discovery,
 ) -> Result<PrintSession> {
     let catalog = ModelCatalog::offline(&params.model_policy);
     let active_provider = params.model.provider.to_string();
@@ -358,7 +359,7 @@ fn start_print_session(
         coordinator.clone(),
     ));
     catalog.attach(&orchestration);
-    let discovery = catalog.discover(model_policy, active_provider, |_| {});
+    let discovery = discover(&catalog, active_provider);
     smol::block_on(discovery.wait_active(ACTIVE_DISCOVERY_BOUND));
     let commands = registry.bind_target(
         session_capabilities(),
@@ -536,6 +537,7 @@ pub fn run(
             session_options,
             &lua_handle,
             &command_registry,
+            |catalog, active| catalog.discover(Arc::clone(&model_policy), active, |_| {}),
         )?;
 
         with_print_session(session, |session| {
@@ -778,8 +780,8 @@ mod tests {
     use maki_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use maki_providers::{
         ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
-        provider::{BoxFuture, Provider},
+        StreamResponse, TokenUsage, model_registry,
+        provider::{BoxFuture, ModelBatch, Provider},
     };
     use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::borrow::Cow;
@@ -804,7 +806,6 @@ mod tests {
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
     const DISCOVERY_PROVIDER: &str = "mistral";
-    const DISCOVERY_KEY: &str = "print-discovery-key";
     const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
     const DISCOVERED_WINDOW: u32 = 777_000;
     const MODELS_COMMAND: &str = "/print_models";
@@ -1059,6 +1060,7 @@ mod tests {
             Default::default(),
             &EventHandle::disconnected_for_test(),
             &CommandRegistry::new(),
+            |_, _| Discovery::idle(),
         )
         .unwrap();
         smol::block_on(session.handle.input_tx.admit(input(message))).unwrap();
@@ -1355,47 +1357,6 @@ mod tests {
     #[test]
     fn print_root_starts_on_its_discovered_provider() {
         let state = tempfile::tempdir().unwrap();
-        maki_storage::paths::init_at(state.path().to_path_buf()).unwrap();
-        std::fs::write(state.path().join("models-dev-catalog.json"), "{}").unwrap();
-        let listener =
-            smol::Async::new(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).unwrap();
-        let mut providers = maki_config::providers::ProvidersConfig::default();
-        providers.upsert(
-            DISCOVERY_PROVIDER.into(),
-            maki_config::providers::ProviderDef {
-                api_key: Some(DISCOVERY_KEY.into()),
-                base_url: Some(format!(
-                    "http://{}",
-                    listener.get_ref().local_addr().unwrap()
-                )),
-                ..Default::default()
-            },
-        );
-        providers.save().unwrap();
-        let _server = smol::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0];
-            while !request.ends_with(b"\r\n\r\n") {
-                futures_lite::AsyncReadExt::read_exact(&mut stream, &mut byte)
-                    .await
-                    .unwrap();
-                request.push(byte[0]);
-            }
-            let body = serde_json::json!({ "data": [{
-                "id": DISCOVERY_MODEL_ID,
-                "max_context_length": DISCOVERED_WINDOW,
-                "capabilities": { "completion_chat": true },
-            }] })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            futures_lite::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
-                .await
-                .unwrap();
-        });
         let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
         let registry = CommandRegistry::new();
         let (ui, notices) = maki_lua::test_support::RecordingUi::new();
@@ -1441,6 +1402,26 @@ mod tests {
             lua_handle.session_option_catalog(),
             &lua_handle,
             &registry,
+            |catalog, active| {
+                catalog.discover_from(
+                    async move |mut on_ready| {
+                        model_registry::set_known_models(
+                            DISCOVERY_PROVIDER,
+                            vec![ModelInfo {
+                                context_window: Some(DISCOVERED_WINDOW),
+                                ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+                            }],
+                        );
+                        on_ready(ModelBatch {
+                            provider: Some(DISCOVERY_PROVIDER),
+                            models: vec![spec],
+                            warnings: Vec::new(),
+                        });
+                    },
+                    active,
+                    |_| {},
+                )
+            },
         )
         .unwrap();
 
@@ -1642,6 +1623,7 @@ mod tests {
             lua_handle.session_option_catalog(),
             &lua_handle,
             &registry,
+            |_, _| Discovery::idle(),
         )
         .unwrap();
         let manager = session.handle.manager.clone();
@@ -1806,6 +1788,7 @@ mod tests {
             Default::default(),
             &EventHandle::disconnected_for_test(),
             registry,
+            |_, _| Discovery::idle(),
         )
         .unwrap();
         with_print_session(session, |session| {

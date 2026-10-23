@@ -6,7 +6,7 @@ use arc_swap::ArcSwapOption;
 use maki_agent::actor::ConfigChange;
 use maki_agent::session_coordinator::{SessionCoordinatorHandle, publication_claim};
 use maki_config::ModelPolicy;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::provider::{ModelBatch, available_model_specs, fetch_all_models};
 use tracing::warn;
 
 use super::{AgentOrchestration, commit_config_change};
@@ -85,25 +85,42 @@ impl ModelCatalog {
         attached.push(Arc::downgrade(orchestration));
     }
 
-    /// Discovers every provider's models; {applied} gets each batch's
-    /// warnings once the batch is in the catalog. Refreshes run one batch at
-    /// a time and stop with the discovery. {active} names the provider
-    /// [`Discovery::wait_active`] waits for.
+    /// Discovers every provider's models; see [`Self::discover_from`].
     pub fn discover(
         &self,
         policy: Arc<ModelPolicy>,
         active: String,
-        mut applied: impl FnMut(Vec<String>) + Send + 'static,
+        applied: impl FnMut(Vec<String>) + Send + 'static,
     ) -> Discovery {
+        self.discover_from(
+            async move |on_ready| fetch_all_models(&policy, on_ready).await,
+            active,
+            applied,
+        )
+    }
+
+    /// Applies each batch {fetch} lists; {applied} gets each batch's
+    /// warnings once the batch is in the catalog. Refreshes run one batch at
+    /// a time and stop with the discovery. {active} names the provider
+    /// [`Discovery::wait_active`] waits for.
+    pub fn discover_from<F>(
+        &self,
+        fetch: impl FnOnce(Box<dyn FnMut(ModelBatch) + Send>) -> F + Send + 'static,
+        active: String,
+        mut applied: impl FnMut(Vec<String>) + Send + 'static,
+    ) -> Discovery
+    where
+        F: Future<Output = ()> + Send,
+    {
         let catalog = self.clone();
         let (ready, active_rx) = flume::bounded::<()>(0);
         let task = smol::spawn(async move {
             let (landed, refreshes) = flume::unbounded();
-            let fetch = fetch_all_models(&policy, move |batch| {
+            let fetch = fetch(Box::new(move |batch| {
                 let active = batch.provider == Some(active.as_str());
                 let _ = landed.send((catalog.apply(batch.models), active));
                 applied(batch.warnings);
-            });
+            }));
             let mut ready = Some(ready);
             let refresh = async {
                 while let Ok((refresh, active)) = refreshes.recv_async().await {
