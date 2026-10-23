@@ -544,7 +544,7 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> PreparedApp {
-        let mut state = SessionState::from_session(session, &config.model, &storage, &model_policy);
+        let mut state = SessionState::from_session(session, &config.model, &model_policy);
         state.adopt(&config);
         permissions.load_session_rules(session_state::stored_to_rules(
             &state.session.meta.session_rules,
@@ -685,20 +685,16 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        let config = session_state::SessionState::from_session(
-            session.clone(),
-            model,
-            &storage,
-            &model_policy,
-        )
-        .starting_config(
-            Arc::new(DetachedProvider),
-            model,
-            PathBuf::from(&session.cwd),
-            &lua_event_handle.mode_registry(),
-            &storage,
-            maki_config::SessionDefaults::default(),
-        );
+        let config =
+            session_state::SessionState::from_session(session.clone(), model, &model_policy)
+                .starting_config(
+                    Arc::new(DetachedProvider),
+                    model,
+                    PathBuf::from(&session.cwd),
+                    &lua_event_handle.mode_registry(),
+                    &storage,
+                    maki_config::SessionDefaults::default(),
+                );
         Self::prepare(
             config,
             session,
@@ -2677,6 +2673,9 @@ impl App {
     /// Without a coordinator there is nothing to await, so it applies at once.
     fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
         if self.coordinator.is_none() {
+            if id == maki_agent::session_options::YOLO_OPTION_ID {
+                self.permissions.set_yolo(!current);
+            }
             self.apply_toggled_option(id, !current);
             return Vec::new();
         }
@@ -2684,12 +2683,12 @@ impl App {
     }
 
     /// The app-side half of a toggle, run once the coordinator has committed
-    /// it (or immediately when there is no coordinator).
+    /// it (or immediately when there is no coordinator); the commit itself
+    /// already projected YOLO onto the permissions.
     pub(crate) fn apply_toggled_option(&mut self, id: &str, enabled: bool) {
         use maki_agent::session_options::YOLO_OPTION_ID;
         let message = match id {
             YOLO_OPTION_ID => {
-                self.permissions.set_yolo(enabled);
                 if enabled {
                     "YOLO mode enabled"
                 } else {

@@ -50,7 +50,7 @@ use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults, UiConfig};
 use maki_lua::orchestration::{
     AgentOrchestration, ConfigMutationReserver, DURABLE_CONFIG_UNAVAILABLE, Discovery,
-    ModelCatalog, OrchestrationServices, TrustedTarget,
+    ModelCatalog, OrchestrationServices, TrustedTarget, project_yolo,
 };
 use maki_lua::session_snapshot::{
     STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot, SessionSnapshot,
@@ -591,26 +591,6 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
     }
 }
 
-/// Projects the parts of a committed option snapshot that are not agent config.
-/// Thinking, fast and workflow are actor config and are written by
-/// `project_root_mode` alone; YOLO is permission state, which has no actor
-/// home.
-fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
-    for option in snapshot.options.iter() {
-        if option.definition.id.as_ref() == YOLO_OPTION_ID {
-            let enabled = option.current_value.as_ref() == ENABLED_VALUE;
-            if app.permissions.is_yolo() != enabled {
-                app.permissions.set_yolo(enabled);
-            }
-        }
-    }
-}
-
-fn project_committed_options(runtime: &mut SessionRuntime) {
-    let snapshot = runtime.coordinator.read().options();
-    project_committed_options_for_app(&mut runtime.app, &snapshot);
-}
-
 /// Commits mode `id` on `target` and reports it as one session op.
 fn dispatch_mode_commit(
     runtime: &SessionRuntime,
@@ -674,6 +654,7 @@ fn observe_config_commits(
         let timeouts = handles.orchestration_template.timeouts;
         let cwd = handles.cwd_slot();
         let permissions = Arc::clone(&handles.orchestration_template.permissions);
+        project_yolo(&coordinator, Arc::clone(&permissions));
         let binding = target.map_err(ConfigChangeError::from).and_then(|target| {
             coordinator.bind_actor(
                 target,
@@ -734,7 +715,6 @@ fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsS
 }
 
 fn checkpoint_runtime(runtime: &mut SessionRuntime) {
-    project_committed_options(runtime);
     if !runtime.lock_lost {
         runtime.app.checkpoint();
     }
@@ -887,7 +867,7 @@ impl PreparedSessionRuntime {
                 return Err(error);
             }
         };
-        let mut runtime = SessionRuntime {
+        Ok(SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config: None,
@@ -904,9 +884,7 @@ impl PreparedSessionRuntime {
             lock_lost: false,
             restore_pending: resumed,
             pending_approval: None,
-        };
-        project_committed_options(&mut runtime);
-        Ok(runtime)
+        })
     }
 
     fn activate_replacing(
@@ -964,7 +942,7 @@ impl PreparedSessionRuntime {
                 return Err((error, session_lock));
             }
         };
-        let mut runtime = SessionRuntime {
+        Ok(SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config: None,
@@ -981,9 +959,7 @@ impl PreparedSessionRuntime {
             lock_lost: false,
             restore_pending: resumed,
             pending_approval: None,
-        };
-        project_committed_options(&mut runtime);
-        Ok(runtime)
+        })
     }
 }
 
@@ -1409,12 +1385,7 @@ impl SpawnCtx {
         // seeded with. `effective_config` only carries a caller's explicit
         // override; everything else comes from the session being resumed.
         let config = effective_config.unwrap_or_else(|| {
-            let state = SessionState::from_session(
-                session.clone(),
-                &model,
-                &self.storage,
-                &self.model_policy,
-            );
+            let state = SessionState::from_session(session.clone(), &model, &self.model_policy);
             let provider = Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>;
             state.starting_config(
                 provider,
@@ -4285,7 +4256,6 @@ impl<'t> EventLoop<'t> {
             match settled_lock {
                 LockSettlement::Held(lease) => {
                     let snapshot = coordinator.read().options();
-                    project_committed_options_for_app(&mut app, &snapshot);
                     if !lock_lost {
                         app.checkpoint_now();
                     }
@@ -6794,7 +6764,6 @@ mod tests {
             wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
         });
 
-        project_committed_options(&mut runtime);
         drain_config_commits(&mut runtime);
 
         assert!(runtime.app.permissions.is_yolo());

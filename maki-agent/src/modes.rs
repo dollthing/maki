@@ -3,11 +3,12 @@
 //! ACP all share one `Arc<ModeRegistry>`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use maki_storage::StateDir;
 use maki_storage::plans::new_plan_path;
+use maki_storage::sessions::{SessionMeta, StoredMode};
 
 use crate::AgentMode;
 use crate::prompt::PLAN_PROMPT;
@@ -144,6 +145,36 @@ pub fn resolve(
         ModeId::Custom(_) => AgentMode::Custom(def.id.clone()),
     };
     Ok((mode, def))
+}
+
+/// The mode key a session was saved in and its plan file while that still
+/// exists; `None` for build.
+pub fn saved(meta: &SessionMeta) -> Option<(&str, Option<&Path>)> {
+    let key = match &meta.mode {
+        Some(StoredMode::Plan) => ModeId::Plan.key(),
+        Some(StoredMode::Custom(name)) => name.as_str(),
+        Some(StoredMode::Build) | None => return None,
+    };
+    let plan = meta
+        .plan_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.exists());
+    Some((key, plan))
+}
+
+/// The mode a saved session resumes in, through [`resolve`]: a missing custom
+/// mode is an error the caller answers by starting in build mode.
+pub fn restored(
+    registry: &ModeRegistry,
+    meta: &SessionMeta,
+    state_dir: &StateDir,
+) -> Result<(AgentMode, ModeDef), ModeError> {
+    let Some((key, plan)) = saved(meta) else {
+        return Ok((AgentMode::Build, registry.current(&AgentMode::Build)));
+    };
+    let current = plan.map_or(AgentMode::Build, |plan| AgentMode::Plan(plan.to_path_buf()));
+    resolve(registry, key, &current, state_dir)
 }
 
 /// Shared, thread-safe store of mode definitions.

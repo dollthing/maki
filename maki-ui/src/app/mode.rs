@@ -5,8 +5,6 @@ use std::sync::Arc;
 use crate::agent::QueuedMessage;
 use crate::theme;
 use maki_agent::{AgentInput, AgentMode, ModeDef, ModeId, ModeRegistry};
-use maki_storage::plans;
-use maki_storage::{StateDir, StorageError};
 use ratatui::style::{Color, Modifier, Style};
 
 use super::{App, ModelPickerPurpose};
@@ -119,13 +117,6 @@ impl PlanState {
 
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
-    }
-
-    pub(crate) fn allocate_path(&mut self, storage: &StateDir) -> Result<(), StorageError> {
-        if matches!(self, Self::None) {
-            *self = Self::Drafting(plans::new_plan_path(storage)?);
-        }
-        Ok(())
     }
 }
 

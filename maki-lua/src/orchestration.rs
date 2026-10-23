@@ -13,7 +13,7 @@ use maki_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use maki_agent::session_options::YOLO_OPTION_ID;
-use maki_agent::{AgentRef, ModeId, ModeRegistry, tools::ToolContext};
+use maki_agent::{AgentRef, ModeRegistry, modes, tools::ToolContext};
 use maki_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, ResolutionError, TargetHandle,
@@ -21,12 +21,11 @@ use maki_commands::{
 use maki_providers::Message;
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use maki_storage::sessions::{HistorySnapshot, SessionMeta, StoredMode, StoredSubagent};
+use maki_storage::sessions::{HistorySnapshot, SessionMeta, StoredSubagent};
 use mlua::{Function, Lua, RegistryKey};
 use std::{
     collections::HashMap,
     future::Future,
-    path::Path,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -450,11 +449,16 @@ pub async fn bind_frontend_root(
         .map_err(|error| error.to_string())
 }
 
-/// Keeps {permissions}' YOLO state on {coordinator}'s committed option.
+/// Keeps {permissions}' YOLO state on {coordinator}'s committed option,
+/// inside the commit. An unchanged value leaves a session that never chose
+/// YOLO on its seed.
 pub fn project_yolo(coordinator: &SessionCoordinatorHandle, permissions: Arc<PermissionManager>) {
-    coordinator
-        .read()
-        .project_options(move |options| permissions.set_yolo(options.enabled(YOLO_OPTION_ID)));
+    coordinator.read().project_options(move |options| {
+        let enabled = options.enabled(YOLO_OPTION_ID);
+        if permissions.is_yolo() != enabled {
+            permissions.set_yolo(enabled);
+        }
+    });
 }
 
 /// The orchestration a non-UI frontend binds to its root graph: the root's
@@ -563,16 +567,9 @@ pub async fn restore_mode(
     meta: &SessionMeta,
     state_dir: &StateDir,
 ) -> Result<(), ConfigChangeError> {
-    let key = match &meta.mode {
-        Some(StoredMode::Plan) => ModeId::Plan.key(),
-        Some(StoredMode::Custom(name)) => name.as_str(),
-        Some(StoredMode::Build) | None => return Ok(()),
+    let Some((key, saved_plan)) = modes::saved(meta) else {
+        return Ok(());
     };
-    let saved_plan = meta
-        .plan_path
-        .as_deref()
-        .map(Path::new)
-        .filter(|path| path.exists());
     reserve_config_change(services, target)?
         .commit_mode(
             target,

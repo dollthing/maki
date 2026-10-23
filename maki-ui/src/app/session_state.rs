@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
-use maki_agent::session_defaults;
 use maki_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
+use maki_agent::{modes, session_defaults};
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::{Provider, adjust_model};
 use maki_providers::{Model, Timeouts, TokenUsage, settle_session};
@@ -62,22 +62,19 @@ pub(crate) struct SessionState {
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
-const PLAN_PATH_FAILED_WARNING: &str = "Could not create a plan file, resumed in build mode";
+const MODE_RESTORE_FAILED_WARNING: &str = "Could not restore the saved mode, resumed in build mode";
 
 impl SessionState {
     pub fn from_session(
         mut session: AppSession,
         fallback_model: &Model,
-        storage: &StateDir,
         model_policy: &ModelPolicy,
     ) -> Self {
         let model = resumed_model(&mut session, fallback_model, model_policy);
 
-        let mode = stored_mode(&session.meta.mode);
-
         let mut warnings = Vec::new();
 
-        let mut plan = match &session.meta.plan_path {
+        let plan = match &session.meta.plan_path {
             Some(p) if Path::new(p).exists() => {
                 if session.meta.plan_written {
                     PlanState::Ready(PathBuf::from(p))
@@ -91,13 +88,6 @@ impl SessionState {
             }
             None => PlanState::None,
         };
-
-        if mode == Mode::Plan
-            && let Err(error) = plan.allocate_path(storage)
-        {
-            warnings.push(format!("{PLAN_PATH_FAILED_WARNING}: {error}"));
-            session.meta.mode = Some(StoredMode::Build);
-        }
 
         let fast_pending = session.meta.fast && !model.supports_fast() && model.fast_pending();
         let token_usage = session.token_usage;
@@ -120,22 +110,6 @@ impl SessionState {
         Arc::make_mut(&mut self.session)
     }
 
-    /// The mode the session was saved in, carrying the plan path plan mode
-    /// writes to.
-    fn agent_mode(&self) -> AgentMode {
-        match stored_mode(&self.session.meta.mode) {
-            Mode::Plan => match self.plan.path() {
-                Some(path) => AgentMode::Plan(path.to_path_buf()),
-                None => {
-                    debug_assert!(false, "plan mode without a path");
-                    AgentMode::Build
-                }
-            },
-            Mode::Build => AgentMode::Build,
-            Mode::Custom(name) => AgentMode::Custom(maki_agent::ModeId::Custom(name)),
-        }
-    }
-
     /// The configuration the agent is seeded with: the session being resumed,
     /// or {defaults} for a blank one. The app shows it until the agent
     /// answers, then the agent's committed config.
@@ -148,7 +122,12 @@ impl SessionState {
         storage: &StateDir,
         defaults: SessionDefaults,
     ) -> EffectiveAgentConfig {
-        let mode = self.agent_mode();
+        let build = AgentMode::Build;
+        let (mode, mode_def) = modes::restored(registry, &self.session.meta, storage)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "resuming in build mode");
+                (build.clone(), registry.current(&build))
+            });
         let settings = session_defaults::resolve(
             defaults,
             &read_prefs(storage),
@@ -164,14 +143,19 @@ impl SessionState {
                 fast: settings.fast,
                 workflow: settings.workflow,
             },
-            mode.clone(),
+            mode,
         )
-        .with_mode_def(registry.get(&mode.id()))
+        .with_mode_def(Some(mode_def))
         .with_context(AgentContextSnapshot::new(cwd))
     }
 
-    /// Adopts the plan path of the config the agent was seeded with.
+    /// Adopts the plan path of the config the agent was seeded with, and
+    /// says so when the saved mode could not be restored.
     pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
+        if config.mode == AgentMode::Build && modes::saved(&self.session.meta).is_some() {
+            self.warnings.push(MODE_RESTORE_FAILED_WARNING.into());
+            self.session_mut().meta.mode = Some(StoredMode::Build);
+        }
         if let Some(path) = config.mode.plan_path()
             && self.plan.path() != Some(path)
         {
@@ -231,14 +215,6 @@ fn resumed_model(
                 fallback_model.clone()
             }
         }
-    }
-}
-
-fn stored_mode(mode: &Option<StoredMode>) -> Mode {
-    match mode {
-        Some(StoredMode::Plan) => Mode::Plan,
-        Some(StoredMode::Custom(name)) => Mode::Custom(name.as_str().into()),
-        _ => Mode::Build,
     }
 }
 
@@ -332,9 +308,7 @@ mod tests {
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
-        let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        SessionState::from_session(session, model, &storage, &ModelPolicy::default())
+        SessionState::from_session(session, model, &ModelPolicy::default())
     }
 
     /// An old session: counters, no per-model breakdown.
@@ -401,7 +375,7 @@ mod tests {
         });
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let state = SessionState::from_session(session, &model, &storage, &ModelPolicy::default());
+        let state = SessionState::from_session(session, &model, &ModelPolicy::default());
         assert_eq!(state.fast_pending, pending);
         assert_eq!(
             state.cost,
@@ -444,29 +418,48 @@ mod tests {
         assert!(!state.fast_pending);
     }
 
+    const MISSING_CUSTOM_MODE: &str = "review";
+
+    /// Resumes {session} the way the event loop does: seed the agent's config,
+    /// then let the app adopt it.
+    fn restore(session: AppSession, storage: &StateDir) -> (SessionState, EffectiveAgentConfig) {
+        let model = test_model();
+        let mut state = SessionState::from_session(session, &model, &ModelPolicy::default());
+        let config = state.starting_config(
+            maki_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
+            &model,
+            std::env::temp_dir(),
+            &ModeRegistry::builtin(),
+            storage,
+            SessionDefaults::default(),
+        );
+        state.adopt(&config);
+        (state, config)
+    }
+
     #[test]
     fn plan_mode_without_path_allocates_path() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let (state, config) = restore(make_plan_session(Some(StoredMode::Plan), None), &storage);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
+        assert_eq!(state.plan.path(), config.mode.plan_path());
     }
 
-    #[test]
-    fn unallocatable_plan_path_resumes_in_build_mode_and_warns() {
+    #[test_case(Some(StoredMode::Plan), true ; "unallocatable_plan_path")]
+    #[test_case(Some(StoredMode::Custom(MISSING_CUSTOM_MODE.into())), false ; "missing_custom_mode")]
+    fn unrestorable_mode_resumes_in_build_mode_and_warns(mode: Option<StoredMode>, blocked: bool) {
         let tmp = tempfile::tempdir().unwrap();
-        let blocked = tmp.path().join("state");
-        std::fs::write(&blocked, "").unwrap();
-        let storage = StateDir::from_path(blocked);
-        let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let dir = tmp.path().join("state");
+        if blocked {
+            std::fs::write(&dir, "").unwrap();
+        }
+        let (state, config) = restore(make_plan_session(mode, None), &StateDir::from_path(dir));
+        assert_eq!(config.mode, AgentMode::Build);
+        assert_eq!(config.mode_def.unwrap().id, maki_agent::ModeId::Build);
         assert!(state.plan.path().is_none());
         assert_eq!(state.session.meta.mode, Some(StoredMode::Build));
-        assert_eq!(state.warnings.len(), 1);
-        assert!(state.warnings[0].starts_with(PLAN_PATH_FAILED_WARNING));
+        assert_eq!(state.warnings, [MODE_RESTORE_FAILED_WARNING]);
     }
 
     #[test]
@@ -475,12 +468,10 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let (state, _) = restore(session, &storage);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
-        assert_eq!(state.warnings.len(), 1);
-        assert_eq!(state.warnings[0], PLAN_FILE_MISSING_WARNING);
+        assert_eq!(state.warnings, [PLAN_FILE_MISSING_WARNING]);
     }
 
     #[test]
@@ -493,8 +484,7 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let (state, _) = restore(session, &storage);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
     }
 
@@ -519,10 +509,9 @@ mod tests {
     fn build_mode_does_not_allocate_path() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let session = make_plan_session(Some(StoredMode::Build), None);
-        let state =
-            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        let (state, _) = restore(make_plan_session(Some(StoredMode::Build), None), &storage);
         assert!(state.plan.path().is_none());
+        assert!(state.warnings.is_empty());
     }
 
     #[test]
