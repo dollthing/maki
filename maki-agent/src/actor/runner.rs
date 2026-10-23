@@ -564,12 +564,15 @@ impl Runner {
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open
-                || state
-                    .processing
-                    .as_ref()
-                    .is_some_and(|processing| processing.cancellation_reason.is_some())
+            if state.lifecycle != ActorLifecycle::Open {
+                return;
+            }
+            if state
+                .processing
+                .as_ref()
+                .is_some_and(|processing| processing.cancellation_reason.is_some())
             {
+                state.emit(ActorEvent::CompactionEnd(CompactionStatus::Cancelled));
                 return;
             }
             state.active = Some(active);
@@ -577,6 +580,7 @@ impl Runner {
         if plain.is_cancelled() {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;
+            state.emit(ActorEvent::CompactionEnd(CompactionStatus::Cancelled));
             return;
         }
         let cancel = plain.clone();

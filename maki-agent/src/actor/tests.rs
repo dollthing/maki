@@ -2055,6 +2055,7 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
         let (popped, release) = handle.pause_after_next_pop();
         handle.push_compact(1, None).unwrap();
 
@@ -2063,6 +2064,12 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         release.send(()).unwrap();
         until(|| handle.snapshot().queued == 0).await;
         assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
+        let ended = loop {
+            if let ActorEvent::CompactionEnd(status) = events.recv_async().await.unwrap() {
+                break status;
+            }
+        };
+        assert_eq!(ended, CompactionStatus::Cancelled);
 
         handle.push_compact(2, None).unwrap();
         handle
