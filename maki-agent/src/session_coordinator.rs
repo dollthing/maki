@@ -701,11 +701,14 @@ impl SessionCoordinatorHandle {
         Ok((binding, ticket))
     }
 
-    /// The option lease, in the bound actor's config FIFO when there is one.
+    /// The option lease, in the bound actor's config FIFO while that actor
+    /// lives.
     async fn reserve_options_in_turn(
         &self,
     ) -> Result<SessionOptionsReservation, ConfigChangeError> {
-        let binding = lock(&self.read.binding).clone();
+        let binding = lock(&self.read.binding)
+            .clone()
+            .filter(|binding| binding.agent.actor().is_ok());
         Ok(match binding {
             Some(binding) => {
                 reserve_in_turn(&binding.agent, || Ok(self.reserve_options()?)).await?
@@ -909,12 +912,14 @@ impl SessionCoordinatorHandle {
         Ok(commit.config.context.cwd().to_path_buf())
     }
 
+    /// Waits its turn like any other option change, so a batch that lands
+    /// while a change holds the lease is applied after it, not dropped.
     pub async fn update_model_values(
         &self,
         specs: Vec<Arc<str>>,
-    ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
+    ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
         self.ensure_live()?;
-        let reservation = self.reserve_options()?;
+        let reservation = self.reserve_options_in_turn().await?;
         let (reply, response) = flume::bounded(1);
         self.tx
             .send(Operation::UpdateModelValues {
@@ -923,10 +928,10 @@ impl SessionCoordinatorHandle {
                 reply,
             })
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        response
+        Ok(response
             .recv_async()
             .await
-            .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))
+            .unwrap_or(Err(SessionCoordinatorError::StaleSession(self.session_id)))?)
     }
 
     fn request_close(&self) -> Result<flume::Receiver<()>, SessionCoordinatorError> {
@@ -3073,6 +3078,31 @@ mod tests {
             agent.close_subtree().unwrap();
             assert!(change.await.is_err());
             assert!(lock(&installed).is_empty());
+        });
+    }
+
+    #[test]
+    fn discovered_models_wait_for_a_held_change_instead_of_being_dropped() {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(false)))
+                    .unwrap();
+            let _agent = bind(&coordinator, Arc::new(Mutex::new(Vec::new())));
+            let lease = coordinator
+                .reserve_transaction(CheckpointPublication::default())
+                .unwrap();
+            let mut update =
+                Box::pin(coordinator.update_model_values(vec![Arc::from(DISCOVERED_MODEL)]));
+            assert!(futures_lite::future::poll_once(&mut update).await.is_none());
+            drop(lease);
+            let snapshot = update.await.unwrap();
+            let definition = snapshot
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .unwrap();
+            assert!(definition.definition.accepts(DISCOVERED_MODEL));
+            coordinator.close().await.unwrap();
         });
     }
 
