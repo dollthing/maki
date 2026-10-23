@@ -413,7 +413,7 @@ mod tests {
             .unwrap();
         let admission = TrustedTarget {
             target: first.clone(),
-            template: maki_agent::tools::cli_tool_ctx(),
+            template: maki_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
         };
         runtime.sync_admissions(HashMap::from([(handle.id(), admission)]));
         if resolved {
@@ -432,7 +432,7 @@ mod tests {
             handle.id(),
             TrustedTarget {
                 target: second.clone(),
-                template: maki_agent::tools::cli_tool_ctx(),
+                template: maki_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
             },
         )]));
         if close {

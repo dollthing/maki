@@ -600,7 +600,7 @@ impl App {
             plan_form: PlanForm::new(),
             plan_form_target: None,
             plan_forms: HashMap::new(),
-            status_bar: StatusBar::new(flash),
+            status_bar: StatusBar::new(flash, config.context.cwd().to_path_buf()),
             status: Status::Idle,
             state,
             seed_config: Arc::new(config),

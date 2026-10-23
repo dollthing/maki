@@ -850,8 +850,8 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
+    cwd: PathBuf,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
@@ -869,9 +869,9 @@ pub fn interpreter_ctx(
         },
         question_mode: QuestionMode::Headless,
         session_id: None,
-        cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd,
         tool_use_id: None,
-        user_response_rx,
+        user_response_rx: None,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
@@ -910,10 +910,9 @@ pub fn interpreter_ctx(
 
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
-pub fn cli_tool_ctx() -> ToolContext {
+pub fn cli_tool_ctx(cwd: PathBuf) -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let project_config = maki_config::ProjectConfig::discover(&cwd);
     interpreter_ctx(
         &AgentMode::Build,
@@ -925,13 +924,13 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            cwd,
+            cwd.clone(),
             project_config,
             Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
-        None,
         Arc::clone(ToolRegistry::global_arc()),
+        cwd,
     )
 }
 
@@ -943,6 +942,7 @@ pub mod test_support {
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+    const TEST_CWD_ERR: &str = "test process has a current directory";
 
     /// Registry and routing tests care about the name and audience only, never
     /// about what the tool returns.
@@ -1063,8 +1063,8 @@ pub mod test_support {
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
             Arc::new(FileReadTracker::new()),
-            None,
             Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
@@ -1102,8 +1102,8 @@ pub mod test_support {
             CancelToken::none(),
             permissions,
             Arc::new(FileReadTracker::new()),
-            None,
             Arc::new(ToolRegistry::new()),
+            env::current_dir().expect(TEST_CWD_ERR),
         );
         ctx.tool_use_id = None;
         ctx
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn cloned_tool_context_shares_published_definitions() {
-        let mut context = cli_tool_ctx();
+        let mut context = cli_tool_ctx(env::current_dir().unwrap());
         context.request_tools = Some(RequestTools::assembled(
             serde_json::json!([{ "name": PINNED_TOOL }]),
             &context.config,

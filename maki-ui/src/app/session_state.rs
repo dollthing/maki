@@ -412,7 +412,7 @@ mod tests {
             })
         );
         let seeded = state.starting_config(
-            maki_agent::tools::cli_tool_ctx().provider,
+            maki_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()).provider,
             &model,
             tmp.path().to_path_buf(),
             &ModeRegistry::builtin(),

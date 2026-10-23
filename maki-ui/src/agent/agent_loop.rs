@@ -160,9 +160,7 @@ impl TuiActorBackend {
             },
         )
         .with_mcp(self.mcp.clone());
-        let mut template = agent.tool_context();
-        template.cwd = (**self.cwd.load()).clone();
-        template
+        agent.tool_context_at((**self.cwd.load()).clone())
     }
 
     /// Build the system prompt, honoring the CLI override and append.

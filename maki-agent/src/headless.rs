@@ -561,9 +561,6 @@ impl ActorBackend for HeadlessBackend {
         let local_tools = Arc::clone(&self.local_tools);
         let mcp = self.mcp.clone();
         Some(Arc::new(move |_, mode, config| {
-            let cwd = config
-                .map(|config| config.context.cwd().to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
             agent::TurnAdmissionSnapshot {
                 mode_def: config
                     .and_then(|config| config.mode_def.clone())
@@ -572,17 +569,20 @@ impl ActorBackend for HeadlessBackend {
                         _ => Some(params.modes.current(mode)),
                     })
                     .map(Arc::new),
-                prompt_inputs: Some(Arc::new(TurnPromptInputs {
-                    instructions: agent::load_instructions(&cwd.to_string_lossy()),
-                    cwd,
-                    mcp_prompt: None,
-                    resolved: None,
-                    ready: Some(ResolvedPromptInputs {
-                        slots: Arc::clone(&params.prompt_slots),
-                        slots_error: None,
-                        mcp_messages: None,
-                    }),
-                })),
+                prompt_inputs: config.map(|config| {
+                    let cwd = config.context.cwd().to_path_buf();
+                    Arc::new(TurnPromptInputs {
+                        instructions: agent::load_instructions(&cwd.to_string_lossy()),
+                        cwd,
+                        mcp_prompt: None,
+                        resolved: None,
+                        ready: Some(ResolvedPromptInputs {
+                            slots: Arc::clone(&params.prompt_slots),
+                            slots_error: None,
+                            mcp_messages: None,
+                        }),
+                    })
+                }),
                 bindings: Arc::new(TurnToolBindings::capture(
                     &params.registry,
                     &local_tools,

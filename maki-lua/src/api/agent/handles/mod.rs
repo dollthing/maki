@@ -265,7 +265,7 @@ mod tests {
             let mut context = stub_ctx(&AgentMode::Build);
             context.workflow = true;
             let mut expected = context.registry.definitions(
-                &maki_agent::template::env_vars(),
+                &maki_agent::template::env_vars_for(&context.cwd),
                 &DescriptionContext {
                     filter: &context.tool_filter,
                     audience: context.audience,

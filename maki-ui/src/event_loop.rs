@@ -145,6 +145,7 @@ pub(crate) struct ShutdownReport {
 }
 
 pub struct EventLoopParams {
+    pub cwd: PathBuf,
     pub model: Model,
     pub needs_login: bool,
     pub explicit_model: bool,
@@ -1699,6 +1700,7 @@ impl<'t> EventLoop<'t> {
         params: EventLoopParams,
     ) -> Result<Self> {
         let EventLoopParams {
+            cwd,
             mut model,
             needs_login,
             explicit_model,
@@ -1755,8 +1757,6 @@ impl<'t> EventLoop<'t> {
             maki_highlight::pool::spawn(crate::highlight::warmup);
             crate::update::spawn_check();
         });
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(

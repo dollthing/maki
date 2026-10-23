@@ -1,4 +1,4 @@
-use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use color_eyre::Result;
@@ -15,6 +15,7 @@ use crate::setup;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    cwd: PathBuf,
     model_arg: Option<String>,
     yolo: bool,
     automode: bool,
@@ -27,7 +28,6 @@ pub fn run(
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let trust = project::resolve(&storage, &cwd, trust_mode);
     load_env_files(&trust.project_config);
 

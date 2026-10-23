@@ -1,6 +1,5 @@
-use std::env;
 use std::io::{self, IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -307,7 +306,7 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
     )
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
@@ -315,8 +314,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
-
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
     let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);
@@ -368,6 +365,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
+            cwd,
             model: stack.model,
             explicit_model,
             config: stack.config.agent,
@@ -391,6 +389,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if cli.print {
         let timeouts = stack.timeouts();
         crate::print::run(
+            cwd,
             &stack.model,
             initial_prompt,
             cli.images,
@@ -437,6 +436,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
+                cwd: cwd.clone(),
                 model,
                 needs_login: stack.needs_login,
                 explicit_model: apply_explicit_model,
@@ -547,7 +547,6 @@ mod tests {
     use color_eyre::eyre::eyre;
     use maki_config::RawConfig;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
 
@@ -750,8 +749,11 @@ mod tests {
     fn print_mode_bare_continue_errors() {
         use clap::Parser;
 
-        let err = run(Cli::parse_from(["makima", "--print", "-c"]))
-            .expect_err("bare -c under --print fails before any stack work");
+        let err = run(
+            Cli::parse_from(["makima", "--print", "-c"]),
+            PathBuf::from(THIS_CWD),
+        )
+        .expect_err("bare -c under --print fails before any stack work");
         assert!(err.to_string().contains(PICKER_NEEDS_TUI_ERR));
     }
 

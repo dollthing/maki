@@ -521,7 +521,7 @@ async fn load_session(
     {
         warn!(%error, "saved mode not restored; the session resumes in build mode");
     }
-    for update in translate::replay_history(&replay_history, &session_cwd, home.as_deref()) {
+    for update in translate::replay_history(&replay_history, Some(&session_cwd), home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
     let mode = committed_mode(srv).await?;
@@ -1908,7 +1908,7 @@ fn start_event_pump(
                 AgentEvent::ThinkingBlockEnd => translate::thinking_block_end(),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    let update = translate::tool_start(&event, &session.cwd().unwrap_or_default(), home.as_deref());
+                    let update = translate::tool_start(&event, session.cwd().as_deref(), home.as_deref());
                     if let Some(raw_input) = &event.raw_input {
                         tool_inputs.insert(event.id.clone(), raw_input.clone());
                     }
@@ -1917,7 +1917,7 @@ fn start_event_pump(
                 AgentEvent::ToolExecutionStart { id } => translate::tool_execution_start(&id),
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => {
-                    translate::tool_done(&event, &session.cwd().unwrap_or_default(), home.as_deref())
+                    translate::tool_done(&event, session.cwd().as_deref(), home.as_deref())
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
@@ -1931,7 +1931,7 @@ fn start_event_pump(
                                 format!("{tool}: {}", scopes.join(", ")),
                                 &tool.to_string(),
                                 raw_input,
-                                &session.cwd().unwrap_or_default(),
+                                session.cwd().as_deref(),
                                 home.as_deref(),
                     ),
                             permissions::permission_options(project_trusted),

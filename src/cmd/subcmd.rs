@@ -548,9 +548,14 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+pub fn models(
+    cwd: &Path,
+    no_plugins: bool,
+    no_jit: bool,
+    refresh: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit, headless())
@@ -606,9 +611,14 @@ pub fn sessions(storage: &StateDir, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+pub fn index(
+    cwd: &Path,
+    path: &str,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
     let mut host =
@@ -642,7 +652,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .tool
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
-    let ctx = maki_agent::tools::cli_tool_ctx();
+    let ctx = maki_agent::tools::cli_tool_ctx(cwd.to_path_buf());
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
@@ -651,11 +661,10 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
+pub fn mcp_auth(cwd: &Path, server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     smol::block_on(async {
-        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, trust_mode);
-        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
+        let trust = project::resolve(storage, cwd, trust_mode);
+        let (config, _) = mcp_config::load_config(cwd, trust.project_config);
         let raw = config
             .mcp
             .get(server)
@@ -689,7 +698,9 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prompt(
+    cwd: &Path,
     variant: &crate::cli::PromptVariant,
     plan: bool,
     tools: bool,
@@ -708,11 +719,10 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    let trust = project::resolve_noninteractive(cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let vars = template::env_vars();
+    let vars = template::env_vars_for(cwd);
     let reg = ToolRegistry::global_arc();
     let mut host = PluginHost::with_jit(Arc::clone(reg), !no_jit, headless())
         .context("initialize lua plugin host")?;

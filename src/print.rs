@@ -54,6 +54,7 @@ use serde_json::Value;
 use crate::command_attachments;
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const UNCOMMITTED_ROOT_ERR: &str = "print root has no committed config";
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -450,6 +451,7 @@ fn operation_result(outcome: Result<String, String>, session_id: &SessionRef) ->
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    cwd: PathBuf,
     model: &Model,
     prompt_arg: Option<String>,
     image_paths: Vec<PathBuf>,
@@ -488,7 +490,6 @@ pub fn run(
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
     let prompt_slots = lua_handle.collect_prompt_slots();
     let session_options = lua_handle.session_option_catalog();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) = maki_agent::mcp::start_with_commands(
             &cwd,
@@ -507,7 +508,6 @@ pub fn run(
 
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
-    let working_dir = cwd.to_string_lossy().into_owned();
     let outcome = (|| {
         let session = start_print_session(
             InteractiveParams {
@@ -554,7 +554,13 @@ pub fn run(
                     smol::block_on(handle.input_tx.admit(input)).map_err(|error| eyre!(error))?;
                     let event_rx = &handle.event_rx;
                     let tool_names = &handle.tool_names;
-                    let cwd = &working_dir;
+                    let config = session
+                        .root
+                        .target
+                        .effective_config()
+                        .map_err(|error| eyre!(error))?
+                        .ok_or_else(|| eyre!(UNCOMMITTED_ROOT_ERR))?;
+                    let cwd = &*config.context.cwd().to_string_lossy();
                     (|| -> Result<_> {
                         let mut verbose_out = match format {
                             OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),

@@ -313,8 +313,7 @@ impl ActorBackend for LuaActorBackend {
             };
             let cwd = config
                 .map(|config| config.context.cwd().to_path_buf())
-                .or_else(|| state.template.get().map(|template| template.cwd.clone()))
-                .unwrap_or_else(|| ".".into());
+                .or_else(|| state.template.get().map(|template| template.cwd.clone()));
             let (resolved, ready) = if let Some(requests) = &state.prompt_requests {
                 let (slot_tx, slot_rx) = flume::bounded(1);
                 let _ = requests.send(Request::CollectPromptSlots { reply: slot_tx });
@@ -344,13 +343,15 @@ impl ActorBackend for LuaActorBackend {
             };
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
-                prompt_inputs: Some(Arc::new(TurnPromptInputs {
-                    cwd,
-                    instructions: Instructions::default(),
-                    mcp_prompt: None,
-                    resolved,
-                    ready,
-                })),
+                prompt_inputs: cwd.map(|cwd| {
+                    Arc::new(TurnPromptInputs {
+                        cwd,
+                        instructions: Instructions::default(),
+                        mcp_prompt: None,
+                        resolved,
+                        ready,
+                    })
+                }),
                 bindings: Arc::new(TurnToolBindings::capture(
                     &params.registry,
                     &state.local_tools,
@@ -746,7 +747,9 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let slots = Arc::clone(&try_pair!(dispatch_ctx(&lua, &ctx, "system_prompt")).prompt_slots);
+    let agent = try_pair!(dispatch_ctx(&lua, &ctx, "system_prompt"));
+    let slots = Arc::clone(&agent.prompt_slots);
+    let vars = env_vars_for(&agent.cwd);
     let invocation = try_pair!(InvocationGuard::capture(&lua));
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
     // meanwhile needs `ctx:finish`, which takes it mutably.
@@ -759,7 +762,6 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
@@ -832,7 +834,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         .excluding(&disabled)
         .excluding(maki_agent::tools::capability_exclusions(model));
 
-    let vars = maki_agent::template::env_vars();
+    let vars = env_vars_for(&agent.cwd);
     let ctx_desc = DescriptionContext {
         filter: &filter,
         audience,
@@ -2526,7 +2528,7 @@ mod tests {
             managed_turn: None,
         };
         let state = Arc::new(LuaActorState {
-            template: OnceLock::new(),
+            template: OnceLock::from(stub_ctx(&AgentMode::Build)),
             params: OnceLock::from(params),
             prompt_requests: None,
             custom_system: String::new(),
@@ -3263,7 +3265,7 @@ mod tests {
             },
         )
         .with_admission(Some(admitted.clone()));
-        let inherited = AgentContext::from(&agent.tool_context());
+        let inherited = AgentContext::from(&agent.tool_context().unwrap());
         assert_eq!(inherited.cwd, directory.path());
         assert!(Arc::ptr_eq(
             &inherited.prompt_slots,

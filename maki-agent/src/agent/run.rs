@@ -35,6 +35,7 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
 const MAX_COMPLETION_RECOVERY_ATTEMPTS: u32 = 2;
 const COMPLETION_RECOVERY_EXHAUSTED: &str =
     "required output recovery exhausted before output was reported";
@@ -682,7 +683,7 @@ impl<'h> Agent<'h> {
         if let Some(names) = &def.tools {
             tools = Cow::Owned(filter_tools(&tools, names));
         }
-        let ctx = self.tool_context();
+        let ctx = self.tool_context()?;
         if let Some(definitions) = tools.to_mut().as_array_mut() {
             definitions.retain(|definition| {
                 definition
@@ -891,7 +892,7 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        let ctx = self.tool_context();
+        let ctx = self.tool_context()?;
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -902,23 +903,21 @@ impl<'h> Agent<'h> {
         .await
     }
 
-    pub fn tool_context(&self) -> ToolContext {
+    /// The working directory comes only from the turn's admission: a turn the
+    /// actor never admitted has no directory to run tools in.
+    pub fn tool_context(&self) -> Result<ToolContext, AgentError> {
         let cwd = self
             .admission
             .as_ref()
             .and_then(|admission| admission.prompt_inputs.as_ref())
             .map(|inputs| inputs.cwd.clone())
-            .or_else(|| {
-                self.session_id
-                    .as_ref()
-                    .and_then(|session| {
-                        crate::session_coordinator::SessionCoordinatorHandle::resolve(session.id())
-                            .ok()
-                    })
-                    .and_then(|coordinator| coordinator.read().cwd())
-            })
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+            .ok_or_else(|| AgentError::Config {
+                message: NO_ADMITTED_CWD_ERR.into(),
+            })?;
+        Ok(self.tool_context_at(cwd))
+    }
+
+    pub fn tool_context_at(&self, cwd: PathBuf) -> ToolContext {
         ToolContext {
             execution_agent_id: Some(self.agent_id),
             provider: Arc::clone(&self.provider),
@@ -1187,6 +1186,8 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
 
+    const TEST_CWD: &str = "/tmp";
+
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
     }
@@ -1399,6 +1400,41 @@ mod tests {
         }
     }
 
+    /// What the actor admits for the next turn in `mode`: its mode, its tool
+    /// bindings and the working directory tools run in.
+    fn admit(agent: &mut Agent<'_>, mode: &AgentMode) {
+        let mode_def = match mode {
+            AgentMode::Custom(id) => agent.modes.get(id),
+            _ => Some(agent.modes.current(mode)),
+        };
+        let prompt_inputs = TurnPromptInputs {
+            cwd: TEST_CWD.into(),
+            instructions: Default::default(),
+            mcp_prompt: None,
+            resolved: None,
+            ready: None,
+        };
+        agent.admission = Some(TurnAdmissionSnapshot {
+            mode_def: mode_def.map(Arc::new),
+            bindings: Arc::new(TurnToolBindings::capture(
+                &agent.registry,
+                &agent.local_tools,
+                agent.mcp.as_ref(),
+            )),
+            prompt_inputs: Some(Arc::new(prompt_inputs)),
+            mcp_startup_notice: None,
+        });
+    }
+
+    async fn run_admitted(
+        agent: &mut Agent<'_>,
+        turn_id: TurnId,
+        input: AgentInput,
+    ) -> TurnOutcome {
+        admit(agent, &input.mode);
+        agent.run(turn_id, input).await
+    }
+
     fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
@@ -1434,7 +1470,7 @@ mod tests {
                 agent = agent.with_cancel(token);
             }
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
             assert_eq!(outcome.turn_id(), turn_id);
             assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), failed);
             assert_eq!(matches!(outcome, TurnOutcome::Cancelled { .. }), cancelled);
@@ -1540,7 +1576,7 @@ mod tests {
             let (agent, events) = make_agent(provider, &mut history);
             drop(events);
             let mut agent = agent.with_turn_inbox(Some(inbox.clone()));
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             assert!(requests.lock().unwrap().is_empty());
             assert!(!*inbox.submitted.lock().unwrap());
@@ -1576,7 +1612,7 @@ mod tests {
             let mut agent = agent.with_turn_inbox(Some(inbox));
             agent.config.max_turns = max_turns;
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
             assert_eq!(outcome.turn_id(), turn_id);
             if max_turns.is_some() {
                 assert!(matches!(outcome, TurnOutcome::Failed { failure, .. }
@@ -1640,7 +1676,7 @@ mod tests {
             );
             let mut agent = agent.with_turn_inbox(Some(Arc::new(PendingCompletionInbox)));
             agent.config.max_turns = Some(1);
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(
                 outcome,
                 TurnOutcome::Completed {
@@ -1712,7 +1748,7 @@ mod tests {
             let inbox = Arc::new(LateReportInbox::new(true));
             let mut agent = agent.with_turn_inbox(Some(Arc::clone(&inbox) as Arc<dyn TurnInbox>));
             agent.config.max_turns = Some(1);
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(
                 outcome,
                 TurnOutcome::Completed {
@@ -1748,7 +1784,7 @@ mod tests {
                 .with_instruction_consumed_callback(Arc::new(move || {
                     *called.lock().unwrap() += 1;
                 }));
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Completed { .. }));
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
@@ -1840,7 +1876,7 @@ mod tests {
                 .with_instruction_consumed_callback(Arc::new(move || {
                     *called.lock().unwrap() += 1;
                 }));
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Completed { .. }));
             assert_eq!(capture.lock().unwrap().is_some(), observation_only);
             assert_eq!(
@@ -1879,7 +1915,7 @@ mod tests {
                 }
             }));
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
             assert_eq!(outcome.turn_id(), turn_id);
             assert_eq!(outcome.num_turns(), 3);
             assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), exhaust);
@@ -1923,7 +1959,7 @@ mod tests {
             let mut agent = agent.with_completion_check(Arc::new(|| Ok(Some(NUDGE.into()))));
             agent.config.max_turns = max_turns;
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
             assert_eq!(outcome.turn_id(), turn_id);
             assert_eq!(outcome.num_turns(), MAX_COMPLETION_RECOVERY_ATTEMPTS + 1);
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
@@ -1981,7 +2017,7 @@ mod tests {
                     DIAGNOSTIC.into()
                 }));
             agent.config.max_turns = max_turns;
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert_eq!(
                 outcome.num_turns(),
                 max_turns.unwrap_or(MAX_COMPLETION_RECOVERY_ATTEMPTS + 1)
@@ -2007,7 +2043,7 @@ mod tests {
                 .with_completion_check(Arc::new(|| {
                     panic!("cancelled turns must not recover output")
                 }));
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             assert_eq!(
@@ -2042,7 +2078,7 @@ mod tests {
                 Ok(Some(NUDGE.into()))
             }));
             agent.config.max_turns = Some(max_turns);
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(
                 &outcome,
                 TurnOutcome::Failed { failure, .. }
@@ -2095,7 +2131,7 @@ mod tests {
                 }
             }));
             agent.config.max_turns = Some(1);
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert_eq!(outcome.num_turns(), 1);
             if fail {
                 assert!(matches!(
@@ -2132,7 +2168,7 @@ mod tests {
         input.workflow = true;
         input.fast = true;
         input.thinking = ThinkingConfig::Budget(8192);
-        smol::block_on(agent.run(TurnId::generate(), input));
+        smol::block_on(run_admitted(&mut agent, TurnId::generate(), input));
         assert!(agent.workflow && agent.opts.fast);
         assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
     }
@@ -2156,8 +2192,8 @@ mod tests {
                         rules: vec![],
                         ..Default::default()
                     },
-                    std::path::PathBuf::from("/tmp"),
-                    maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
+                    PathBuf::from(TEST_CWD),
+                    maki_config::ProjectConfig::for_project(std::path::Path::new(TEST_CWD)),
                     Arc::default(),
                 )),
                 session_id: None,
@@ -2207,17 +2243,13 @@ mod tests {
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
                 &mut history,
             );
-            agent.admission = Some(TurnAdmissionSnapshot {
-                mode_def: None,
-                bindings: Arc::default(),
-                prompt_inputs: None,
-                mcp_startup_notice: Some(2),
-            });
+            admit(&mut agent, &AgentMode::Build);
+            agent.admission.as_mut().unwrap().mcp_startup_notice = Some(2);
 
             agent.run(TurnId::generate(), default_input()).await;
             drop(agent);
 
-            let message = history.as_slice().last().unwrap();
+            let message = history.as_slice().first().unwrap();
             assert_eq!(
                 message.user_text(),
                 Some(
@@ -2250,7 +2282,7 @@ mod tests {
                 observation_source: Some(source.clone()),
                 ..Message::observation(RESULT.into())
             }];
-            agent.run(TurnId::generate(), input).await;
+            run_admitted(&mut agent, TurnId::generate(), input).await;
             drop(agent);
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
@@ -2279,7 +2311,7 @@ mod tests {
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
 
-            agent.run(TurnId::generate(), input).await;
+            run_admitted(&mut agent, TurnId::generate(), input).await;
             drop(agent);
 
             assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
@@ -2334,7 +2366,7 @@ mod tests {
             let mut input = default_input();
             input.message.clear();
 
-            agent.run(TurnId::generate(), input).await;
+            run_admitted(&mut agent, TurnId::generate(), input).await;
             drop(agent);
 
             assert_eq!(history.as_slice().len(), 2);
@@ -2355,7 +2387,7 @@ mod tests {
         let mut history = History::new(Vec::new());
         let (mut agent, _event_rx) = make_agent(provider, &mut history);
         agent.config.max_turns = max_turns;
-        let outcome = agent.run(TurnId::generate(), default_input()).await;
+        let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
         match outcome {
             TurnOutcome::Completed {
                 num_turns, reason, ..
@@ -2387,7 +2419,7 @@ mod tests {
                 &mut history,
             );
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
             let events = drain_events(&event_rx);
             let terminal = terminal_outcomes(&events);
             assert_eq!(terminal, [&outcome]);
@@ -2404,7 +2436,7 @@ mod tests {
                 ..Default::default()
             };
             let (mut agent, event_rx) = make_agent(provider, &mut history);
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             let events = drain_events(&event_rx);
             assert_eq!(terminal_outcomes(&events), [&outcome]);
@@ -2423,8 +2455,8 @@ mod tests {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(provider, &mut history);
 
-            let failed = agent.run(TurnId::generate(), default_input()).await;
-            let completed = agent.run(TurnId::generate(), default_input()).await;
+            let failed = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let completed = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
 
             assert!(matches!(failed, TurnOutcome::Failed { num_turns: 0, .. }));
             assert!(matches!(
@@ -2447,8 +2479,8 @@ mod tests {
             let (mut agent, _event_rx) =
                 make_agent(MockProvider::new(vec![first, second]), &mut history);
 
-            let first = agent.run(TurnId::generate(), default_input()).await;
-            let second = agent.run(TurnId::generate(), default_input()).await;
+            let first = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let second = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
 
             assert_eq!(first.usage().input, 11);
             assert_eq!(second.usage().input, 22);
@@ -2470,7 +2502,7 @@ mod tests {
             );
 
             let turn_id = TurnId::generate();
-            let outcome = agent.run(turn_id, default_input()).await;
+            let outcome = run_admitted(&mut agent, turn_id, default_input()).await;
 
             assert!(matches!(outcome, TurnOutcome::Completed { .. }));
             assert_eq!(outcome.turn_id(), turn_id);
@@ -2582,7 +2614,7 @@ mod tests {
                 &agent.config,
                 &agent.model,
             );
-            let outcome = agent.run(ticket.turn_id(), default_input()).await;
+            let outcome = run_admitted(&mut agent, ticket.turn_id(), default_input()).await;
             let expected = crate::TurnFailure::from_agent_error(&AgentError::Channel);
             assert!(matches!(&outcome, TurnOutcome::Failed { failure, .. }
                 if failure.kind == expected.kind && failure.diagnostic == expected.diagnostic));
@@ -2621,7 +2653,7 @@ mod tests {
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));
-            agent.run(TurnId::generate(), default_input()).await;
+            run_admitted(&mut agent, TurnId::generate(), default_input()).await;
 
             let captured = captured.lock().unwrap();
             assert_eq!(captured.len(), 2);
@@ -2700,7 +2732,7 @@ mod tests {
             if let Some(s) = source {
                 agent = agent.with_interrupt_source(s);
             }
-            let _ = agent.run(TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             let events = drain_events(&event_rx);
 
             assert_eq!(
@@ -2733,10 +2765,8 @@ mod tests {
 
             let mut history = History::new(prior);
             let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let result = agent
-                .with_interrupt_source(source)
-                .run(TurnId::generate(), default_input())
-                .await;
+            let mut agent = agent.with_interrupt_source(source);
+            let result = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
 
             assert!(matches!(result, TurnOutcome::Completed { .. }));
         });
@@ -2802,7 +2832,7 @@ mod tests {
             let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
             let mut agent = agent.with_cancel(cancel);
 
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             assert_ends_with_cancel_marker(&history);
@@ -2833,7 +2863,7 @@ mod tests {
             let (agent, _event_rx) = make_agent(provider, &mut history);
             let mut agent = agent.with_cancel(cancel);
 
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             assert_ends_with_cancel_marker(&history);
@@ -2875,7 +2905,7 @@ mod tests {
                 }
             });
 
-            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             pump.await;
@@ -2907,7 +2937,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -2955,7 +2985,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -2998,8 +3028,8 @@ mod tests {
                 .collect();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(TurnId::generate(), default_input()).await;
-            let _ = agent.run(TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let _ = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -3021,7 +3051,8 @@ mod tests {
             serde_json::json!([{ "name": "read", "description": "pinned description" }]);
         agent.tools =
             crate::tools::RequestTools::assembled(definitions.clone(), &agent.config, &agent.model);
-        let context = agent.tool_context();
+        admit(&mut agent, &AgentMode::Build);
+        let context = agent.tool_context().unwrap();
         assert_eq!(context.execution_agent_id, Some(agent.agent_id));
         let snapshot = context.request_tools.unwrap();
         assert_eq!(snapshot.definitions(), &definitions);
@@ -3030,14 +3061,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_context_carries_the_session() {
+    fn tool_context_needs_an_admitted_cwd() {
         let mut history = History::new(Vec::new());
         let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-        assert_eq!(agent.tool_context().session_id, None);
+        let error = agent.tool_context().err().expect("no admission, no cwd");
+        assert_eq!(error.to_string(), NO_ADMITTED_CWD_ERR);
 
+        admit(&mut agent, &AgentMode::Build);
         let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
         agent.session_id = Some(session.clone());
-        assert_eq!(agent.tool_context().session_id, Some(session));
+        let context = agent.tool_context().unwrap();
+        assert_eq!(context.session_id, Some(session));
+        assert_eq!(context.cwd, PathBuf::from(TEST_CWD));
     }
 
     #[test]
@@ -3103,7 +3138,8 @@ mod tests {
             agent.request_tools(),
             Err(AgentError::Config { .. })
         ));
-        let outcome = smol::block_on(agent.run(
+        let outcome = smol::block_on(run_admitted(
+            &mut agent,
             TurnId::generate(),
             AgentInput {
                 mode: AgentMode::Custom(crate::ModeId::Custom("removed".into())),
@@ -3148,7 +3184,8 @@ mod tests {
             &AgentConfig::default(),
             &default_model(),
         );
-        let outcome = smol::block_on(agent.run(
+        let outcome = smol::block_on(run_admitted(
+            &mut agent,
             TurnId::generate(),
             AgentInput {
                 mode: AgentMode::Custom(crate::ModeId::Custom("audit".into())),
@@ -3159,7 +3196,7 @@ mod tests {
             outcome,
             TurnOutcome::Completed { num_turns: 2, .. }
         ));
-        let context = agent.tool_context();
+        let context = agent.tool_context().unwrap();
         assert_eq!(context.clone().restrict_write_to(), None);
         assert_eq!(
             context.mode_def.as_ref().unwrap().tools.as_ref().unwrap(),
@@ -3200,8 +3237,10 @@ mod tests {
             &agent.local_tools,
             agent.mcp.as_ref(),
         ));
+        let mode = agent.mode.clone();
+        admit(&mut agent, &mode);
         assert!(tool_dispatch::authorize_advertised(
-            &agent.tool_context(),
+            &agent.tool_context().unwrap(),
             "srv__probe"
         ));
         agent
@@ -3231,6 +3270,8 @@ mod tests {
             "srv.probe",
             "probe",
         )]));
+        let mode = agent.mode.clone();
+        admit(&mut agent, &mode);
         let names: Vec<String> = agent
             .request_tools()
             .unwrap()

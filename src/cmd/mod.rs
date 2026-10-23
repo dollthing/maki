@@ -2,6 +2,9 @@ mod acp;
 mod subcmd;
 mod tui;
 
+use std::env;
+use std::path::PathBuf;
+
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
@@ -10,6 +13,12 @@ use maki_storage::StateDir;
 use crate::cli::{AuthAction, Cli, Command, McpAction, TrustAction};
 use crate::project_trust;
 use crate::update;
+
+const CWD_ERR: &str = "cannot read the current directory (was it deleted?)";
+
+fn startup_cwd() -> Result<PathBuf> {
+    env::current_dir().context(CWD_ERR)
+}
 
 /// Seed `plugins.bash.auto_mode` so the loaded bash plugin classifies every
 /// command. Call after `into_config`, before `load_builtins`.
@@ -40,11 +49,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode)?;
+            subcmd::index(
+                &startup_cwd()?,
+                &path,
+                cli.no_plugins,
+                cli.no_jit,
+                trust_mode,
+            )?;
         }
-        Some(Command::Models { refresh }) => {
-            subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode)?
-        }
+        Some(Command::Models { refresh }) => subcmd::models(
+            &startup_cwd()?,
+            cli.no_plugins,
+            cli.no_jit,
+            refresh,
+            trust_mode,
+        )?,
         Some(Command::Sessions { json }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             subcmd::sessions(&storage, json)?;
@@ -52,7 +71,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                McpAction::Auth { server } => subcmd::mcp_auth(&server, &storage, trust_mode)?,
+                McpAction::Auth { server } => {
+                    subcmd::mcp_auth(&startup_cwd()?, &server, &storage, trust_mode)?
+                }
                 McpAction::Logout { server } => subcmd::mcp_logout(&server, &storage)?,
             }
         }
@@ -68,6 +89,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             automode,
         }) => {
             acp::run(
+                startup_cwd()?,
                 model,
                 yolo,
                 automode,
@@ -99,6 +121,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             names,
         }) => {
             subcmd::prompt(
+                &startup_cwd()?,
                 &variant,
                 plan,
                 tools,
@@ -109,7 +132,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )?;
         }
         None => {
-            tui::run(cli)?;
+            tui::run(cli, startup_cwd()?)?;
         }
     }
     Ok(())

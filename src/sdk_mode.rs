@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -502,6 +502,7 @@ impl SdkWriter {
 
 pub struct SdkParams {
     pub cli: Cli,
+    pub cwd: PathBuf,
     pub model: Model,
     pub explicit_model: bool,
     pub config: AgentConfig,
@@ -572,6 +573,7 @@ impl SdkCommands {
 pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
+        cwd,
         model,
         explicit_model,
         mut config,
@@ -598,7 +600,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     );
     let startup_permission_mode = permission_mode;
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
     let storage = StateDir::resolve().context("resolve state dir")?;
     let restored = resolve_session(&cli, &working_dir, &storage)?;

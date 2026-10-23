@@ -180,7 +180,9 @@ mod tests {
     use std::pin::Pin;
 
     use futures_lite::future::race;
-    use maki_agent::actor::{ActorLifecycle, EffectiveAgentConfig};
+    use maki_agent::actor::{
+        ActorLifecycle, AdmissionPreparation, AgentContextSnapshot, EffectiveAgentConfig,
+    };
     use maki_agent::agent::RunSettings;
     use maki_agent::tools::test_support::stub_ctx;
     use maki_agent::{
@@ -238,6 +240,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             self.backend.run_compact(history, context, instructions)
         }
+
+        fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+            self.backend.admission_preparation()
+        }
     }
 
     #[test]
@@ -266,7 +272,9 @@ mod tests {
                     workflow: false,
                 },
                 context.mode.clone(),
-            );
+            )
+            .with_mode_def(Some(context.modes.current(&context.mode)))
+            .with_context(AgentContextSnapshot::new(context.cwd.clone()));
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let mut root_fixture = None;
             let target = manager

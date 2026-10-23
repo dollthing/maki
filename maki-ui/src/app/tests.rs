@@ -545,7 +545,7 @@ fn app_with_root(root: AgentRef) -> App {
 fn root_config() -> EffectiveAgentConfig {
     EffectiveAgentConfig::new(
         maki_agent::RunSettings {
-            provider: cli_tool_ctx().provider,
+            provider: cli_tool_ctx(std::env::current_dir().unwrap()).provider,
             model: test_model(),
             fast: false,
             workflow: false,
@@ -606,7 +606,7 @@ fn commit_root_model(app: &App, model: Model) {
         app,
         maki_agent::actor::ConfigChange::Patch(maki_agent::actor::ConfigPatch {
             model: Some(maki_agent::actor::PreparedModel {
-                provider: cli_tool_ctx().provider,
+                provider: cli_tool_ctx(std::env::current_dir().unwrap()).provider,
                 model,
             }),
             ..Default::default()
@@ -5474,7 +5474,7 @@ fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
     let shared = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
         messages.clone(),
     )));
-    let template = cli_tool_ctx();
+    let template = cli_tool_ctx(std::env::current_dir().unwrap());
     let config = EffectiveAgentConfig::new(
         maki_agent::RunSettings {
             provider: template.provider,
@@ -5678,7 +5678,7 @@ fn rejected_command_turn_retains_pending_shell_results(root: bool) {
     let root_before = serde_json::to_value(app.shell.results_for(None)).unwrap();
     let admission = maki_lua::orchestration::TrustedTarget {
         target: target.clone(),
-        template: cli_tool_ctx(),
+        template: cli_tool_ctx(std::env::current_dir().unwrap()),
     };
     let turn = maki_commands::AgentTurn {
         content: maki_commands::CommandContent {
@@ -10007,7 +10007,7 @@ fn bind_actor_target(app: &App, target: AgentRef) {
         app.command_target.id(),
         maki_lua::orchestration::TrustedTarget {
             target,
-            template: cli_tool_ctx(),
+            template: cli_tool_ctx(std::env::current_dir().unwrap()),
         },
     )]));
 }
@@ -10026,7 +10026,7 @@ fn spawn_input_child_with_mode(
     name: &str,
     mode: AgentMode,
 ) -> (AgentRef, flume::Receiver<AgentInput>) {
-    let template = cli_tool_ctx();
+    let template = cli_tool_ctx(std::env::current_dir().unwrap());
     let config = EffectiveAgentConfig::new(
         maki_agent::RunSettings {
             provider: template.provider,
