@@ -538,6 +538,10 @@ impl Runner {
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;
+            if let BackendResult::ControlCompacted(status) = result {
+                state.emit(ActorEvent::CompactionEnd(status));
+                return;
+            }
         }
         match result {
             BackendResult::ControlDone => {}

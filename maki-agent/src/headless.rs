@@ -18,8 +18,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::actor::{
-    ActorError, AdmissionPreparation, AgentActorHandle, AgentContextSnapshot, PreparedModel,
-    PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
+    ActorError, AdmissionPreparation, AgentActorHandle, AgentContextSnapshot, CompactionStatus,
+    PreparedModel, PreparedReadiness, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
 };
 use crate::agent::isolated_turn::IsolatedTurnEvent;
 use crate::agent::{self, History, PromptSlotSource, TurnSetup};
@@ -743,7 +743,13 @@ impl ActorBackend for HeadlessBackend {
                         .compact(history, &context, instructions.as_deref(), &combined)
                         .await;
                     cancellation.cancel().await;
+                    let status = match result {
+                        ManualCompactionEvent::Completed => CompactionStatus::Completed,
+                        ManualCompactionEvent::Cancelled => CompactionStatus::Cancelled,
+                        _ => CompactionStatus::Failed,
+                    };
                     let _ = output.send(result);
+                    return BackendResult::ControlCompacted(status);
                 }
                 Some(InteractiveControl::Reset(reply)) => {
                     let previous = history.snapshot().clone();
@@ -1142,7 +1148,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::actor::{ConfigChange, ConfigPatch, PreparedModel};
+    use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{ModeRegistry, TurnOutcome};
@@ -1530,6 +1536,9 @@ pub(crate) mod tests {
             );
             let (provider, _) = recording();
             let (handle, coordinator) = fixture(original.clone(), checkpoint, provider);
+            let root = handle.initialized_root().await.unwrap();
+            let actor = root.actor().unwrap();
+            let events = actor.subscribe_events();
             let (output, results) = flume::unbounded();
             handle
                 .control_tx
@@ -1555,8 +1564,22 @@ pub(crate) mod tests {
             } else {
                 assert_eq!(terminal, ManualCompactionEvent::Completed);
             }
-            let root = handle.initialized_root().await.unwrap();
-            let actor = root.actor().unwrap();
+            let ended = bounded(async {
+                loop {
+                    if let ActorEvent::CompactionEnd(status) = events.recv_async().await.unwrap() {
+                        return status;
+                    }
+                }
+            })
+            .await;
+            assert_eq!(
+                ended,
+                if fail {
+                    CompactionStatus::Failed
+                } else {
+                    CompactionStatus::Completed
+                }
+            );
             bounded(actor.runtime_barrier()).await.unwrap();
             let transcript = actor
                 .transcript(crate::actor::TranscriptRequest {

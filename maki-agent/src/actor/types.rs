@@ -134,6 +134,8 @@ pub enum BackendResult {
     ControlDone,
     ControlFailed,
     CompactDone,
+    /// A control that compacted the history ended this way.
+    ControlCompacted(super::CompactionStatus),
 }
 
 /// A standalone control operation. Carries the actor admission that identified
