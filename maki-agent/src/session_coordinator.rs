@@ -633,6 +633,11 @@ impl SessionCoordinatorHandle {
         Ok(())
     }
 
+    /// The root agent this session's options drive.
+    pub fn agent(&self) -> Result<AgentRef, SessionCoordinatorError> {
+        Ok(self.actor_binding()?.agent)
+    }
+
     fn actor_binding(&self) -> Result<ActorBinding, SessionCoordinatorError> {
         self.ensure_live()?;
         lock(&self.read.binding)

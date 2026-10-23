@@ -794,6 +794,8 @@ mod tests {
     const PRINT_MODEL: &str = "anthropic/claude-opus-4-8";
     const PRINT_RUNNER: &str = "print_runner";
     const RUNNER_DISPATCHED: &str = "true|nil";
+    const MODE_AUTOCMD: &str = "PrintModeAutocmd";
+    const MODES_SET: &str = "plan|build";
     const OUTPUT_ERROR: &str = "print output failed";
     const ROOT_RESPONSE: &str = "root response";
     const PRINT_NESTED_TOOL: &str = "print_nested_task";
@@ -1566,6 +1568,24 @@ mod tests {
         )
         .unwrap();
         host.load_source(
+            MODE_AUTOCMD,
+            &format!(
+                r#"
+                maki.api.create_autocmd("{MODE_AUTOCMD}", {{
+                    callback = function(ev)
+                        maki.async.run(function()
+                            local opts = {{ session = ev.data.session_id }}
+                            local plan, plan_err = maki.session.set_mode("plan", opts)
+                            local build, build_err = maki.session.set_mode("build", opts)
+                            maki.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
+                        end)
+                    end,
+                }})
+            "#
+            ),
+        )
+        .unwrap();
+        host.load_source(
             "print_initialized_command",
             &format!(r#"
                 maki.api.register_command({{
@@ -1643,6 +1663,11 @@ mod tests {
                 ));
                 assert_eq!(handle.permissions.is_yolo(), yolo);
             }
+            host.event_handle().fire_autocmd(
+                MODE_AUTOCMD,
+                serde_json::json!({ "session_id": session_id.to_string() }),
+            );
+            assert_eq!(notices.recv_timeout(GATE_TIMEOUT).unwrap(), MODES_SET);
             host.event_handle().run_command(
                 Arc::from(PRINT_RUNNER),
                 Arc::from(format!("/{PRINT_RUNNER}").as_str()),

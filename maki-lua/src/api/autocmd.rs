@@ -174,7 +174,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Except `"SessionPickerRequested"`, `"ModeChanged"` and `"StoreChanged"`, each host event
 /// carries `data.session_id`. For `"SessionReset"` that
 /// is the session being left behind; the other events name the session now
-/// running or focused. Tool events also carry `data.tool_id` and `data.tool`.
+/// running or focused. A callback has no ctx; it reaches that session through
+/// the session-addressed calls, such as `maki.session.set_option` and
+/// `maki.session.set_mode`. Tool events also carry `data.tool_id` and `data.tool`.
 /// `"SessionFocusChanged"` also carries `data.previous_session_id` except on
 /// initial startup. `"ModeChanged"` carries `data.mode`, and fires only when
 /// the mode actually changes. `"StoreChanged"` carries `data.registry` and, for

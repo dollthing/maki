@@ -946,7 +946,9 @@ picker is not open when the event returns.
 Except `"SessionPickerRequested"`, `"ModeChanged"` and `"StoreChanged"`, each host event
 carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
-running or focused. Tool events also carry `data.tool_id` and `data.tool`.
+running or focused. A callback has no ctx; it reaches that session through
+the session-addressed calls, such as `maki.session.set_option` and
+`maki.session.set_mode`. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
 initial startup. `"ModeChanged"` carries `data.mode`, and fires only when
 the mode actually changes. `"StoreChanged"` carries `data.registry` and, for
@@ -4071,7 +4073,7 @@ attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends. A tool handler
 cannot create, focus or delete sessions, and the functions that change
 a session (`prompt`, `set_option`, `set_title`) accept
-only the session its own turn belongs to. Every function that reads or
+only the session its own turn belongs to; `set_mode` refuses them. Every function that reads or
 changes one session takes it explicitly; `ctx:session_id()` names the
 invocation's session, and `current` names the focused one. Tool
 handlers cannot read UI focus, so `current` refuses them.
@@ -4404,6 +4406,32 @@ See [Configuration changes](/docs/modes/#configuration-changes).
 
 ```lua
 local ok, err = maki.session.set_option("fast", "enabled", { session = id })
+```
+
+---
+
+### `maki.session.set_mode()` {#maki-session-set_mode}
+
+```lua
+maki.session.set_mode({name}, {opts?})
+```
+
+Switches a live session's root agent to mode {name}, through the same
+config queue as `Agent:set_mode`. Autocmd and timer callbacks have no ctx,
+so they set a mode this way, naming the session their event carries.
+Tool handlers use `Agent:set_mode` on their own agent instead.
+
+**Parameters:**
+
+- `{name}` (`string`) Registered mode name.
+- `{opts?}` (`table`) Required `session` (string) id of a live session.
+
+**Returns:** (`string|nil`, `string|nil`) The committed mode name, or nil and an error.
+
+**Example:**
+
+```lua
+local mode, err = maki.session.set_mode("plan", { session = ev.data.session_id })
 ```
 
 ---
