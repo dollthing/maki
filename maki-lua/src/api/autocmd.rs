@@ -294,7 +294,7 @@ fn dispatch_snapshot(
             .load(CALLBACK_WRAPPER)
             .set_name("=autocmd_callback")
             .call::<Function>((entry.callback, ev, keep))?;
-        enqueue_callback(lua, work, entry.plugin, entry.cancel, target.clone())?;
+        enqueue_callback(lua, work, entry.plugin, event, entry.cancel, target.clone())?;
     }
     Ok(())
 }

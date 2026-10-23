@@ -1667,6 +1667,7 @@ pub(crate) fn enqueue_callback(
     lua: &Lua,
     work: Function,
     plugin: Arc<str>,
+    event: &str,
     cancel: CancelToken,
     target: Option<TrustedTarget>,
 ) -> mlua::Result<()> {
@@ -1685,7 +1686,11 @@ pub(crate) fn enqueue_callback(
         command_depth: 0,
         command_invocation: None,
         pinned_target: target,
-        call: TaskCall::Event { plugin, depth },
+        call: TaskCall::Event {
+            plugin,
+            event: Arc::from(event),
+            depth,
+        },
     };
     lua.app_data_ref::<SpawnQueue>()
         .ok_or_else(|| mlua::Error::runtime(SPAWN_QUEUE_NOT_INIT))?
@@ -1919,6 +1924,7 @@ pub(crate) enum TaskCall {
     /// when the event has no agent.
     Event {
         plugin: Arc<str>,
+        event: Arc<str>,
         depth: u8,
     },
 }
@@ -2177,8 +2183,15 @@ fn spawn_async_task(
         )
         .await;
         if let Err(e) = &result {
-            let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
-            tracing::debug!(error = %e, tool_id, "async.run: task failed");
+            match &task.call {
+                TaskCall::Event { plugin, event, .. } if !task.cancel.is_cancelled() => {
+                    tracing::warn!(error = %e, %plugin, %event, "autocmd callback failed");
+                }
+                _ => {
+                    let tool_id = task.live_ctx.as_ref().map(|l| l.tool_use_id.as_str());
+                    tracing::debug!(error = %e, tool_id, "async.run: task failed");
+                }
+            }
         }
 
         if let Some(ref live) = task.live_ctx
