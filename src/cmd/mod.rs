@@ -8,13 +8,17 @@ use std::path::PathBuf;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use maki_agent::tools::ToolRegistry;
+use maki_config::PermissionsConfig;
 use maki_storage::StateDir;
+use tracing::warn;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, TrustAction};
 use crate::project_trust;
 use crate::update;
 
 const CWD_ERR: &str = "cannot read the current directory (was it deleted?)";
+const UNMATCHED_RULE_WARNING: &str = "permission rule matches no tool in this project";
 
 fn startup_cwd() -> Result<PathBuf> {
     env::current_dir().context(CWD_ERR)
@@ -31,6 +35,21 @@ pub fn seed_automode(config: &mut maki_config::Config, automode: bool) {
             .or_default()
             .insert("auto_mode".into(), serde_json::Value::Bool(true));
     }
+}
+
+/// Logs each permission rule whose tool nothing registered, and returns it as
+/// a startup warning, so a typo'd section such as `[bassh]` shows up.
+/// Call once logging is up and every plugin has registered its tools.
+fn unmatched_permission_rules(permissions: &PermissionsConfig) -> Vec<String> {
+    let registry = ToolRegistry::global();
+    permissions
+        .unmatched_rules(|tool| registry.get(tool).is_some())
+        .into_iter()
+        .map(|rule| {
+            warn!(rule, "{UNMATCHED_RULE_WARNING}");
+            format!("{UNMATCHED_RULE_WARNING}: {rule}")
+        })
+        .collect()
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {

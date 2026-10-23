@@ -1063,6 +1063,16 @@ impl From<Effect> for DefaultEffect {
     }
 }
 
+impl DefaultEffect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PermissionTarget {
     Global,
@@ -1222,6 +1232,36 @@ pub struct PermissionsConfig {
     pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
     pub yolo: bool,
+}
+
+impl PermissionsConfig {
+    /// The rules and defaults of tool sections that {registered} does not
+    /// name, as they read in the file. Such a section still loads: a global
+    /// rule may be for a tool only some projects register.
+    pub fn unmatched_rules(&self, registered: impl Fn(&str) -> bool) -> Vec<String> {
+        let unmatched = |tool: &ToolKey| match tool {
+            ToolKey::Native(name) if !registered(name) => Some(Arc::clone(name)),
+            _ => None,
+        };
+        let rules = self.rules.iter().filter_map(|rule| {
+            let tool = unmatched(&rule.tool)?;
+            let effect = DefaultEffect::from(rule.effect).as_str();
+            Some(match &rule.scope {
+                Some(scope) => format!("[{tool}] {effect} {scope:?}"),
+                None => format!("[{tool}] {effect} = true"),
+            })
+        });
+        let defaults = self.tool_defaults.iter().filter_map(|(tool, effect)| {
+            Some(format!(
+                "[{}] default = {:?}",
+                unmatched(tool)?,
+                effect.as_str()
+            ))
+        });
+        let mut unmatched: Vec<_> = rules.chain(defaults).collect();
+        unmatched.sort();
+        unmatched
+    }
 }
 
 #[derive(Clone)]
@@ -2952,6 +2992,28 @@ mod tests {
         assert_eq!(
             perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Allow)
+        );
+    }
+
+    #[test]
+    fn unmatched_rules_name_only_sections_for_unregistered_tools() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[bash]\nallow = [\"cargo *\"]\n\n\
+             [bassh]\ndefault = \"deny\"\nallow = [\"ls\"]\ndeny = true\n\n\
+             [mcp.github]\ndeny = [\"delete_repo\"]\n",
+        );
+        let perms =
+            load_permissions_inner(Some(&global), &ProjectConfig::for_project(dir.path())).unwrap();
+        assert_eq!(
+            perms.unmatched_rules(|tool| tool == "bash"),
+            [
+                r#"[bassh] allow "ls""#,
+                r#"[bassh] default = "deny""#,
+                "[bassh] deny = true",
+            ]
         );
     }
 
