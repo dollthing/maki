@@ -42,6 +42,22 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             context_window: GPT_6_1_CONTEXT_WINDOW,
         },
         ModelEntry {
+            prefixes: &["gpt-6.1-terra"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 1.00,
+                output: 5.00,
+                cache_write: 1.25,
+                cache_read: 0.05,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_1_CONTEXT_WINDOW,
+        },
+        ModelEntry {
             prefixes: &["gpt-6-astra"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
@@ -404,6 +420,15 @@ mod tests {
         0.1,
         2.5,
         10.0,
+        GPT_6_1_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-6.1-terra",
+        ModelTier::Medium,
+        1.0,
+        0.05,
+        1.25,
+        5.0,
         GPT_6_1_CONTEXT_WINDOW
     )]
     #[test_case(

@@ -91,6 +91,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
+| Medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
 | Medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
