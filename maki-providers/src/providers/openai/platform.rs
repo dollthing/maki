@@ -35,6 +35,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -78,17 +79,19 @@ fn is_codex_model(model_id: &str) -> bool {
 // like `gpt-5.6-terra-preview`.
 fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     if model_id.contains("-codex") {
-        return Some(if model_id.starts_with("gpt-6.1-sol") {
-            GPT_6_1_PLAN_CONTEXT_WINDOW
-        } else {
-            CODEX_PLAN_CONTEXT_WINDOW
-        });
+        return Some(
+            if model_id.starts_with("gpt-6.1-sol") || model_id.starts_with("gpt-6.1-terra") {
+                GPT_6_1_PLAN_CONTEXT_WINDOW
+            } else {
+                CODEX_PLAN_CONTEXT_WINDOW
+            },
+        );
     }
     if !PLAN_MODELS.contains(&model_id) {
         return None;
     }
     Some(match model_id {
-        "gpt-6.1-sol" => GPT_6_1_PLAN_CONTEXT_WINDOW,
+        "gpt-6.1-sol" | "gpt-6.1-terra" => GPT_6_1_PLAN_CONTEXT_WINDOW,
         id if id.starts_with("gpt-5.6-") => GPT_5_6_PLAN_CONTEXT_WINDOW,
         _ => CODEX_PLAN_CONTEXT_WINDOW,
     })
@@ -609,6 +612,7 @@ mod tests {
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
     #[test_case("gpt-6.1-sol")]
+    #[test_case("gpt-6.1-terra")]
     #[test_case("gpt-6-astra")]
     #[test_case("gpt-6-sol")]
     #[test_case("gpt-6-luna")]
@@ -620,6 +624,9 @@ mod tests {
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
     #[test_case("gpt-6.1-sol", Some(500_000))]
+    #[test_case("gpt-6.1-terra", Some(500_000))]
+    #[test_case("gpt-6.1-terra-codex", Some(500_000) ; "terra codex suffix keeps the 6.1 bump")]
+    #[test_case("gpt-6.1-terra-preview", None ; "terra near-match is rejected")]
     #[test_case("gpt-6.1-sol-codex", Some(500_000) ; "codex suffix keeps the 6.1 bump")]
     #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
