@@ -422,12 +422,11 @@ impl App {
         };
         let config = self.focused_config();
         let model_switch_queued = render_chat == 0 && model_switch_queued;
+        let model_spec = config.as_ref().map(|config| config.model.spec());
         let model_id = if model_switch_queued {
             model_id
         } else {
-            config
-                .as_ref()
-                .map_or(model_id, |config| config.model.id.as_str())
+            model_spec.as_deref().unwrap_or(model_id)
         };
         let opts = self.displayed_config(render_chat).options();
         let status = if self.focused_streaming() {
