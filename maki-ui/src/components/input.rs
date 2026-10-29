@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_storage::input_history::InputHistory;
 use std::collections::HashSet;
 use std::mem;
@@ -21,8 +21,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use super::apply_scroll_delta;
 use super::scrollbar::render_vertical_scrollbar;
-use super::{apply_scroll_delta, visual_line_count};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
@@ -93,11 +93,28 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    last_width: u16,
+    last_focused: bool,
+    preferred_column: Option<usize>,
 }
 
 impl InputBox {
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         self.follow_cursor = true;
+
+        if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            if self.move_visual(key.code == KeyCode::Down) {
+                return InputAction::CursorMoved;
+            }
+            self.preferred_column = None;
+            if key.code == KeyCode::Up {
+                self.history_up();
+            } else {
+                self.history_down();
+            }
+            return InputAction::PaletteSync(self.buffer.value());
+        }
+        self.preferred_column = None;
 
         match key.code {
             KeyCode::Up if self.is_at_first_line() => {
@@ -135,6 +152,7 @@ impl InputBox {
 
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
+        self.preferred_column = None;
         self.buffer.insert_text(text);
         InputAction::PaletteSync(self.buffer.value())
     }
@@ -188,6 +206,9 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            last_width: u16::MAX,
+            last_focused: true,
+            preferred_column: None,
         }
     }
 
@@ -206,12 +227,9 @@ impl InputBox {
 
     pub fn line_breaks(&self, content_width: u16) -> LineBreaks {
         let ew = effective_width(content_width as usize);
-        LineBreaks::from_heights(
-            self.buffer
-                .lines()
-                .iter()
-                .map(|line| visual_line_count(line.width(), ew) as u16),
-        )
+        LineBreaks::from_heights(self.buffer.lines().iter().enumerate().map(|(y, line)| {
+            line_ranges(line, ew, self.last_focused && y == self.buffer.y()).len() as u16
+        }))
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -279,6 +297,7 @@ impl InputBox {
     }
 
     pub fn set_input(&mut self, s: String) {
+        self.preferred_column = None;
         self.buffer = TextBuffer::new(s);
     }
 
@@ -315,26 +334,74 @@ impl InputBox {
         }
     }
 
-    fn visual_cursor_y(&self, ew: usize) -> u16 {
-        let lines_above: u16 = self
-            .buffer
+    fn visual_rows(&self, ew: usize) -> Vec<(usize, usize, usize, usize)> {
+        self.buffer
             .lines()
             .iter()
-            .take(self.buffer.y())
-            .map(|line| visual_line_count(line.width(), ew) as u16)
-            .sum();
+            .enumerate()
+            .flat_map(|(y, line)| {
+                line_ranges(line, ew, y == self.buffer.y())
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(row, (start, end))| (y, row, start, end))
+            })
+            .collect()
+    }
 
-        let wrap_row = {
-            let line = &self.buffer.lines()[self.buffer.y()];
-            let cursor_col: usize = line
-                .chars()
-                .take(self.buffer.x())
-                .map(|c| c.width().unwrap_or(1))
-                .sum();
-            cursor_col.checked_div(ew).unwrap_or(0) as u16
+    fn cursor_row(&self, rows: &[(usize, usize, usize, usize)]) -> usize {
+        rows.iter()
+            .rposition(|&(y, _, start, _)| y == self.buffer.y() && start <= self.buffer.x())
+            .unwrap_or(0)
+    }
+
+    fn visual_cursor_y(&self, ew: usize) -> u16 {
+        self.cursor_row(&self.visual_rows(ew))
+            .min(u16::MAX as usize) as u16
+    }
+
+    fn move_visual(&mut self, down: bool) -> bool {
+        let rows = self.visual_rows(effective_width(self.last_width as usize));
+        let current = self.cursor_row(&rows);
+        let target = if down {
+            current.checked_add(1).filter(|&i| i < rows.len())
+        } else {
+            current.checked_sub(1)
         };
-
-        lines_above + wrap_row
+        let Some(target) = target else { return false };
+        let (y, row, start, _) = rows[current];
+        let column = *self.preferred_column.get_or_insert_with(|| {
+            usize::from(row == 0) * PREFIX_WIDTH as usize
+                + self.buffer.lines()[y]
+                    .chars()
+                    .skip(start)
+                    .take(self.buffer.x() - start)
+                    .map(|c| c.width().unwrap_or(1))
+                    .sum::<usize>()
+        });
+        let (y, row, start, end) = rows[target];
+        let desired = column.saturating_sub(usize::from(row == 0) * PREFIX_WIDTH as usize);
+        let mut x = start;
+        let mut width = 0;
+        let has_next_in_line = rows.get(target + 1).is_some_and(|next| next.0 == y);
+        let limit = if has_next_in_line {
+            end.saturating_sub(1).max(start)
+        } else {
+            end
+        };
+        for c in self.buffer.lines()[y]
+            .chars()
+            .skip(start)
+            .take(limit - start)
+        {
+            let w = c.width().unwrap_or(1);
+            if width + w > desired {
+                break;
+            }
+            width += w;
+            x += 1;
+        }
+        self.buffer.set_cursor(y, x);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -348,6 +415,11 @@ impl InputBox {
         top_right_hint: Option<Line<'_>>,
         cwd: &str,
     ) {
+        self.last_focused = focused;
+        if self.last_width != area.width {
+            self.preferred_column = None;
+            self.last_width = area.width;
+        }
         let content_height = area.height.saturating_sub(2);
         let ew = effective_width(area.width as usize);
 
@@ -487,6 +559,7 @@ impl InputBox {
             return;
         };
         self.buffer.set_cursor(y, x);
+        self.preferred_column = None;
         self.follow_cursor = true;
     }
 
@@ -544,6 +617,9 @@ impl InputBox {
                     char_idx += 1;
                 }
 
+                if wrap_row + 1 < n_visual_rows && char_idx == row_char_end {
+                    char_idx = row_char_end.saturating_sub(1).max(row_char_start);
+                }
                 return Some((buf_line_idx, char_idx));
             }
             visual += n_visual_rows;
@@ -576,7 +652,9 @@ fn wrap_line(
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
 
-    wrap_ranges(&widths, ew, is_cursor_line)
+    let ranges = wrap_ranges(&widths, ew, is_cursor_line);
+    let row_count = ranges.len();
+    ranges
         .into_iter()
         .enumerate()
         .map(|(row, (start, end))| {
@@ -596,7 +674,11 @@ fn wrap_line(
                 vec![Span::raw(chunk_text)]
             };
 
-            if is_cursor_line && cursor_x >= start && cursor_x <= end {
+            if is_cursor_line
+                && cursor_x >= start
+                && (cursor_x < end
+                    || (cursor_x == end && end == chars.len() && row + 1 == row_count))
+            {
                 let local_cursor = cursor_x.saturating_sub(start);
                 spans.extend(overlay_cursor(chunk_spans, local_cursor));
             } else {
@@ -611,6 +693,11 @@ fn wrap_line(
 /// Split a line (given per-char display widths) into wrapped row ranges of
 /// char indices, exactly as it is rendered: an extra empty row is appended
 /// when the cursor sits past a completely full last row.
+fn line_ranges(line: &str, ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
+    let widths: Vec<_> = line.chars().map(|c| c.width().unwrap_or(1)).collect();
+    wrap_ranges(&widths, ew, is_cursor_line)
+}
+
 fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
     let row_width = ew.max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -836,13 +923,7 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
         .lines()
         .iter()
         .enumerate()
-        .map(|(i, line)| {
-            let mut text_len = line.width();
-            if cursor_visible && i == cursor_y {
-                text_len += 1;
-            }
-            visual_line_count(text_len, ew)
-        })
+        .map(|(i, line)| line_ranges(line, ew, cursor_visible && i == cursor_y).len())
         .sum()
 }
 
@@ -863,6 +944,153 @@ mod tests {
     fn submit_text(input: &mut InputBox, text: &str) {
         type_text(input, text);
         input.submit();
+    }
+
+    #[test]
+    fn visual_navigation_preserves_column_and_history_boundaries() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        input.set_input(
+            "abcdefghi
+x
+abcdef"
+                .into(),
+        );
+        input.last_width = 6;
+        input.buffer.set_cursor(0, 2);
+        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 7));
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 9));
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (1, 1));
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (2, 2));
+        input.handle_key(up);
+        input.handle_key(up);
+        input.handle_key(up);
+        input.handle_key(up);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 2));
+        input.handle_key(up);
+        assert_eq!(input.buffer.value(), "history");
+    }
+
+    #[test_case(KeyCode::Up, KeyModifiers::CONTROL; "ctrl_up")]
+    #[test_case(KeyCode::Down, KeyModifiers::ALT; "alt_down")]
+    #[test_case(KeyCode::Up, KeyModifiers::SHIFT; "shift_up")]
+    #[test_case(KeyCode::Down, KeyModifiers::SHIFT; "shift_down")]
+    fn modified_arrows_delegate_away_from_logical_boundaries(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        let text = "first\nabcdefghij\nlast";
+        input.set_input(text.into());
+        input.last_width = 6;
+        input.buffer.set_cursor(1, 4);
+        let mut expected = TextBuffer::new(text.into());
+        expected.set_cursor(1, 4);
+        let key = KeyEvent::new(code, modifiers);
+        let result = expected.handle_key(key);
+        let action = input.handle_key(key);
+        assert!(matches!(
+            (result, action),
+            (EditResult::Changed, InputAction::PaletteSync(_))
+                | (EditResult::Moved, InputAction::CursorMoved)
+                | (EditResult::Ignored, InputAction::None)
+        ));
+        assert_eq!(input.buffer.value(), expected.value());
+        assert_eq!(
+            (input.buffer.y(), input.buffer.x()),
+            (expected.y(), expected.x())
+        );
+        assert_eq!(input.history_index, None);
+    }
+
+    #[test_case(KeyModifiers::CONTROL; "ctrl")]
+    #[test_case(KeyModifiers::ALT; "alt")]
+    #[test_case(KeyModifiers::SHIFT; "shift")]
+    fn modified_arrows_use_history_at_logical_boundaries(modifiers: KeyModifiers) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        input.set_input("abcdefghij\nsecond".into());
+        input.last_width = 6;
+        input.buffer.set_cursor(0, 8);
+        let up = KeyEvent::new(KeyCode::Up, modifiers);
+        let down = KeyEvent::new(KeyCode::Down, modifiers);
+        assert!(
+            matches!(input.handle_key(up), InputAction::PaletteSync(value) if value == "history")
+        );
+        assert!(
+            matches!(input.handle_key(down), InputAction::PaletteSync(value) if value == "abcdefghij\nsecond")
+        );
+        input.buffer.set_cursor(1, 0);
+        assert!(
+            matches!(input.handle_key(down), InputAction::PaletteSync(value) if value == "abcdefghij\nsecond")
+        );
+    }
+
+    #[test]
+    fn navigation_after_resize_uses_new_width_and_column() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("abcdefghijklmnop".into());
+        input.buffer.set_cursor(0, 2);
+        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        render_input(&mut input, 6, 8);
+        input.handle_key(down);
+        assert_eq!(input.buffer.x(), 7);
+        render_input(&mut input, 8, 8);
+        input.handle_key(down);
+        assert_eq!(input.buffer.x(), 13);
+    }
+
+    #[test]
+    fn navigation_and_selection_include_extra_cursor_row() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "history");
+        input.set_input("abcd\nnext".into());
+        input.buffer.set_cursor(0, 4);
+        render_input(&mut input, 6, 8);
+        let breaks = input.line_breaks(6);
+        assert!(!breaks.is_line_start(1));
+        assert!(breaks.is_line_start(2));
+        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        input.handle_key(up);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 0));
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (0, 4));
+        input.handle_key(down);
+        assert_eq!((input.buffer.y(), input.buffer.x()), (1, 0));
+        input.last_focused = false;
+        let breaks = input.line_breaks(6);
+        assert!(breaks.is_line_start(1));
+    }
+
+    #[test]
+    fn wide_character_wrap_counts_and_cursor_boundary() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("a界界".into());
+        input.buffer.set_cursor(0, 2);
+        assert_eq!(input.visual_cursor_y(3), 1);
+        assert_eq!(total_visual_lines(&input.buffer, 3, true), 2);
+        assert_eq!(input.height(5), 4);
+        let lines = wrap_line("a界界", 3, true, 2, true, None);
+        let reversed: usize = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(reversed, 1);
+        input.last_width = 5;
+        input.handle_key(KeyEvent::new(
+            KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(input.buffer.x(), 0);
     }
 
     #[test]
@@ -938,6 +1166,70 @@ mod tests {
         input.buffer.move_up();
         assert!(input.is_at_first_line());
         assert!(!input.is_at_last_line());
+    }
+
+    #[test]
+    fn key_history_roundtrip_and_boundaries() {
+        use crossterm::event::KeyModifiers;
+
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for code in [KeyCode::Up, KeyCode::Down] {
+            assert!(matches!(
+                input.handle_key(key(code)),
+                InputAction::PaletteSync(_)
+            ));
+            assert_eq!(input.buffer.value(), "");
+        }
+        for text in ["first", "second"] {
+            for c in text.chars() {
+                input.handle_key(key(KeyCode::Char(c)));
+            }
+            assert!(
+                matches!(input.handle_key(key(KeyCode::Enter)), InputAction::Submit(sub) if sub.text == text)
+            );
+        }
+        for c in "draft".chars() {
+            input.handle_key(key(KeyCode::Char(c)));
+        }
+        for (code, expected) in [
+            (KeyCode::Down, "draft"),
+            (KeyCode::Up, "second"),
+            (KeyCode::Up, "first"),
+            (KeyCode::Up, "first"),
+            (KeyCode::Down, "second"),
+            (KeyCode::Down, "draft"),
+            (KeyCode::Down, "draft"),
+        ] {
+            assert!(
+                matches!(input.handle_key(key(code)), InputAction::PaletteSync(value) if value == expected)
+            );
+            assert_eq!(input.buffer.value(), expected);
+        }
+    }
+
+    #[test]
+    fn key_history_multiline_draft_roundtrip() {
+        use crossterm::event::KeyModifiers;
+
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "previous");
+        input.handle_paste("draft one\ndraft two");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(input.handle_key(up), InputAction::CursorMoved));
+        assert_eq!(input.buffer.value(), "draft one\ndraft two");
+        assert!(
+            matches!(input.handle_key(up), InputAction::PaletteSync(value) if value == "previous")
+        );
+        assert!(
+            matches!(input.handle_key(down), InputAction::PaletteSync(value) if value == "draft one\ndraft two")
+        );
+        assert!(matches!(input.handle_key(down), InputAction::CursorMoved));
+        assert_eq!(input.buffer.value(), "draft one\ndraft two");
+        assert!(
+            matches!(input.handle_key(down), InputAction::PaletteSync(value) if value == "draft one\ndraft two")
+        );
     }
 
     #[test]
@@ -1348,6 +1640,13 @@ mod tests {
     fn click_position_wrapped_line_has_no_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
         // width 10 -> ew 8 -> "abcdefghij" wraps as [0,8) then [8,10).
         single_line("abcdefghij").click_position(area(10), row, col, true)
+    }
+
+    #[test_case((0, 4) => Some((0, 1)); "early wrapped row blank cell stays on row")]
+    #[test_case((1, 0) => Some((0, 2)); "continuation begins at wide character")]
+    #[test_case((1, 4) => Some((0, 3)); "last row allows line end")]
+    fn click_position_wide_character_early_wrap((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        single_line("ab界").click_position(area(5), row, col, true)
     }
 
     #[test_case(true, (1, 2) => Some((0, 8)); "focused full cursor line gets an extra row")]
