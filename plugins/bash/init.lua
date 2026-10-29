@@ -258,18 +258,12 @@ end
 local description = [[Execute a bash command.
 Commands run in ]] .. cwd .. [[ by default.
 
-- **DO NOT** use for file ops! Only git, builds, tests, and system commands.
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
-
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
-})
 
 local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
